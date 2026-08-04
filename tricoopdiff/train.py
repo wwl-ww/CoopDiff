@@ -290,7 +290,4 @@ class TriCoopDiffTrainer:
         self.global_step = ckpt['global_step']
 
 
-def so3_score_norm(sigma):
-    """SO(3) score normalization factor."""
-    sigma = torch.as_tensor(sigma)
-    return torch.sqrt(sigma**2 * (3 + sigma**2) / (1 + sigma**2)**2) * (1 + sigma**2) / sigma**2
+# so3_score_norm — imported from tricoopdiff.diffusion where needed
