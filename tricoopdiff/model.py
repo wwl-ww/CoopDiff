@@ -315,14 +315,16 @@ class TriCoopDiff(nn.Module):
 
 
 def _set_time_embeddings(data, t, model):
-    """Set diffusion time information on the HeteroData object."""
-    if not hasattr(data, 'complex_t'):
+    """Set diffusion time information on the HeteroData object safely."""
+    # Safely get or create complex_t
+    if not hasattr(data, 'complex_t') or data.complex_t is None:
         data.complex_t = {}
-    t_val = t.item() if t.numel() == 1 else t[0].item()
+    t_val = t.item() if hasattr(t, 'numel') and t.numel() == 1 else (t[0].item() if hasattr(t, '__getitem__') else float(t))
     data.complex_t['tr'] = t_val
     data.complex_t['rot'] = t_val
     data.complex_t['tor'] = t_val
-    if not hasattr(data['ligand'], 'node_t'):
+    # Safely set ligand node_t
+    if not hasattr(data['ligand'], 'node_t') or data['ligand'].node_t is None:
         data['ligand'].node_t = {}
     data['ligand'].node_t['tr'] = t_val
     data['ligand'].node_t['rot'] = t_val
