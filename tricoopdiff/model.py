@@ -92,109 +92,104 @@ class TriCoopDiff(nn.Module):
         device = t.device
 
         # ------------------------------------------------------------------
-        # 1. Build subgraphs for the current batch
+        # 1-5: Iterate over batch (HeteroData subgraphs are per-complex)
         # ------------------------------------------------------------------
-        # We process one complex at a time, so B=1 for the subgraph construction.
-        # For batched training, we'd iterate or use DataLoader batching.
+        all_s_q = {'tr': [], 'rot': [], 'tor': []}
+        all_s_se3 = []
+        all_s_se3_components = {'tr': [], 'rot': []}
+        all_confidence = []
+        all_state = []
 
-        # For now: single-complex mode (B=1). Multi-complex batching
-        # requires padding/DataLoader and is deferred to training pipeline.
+        for b in range(B):
+            # Compute POI→E3 relative transform
+            e3_center = e3_data['coords'][b].mean(dim=0)
+            poi_center = poi_data['coords'][b].mean(dim=0)
+            t_e3_to_poi = poi_center - e3_center
 
-        # Compute POI→E3 relative transform for ligand coordinate sync
-        e3_center = e3_data['coords'][0].mean(dim=0)  # [3]
-        poi_center = poi_data['coords'][0].mean(dim=0)  # [3]
-        t_e3_to_poi = poi_center - e3_center  # translation from E3 to POI
-        # Simplified: identity rotation for now (proper SE(3) tracking during diffusion)
+            ligand_coords_poi = transform_ligand_to_poi_frame(
+                ligand_data['coords'][b], t_e3_to_poi,
+                torch.eye(3, device=device),
+            )
 
-        # Transform ligand to POI frame for subgraph 2
-        ligand_coords_poi = transform_ligand_to_poi_frame(
-            ligand_data['coords'][0],
-            t_e3_to_poi,
-            torch.eye(3, device=device),
-        )
+            # Build subgraphs
+            sub1 = build_subgraph_e3l(
+                e3_coords=e3_data['coords'][b],
+                e3_features=e3_data['features'][b],
+                ligand_coords=ligand_data['coords'][b],
+                ligand_features=ligand_data['features'][b],
+                rec_edge_index=e3_data.get('edge_index'),
+                lig_edge_index=ligand_data.get('edge_index'),
+                lig_edge_attr=ligand_data.get('edge_attr'),
+                lig_edge_mask=ligand_data.get('edge_mask'),
+                lig_mask_rotate=ligand_data.get('mask_rotate'),
+            )
 
-        sub1 = build_subgraph_e3l(
-            e3_coords=e3_data['coords'][0],
-            e3_features=e3_data['features'][0],
-            ligand_coords=ligand_data['coords'][0],
-            ligand_features=ligand_data['features'][0],
-            rec_edge_index=e3_data.get('edge_index'),
-            lig_edge_index=ligand_data.get('edge_index'),
-            lig_edge_attr=ligand_data.get('edge_attr'),
-            lig_edge_mask=ligand_data.get('edge_mask'),
-            lig_mask_rotate=ligand_data.get('mask_rotate'),
-        )
+            sub2 = build_subgraph_pol(
+                poi_coords=poi_data['coords'][b],
+                poi_features=poi_data['features'][b],
+                ligand_coords_poi_frame=ligand_coords_poi,
+                ligand_features=ligand_data['features'][b],
+                rec_edge_index=poi_data.get('edge_index'),
+                lig_edge_index=ligand_data.get('edge_index'),
+                lig_edge_attr=ligand_data.get('edge_attr'),
+                lig_edge_mask=ligand_data.get('edge_mask'),
+                lig_mask_rotate=ligand_data.get('mask_rotate'),
+            )
 
-        sub2 = build_subgraph_pol(
-            poi_coords=poi_data['coords'][0],
-            poi_features=poi_data['features'][0],
-            ligand_coords_poi_frame=ligand_coords_poi,
-            ligand_features=ligand_data['features'][0],
-            rec_edge_index=poi_data.get('edge_index'),
-            lig_edge_index=ligand_data.get('edge_index'),
-            lig_edge_attr=ligand_data.get('edge_attr'),
-            lig_edge_mask=ligand_data.get('edge_mask'),
-            lig_mask_rotate=ligand_data.get('mask_rotate'),
-        )
+            # Build ternary graph for TriBrain
+            tri_graph = build_tribrain_graph(
+                e3_coords=e3_data['coords'][b],
+                e3_features=e3_data['features'][b],
+                poi_coords=poi_data['coords'][b],
+                poi_features=poi_data['features'][b],
+                ligand_coords=ligand_data['coords'][b],
+                ligand_features=ligand_data['features'][b],
+            )
 
-        # ------------------------------------------------------------------
-        # 2. Build full ternary graph for TriBrain
-        # ------------------------------------------------------------------
-        tri_graph = build_tribrain_graph(
-            e3_coords=e3_data['coords'][0],
-            e3_features=e3_data['features'][0],
-            poi_coords=poi_data['coords'][0],
-            poi_features=poi_data['features'][0],
-            ligand_coords=ligand_data['coords'][0],
-            ligand_features=ligand_data['features'][0],
-        )
+            # TriBrain forward
+            tri_out = self.tribrain(
+                node_features=tri_graph['node_features'].unsqueeze(0),
+                node_coords=tri_graph['node_coords'].unsqueeze(0),
+                node_types=tri_graph['node_types'].unsqueeze(0),
+            )
 
-        # ------------------------------------------------------------------
-        # 3. TriBrain forward → FiLM params + s_SE3 + confidence + state
-        # ------------------------------------------------------------------
-        tri_out = self.tribrain(
-            node_features=tri_graph['node_features'].unsqueeze(0),
-            node_coords=tri_graph['node_coords'].unsqueeze(0),
-            node_types=tri_graph['node_types'].unsqueeze(0),
-        )
+            film_params_b = tri_out['film_params']
 
-        film_params = tri_out['film_params']  # list of (gamma, beta)
-        s_se3 = tri_out['s_se3']              # [1, 6]
+            # Expert forward with FiLM
+            scores_1 = self._expert_forward_with_film(
+                sub1, t[b:b+1], film_params_b[:self.num_conv_layers]
+            )
+            scores_2 = self._expert_forward_with_film(
+                sub2, t[b:b+1], film_params_b[self.num_conv_layers:]
+            )
 
-        # ------------------------------------------------------------------
-        # 4. Two-body expert forward with FiLM injection
-        # ------------------------------------------------------------------
-        # For both subgraphs, run embedding + per-layer conv with FiLM
+            # Merge scores (direct addition)
+            all_s_q['tr'].append(scores_1['tr_score'] + scores_2['tr_score'])
+            all_s_q['rot'].append(scores_1['rot_score'] + scores_2['rot_score'])
+            all_s_q['tor'].append(scores_1['tor_score'] + scores_2['tor_score'])
 
-        # Subgraph 1 (E3-L)
-        scores_1 = self._expert_forward_with_film(
-            sub1, t, film_params[:self.num_conv_layers]
-        )
+            all_s_se3.append(tri_out['s_se3'])
+            all_s_se3_components['tr'].append(tri_out['s_se3'][:, :3])
+            all_s_se3_components['rot'].append(tri_out['s_se3'][:, 3:])
+            all_confidence.append(tri_out['confidence'])
+            all_state.append(tri_out['state'])
 
-        # Subgraph 2 (POI-L)
-        scores_2 = self._expert_forward_with_film(
-            sub2, t, film_params[self.num_conv_layers:]
-        )
-
-        # ------------------------------------------------------------------
-        # 5. Score merging: direct addition
-        # ------------------------------------------------------------------
+        # Stack batch results
         s_q = {
-            'tr': scores_1['tr_score'] + scores_2['tr_score'],
-            'rot': scores_1['rot_score'] + scores_2['rot_score'],
-            'tor': scores_1['tor_score'] + scores_2['tor_score'],
+            k: torch.stack(v, dim=0).squeeze(0) if len(v[0].shape) <= 2
+            else torch.cat(v, dim=0)
+            for k, v in all_s_q.items()
         }
 
         return {
             's_q': s_q,
-            's_se3': s_se3,
+            's_se3': torch.cat(all_s_se3, dim=0),
             's_se3_components': {
-                'tr': s_se3[:, :3],
-                'rot': s_se3[:, 3:],
+                'tr': torch.cat(all_s_se3_components['tr'], dim=0),
+                'rot': torch.cat(all_s_se3_components['rot'], dim=0),
             },
-            'film_params': film_params,
-            'confidence': tri_out['confidence'],
-            'state': tri_out['state'],
+            'confidence': torch.cat(all_confidence, dim=0),
+            'state': torch.cat(all_state, dim=0),
         }
 
     def _expert_forward_with_film(
