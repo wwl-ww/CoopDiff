@@ -17,6 +17,12 @@ from e3nn import o3
 from torch_scatter import scatter_mean
 
 
+def torus_score_norm(sigma):
+    """Torus (torsion) score normalization: 1 / sigma^2."""
+    sigma = np.asarray(sigma)
+    return 1.0 / (sigma ** 2)
+
+
 class FrozenDiffDock(nn.Module):
     """
     Wrapper around DiffDock's CGModel that:
@@ -197,7 +203,7 @@ class FrozenDiffDock(nn.Module):
             if model.scale_by_sigma:
                 tor_pred = tor_pred * torch.sqrt(
                     torch.tensor(
-                        model.tor_score_norm(edge_sigma.cpu().numpy())
+                        torus_score_norm(edge_sigma.cpu().numpy())
                     ).float().to(lig_node_attr.device)
                 )
 
