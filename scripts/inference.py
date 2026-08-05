@@ -276,8 +276,11 @@ def load_model(checkpoint_path, diffdock_weights, device, no_film=False, single_
 
     frozen_expert = FrozenDiffDock(cg_model, num_conv_layers=num_conv_layers)
 
-    # Build full model
-    model = TriCoopDiff(frozen_expert, tribrain, num_conv_layers=num_conv_layers)
+    # Build full model (with ablation flags)
+    model = TriCoopDiff(
+        frozen_expert, tribrain, num_conv_layers=num_conv_layers,
+        use_film=not no_film,
+    )
 
     # Load TriBrain weights from checkpoint
     if 'tribrain_state_dict' in ckpt:
