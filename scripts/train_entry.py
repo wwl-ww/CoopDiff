@@ -236,16 +236,15 @@ def _make_timestep_emb():
 
 
 def validate(trainer, val_loader, device):
-    """Run validation pass."""
+    """Run validation pass — no backward, no optimizer."""
     trainer.model.eval()
     total_loss = 0.0
     n_batches = 0
 
-    with torch.no_grad():
-        for batch in val_loader:
-            loss_dict = trainer.train_step(**batch)  # same step, no optimizer.step
-            total_loss += loss_dict['loss_total']
-            n_batches += 1
+    for batch in val_loader:
+        loss_dict = trainer.validate_step(**batch)
+        total_loss += loss_dict['loss_total']
+        n_batches += 1
 
     trainer.model.train()
     return total_loss / max(n_batches, 1)

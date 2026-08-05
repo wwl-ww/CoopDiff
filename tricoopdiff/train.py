@@ -67,148 +67,107 @@ class TriCoopDiffTrainer:
 
         self.global_step = 0
 
-    def train_step(
+    def compute_loss(
         self,
         e3_data: dict,
         poi_data: dict,
         ligand_data: dict,
-        t_se3_data: dict,  # ground truth E3-POI SE3 for supervised pre-training
+        t_se3_data: dict,
     ) -> dict:
         """
-        Single training step.
-
-        Args:
-            e3_data: E3 ligase batch
-            poi_data: POI target batch
-            ligand_data: PROTAC batch
-            t_se3_data: dict with 'tr' [B,3], 'rot' [B,3,3] ground truth SE3
+        Compute forward pass + losses without backward.
+        Shared by train_step and validate_step.
 
         Returns:
-            dict of loss values for logging
+            dict of loss values and intermediate tensors
         """
-        self.model.train()
-        self.optimizer.zero_grad()
-
+        self.model.train()  # still need train mode for dropout patterns consistency
         B = e3_data['coords'].shape[0]
         device = self.device
 
-        # ------------------------------------------------------------------
-        # 1. Sample random diffusion time t ~ Uniform(0, 1)
-        # ------------------------------------------------------------------
+        # Sample random diffusion times
         t = torch.rand(B, device=device)
         t_se3 = torch.rand(B, device=device)
 
-        # ------------------------------------------------------------------
-        # 2. Add noise to clean data
-        # ------------------------------------------------------------------
-        # PROTAC noise
+        # Add noise to PROTAC
         noisy_ligand, tr_noise, rot_noise = self.diffusion.add_noise_protac(
-            ligand_data['coords'].to(device),
-            t,
-            t,  # same t for tr/rot/tor in basic mode
-            t,
+            ligand_data['coords'].to(device), t, t, t,
         )
-
-        # SE3 noise (POI relative to E3)
+        # Add noise to POI (SE3)
         noisy_poi, se3_tr_noise, se3_rot_noise = self.diffusion.add_noise_se3(
-            poi_data['coords'].to(device),
-            t_se3,
-            t_se3,
+            poi_data['coords'].to(device), t_se3, t_se3,
         )
 
-        # ------------------------------------------------------------------
-        # 3. Prepare noisy batch data
-        # ------------------------------------------------------------------
+        # Prepare noisy batch
         noisy_e3_data = {**e3_data, 'coords': e3_data['coords'].to(device)}
         noisy_poi_data = {**poi_data, 'coords': noisy_poi}
         noisy_ligand_data = {**ligand_data, 'coords': noisy_ligand}
 
-        # ------------------------------------------------------------------
-        # 4. Model forward → predicted scores
-        # ------------------------------------------------------------------
-        output = self.model(
-            noisy_e3_data,
-            noisy_poi_data,
-            noisy_ligand_data,
-            t=t,
-            t_se3=t_se3,
-        )
+        # Model forward
+        output = self.model(noisy_e3_data, noisy_poi_data, noisy_ligand_data, t=t, t_se3=t_se3)
 
-        # ------------------------------------------------------------------
-        # 5. Score matching loss (denoising score matching)
-        # ------------------------------------------------------------------
-        # PROTAC translation score target
+        # Score matching loss
         tr_sigma, rot_sigma, tor_sigma = self.diffusion.t_to_sigma(t, t, t)
-        tr_score_target = -tr_noise / tr_sigma.unsqueeze(-1) ** 2
-
-        loss_score_tr = F.mse_loss(output['s_q']['tr'], tr_score_target)
-
-        # PROTAC rotation score target
+        loss_score_tr = F.mse_loss(output['s_q']['tr'], -tr_noise / tr_sigma.unsqueeze(-1)**2)
         rot_score_target = self._compute_rot_score_target(rot_noise, rot_sigma)
         loss_score_rot = F.mse_loss(output['s_q']['rot'], rot_score_target)
 
-        # PROTAC torsion score target
         if output['s_q']['tor'].numel() > 0:
             tor_score_target = self._compute_tor_score_target(tor_sigma)
             loss_score_tor = F.mse_loss(output['s_q']['tor'], tor_score_target)
         else:
             loss_score_tor = torch.tensor(0.0, device=device)
-
         loss_score = loss_score_tr + loss_score_rot + loss_score_tor
 
-        # ------------------------------------------------------------------
-        # 6. SE3 score matching loss
-        # ------------------------------------------------------------------
+        # SE3 score matching loss
         se3_tr_sigma, se3_rot_sigma = self.diffusion.se3_t_to_sigma(t_se3, t_se3)
-        se3_tr_target = -se3_tr_noise / se3_tr_sigma.unsqueeze(-1) ** 2
+        loss_se3_tr = F.mse_loss(
+            output['s_se3_components']['tr'],
+            -se3_tr_noise / se3_tr_sigma.unsqueeze(-1)**2,
+        )
         se3_rot_target = self._compute_rot_score_target(se3_rot_noise, se3_rot_sigma)
-
-        loss_se3_tr = F.mse_loss(output['s_se3_components']['tr'], se3_tr_target)
         loss_se3_rot = F.mse_loss(output['s_se3_components']['rot'], se3_rot_target)
         loss_se3 = loss_se3_tr + loss_se3_rot
 
-        # ------------------------------------------------------------------
-        # 7. Physical consistency loss
-        #    Gradient path: L_phys → denoised coords → TriBrain (not through FiLM)
-        # ------------------------------------------------------------------
-        # Approximate denoised coordinates from predicted scores
-        denoised_ligand = self._estimate_denoised(
-            noisy_ligand, output['s_q']['tr'], tr_sigma
-        )
-        denoised_poi = self._estimate_denoised_se3(
-            noisy_poi, output['s_se3'], se3_tr_sigma
-        )
-
+        # Physical consistency loss
+        denoised_ligand = self._estimate_denoised(noisy_ligand, output['s_q']['tr'], tr_sigma)
+        denoised_poi = self._estimate_denoised_se3(noisy_poi, output['s_se3'], se3_tr_sigma)
         loss_phys = self._physical_loss(denoised_ligand, denoised_poi)
 
-        # ------------------------------------------------------------------
-        # 8. Total loss
-        # ------------------------------------------------------------------
         loss_total = (
             self.loss_weights['score'] * loss_score
             + self.loss_weights['phys'] * loss_phys
             + self.loss_weights['se3'] * loss_se3
         )
 
-        # Backward: gradients only flow to TriBrain (experts are frozen)
-        loss_total.backward()
-
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.model.tribrain.parameters(), max_norm=1.0)
-
-        self.optimizer.step()
-        self.global_step += 1
-
         return {
-            'loss_total': loss_total.item(),
+            'loss_total': loss_total,
             'loss_score': loss_score.item(),
             'loss_score_tr': loss_score_tr.item(),
             'loss_score_rot': loss_score_rot.item(),
             'loss_score_tor': loss_score_tor.item(),
             'loss_se3': loss_se3.item(),
             'loss_phys': loss_phys.item(),
-            'lr': self.optimizer.param_groups[0]['lr'],
         }
+
+    def train_step(self, **batch) -> dict:
+        """Forward + backward + optimizer step."""
+        self.optimizer.zero_grad()
+        loss_dict = self.compute_loss(**batch)
+        loss_dict['loss_total'].backward()
+        torch.nn.utils.clip_grad_norm_(self.model.tribrain.parameters(), max_norm=1.0)
+        self.optimizer.step()
+        self.global_step += 1
+
+        result = {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
+        result['lr'] = self.optimizer.param_groups[0]['lr']
+        return result
+
+    @torch.no_grad()
+    def validate_step(self, **batch) -> dict:
+        """Forward + loss only, no backward."""
+        loss_dict = self.compute_loss(**batch)
+        return {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
 
     def _compute_rot_score_target(self, rot_noise, rot_sigma):
         """Compute SO(3) score target for rotation noise."""
