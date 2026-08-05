@@ -40,19 +40,29 @@ class TriCoopDiff(nn.Module):
         frozen_expert: FrozenDiffDock,
         tribrain: TriBrain,
         num_conv_layers: int = 6,
+        use_film: bool = True,
+        use_learned_merge: bool = False,
     ):
         """
         Args:
             frozen_expert: FrozenDiffDock wrapping DiffDock CGModel
             tribrain: TriBrain coordination network
             num_conv_layers: number of conv layers in the expert
+            use_film: if False, skip FiLM modulation (L0 ablation)
+            use_learned_merge: if True, use LearnedCoordinationLayer instead
+                              of direct addition (Ablation B)
         """
         super().__init__()
         self.expert = frozen_expert
         self.tribrain = tribrain
         self.num_conv_layers = num_conv_layers
+        self.use_film = use_film
+        self.use_learned_merge = use_learned_merge
 
-        # Cache for layer outputs (used during inference to collect features)
+        if use_learned_merge:
+            from .merging import LearnedCoordinationLayer
+            self.merge_layer = LearnedCoordinationLayer(hidden_dim=tribrain.node_dim)
+
         self._layer_cache = {}
 
     def forward(
@@ -155,18 +165,31 @@ class TriCoopDiff(nn.Module):
 
             film_params_b = tri_out['film_params']
 
-            # Expert forward with FiLM
-            scores_1 = self._expert_forward_with_film(
-                sub1, t[b:b+1], film_params_b[:self.num_conv_layers]
-            )
-            scores_2 = self._expert_forward_with_film(
-                sub2, t[b:b+1], film_params_b[self.num_conv_layers:]
-            )
+            # Expert forward with (optional) FiLM
+            if self.use_film:
+                scores_1 = self._expert_forward_with_film(
+                    sub1, t[b:b+1], film_params_b[:self.num_conv_layers]
+                )
+                scores_2 = self._expert_forward_with_film(
+                    sub2, t[b:b+1], film_params_b[self.num_conv_layers:]
+                )
+            else:
+                # L0 ablation: no FiLM, use native expert forward
+                raw_out1 = self.expert(sub1)
+                raw_out2 = self.expert(sub2)
+                scores_1 = {'tr_score': raw_out1[0], 'rot_score': raw_out1[1], 'tor_score': raw_out1[2]}
+                scores_2 = {'tr_score': raw_out2[0], 'rot_score': raw_out2[1], 'tor_score': raw_out2[2]}
 
-            # Merge scores (direct addition)
-            all_s_q['tr'].append(scores_1['tr_score'] + scores_2['tr_score'])
-            all_s_q['rot'].append(scores_1['rot_score'] + scores_2['rot_score'])
-            all_s_q['tor'].append(scores_1['tor_score'] + scores_2['tor_score'])
+            # Merge scores
+            if self.use_learned_merge:
+                merged = self.merge_layer(scores_1, scores_2, tri_out['h_cond'])
+            else:
+                from .merging import merge_direct_addition
+                merged = merge_direct_addition(scores_1, scores_2)
+
+            all_s_q['tr'].append(merged['tr_score'])
+            all_s_q['rot'].append(merged['rot_score'])
+            all_s_q['tor'].append(merged['tor_score'])
 
             all_s_se3.append(tri_out['s_se3'])
             all_s_se3_components['tr'].append(tri_out['s_se3'][:, :3])
