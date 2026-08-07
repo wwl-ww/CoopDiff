@@ -341,7 +341,6 @@ def predict_one_case(name, model, cfg, out_dir, seed_num=40, device='cuda'):
 
             lig, lig_graph = graph_func(
                 lig, name=name, max_neighbors=ds_cfg.lig_max_neighbors,
-                ideal_path=auto_download_ideal_sdf(name.split('_')[-1]),
                 use_random_coords=False, seed=seed,
                 use_rdkit_coords=True, radius=ds_cfg.lig_graph_radius)
             geometry_graph = get_geometry_graph_ring(lig)
