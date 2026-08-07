@@ -27,7 +27,7 @@ git clone https://github.com/gcorso/DiffDock.git
 
 ### Core Design (from 模型交接文档 §2)
 
-1. **Two-body expert (frozen)**: DiffDock-L v1.1 split into two physically disconnected subgraphs:
+1. **Two-body expert (frozen)**: DiffDock-L v1.1 (ns=48, nv=10, num_conv_layers=6, ~20M params, Corso et al. ICLR 2023) split into two physically disconnected subgraphs:
    - Subgraph 1 (E3-L): E3 residues + PROTAC atoms only — no POI nodes
    - Subgraph 2 (POI-L): POI residues + PROTAC atoms only — no E3 nodes
    - Each subgraph receives standard protein-ligand docking input (zero OOD)

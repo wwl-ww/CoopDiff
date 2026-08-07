@@ -231,8 +231,10 @@ def load_model(checkpoint_path, diffdock_weights, device, no_film=False, single_
 
     # Determine config from checkpoint or use defaults
     cfg = ckpt.get('config', {})
-    ns = cfg.get('ns', 32)
-    nv = cfg.get('nv', 4)
+    ns = cfg.get('ns', 32)           # TriBrain scalar channels
+    nv = cfg.get('nv', 4)            # TriBrain vector channels
+    expert_ns = cfg.get('expert_ns', 48)  # DiffDock-L scalar channels
+    expert_nv = cfg.get('expert_nv', 10)  # DiffDock-L vector channels
     num_layers = cfg.get('num_transformer_layers', 3)
     num_conv_layers = cfg.get('num_conv_layers', 6)
     node_dim = cfg.get('node_dim', 128)
@@ -267,7 +269,7 @@ def load_model(checkpoint_path, diffdock_weights, device, no_film=False, single_
             ),
             device=device,
             timestep_emb_func=_make_timestep_emb(32),
-            ns=ns, nv=nv,
+            ns=expert_ns, nv=expert_nv,
             num_conv_layers=num_conv_layers,
             scale_by_sigma=True,
             separate_noise_schedule=False,

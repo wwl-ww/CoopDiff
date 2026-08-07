@@ -56,8 +56,12 @@ def parse_args():
     p.add_argument("--resume", default=None, help="Resume from checkpoint")
 
     # Model config
-    p.add_argument("--ns", type=int, default=32, help="Scalar channels")
-    p.add_argument("--nv", type=int, default=4, help="Vector channels")
+    # TriBrain params
+    p.add_argument("--ns", type=int, default=32, help="TriBrain scalar channels")
+    p.add_argument("--nv", type=int, default=4, help="TriBrain vector channels")
+    # DiffDock-L params (ns=48, nv=10, num_conv_layers=6 from paper)
+    p.add_argument("--expert_ns", type=int, default=48, help="DiffDock-L scalar channels")
+    p.add_argument("--expert_nv", type=int, default=10, help="DiffDock-L vector channels")
     p.add_argument("--num_transformer_layers", type=int, default=3)
     p.add_argument("--num_conv_layers", type=int, default=6)
     p.add_argument("--node_dim", type=int, default=128)
@@ -202,7 +206,7 @@ def build_trainer(args, device):
         ),
         device=device,
         timestep_emb_func=_make_timestep_emb(),
-        ns=args.ns, nv=args.nv,
+        ns=args.expert_ns, nv=args.expert_nv,
         num_conv_layers=args.num_conv_layers,
         scale_by_sigma=True,
         separate_noise_schedule=False,
