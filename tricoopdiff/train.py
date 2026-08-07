@@ -123,7 +123,7 @@ class TriCoopDiffTrainer:
 
         if output['s_q']['tor'].numel() > 0:
             tor_score_target = self._compute_tor_score_target(tor_sigma)
-            tor_norm = 1.0 / tor_sigma**2  # torus score_norm = 1/σ²
+            tor_norm = tor_sigma**2  # weight high-noise less (∝ 1/σ²)
             loss_score_tor = ((output['s_q']['tor'] - tor_score_target)**2 / tor_norm).mean()
         else:
             loss_score_tor = torch.tensor(0.0, device=device)
