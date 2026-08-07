@@ -17,6 +17,12 @@ from e3nn import o3
 from torch_scatter import scatter_mean
 
 
+def torus_score_norm(sigma):
+    """Torus (torsion) score normalization: 1 / sigma^2."""
+    sigma = np.asarray(sigma)
+    return 1.0 / (sigma ** 2)
+
+
 class FrozenDiffDock(nn.Module):
     """
     Wrapper around DiffDock's CGModel that:
@@ -151,9 +157,10 @@ class FrozenDiffDock(nn.Module):
 
         if model.scale_by_sigma:
             tr_pred = tr_pred / tr_sigma.unsqueeze(1)
+            from .diffusion import so3_score_norm
             rot_pred = (
                 rot_pred
-                * model.so3_score_norm(rot_sigma.cpu()).unsqueeze(1).to(lig_node_attr.device)
+                * so3_score_norm(rot_sigma.cpu()).unsqueeze(1).to(lig_node_attr.device)
             )
 
         # Torsion scores
@@ -196,7 +203,7 @@ class FrozenDiffDock(nn.Module):
             if model.scale_by_sigma:
                 tor_pred = tor_pred * torch.sqrt(
                     torch.tensor(
-                        model.tor_score_norm(edge_sigma.cpu().numpy())
+                        torus_score_norm(edge_sigma.cpu().numpy())
                     ).float().to(lig_node_attr.device)
                 )
 
@@ -205,19 +212,6 @@ class FrozenDiffDock(nn.Module):
             'rot_score': rot_pred,
             'tor_score': tor_pred,
         }
-
-    def so3_score_norm(self, sigma):
-        """Compute SO(3) score normalization factor."""
-        # Borrowed from DiffDock's utils/so3.py
-        sigma = torch.tensor(sigma) if not torch.is_tensor(sigma) else sigma
-        return torch.sqrt(
-            sigma**2 * (3 + sigma**2) / (1 + sigma**2)**2
-        ) * (1 + sigma**2) / sigma**2
-
-    def tor_score_norm(self, sigma):
-        """Compute torsion score normalization factor."""
-        # Borrowed from DiffDock's utils/torus.py
-        return 1.0 / (sigma**2)
 
     def forward(self, data):
         """

@@ -486,10 +486,20 @@ def vector_to_skew(v: torch.Tensor) -> torch.Tensor:
     device = v.device
 
     z = torch.zeros(*batch_dims, device=device)
-    o = torch.ones(*batch_dims, device=device)
 
     row0 = torch.stack([z, -v[..., 2], v[..., 1]], dim=-1)
     row1 = torch.stack([v[..., 2], z, -v[..., 0]], dim=-1)
     row2 = torch.stack([-v[..., 1], v[..., 0], z], dim=-1)
 
     return torch.stack([row0, row1, row2], dim=-2)
+
+
+def so3_score_norm(sigma):
+    """
+    SO(3) score normalization factor.
+
+    Used to normalize rotation scores during training and inference.
+    Reference: DiffDock utils/so3.py score_norm.
+    """
+    sigma = torch.as_tensor(sigma, dtype=torch.float32)
+    return torch.sqrt(sigma**2 * (3 + sigma**2) / (1 + sigma**2)**2) * (1 + sigma**2) / sigma**2

@@ -18,7 +18,34 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_scatter import scatter_mean, scatter_sum
+
+# torch_scatter is a common dependency but may need separate install.
+# Fall back to manual scatter if unavailable.
+try:
+    from torch_scatter import scatter_mean, scatter_sum
+    _has_torch_scatter = True
+except ImportError:
+    _has_torch_scatter = False
+
+    def scatter_mean(src, index, dim=0, dim_size=None):
+        """Fallback scatter_mean using torch operations."""
+        if dim_size is None:
+            dim_size = index.max().item() + 1
+        out = src.new_zeros(dim_size, src.shape[1])
+        ones = src.new_ones(src.shape[0], 1)
+        out.index_add_(0, index, src)
+        count = out.new_zeros(dim_size, 1)
+        count.index_add_(0, index, ones)
+        count = count.clamp(min=1)
+        return out / count
+
+    def scatter_sum(src, index, dim=0, dim_size=None):
+        """Fallback scatter_sum using torch operations."""
+        if dim_size is None:
+            dim_size = index.max().item() + 1
+        out = src.new_zeros(dim_size, src.shape[1])
+        out.index_add_(0, index, src)
+        return out
 
 
 # ---------------------------------------------------------------------------
