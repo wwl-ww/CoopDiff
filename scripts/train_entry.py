@@ -226,13 +226,9 @@ def build_trainer(args, device):
     return model, diffusion, trainer
 
 
-def _make_timestep_emb():
-    """Minimal timestep embedding function."""
-    import torch.nn as nn
-    emb = nn.Embedding(1, 32)  # placeholder
-    def fn(t):
-        return emb(torch.zeros(1, dtype=torch.long, device=t.device if hasattr(t, 'device') else 'cpu'))
-    return fn
+def _make_timestep_emb(embedding_dim=32):
+    from utils.diffusion_utils import GaussianFourierProjection
+    return GaussianFourierProjection(embedding_size=embedding_dim)
 
 
 def validate(trainer, val_loader, device):
