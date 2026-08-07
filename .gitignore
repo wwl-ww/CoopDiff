@@ -60,3 +60,6 @@ wandb/
 # DiffDock (cloned separately)
 DiffDock/
 DeepTernary/
+
+# Audit outputs (large, generated)
+audit_results/
