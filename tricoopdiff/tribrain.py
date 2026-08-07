@@ -66,15 +66,30 @@ class MultiScalePooling(nn.Module):
     Total params: ~66k
     """
 
-    def __init__(self, node_dim: int = 128, token_dim: int = 128):
+    def __init__(
+        self,
+        node_dim: int = 128,
+        token_dim: int = 128,
+        input_dim: int = None,
+    ):
+        """
+        Args:
+            node_dim: internal representation dimension (legacy, defaults to input_dim)
+            token_dim: output token dimension
+            input_dim: actual input feature dimension (e.g. 1280 for ESM2).
+                       Defaults to node_dim for backwards compatibility.
+        """
         super().__init__()
+        if input_dim is None:
+            input_dim = node_dim
         self.node_dim = node_dim
         self.token_dim = token_dim
+        self.input_dim = input_dim
 
         # Projection layers for each scale
-        self.short_proj = nn.Linear(node_dim, token_dim)
-        self.mid_proj = nn.Linear(node_dim, token_dim)
-        self.global_proj = nn.Linear(node_dim, token_dim)
+        self.short_proj = nn.Linear(input_dim, token_dim)
+        self.mid_proj = nn.Linear(input_dim, token_dim)
+        self.global_proj = nn.Linear(input_dim, token_dim)
 
         # Attention pooling: learnable query vectors
         self.short_query = nn.Parameter(torch.randn(1, token_dim) * 0.02)
@@ -368,6 +383,7 @@ class TriBrain(nn.Module):
     def __init__(
         self,
         node_dim: int = 128,
+        input_dim: int = None,
         ns: int = 32,
         nv: int = 4,
         num_transformer_layers: int = 3,
@@ -376,7 +392,9 @@ class TriBrain(nn.Module):
     ):
         """
         Args:
-            node_dim: input/output feature dimension
+            node_dim: internal representation dimension
+            input_dim: input feature dimension (e.g. 1280 for ESM2).
+                       Defaults to node_dim for backwards compatibility.
             ns: scalar channel count
             nv: vector channel count
             num_transformer_layers: depth of equivariant transformer
@@ -385,11 +403,16 @@ class TriBrain(nn.Module):
             dropout: dropout rate
         """
         super().__init__()
+        if input_dim is None:
+            input_dim = node_dim
         self.node_dim = node_dim
+        self.input_dim = input_dim
         self.num_conv_layers = num_conv_layers_per_expert
 
         # Multi-scale pooling: ~66k params
-        self.pooling = MultiScalePooling(node_dim=node_dim, token_dim=node_dim)
+        self.pooling = MultiScalePooling(
+            node_dim=node_dim, token_dim=node_dim, input_dim=input_dim
+        )
 
         # Equivariant transformer: ~1.1M params
         self.transformer = EquivariantTransformer(

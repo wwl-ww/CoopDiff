@@ -296,6 +296,9 @@ def predict_one_case(name, model, cfg, out_dir, seed_num=40, device='cuda'):
     lig_path = os.path.join(unboud_folder, name, 'ligand.pdb')
     p1_path = os.path.join(unboud_folder, name, 'unbound_protein1.pdb')
     p2_path = os.path.join(unboud_folder, name, 'unbound_protein2.pdb')
+    # Bound (holo) structures for complex merge — correct chain IDs (A=E3, B=POI)
+    merge_p1_path = os.path.join(unboud_folder, name, 'protein1.pdb')  # chain A = E3
+    merge_p2_path = os.path.join(unboud_folder, name, 'protein2.pdb')  # chain B = POI
 
     # Build receptor graphs (once — shared across seeds)
     lig_origin = read_molecule(lig_path, sanitize=True, remove_hs=ds_cfg.remove_h)
@@ -446,7 +449,7 @@ def predict_one_case(name, model, cfg, out_dir, seed_num=40, device='cuda'):
 
             # Save predicted protein2 PDB
             p2_pred_file = os.path.join(out_dir_case, f'p2_pred_{name}_{seed}.pdb')
-            p2_pdb = PandasPdb().read_pdb(p2_path)
+            p2_pdb = PandasPdb().read_pdb(merge_p2_path)
             p2_gt_coords = p2_pdb.df['ATOM'][['x_coord', 'y_coord', 'z_coord']].to_numpy()
             p2_pred_coords = rotate_and_translate(
                 p2_gt_coords, p2_rot.cpu().numpy(), p2_trans.cpu().numpy())
@@ -456,7 +459,7 @@ def predict_one_case(name, model, cfg, out_dir, seed_num=40, device='cuda'):
             # Save full complex PDB
             complex_save_path = os.path.join(out_dir_case, f'complex_pred_{name}_{seed}.pdb')
             merge_pdbs(
-                pdb_files=[p1_path, p2_pred_file, lig_pred_path],
+                pdb_files=[merge_p1_path, p2_pred_file, lig_pred_path],
                 path=complex_save_path)
 
             # Compute per-seed metrics
