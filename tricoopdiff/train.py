@@ -106,27 +106,38 @@ class TriCoopDiffTrainer:
         # Model forward
         output = self.model(noisy_e3_data, noisy_poi_data, noisy_ligand_data, t=t, t_se3=t_se3)
 
-        # Score matching loss
+        # Score matching loss — matches DiffDock paper §4
+        # Translation: weighted by σ² (R³ Euclidean DSM)
+        # Rotation: normalized by SO(3) score_norm
+        # Torsion: normalized by torus score_norm
+        from .diffusion import so3_score_norm
+
         tr_sigma, rot_sigma, tor_sigma = self.diffusion.t_to_sigma(t, t, t)
-        loss_score_tr = F.mse_loss(output['s_q']['tr'], -tr_noise / tr_sigma.unsqueeze(-1)**2)
+        tr_score_target = -tr_noise / tr_sigma.unsqueeze(-1)**2
+        diff_tr = output['s_q']['tr'] - tr_score_target
+        loss_score_tr = (diff_tr**2 * tr_sigma.unsqueeze(-1)**2).mean()
+
         rot_score_target = self._compute_rot_score_target(rot_noise, rot_sigma)
-        loss_score_rot = F.mse_loss(output['s_q']['rot'], rot_score_target)
+        rot_norm = so3_score_norm(rot_sigma).unsqueeze(-1)
+        loss_score_rot = ((output['s_q']['rot'] - rot_score_target)**2 / rot_norm**2).mean()
 
         if output['s_q']['tor'].numel() > 0:
             tor_score_target = self._compute_tor_score_target(tor_sigma)
-            loss_score_tor = F.mse_loss(output['s_q']['tor'], tor_score_target)
+            tor_norm = 1.0 / tor_sigma**2  # torus score_norm = 1/σ²
+            loss_score_tor = ((output['s_q']['tor'] - tor_score_target)**2 / tor_norm).mean()
         else:
             loss_score_tor = torch.tensor(0.0, device=device)
         loss_score = loss_score_tr + loss_score_rot + loss_score_tor
 
-        # SE3 score matching loss
+        # SE3 score matching loss — same pattern as PROTAC
         se3_tr_sigma, se3_rot_sigma = self.diffusion.se3_t_to_sigma(t_se3, t_se3)
-        loss_se3_tr = F.mse_loss(
-            output['s_se3_components']['tr'],
-            -se3_tr_noise / se3_tr_sigma.unsqueeze(-1)**2,
-        )
+        se3_tr_target = -se3_tr_noise / se3_tr_sigma.unsqueeze(-1)**2
+        diff_se3_tr = output['s_se3_components']['tr'] - se3_tr_target
+        loss_se3_tr = (diff_se3_tr**2 * se3_tr_sigma.unsqueeze(-1)**2).mean()
+
         se3_rot_target = self._compute_rot_score_target(se3_rot_noise, se3_rot_sigma)
-        loss_se3_rot = F.mse_loss(output['s_se3_components']['rot'], se3_rot_target)
+        se3_rot_norm = so3_score_norm(se3_rot_sigma).unsqueeze(-1)
+        loss_se3_rot = ((output['s_se3_components']['rot'] - se3_rot_target)**2 / se3_rot_norm**2).mean()
         loss_se3 = loss_se3_tr + loss_se3_rot
 
         # Physical consistency loss
