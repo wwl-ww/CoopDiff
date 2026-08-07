@@ -40,6 +40,26 @@ git clone https://github.com/gcorso/DiffDock.git
 
 3. **FiLM modulation**: Each DiffDock Conv layer output `h` becomes `h' = h * (1+γ) + β`. At initialization, FiLM is transparent (output numerically identical to native DiffDock).
 
+### DiffDock-L Paper Parameters (Corso et al. ICLR 2023)
+
+| Parameter | Value |
+|-----------|-------|
+| ns | 48 |
+| nv | 10 |
+| num_conv_layers | 6 |
+| sigma_embed_dim | 64 |
+| distance_embed_dim | 64 |
+| cross_distance_embed_dim | 64 |
+| dropout | 0.1 |
+| receptor_radius | 15 |
+| c_alpha_max_neighbors | 24 |
+| tr_sigma | 0.1 → 19 |
+| rot/tor_sigma | 0.03 → 1.55 |
+| train batch_size | 16 |
+| train lr | 1e-3 (Plateau, patience=30) |
+| train epochs | 850 |
+| optimizer | Adam + EMA |
+
 4. **Multi-rate diffusion**: PROTAC degrees of freedom use fast noise decay (λ_q, threshold at t=0.7); E3-POI rigid body uses slow decay (λ_SE3, threshold at t=0.5). This is an empirical noise schedule trick, not a strict SDE derivation.
 
 5. **TriReflect post-processing**: KD-tree clash detection, bond anomaly detection, linker strain detection, local MMFF94 minimization (max 3 rounds).

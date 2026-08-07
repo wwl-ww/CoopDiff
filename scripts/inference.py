@@ -259,18 +259,26 @@ def load_model(checkpoint_path, diffdock_weights, device, no_film=False, single_
         print("  git clone https://github.com/gcorso/DiffDock.git")
         sys.exit(1)
 
-    # Build CGModel with default DiffDock-L config
+    # Build CGModel with DiffDock-L paper config (Corso et al. ICLR 2023)
+    # tr_sigma: 0.1→19, rot/tor_sigma: 0.03→1.55, sigma_embed=64
+    # distance_embed=64, cross_distance_embed=64, dropout=0.1
     def _build_cg_model():
         return CGModel(
             t_to_sigma=lambda tr, rot, tor: (
-                torch.tensor(0.1) * (30.0 / 0.1) ** tr,
-                torch.tensor(0.1) * (1.6 / 0.1) ** rot,
-                torch.tensor(0.2) * (2.0 / 0.2) ** tor,
+                torch.tensor(0.1) * (19.0 / 0.1) ** tr,
+                torch.tensor(0.03) * (1.55 / 0.03) ** rot,
+                torch.tensor(0.03) * (1.55 / 0.03) ** tor,
             ),
             device=device,
-            timestep_emb_func=_make_timestep_emb(32),
+            timestep_emb_func=_make_timestep_emb(64),
             ns=expert_ns, nv=expert_nv,
             num_conv_layers=num_conv_layers,
+            sigma_embed_dim=64,
+            distance_embed_dim=64,
+            cross_distance_embed_dim=64,
+            dropout=0.1,
+            receptor_radius=15,
+            c_alpha_max_neighbors=24,
             scale_by_sigma=True,
             separate_noise_schedule=False,
         )

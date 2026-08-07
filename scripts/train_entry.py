@@ -45,9 +45,9 @@ def parse_args():
 
     # Training
     p.add_argument("--output_dir", required=True, help="Checkpoint output directory")
-    p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--epochs", type=int, default=850)       # paper: 850 epochs
+    p.add_argument("--batch_size", type=int, default=16)     # paper: batch_size=16
+    p.add_argument("--lr", type=float, default=1e-3)         # paper: lr=1e-3, Plateau scheduler
     p.add_argument("--weight_decay", type=float, default=1e-4)
 
     # Phase
@@ -200,14 +200,20 @@ def build_trainer(args, device):
 
     cg_model = CGModel(
         t_to_sigma=lambda tr, rot, tor: (
-            torch.tensor(0.1) * (30.0 / 0.1) ** tr,
-            torch.tensor(0.1) * (1.6 / 0.1) ** rot,
-            torch.tensor(0.2) * (2.0 / 0.2) ** tor,
+            torch.tensor(0.1) * (19.0 / 0.1) ** tr,
+            torch.tensor(0.03) * (1.55 / 0.03) ** rot,
+            torch.tensor(0.03) * (1.55 / 0.03) ** tor,
         ),
         device=device,
-        timestep_emb_func=_make_timestep_emb(),
+        timestep_emb_func=_make_timestep_emb(64),
         ns=args.expert_ns, nv=args.expert_nv,
         num_conv_layers=args.num_conv_layers,
+        sigma_embed_dim=64,
+        distance_embed_dim=64,
+        cross_distance_embed_dim=64,
+        dropout=0.1,
+        receptor_radius=15,
+        c_alpha_max_neighbors=24,
         scale_by_sigma=True,
         separate_noise_schedule=False,
     )

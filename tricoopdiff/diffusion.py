@@ -33,13 +33,13 @@ class MultiRateDiffusion(nn.Module):
 
     def __init__(
         self,
-        # PROTAC noise parameters
+        # PROTAC noise parameters (from DiffDock-L paper: 0.1→19, 0.03→1.55)
         tr_sigma_min: float = 0.1,
-        tr_sigma_max: float = 30.0,
-        rot_sigma_min: float = 0.1,
-        rot_sigma_max: float = 1.6,
-        tor_sigma_min: float = 0.2,
-        tor_sigma_max: float = 2.0,
+        tr_sigma_max: float = 19.0,
+        rot_sigma_min: float = 0.03,
+        rot_sigma_max: float = 1.55,
+        tor_sigma_min: float = 0.03,
+        tor_sigma_max: float = 1.55,
         # SE3 noise parameters (E3-POI rigid body)
         se3_tr_sigma_min: float = 0.5,
         se3_tr_sigma_max: float = 20.0,
