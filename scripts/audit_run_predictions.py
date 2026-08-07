@@ -40,6 +40,7 @@ from datetime import datetime
 from functools import partial
 
 import numpy as np
+import scipy.spatial as spa
 import torch
 from biopandas.pdb import PandasPdb
 from rdkit import Chem
@@ -501,7 +502,8 @@ def predict_one_case(name, model, cfg, out_dir, seed_num=40, device='cuda'):
     with open(csv_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=[
             'seed', 'fnat', 'irms', 'Lrms', 'dockq',
-            'pred_p2_rmsd', 'gt_p2_rmsd', 'lig_rmsd', 'sm_rmsd', 'overall_rmsd'])
+            'pred_p2_rmsd', 'gt_p2_rmsd', 'lig_rmsd', 'sm_rmsd', 'overall_rmsd',
+            'error'])
         writer.writeheader()
         writer.writerows(results_sorted)
 
