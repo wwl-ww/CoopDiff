@@ -119,7 +119,7 @@ def compute_dockq_metrics(all_case_results):
             case_best_dockq.append(max(dockqs))
 
     if not all_dockq:
-        return {'mean_dockq': 0, 'std_dockq': 0, 'median_dockq': 0}
+        return {'mean_dockq': 0, 'std_dockq': 0, 'median_dockq': 0, 'mean_best_dockq': 0, 'std_best_dockq': 0, 'best_dockqs': [], 'all_dockqs': []}
 
     return {
         'mean_dockq': float(np.mean(all_dockq)),

@@ -1,12 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=deepternary_audit
-#SBATCH --output=logs/audit_%j.out
-#SBATCH --error=logs/audit_%j.err
+#SBATCH --partition=gpu_a800
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=4
 #SBATCH --time=24:00:00
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --gres=gpu:1
+#SBATCH --job-name=deepternary_audit
+#SBATCH --output=logs/audit-%j.out
+#SBATCH --error=logs/audit-%j.err
 #
 # DeepTernary Baseline Audit — Full Pipeline
 # ==========================================
@@ -15,54 +14,40 @@
 #
 # Submit:  sbatch scripts/audit_slurm.sh
 # Monitor: squeue -u $USER
-# Logs:    logs/audit_<jobid>.out
+# Logs:    logs/audit-<jobid>.out
 
-set -euo pipefail
+eval "$(/data/home/scwb792/run/miniconda3/bin/conda shell.bash hook)"
+conda activate tricoopdiff
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# Add nvidia CUDA libraries to LD_LIBRARY_PATH (needed by DGL graphbolt)
+NVIDIA_LIB_DIRS=$(find "$CONDA_PREFIX"/lib/python*/site-packages/nvidia -name lib -type d 2>/dev/null | tr '\n' ':')
+export LD_LIBRARY_PATH="${NVIDIA_LIB_DIRS}${LD_LIBRARY_PATH}"
+
 PROJECT_ROOT="/data/run01/scwb792/mwj/CoopDiff"
-CONDA_ENV="tricoopdiff"         # conda environment name
 DEEPTERNARY_ROOT="$PROJECT_ROOT/DeepTernary"
 WORK_DIR="$DEEPTERNARY_ROOT/output/checkpoints/PROTAC"
 OUT_DIR="$PROJECT_ROOT/audit_results"
 SEEDS=40
 
-# ── Setup ─────────────────────────────────────────────────────────────────────
+cd "$PROJECT_ROOT"
+mkdir -p logs audit_results
+export PYTHONPATH="$DEEPTERNARY_ROOT:$PYTHONPATH"
+
 echo "=== DeepTernary Audit Pipeline ==="
 echo "Started at: $(date)"
 echo "Job ID:     $SLURM_JOB_ID"
 echo "Node:       $(hostname)"
-echo "Project:    $PROJECT_ROOT"
-echo "Output:     $OUT_DIR"
 echo ""
 
-cd "$PROJECT_ROOT"
-mkdir -p logs audit_results
-
-# Activate conda environment
-echo "--- Activating conda environment: $CONDA_ENV ---"
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$CONDA_ENV"
-
-# Verify dependencies
 echo "--- Checking dependencies ---"
 python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
 python -c "import dgl; print(f'DGL {dgl.__version__}')"
 python -c "import rdkit; print(f'RDKit {rdkit.__version__}')"
 python -c "from Bio import __version__; print(f'BioPython {__version__}')"
-
-# Ensure DeepTernary is importable
-export PYTHONPATH="$DEEPTERNARY_ROOT:$PYTHONPATH"
 python -c "from deepternary.models.ternary_pdb import TernaryPreprocessedDataset; print('DeepTernary import OK')"
-
 echo ""
-echo "--- Configuration ---"
-echo "Work dir:    $WORK_DIR"
-echo "Output dir:  $OUT_DIR"
-echo "Seeds/case:  $SEEDS"
 
-# ── Phase 0: Verify checkpoint and config ─────────────────────────────────────
-echo ""
+# ── Phase 0: Verify inputs ───────────────────────────────────────────────────────
 echo "=== Phase 0: Verify inputs ==="
 if [ ! -f "$WORK_DIR/last_checkpoint" ]; then
     echo "ERROR: last_checkpoint not found in $WORK_DIR"
@@ -76,9 +61,9 @@ fi
 echo "Config:     $CONFIG_FILE"
 echo "Checkpoint: $(cat $WORK_DIR/last_checkpoint)"
 echo "Test cases: $(wc -l < $DEEPTERNARY_ROOT/data/PROTAC/protac22.txt)"
-
-# ── Phase 1: Run predictions ──────────────────────────────────────────────────
 echo ""
+
+# ── Phase 1: Run predictions ─────────────────────────────────────────────────────
 echo "=== Phase 1: Run predictions ==="
 echo "Started at: $(date)"
 
@@ -91,7 +76,7 @@ python scripts/audit_run_predictions.py \
 
 echo "Phase 1 done at: $(date)"
 
-# ── Phase 2: Compute metrics ──────────────────────────────────────────────────
+# ── Phase 2: Compute metrics ─────────────────────────────────────────────────────
 echo ""
 echo "=== Phase 2: Compute metrics ==="
 echo "Started at: $(date)"
@@ -104,7 +89,7 @@ python scripts/audit_compute_metrics.py \
 
 echo "Phase 2 done at: $(date)"
 
-# ── Done ──────────────────────────────────────────────────────────────────────
+# ── Done ─────────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Audit Complete ==="
 echo "Finished at: $(date)"
