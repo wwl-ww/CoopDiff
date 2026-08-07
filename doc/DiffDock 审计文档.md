@@ -182,7 +182,7 @@ L_{tor} = \langle (s_\theta^{tor} - s^{tor})^2 / \text{score\_norm}^2(\sigma_{to
 | 6 | Conv 循环 + FiLM 注入 | ✅ | 源码验证 |
 | 7 | Score head 逻辑复制 | ✅ | 源码验证 |
 | 8 | timestep_emb (GaussianFourierProjection(64)) | ✅ | 已替换 placeholder |
-| 9 | **损失函数权重匹配** | ⚠️ | 我们的 loss 未做 sigma 加权 |
-| 10 | **SO(3) 采样精确性** | ⚠️ | 用近似 `so3_score_norm`，完整版需 .so3_*.npy |
-| 11 | **ESM-2 嵌入** | ⚠️ | 当前未⽤，⽤原始氨基酸类型代替 |
-| 12 | **温度采样** | ⚠️ | 推理未实现温度参数 |
+| 9 | **损失函数权重匹配** | ✅ | sigma 加权 + score_norm 归一化 |
+| 10 | **SO(3) 采样精确性** | ✅ | 预计算查表，缓存 .so3_*.npy |
+| 11 | **ESM-2 嵌入** | 🔧 | 服务器同学负责 |
+| 12 | **温度采样** | ✅ | 匹配 v1.1 yaml (temp=1.17/2.06/7.04) |
