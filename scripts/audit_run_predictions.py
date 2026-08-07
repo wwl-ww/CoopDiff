@@ -233,6 +233,8 @@ def get_lig_graph_protac(mol, name, lig1=None, lig2=None, radius=20,
         (torch.tensor(src_list), torch.tensor(dst_list)),
         num_nodes=num_nodes, idtype=torch.int32)
     graph.ndata["feat"] = lig_atom_featurizer(mol)
+    graph.edata["feat"] = distance_featurizer(
+        dist_list, 0.75)  # avg distance = 1.3 So divisor = (4/7)*1.3 = ~0.75
     graph.ndata["x"] = torch.from_numpy(np.array(true_lig_coords).astype(np.float32))
     graph.ndata["mu_r_norm"] = torch.from_numpy(np.array(mean_norm_list).astype(np.float32))
     if use_rdkit_coords:
