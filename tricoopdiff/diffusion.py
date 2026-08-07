@@ -40,6 +40,16 @@ class MultiRateDiffusion(nn.Module):
         rot_sigma_max: float = 1.55,
         tor_sigma_min: float = 0.03,
         tor_sigma_max: float = 1.55,
+        # Temperature sampling (from DiffDock v1.1 default_inference_args.yaml)
+        temp_sampling_tr: float = 1.17,
+        temp_sampling_rot: float = 2.06,
+        temp_sampling_tor: float = 7.04,
+        temp_psi_tr: float = 0.73,
+        temp_psi_rot: float = 0.90,
+        temp_psi_tor: float = 0.59,
+        temp_sigma_data_tr: float = 0.93,
+        temp_sigma_data_rot: float = 0.75,
+        temp_sigma_data_tor: float = 0.69,
         # SE3 noise parameters (E3-POI rigid body)
         se3_tr_sigma_min: float = 0.5,
         se3_tr_sigma_max: float = 20.0,
@@ -71,6 +81,11 @@ class MultiRateDiffusion(nn.Module):
         self.lambda_se3_threshold = lambda_se3_threshold
 
         self.inference_steps = inference_steps
+
+        # Temperature sampling
+        self.temp_sampling = [temp_sampling_tr, temp_sampling_rot, temp_sampling_tor]
+        self.temp_psi = [temp_psi_tr, temp_psi_rot, temp_psi_tor]
+        self.temp_sigma_data = [temp_sigma_data_tr, temp_sigma_data_rot, temp_sigma_data_tor]
 
     # ------------------------------------------------------------------
     # Noise schedule: maps diffusion time t → noise level σ
@@ -225,17 +240,39 @@ class MultiRateDiffusion(nn.Module):
         tr_g = tr_sigma * np.sqrt(2 * np.log(self.tr_sigma_max / self.tr_sigma_min))
         rot_g = rot_sigma * np.sqrt(2 * np.log(self.rot_sigma_max / self.rot_sigma_min))
 
-        # Translation update
-        tr_perturb = tr_g**2 * dt_tr.unsqueeze(-1) * tr_score
-        if add_noise:
-            tr_z = torch.randn(B, 3, device=device)
-            tr_perturb = tr_perturb + tr_g * torch.sqrt(dt_tr).unsqueeze(-1) * tr_z
+        # Translation update (with temperature sampling)
+        if self.temp_sampling[0] != 1.0:
+            ts = self.temp_sampling[0]
+            tpsi = self.temp_psi[0]
+            tsd = self.temp_sigma_data[0]
+            tr_sigma_data = torch.exp(tsd * np.log(self.tr_sigma_max) + (1 - tsd) * np.log(self.tr_sigma_min))
+            lambda_tr = (tr_sigma_data + tr_sigma) / (tr_sigma_data + tr_sigma / ts)
+            tr_perturb = (tr_g**2 * dt_tr.unsqueeze(-1) * (lambda_tr + ts * tpsi / 2) * tr_score)
+            if add_noise:
+                tr_z = torch.randn(B, 3, device=device)
+                tr_perturb = tr_perturb + tr_g * torch.sqrt(dt_tr * (1 + tpsi)).unsqueeze(-1) * tr_z
+        else:
+            tr_perturb = tr_g**2 * dt_tr.unsqueeze(-1) * tr_score
+            if add_noise:
+                tr_z = torch.randn(B, 3, device=device)
+                tr_perturb = tr_perturb + tr_g * torch.sqrt(dt_tr).unsqueeze(-1) * tr_z
 
-        # Rotation update
-        rot_perturb = rot_score * dt_rot.unsqueeze(-1) * rot_g**2
-        if add_noise:
-            rot_z = torch.randn(B, 3, device=device)
-            rot_perturb = rot_perturb + rot_g * torch.sqrt(dt_rot).unsqueeze(-1) * rot_z
+        # Rotation update (with temperature sampling)
+        if self.temp_sampling[1] != 1.0:
+            ts = self.temp_sampling[1]
+            tpsi = self.temp_psi[1]
+            tsd = self.temp_sigma_data[1]
+            rot_sigma_data = torch.exp(tsd * np.log(self.rot_sigma_max) + (1 - tsd) * np.log(self.rot_sigma_min))
+            lambda_rot = (rot_sigma_data + rot_sigma) / (rot_sigma_data + rot_sigma / ts)
+            rot_perturb = (rot_g**2 * dt_rot.unsqueeze(-1) * (lambda_rot + ts * tpsi / 2) * rot_score)
+            if add_noise:
+                rot_z = torch.randn(B, 3, device=device)
+                rot_perturb = rot_perturb + rot_g * torch.sqrt(dt_rot * (1 + tpsi)).unsqueeze(-1) * rot_z
+        else:
+            rot_perturb = rot_score * dt_rot.unsqueeze(-1) * rot_g**2
+            if add_noise:
+                rot_z = torch.randn(B, 3, device=device)
+                rot_perturb = rot_perturb + rot_g * torch.sqrt(dt_rot).unsqueeze(-1) * rot_z
 
         # Apply updates
         ligand_pos = ligand_pos + tr_perturb.unsqueeze(1)
