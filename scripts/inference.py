@@ -214,6 +214,11 @@ def main():
 # Model Loading
 # ===================================================================
 
+def _make_timestep_emb(embedding_dim=32):
+    from utils.diffusion_utils import GaussianFourierProjection
+    return GaussianFourierProjection(embedding_size=embedding_dim)
+
+
 def load_model(checkpoint_path, diffdock_weights, device, no_film=False, single_rate=False):
     """Load TriCoopDiff model and diffusion process."""
     from tricoopdiff import TriCoopDiff
@@ -261,7 +266,7 @@ def load_model(checkpoint_path, diffdock_weights, device, no_film=False, single_
                 torch.tensor(0.2) * (2.0 / 0.2) ** tor,
             ),
             device=device,
-            timestep_emb_func=lambda t: torch.ones(32),  # placeholder
+            timestep_emb_func=_make_timestep_emb(32),
             ns=ns, nv=nv,
             num_conv_layers=num_conv_layers,
             scale_by_sigma=True,
