@@ -33,13 +33,23 @@ class MultiRateDiffusion(nn.Module):
 
     def __init__(
         self,
-        # PROTAC noise parameters
+        # PROTAC noise parameters (from DiffDock-L paper: 0.1→19, 0.03→1.55)
         tr_sigma_min: float = 0.1,
-        tr_sigma_max: float = 30.0,
-        rot_sigma_min: float = 0.1,
-        rot_sigma_max: float = 1.6,
-        tor_sigma_min: float = 0.2,
-        tor_sigma_max: float = 2.0,
+        tr_sigma_max: float = 19.0,
+        rot_sigma_min: float = 0.03,
+        rot_sigma_max: float = 1.55,
+        tor_sigma_min: float = 0.03,
+        tor_sigma_max: float = 1.55,
+        # Temperature sampling (from DiffDock v1.1 default_inference_args.yaml)
+        temp_sampling_tr: float = 1.17,
+        temp_sampling_rot: float = 2.06,
+        temp_sampling_tor: float = 7.04,
+        temp_psi_tr: float = 0.73,
+        temp_psi_rot: float = 0.90,
+        temp_psi_tor: float = 0.59,
+        temp_sigma_data_tr: float = 0.93,
+        temp_sigma_data_rot: float = 0.75,
+        temp_sigma_data_tor: float = 0.69,
         # SE3 noise parameters (E3-POI rigid body)
         se3_tr_sigma_min: float = 0.5,
         se3_tr_sigma_max: float = 20.0,
@@ -71,6 +81,11 @@ class MultiRateDiffusion(nn.Module):
         self.lambda_se3_threshold = lambda_se3_threshold
 
         self.inference_steps = inference_steps
+
+        # Temperature sampling
+        self.temp_sampling = [temp_sampling_tr, temp_sampling_rot, temp_sampling_tor]
+        self.temp_psi = [temp_psi_tr, temp_psi_rot, temp_psi_tor]
+        self.temp_sigma_data = [temp_sigma_data_tr, temp_sigma_data_rot, temp_sigma_data_tor]
 
     # ------------------------------------------------------------------
     # Noise schedule: maps diffusion time t → noise level σ
@@ -225,17 +240,39 @@ class MultiRateDiffusion(nn.Module):
         tr_g = tr_sigma * np.sqrt(2 * np.log(self.tr_sigma_max / self.tr_sigma_min))
         rot_g = rot_sigma * np.sqrt(2 * np.log(self.rot_sigma_max / self.rot_sigma_min))
 
-        # Translation update
-        tr_perturb = tr_g**2 * dt_tr.unsqueeze(-1) * tr_score
-        if add_noise:
-            tr_z = torch.randn(B, 3, device=device)
-            tr_perturb = tr_perturb + tr_g * torch.sqrt(dt_tr).unsqueeze(-1) * tr_z
+        # Translation update (with temperature sampling)
+        if self.temp_sampling[0] != 1.0:
+            ts = self.temp_sampling[0]
+            tpsi = self.temp_psi[0]
+            tsd = self.temp_sigma_data[0]
+            tr_sigma_data = torch.exp(tsd * np.log(self.tr_sigma_max) + (1 - tsd) * np.log(self.tr_sigma_min))
+            lambda_tr = (tr_sigma_data + tr_sigma) / (tr_sigma_data + tr_sigma / ts)
+            tr_perturb = (tr_g**2 * dt_tr.unsqueeze(-1) * (lambda_tr + ts * tpsi / 2) * tr_score)
+            if add_noise:
+                tr_z = torch.randn(B, 3, device=device)
+                tr_perturb = tr_perturb + tr_g * torch.sqrt(dt_tr * (1 + tpsi)).unsqueeze(-1) * tr_z
+        else:
+            tr_perturb = tr_g**2 * dt_tr.unsqueeze(-1) * tr_score
+            if add_noise:
+                tr_z = torch.randn(B, 3, device=device)
+                tr_perturb = tr_perturb + tr_g * torch.sqrt(dt_tr).unsqueeze(-1) * tr_z
 
-        # Rotation update
-        rot_perturb = rot_score * dt_rot.unsqueeze(-1) * rot_g**2
-        if add_noise:
-            rot_z = torch.randn(B, 3, device=device)
-            rot_perturb = rot_perturb + rot_g * torch.sqrt(dt_rot).unsqueeze(-1) * rot_z
+        # Rotation update (with temperature sampling)
+        if self.temp_sampling[1] != 1.0:
+            ts = self.temp_sampling[1]
+            tpsi = self.temp_psi[1]
+            tsd = self.temp_sigma_data[1]
+            rot_sigma_data = torch.exp(tsd * np.log(self.rot_sigma_max) + (1 - tsd) * np.log(self.rot_sigma_min))
+            lambda_rot = (rot_sigma_data + rot_sigma) / (rot_sigma_data + rot_sigma / ts)
+            rot_perturb = (rot_g**2 * dt_rot.unsqueeze(-1) * (lambda_rot + ts * tpsi / 2) * rot_score)
+            if add_noise:
+                rot_z = torch.randn(B, 3, device=device)
+                rot_perturb = rot_perturb + rot_g * torch.sqrt(dt_rot * (1 + tpsi)).unsqueeze(-1) * rot_z
+        else:
+            rot_perturb = rot_score * dt_rot.unsqueeze(-1) * rot_g**2
+            if add_noise:
+                rot_z = torch.randn(B, 3, device=device)
+                rot_perturb = rot_perturb + rot_g * torch.sqrt(dt_rot).unsqueeze(-1) * rot_z
 
         # Apply updates
         ligand_pos = ligand_pos + tr_perturb.unsqueeze(1)
@@ -494,12 +531,81 @@ def vector_to_skew(v: torch.Tensor) -> torch.Tensor:
     return torch.stack([row0, row1, row2], dim=-2)
 
 
-def so3_score_norm(sigma):
-    """
-    SO(3) score normalization factor.
+# ------------------------------------------------------------------
+# SO(3) score normalization — precomputed table lookup
+# Matches DiffDock utils/so3.py exactly
+# ------------------------------------------------------------------
 
-    Used to normalize rotation scores during training and inference.
-    Reference: DiffDock utils/so3.py score_norm.
+_MIN_EPS, _MAX_EPS, _N_EPS = 0.0005, 4, 2000
+_X_N = 2000
+_omegas_array = None
+_cdf_vals = None
+_score_norms = None
+_exp_score_norms = None
+
+
+def _init_so3_cache(cache_dir=None):
+    """Precompute SO(3) score norms and cache to disk. Run once."""
+    global _omegas_array, _cdf_vals, _score_norms, _exp_score_norms
+    if _exp_score_norms is not None:
+        return
+
+    import os as _os
+    cache_dir = cache_dir or '.'
+    omega_file = _os.path.join(cache_dir, '.so3_omegas_array4.npy')
+    score_file = _os.path.join(cache_dir, '.so3_exp_score_norms4.npy')
+
+    if _os.path.exists(omega_file) and _os.path.exists(score_file):
+        _omegas_array = np.load(omega_file)
+        _exp_score_norms = np.load(score_file)
+        return
+
+    _eps_array = 10 ** np.linspace(np.log10(_MIN_EPS), np.log10(_MAX_EPS), _N_EPS)
+    _omegas_array = np.linspace(0, np.pi, _X_N + 1)[1:]
+
+    def _expansion(omega, eps, L=2000):
+        l = np.arange(L).reshape(-1, 1)
+        return ((2 * l + 1) * np.exp(-l * (l + 1) * eps**2 / 2)
+                * np.sin(omega * (l + 0.5)) / np.sin(omega / 2)).sum(0)
+
+    def _density(exp, omega):
+        return exp * (1 - np.cos(omega)) / np.pi
+
+    def _score(exp, omega, eps, L=2000):
+        l = np.arange(L).reshape(-1, 1)
+        hi = np.sin((l + 0.5) * omega)
+        dhi = (l + 0.5) * np.cos((l + 0.5) * omega)
+        lo = np.sin(omega / 2)
+        dlo = 0.5 * np.cos(omega / 2)
+        dSigma = ((2 * l + 1) * np.exp(-l * (l + 1) * eps**2 / 2)
+                  * (lo * dhi - hi * dlo) / lo**2).sum(0)
+        return dSigma / exp
+
+    exp_vals = np.asarray([_expansion(_omegas_array, eps) for eps in _eps_array])
+    pdf_vals = np.asarray([_density(exp, _omegas_array) for exp in exp_vals])
+    _cdf_vals = np.asarray([pdf.cumsum() / _X_N * np.pi for pdf in pdf_vals])
+    _score_norms = np.asarray([
+        _score(exp_vals[i], _omegas_array, _eps_array[i]) for i in range(len(_eps_array))
+    ])
+    _exp_score_norms = np.sqrt(
+        np.sum(_score_norms**2 * pdf_vals, axis=1)
+        / np.sum(pdf_vals, axis=1) / np.pi
+    )
+    np.save(omega_file, _omegas_array)
+    np.save(score_file, _exp_score_norms)
+
+
+def so3_score_norm(sigma, cache_dir=None):
     """
-    sigma = torch.as_tensor(sigma, dtype=torch.float32)
-    return torch.sqrt(sigma**2 * (3 + sigma**2) / (1 + sigma**2)**2) * (1 + sigma**2) / sigma**2
+    SO(3) score normalization factor — table lookup matching DiffDock.
+    For sigma values outside the precomputed range, falls back to analytic approx.
+    """
+    _init_so3_cache(cache_dir)
+    sigma_np = sigma.detach().cpu().numpy() if hasattr(sigma, 'cpu') else np.asarray(sigma)
+    eps_idx = (np.log10(sigma_np) - np.log10(_MIN_EPS)) / (
+        np.log10(_MAX_EPS) - np.log10(_MIN_EPS)) * _N_EPS
+    eps_idx = np.clip(np.around(eps_idx).astype(int), 0, _N_EPS - 1)
+    result = torch.from_numpy(_exp_score_norms[eps_idx]).float()
+    if hasattr(sigma, 'device'):
+        result = result.to(sigma.device)
+    return result

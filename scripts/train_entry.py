@@ -45,9 +45,9 @@ def parse_args():
 
     # Training
     p.add_argument("--output_dir", required=True, help="Checkpoint output directory")
-    p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--epochs", type=int, default=850)       # paper: 850 epochs
+    p.add_argument("--batch_size", type=int, default=16)     # paper: batch_size=16
+    p.add_argument("--lr", type=float, default=1e-3)         # paper: lr=1e-3, Plateau scheduler
     p.add_argument("--weight_decay", type=float, default=1e-4)
 
     # Phase
@@ -56,8 +56,12 @@ def parse_args():
     p.add_argument("--resume", default=None, help="Resume from checkpoint")
 
     # Model config
-    p.add_argument("--ns", type=int, default=32, help="Scalar channels")
-    p.add_argument("--nv", type=int, default=4, help="Vector channels")
+    # TriBrain params
+    p.add_argument("--ns", type=int, default=32, help="TriBrain scalar channels")
+    p.add_argument("--nv", type=int, default=4, help="TriBrain vector channels")
+    # DiffDock-L params (ns=48, nv=10, num_conv_layers=6 from paper)
+    p.add_argument("--expert_ns", type=int, default=48, help="DiffDock-L scalar channels")
+    p.add_argument("--expert_nv", type=int, default=10, help="DiffDock-L vector channels")
     p.add_argument("--num_transformer_layers", type=int, default=3)
     p.add_argument("--num_conv_layers", type=int, default=6)
     p.add_argument("--node_dim", type=int, default=128)
@@ -196,14 +200,20 @@ def build_trainer(args, device):
 
     cg_model = CGModel(
         t_to_sigma=lambda tr, rot, tor: (
-            torch.tensor(0.1) * (30.0 / 0.1) ** tr,
-            torch.tensor(0.1) * (1.6 / 0.1) ** rot,
-            torch.tensor(0.2) * (2.0 / 0.2) ** tor,
+            torch.tensor(0.1) * (19.0 / 0.1) ** tr,
+            torch.tensor(0.03) * (1.55 / 0.03) ** rot,
+            torch.tensor(0.03) * (1.55 / 0.03) ** tor,
         ),
         device=device,
-        timestep_emb_func=_make_timestep_emb(),
-        ns=args.ns, nv=args.nv,
+        timestep_emb_func=_make_timestep_emb(64),
+        ns=args.expert_ns, nv=args.expert_nv,
         num_conv_layers=args.num_conv_layers,
+        sigma_embed_dim=64,
+        distance_embed_dim=64,
+        cross_distance_embed_dim=64,
+        dropout=0.1,
+        receptor_radius=15,
+        c_alpha_max_neighbors=24,
         scale_by_sigma=True,
         separate_noise_schedule=False,
     )

@@ -27,7 +27,7 @@ git clone https://github.com/gcorso/DiffDock.git
 
 ### Core Design (from 模型交接文档 §2)
 
-1. **Two-body expert (frozen)**: DiffDock-L v1.1 split into two physically disconnected subgraphs:
+1. **Two-body expert (frozen)**: DiffDock-L v1.1 (ns=48, nv=10, num_conv_layers=6, ~20M params, Corso et al. ICLR 2023) split into two physically disconnected subgraphs:
    - Subgraph 1 (E3-L): E3 residues + PROTAC atoms only — no POI nodes
    - Subgraph 2 (POI-L): POI residues + PROTAC atoms only — no E3 nodes
    - Each subgraph receives standard protein-ligand docking input (zero OOD)
@@ -39,6 +39,26 @@ git clone https://github.com/gcorso/DiffDock.git
    - Also outputs E3-POI rigid body scores (s_SE3)
 
 3. **FiLM modulation**: Each DiffDock Conv layer output `h` becomes `h' = h * (1+γ) + β`. At initialization, FiLM is transparent (output numerically identical to native DiffDock).
+
+### DiffDock-L Paper Parameters (Corso et al. ICLR 2023)
+
+| Parameter | Value |
+|-----------|-------|
+| ns | 48 |
+| nv | 10 |
+| num_conv_layers | 6 |
+| sigma_embed_dim | 64 |
+| distance_embed_dim | 64 |
+| cross_distance_embed_dim | 64 |
+| dropout | 0.1 |
+| receptor_radius | 15 |
+| c_alpha_max_neighbors | 24 |
+| tr_sigma | 0.1 → 19 |
+| rot/tor_sigma | 0.03 → 1.55 |
+| train batch_size | 16 |
+| train lr | 1e-3 (Plateau, patience=30) |
+| train epochs | 850 |
+| optimizer | Adam + EMA |
 
 4. **Multi-rate diffusion**: PROTAC degrees of freedom use fast noise decay (λ_q, threshold at t=0.7); E3-POI rigid body uses slow decay (λ_SE3, threshold at t=0.5). This is an empirical noise schedule trick, not a strict SDE derivation.
 
