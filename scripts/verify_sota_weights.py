@@ -132,9 +132,12 @@ def predict_one(name, cfg, seed_num=40):
         lig_coords_gt = deepcopy(lig_graph.ndata['x'])
 
         # Unbound pocket
-        from deepternary.models.process_mols import get_lig_coords as _get_lig_coords
-        lig1_coords = _get_lig_coords(os.path.join(UNBOUND_FOLDER, name, 'unbound_lig1.pdb'))
-        lig2_coords = _get_lig_coords(os.path.join(UNBOUND_FOLDER, name, 'unbound_lig2.pdb'))
+        def get_lig_coords(lig_path):
+            lig = read_molecule(lig_path, sanitize=True, remove_hs=True)
+            conf = lig.GetConformer()
+            return torch.from_numpy(conf.GetPositions()).float()
+        lig1_coords = get_lig_coords(os.path.join(UNBOUND_FOLDER, name, 'unbound_lig1.pdb'))
+        lig2_coords = get_lig_coords(os.path.join(UNBOUND_FOLDER, name, 'unbound_lig2.pdb'))
 
         def replace_to_unbound_coords(whole_coords, part_coords):
             cdist = torch.cdist(whole_coords, part_coords)
