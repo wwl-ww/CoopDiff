@@ -351,13 +351,18 @@ def predict_one_case(name, model, cfg, out_dir, seed_num=40, device='cuda'):
 
             if FIX_TWO_ENDS:
                 graph_func = partial(get_lig_graph_protac, lig1=lig1, lig2=lig2)
+                lig, lig_graph = graph_func(
+                    lig, name=name, max_neighbors=ds_cfg.lig_max_neighbors,
+                    use_random_coords=False, seed=seed,
+                    use_rdkit_coords=True, radius=ds_cfg.lig_graph_radius)
             else:
-                graph_func = get_lig_graph_revised
-
-            lig, lig_graph = graph_func(
-                lig, name=name, max_neighbors=ds_cfg.lig_max_neighbors,
-                use_random_coords=False, seed=seed,
-                use_rdkit_coords=True, radius=ds_cfg.lig_graph_radius)
+                lig_name = name.split('_')[-1]
+                ideal_path = auto_download_ideal_sdf(lig_name)
+                lig, lig_graph = get_lig_graph_revised(
+                    lig, name=name, max_neighbors=ds_cfg.lig_max_neighbors,
+                    use_random_coords=False, seed=seed,
+                    use_rdkit_coords=True, radius=ds_cfg.lig_graph_radius,
+                    ideal_path=ideal_path)
             geometry_graph = get_geometry_graph_ring(lig)
 
             lig_coords_gt = deepcopy(lig_graph.ndata['x'])
