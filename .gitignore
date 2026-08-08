@@ -53,6 +53,9 @@ outputs/
 wandb/
 *.log
 
+# DiffDock auto-generated cache files (CWD)
+*.npy
+
 # Environment config
 .env
 .env.local
@@ -61,5 +64,5 @@ wandb/
 DiffDock/
 DeepTernary/
 
-# Audit outputs (large, generated)
-audit_results/
+# Results & audit outputs (large, generated)
+results/
