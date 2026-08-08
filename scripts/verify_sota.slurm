@@ -14,7 +14,7 @@ conda activate tricoopdiff
 
 # Add nvidia CUDA libraries to LD_LIBRARY_PATH (needed by DGL graphbolt)
 NVIDIA_LIB_DIRS=$(find "$CONDA_PREFIX"/lib/python*/site-packages/nvidia -name lib -type d 2>/dev/null | tr '\n' ':')
-export LD_LIBRARY_PATH="${NVIDIA_LIB_DIRS}${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${NVIDIA_LIB_DIRS}${LD_LIBRARY_PATH:-}"
 
 PROJECT_ROOT="/data/run01/scwb792/mwj/CoopDiff"
 

@@ -37,7 +37,7 @@ from mmpretrain.apis.model import get_model
 
 # ── Config ────────────────────────────────────────────────────────────────
 # Use the SOTA config from public/ + the SOTA checkpoint
-CONFIG_PATH = os.path.join(_PROJECT_ROOT, 'DeepTernary/output/checkpoints/PROTAC/20240301_081911/vis_data/config.py')
+CONFIG_PATH = os.path.join(_PROJECT_ROOT, 'DeepTernary/output/checkpoints/PROTAC/protac_test_config.py')
 CHECKPOINT_PATH = os.path.join(_PROJECT_ROOT, 'DeepTernary/output/checkpoints/PROTAC/epoch_1000.pth')
 PDB_PATH = os.path.join(_PROJECT_ROOT, 'DeepTernary/data/PDB_sdf')
 UNBOUND_FOLDER = os.path.join(_PROJECT_ROOT, 'DeepTernary/output/protac22')
