@@ -62,16 +62,29 @@ def RMSD(pred, gt):
         return np.sqrt(np.sum(diff ** 2, axis=1).mean())
     raise NotImplementedError
 
-def auto_download_ideal_sdf(lig_name):
-    import requests
-    ideal_sdf_path = f'{IDEAL_PATH}/{lig_name}_ideal.sdf'
-    if not os.path.exists(ideal_sdf_path):
+def auto_download_ideal_sdf(lig_name, case_name=None):
+    # First check per-case cache in protac22 (already exists for all 22 cases)
+    if case_name:
+        case_cache = os.path.join(UNBOUND_FOLDER, case_name, 'ligand_ideal.sdf')
+        if os.path.exists(case_cache):
+            return case_cache
+    # Then check shared cache
+    ideal_sdf_path = os.path.join(IDEAL_PATH, f'{lig_name}_ideal.sdf')
+    if os.path.exists(ideal_sdf_path):
+        return ideal_sdf_path
+    # Try download (may fail behind firewall)
+    try:
+        import requests
         os.makedirs(IDEAL_PATH, exist_ok=True)
         url = f'https://files.rcsb.org/ligands/download/{lig_name}_ideal.sdf'
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
         with open(ideal_sdf_path, 'wb') as f:
             f.write(response.content)
-    return ideal_sdf_path
+        return ideal_sdf_path
+    except Exception as e:
+        print(f'  [WARN] Cannot get ideal SDF for {lig_name}: {e}')
+        return None
 
 # ── Main prediction loop (adapted from predict_cpu.py) ─────────────────────
 @torch.no_grad()
@@ -111,7 +124,7 @@ def predict_one(name, cfg, seed_num=40):
 
         lig, lig_graph = get_lig_graph_revised(
             lig, name=name, max_neighbors=ds_cfg.lig_max_neighbors,
-            ideal_path=auto_download_ideal_sdf(name.split('_')[-1]),
+            ideal_path=auto_download_ideal_sdf(name.split('_')[-1], case_name=name),
             use_random_coords=False, seed=seed,
             use_rdkit_coords=True, radius=ds_cfg.lig_graph_radius)
         geometry_graph = get_geometry_graph_ring(lig)
