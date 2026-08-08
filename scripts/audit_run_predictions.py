@@ -83,7 +83,7 @@ from deepternary.models.ternary_pdb import get_pocket_and_mask
 
 # ── Global settings ──────────────────────────────────────────────────────────
 
-FIX_TWO_ENDS = True   # Use fixed-two-ends RDKit conformer generation
+FIX_TWO_ENDS = True   # Use fixed-two-ends RDKit conformer generation (override with --no-fix-two-ends)
 CORRECT_LIGAND = True  # Run EquiBind ligand correction
 USE_RDKIT_COORDS = True
 UNBOUND = True
@@ -549,6 +549,8 @@ def parse_args():
                    help='Save progress JSON every N cases')
     p.add_argument('--resume-from', default=None,
                    help='Path to progress JSON to resume from')
+    p.add_argument('--no-fix-two-ends', action='store_true', default=False,
+                   help='Disable two-ends fixation (match official SOTA config)')
     return p.parse_args()
 
 
@@ -575,6 +577,11 @@ def main():
                 args.checkpoint = alt
             else:
                 sys.exit(f"Checkpoint not found: {args.checkpoint}")
+
+    # Override global FIX_TWO_ENDS if flag is set
+    global FIX_TWO_ENDS
+    if args.no_fix_two_ends:
+        FIX_TWO_ENDS = False
 
     print(f"Config:     {args.config}")
     print(f"Checkpoint: {args.checkpoint}")
