@@ -163,6 +163,7 @@ def get_lig_graph_protac(mol, name, lig1=None, lig2=None, radius=20,
     true_lig_coords = conf.GetPositions()
 
     if use_rdkit_coords:
+        mol_saved = deepcopy(mol)  # preserve original for fallback
         if name in _embedding_failed_names:
             rdkit_coords = None
         else:
@@ -174,26 +175,34 @@ def get_lig_graph_protac(mol, name, lig1=None, lig2=None, radius=20,
                 rdkit_coords = None
 
         if rdkit_coords is None:
-            print(f"  [INFO] {name}: falling back to ideal.sdf")
+            print(f"  [INFO] {name}: RDKit with fixed ends failed, trying fallbacks")
             _embedding_failed_names.add(name)
             ideal_path = auto_download_ideal_sdf(name.split('_')[-1])
-            if ideal_path is None:
-                raise RuntimeError(f"Cannot get ideal SDF for {name}")
-            ideal_mol = read_molecule(ideal_path, sanitize=True, remove_hs=True)
-            if ideal_mol is None:
-                raise ValueError(f"ideal_mol is None for {ideal_path}")
-            try:
-                mol, rdkit_coords = get_rdkit_coords_with_fixed_ends(
-                    deepcopy(ideal_mol), lig1, lig2, seed=seed)
-            except Exception:
-                mol, rdkit_coords = get_rdkit_coords_v2(
-                    deepcopy(ideal_mol), seed=seed, use_random_coords=use_random_coords)
-            if mol is None:
-                mol = ideal_mol
+            if ideal_path is not None:
+                ideal_mol = read_molecule(ideal_path, sanitize=True, remove_hs=True)
+                if ideal_mol is not None:
+                    try:
+                        mol, rdkit_coords = get_rdkit_coords_with_fixed_ends(
+                            deepcopy(ideal_mol), lig1, lig2, seed=seed)
+                    except Exception:
+                        mol, rdkit_coords = get_rdkit_coords_v2(
+                            deepcopy(ideal_mol), seed=seed, use_random_coords=use_random_coords)
+                    if mol is None:
+                        mol = ideal_mol
+                        try:
+                            rdkit_coords = ideal_mol.GetConformer().GetPositions()
+                        except Exception:
+                            pass
+            # If ideal SDF path failed entirely, try get_rdkit_coords_v2 on original mol
+            if rdkit_coords is None:
+                print(f"  [INFO] {name}: ideal SDF fallback failed, trying get_rdkit_coords_v2 on original mol")
                 try:
-                    rdkit_coords = ideal_mol.GetConformer().GetPositions()
-                except Exception as e:
-                    raise RuntimeError(f"ideal_mol {ideal_path} coords failed: {e}")
+                    mol, rdkit_coords = get_rdkit_coords_v2(
+                        deepcopy(mol_saved), seed=seed, use_random_coords=use_random_coords)
+                except Exception:
+                    pass
+            if rdkit_coords is None:
+                raise RuntimeError(f"All coordinate generation methods failed for {name}")
             if rdkit_coords.shape != true_lig_coords.shape:
                 raise RuntimeError(
                     f"{name}: shape mismatch — rdkit {rdkit_coords.shape} vs true {true_lig_coords.shape}")
