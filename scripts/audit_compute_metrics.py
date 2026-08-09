@@ -153,7 +153,9 @@ def compute_ligand_rmsd_metrics(all_case_results):
 def compute_clash_rate_for_pdb(pdb_path, clash_cutoff=3.0):
     """
     Compute inter-molecular clash rate for a ternary complex PDB.
-    Uses Cβ-Cβ distances between different chains/molecules.
+    Separates atoms into three groups: protein chain A (E3), protein chain B (POI),
+    and HETATM ligand (PROTAC). Counts clashes between all 3 pairwise combinations:
+    E3-POI, E3-PROTAC, POI-PROTAC. Excludes waters (HOH) and intra-molecular pairs.
     Returns fraction of inter-molecular atom pairs with distance < cutoff.
     """
     if not HAVE_BIOPYTHON:
@@ -164,32 +166,45 @@ def compute_clash_rate_for_pdb(pdb_path, clash_cutoff=3.0):
         structure = parser.get_structure('complex', pdb_path)
         model = structure[0]
 
-        # Collect atoms by chain
-        chain_atoms = defaultdict(list)
-        all_atoms = []
+        # Separate into three groups: protein chains + ligand HETATMs
+        protein_atoms = defaultdict(list)  # chain_id -> atoms
+        ligand_atoms = []
+
         for chain in model:
             for residue in chain:
-                if residue.get_id()[0] != ' ':  # skip heteroatoms
+                hetfield = residue.get_id()[0]
+                resname = residue.get_resname().strip()
+                if resname in ('HOH', 'WAT', 'DOD'):
                     continue
-                for atom in residue:
-                    chain_atoms[chain.id].append(atom)
-                    all_atoms.append(atom)
+                if hetfield != ' ':  # HETATM — ligand
+                    for atom in residue:
+                        ligand_atoms.append(atom)
+                else:  # ATOM — protein
+                    for atom in residue:
+                        protein_atoms[chain.id].append(atom)
 
-        chain_ids = list(chain_atoms.keys())
-        if len(chain_ids) < 2:
+        # Build all molecule groups
+        groups = {}  # label -> atom list
+        for chain_id, atoms in protein_atoms.items():
+            groups[f'protein_{chain_id}'] = atoms
+        if ligand_atoms:
+            groups['ligand'] = ligand_atoms
+
+        group_labels = list(groups.keys())
+        if len(group_labels) < 2:
             return 0.0
 
-        # Count inter-chain clashes
+        # Count pairwise inter-molecular clashes
         total_inter_pairs = 0
         clash_count = 0
-        for i in range(len(chain_ids)):
-            for j in range(i + 1, len(chain_ids)):
-                atoms_i = chain_atoms[chain_ids[i]]
-                atoms_j = chain_atoms[chain_ids[j]]
+        for i in range(len(group_labels)):
+            for j in range(i + 1, len(group_labels)):
+                atoms_i = groups[group_labels[i]]
+                atoms_j = groups[group_labels[j]]
                 for ai in atoms_i:
                     for aj in atoms_j:
                         total_inter_pairs += 1
-                        dist = ai - aj  # BioPython atom subtraction gives distance
+                        dist = ai - aj
                         if dist < clash_cutoff:
                             clash_count += 1
 
@@ -602,7 +617,7 @@ def main():
     # 3. Clash rate
     if not args.skip_clash:
         clash_metrics = compute_clash_metrics(all_case_results, args.pred_dir)
-        print(f"  Clash: mean={clash_metrics['mean_clash_rate']:.4f}")
+        print(f"  Clash: mean={clash_metrics['mean_clash_rate']:.6f}")
     else:
         clash_metrics = {'mean_clash_rate': 0.0, 'std_clash_rate': 0.0}
 
@@ -719,6 +734,7 @@ def main():
             **dockq_metrics,
             **lig_rmsd_metrics,
             'mean_clash_rate': clash_metrics['mean_clash_rate'],
+            'std_clash_rate': clash_metrics.get('std_clash_rate', 0.0),
             'mean_linker_strain': strain_metrics['mean_linker_strain'],
             'capri_distribution': capri_dist,
         },
