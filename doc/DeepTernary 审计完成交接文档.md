@@ -17,6 +17,24 @@
 
 **结论**：审计结果略低于官方基线，差异不具统计显著性（p=0.09, t=-1.78），但有个别异常用例需关注。
 
+### Linker 长度分层
+
+| 分层 | n | mean best DockQ |
+|------|---|-----------------|
+| short (≤8 可旋转键) | 7 | 0.6800 |
+| mid (8-15) | 9 | 0.7173 |
+| long (>15) | 6 | 0.5463 |
+
+### 系综指标
+
+| 指标 | 值 |
+|------|-----|
+| 平均聚类数 (40 seed, 2Å cutoff) | 37.4 |
+| 平均 Top-1 RMSD | 5.47 Å |
+| 平均 Linker 应变能 | 319.51 kcal/mol |
+| Acceptable+ 率 (DockQ ≥ 0.23) | 62.05% |
+| CAPRI High/Medium/Acceptable/Incorrect | 2.4% / 18.9% / 40.8% / 38.0% |
+
 ### 分用例详情
 
 | Case | Audit Best | Official Best | Delta | Status |
@@ -154,10 +172,9 @@ logs/
 
 ## 六、已知局限
 
-1. **指标不完整**：当前审计只计算了 DockQ，未计算 linker 应变能、系综多样性、冲突率等完整指标
-2. **系综分析缺失**：40 种子聚类分析未执行
-3. **DockQ 计算依赖 DeepTernary 自带脚本**：`DeepTernary/DockQ/DockQ.py`，精度待验证
-4. **3 个严重异常用例**（6BOY、5T35_D、6HR2_F）未深入排查根因
+1. **冲突率未正确计算**：依赖 BioPython PDBParser，当前环境未安装，fallback 为 0
+2. **DockQ 计算依赖 DeepTernary 自带脚本**：`DeepTernary/DockQ/DockQ.py`，精度待验证
+3. **3 个严重异常用例**（6BOY、5T35_D、6HR2_F）未深入排查根因
 
 ---
 
