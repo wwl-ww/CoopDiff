@@ -265,61 +265,178 @@ def generate_esm_embeddings(protein_paths, device):
     return result
 
 
-def build_complex_pdb(protein_path, ligand_pos, ligand_mol, output_path):
-    """Write a complex PDB with protein + docked ligand for DockQ.
+def _parse_pdb_atoms(pdb_path):
+    """Read ATOM/HETATM/TER lines from a PDB file as raw strings.
 
-    Uses BioPython to read the protein, adds the ligand as HETATM,
-    and writes the combined PDB.
+    Returns (atom_lines, hetatm_lines, ter_seen) where atom_lines are ATOM
+    records and hetatm_lines are HETATM records.  TER lines are included
+    with atom_lines.
     """
-    from Bio.PDB import PDBParser, PDBIO
-    from Bio.PDB.Structure import Structure
-    import io
+    atom_lines = []
+    hetatm_lines = []
+    for line in open(pdb_path):
+        if line.startswith("ATOM") or line.startswith("TER"):
+            atom_lines.append(line.rstrip())
+        elif line.startswith("HETATM"):
+            hetatm_lines.append(line.rstrip())
+    return atom_lines, hetatm_lines
 
-    # Read protein
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure("complex", protein_path)
-    io_pdb = PDBIO()
-    io_pdb.set_structure(structure)
 
-    # Write protein part
-    protein_str = io.StringIO()
-    io_pdb.save(protein_str)
-    protein_lines = protein_str.getvalue().splitlines()
+def _format_atom_line(serial, atom_name, res_name, chain, res_seq,
+                       x, y, z, occupancy, bfactor, element):
+    """Write a single ATOM record with strict PDB column alignment."""
+    # ATOM    serial name resName chain resSeq     x       y       z   occ   bfac  element
+    #  1-6    7-11  12-16 17-20   21    22-26   31-38  39-46  47-54  55-60  61-66  77-78
+    return (
+        f"ATOM  {serial:5d} {atom_name:>4s}{res_name:>4s} {chain}{res_seq:4d}    "
+        f"{x:8.3f}{y:8.3f}{z:8.3f}"
+        f"{occupancy:6.2f}{bfactor:6.2f}          {element:>2s}  "
+    )
 
-    # Generate ligand HETATM lines
-    ligand_lines = []
-    if hasattr(ligand_mol, 'GetConformer'):
-        conf = ligand_mol.GetConformer()
-        atom_idx = 0
-        serial = 10000
-        for atom in ligand_mol.GetAtoms():
-            pos_atom = conf.GetAtomPosition(atom_idx)
-            x, y, z = pos_atom.x, pos_atom.y, pos_atom.z
-            ligand_lines.append(
-                f"HETATM{serial:5d}  {atom.GetSymbol():<3s} UNK X   1    "
-                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          "
-                f"{atom.GetSymbol():>2s}  "
-            )
-            serial += 1
-            atom_idx += 1
 
-    # Write combined PDB (protein TER + ligand + END)
-    with open(output_path, "w") as f:
-        for line in protein_lines:
-            if line.startswith("END"):
-                continue
-            if line.startswith("TER"):
-                f.write(line + "\n")
+def build_complex_pdb(protein_path, ligand_pos, ligand_mol, output_path):
+    """Build predicted complex PDB for DockQ: raw protein lines + PROTAC as ATOM.
+
+    Protein ATOM lines are copied verbatim (no BioPython reformatting).
+    PROTAC atoms are written as ATOM records on chain L (not HETATM) so
+    the fnat binary can detect protein-ligand contacts.
+    """
+    atom_lines, _ = _parse_pdb_atoms(protein_path)
+
+    # Build ligand ATOM lines on chain L
+    lig_lines = []
+    if hasattr(ligand_mol, 'GetAtoms'):
+        atoms = list(ligand_mol.GetAtoms())
+        for atom_idx, atom in enumerate(atoms):
+            if atom_idx >= len(ligand_pos):
                 break
-            f.write(line + "\n")
-        for line in ligand_lines:
+            x, y, z = float(ligand_pos[atom_idx, 0]), \
+                       float(ligand_pos[atom_idx, 1]), \
+                       float(ligand_pos[atom_idx, 2])
+            name = atom.GetSymbol().strip()
+            if len(name) == 1:
+                name = " " + name + "  "  # right-justified in cols 13-16
+            lig_lines.append(_format_atom_line(
+                serial=10000 + atom_idx,
+                atom_name=name,
+                res_name="LIG",
+                chain="L",
+                res_seq=atom_idx + 1,
+                x=x, y=y, z=z,
+                occupancy=1.0, bfactor=0.0,
+                element=atom.GetSymbol().strip(),
+            ))
+
+    with open(output_path, "w") as f:
+        for line in atom_lines:
             f.write(line + "\n")
         f.write("TER\n")
+        for line in lig_lines:
+            f.write(line + "\n")
         f.write("END\n")
 
 
-def compute_dockq(model_pdb, native_pdb):
-    """Compute DockQ between predicted complex and native complex."""
+def build_gt_complex_pdb(protein_path, native_ligand_pdb_path, output_path):
+    """Build ground-truth complex PDB: raw protein lines + native PROTAC as ATOM.
+
+    Protein ATOM lines are copied directly from the input PDB.
+    Native PROTAC coordinates from ligand.pdb are written as ATOM records
+    on chain L so the fnat binary can detect protein-ligand contacts.
+
+    This avoids BioPython PDBIO reformatting (which mangles column alignment
+    and occupancy/B-factor fields).
+    """
+    atom_lines, _ = _parse_pdb_atoms(protein_path)
+    lig_atom_lines, lig_hetatm = _parse_pdb_atoms(native_ligand_pdb_path)
+
+    # Ligand atoms may be ATOM or HETATM records — use whichever exists
+    lig_source = lig_hetatm if lig_hetatm else lig_atom_lines
+
+    # Convert ligand atoms to ATOM records on chain L
+    lig_lines = []
+    serial = 90000
+    for line in lig_source:
+        if not (line.startswith("ATOM") or line.startswith("HETATM")):
+            continue
+        # Parse existing PDB columns
+        atom_name = line[12:16]  # cols 13-16
+        res_name = line[17:20].strip()  # cols 18-20
+        try:
+            x = float(line[30:38])
+            y = float(line[38:46])
+            z = float(line[46:54])
+        except ValueError:
+            continue
+        element = line[76:78].strip() if len(line) >= 78 else atom_name.strip()[0]
+
+        lig_lines.append(_format_atom_line(
+            serial=serial,
+            atom_name=atom_name,
+            res_name=res_name if res_name else "LIG",
+            chain="L",
+            res_seq=serial - 89999,  # 1-based per-atom residue numbers
+            x=x, y=y, z=z,
+            occupancy=1.0, bfactor=0.0,
+            element=element,
+        ))
+        serial += 1
+
+    with open(output_path, "w") as f:
+        for line in atom_lines:
+            f.write(line + "\n")
+        f.write("TER\n")
+        for line in lig_lines:
+            f.write(line + "\n")
+        f.write("END\n")
+
+
+def compute_fnat(protein_coords, ligand_coords, native_ligand_coords, cutoff=5.0):
+    """Compute fraction of native protein-ligand contacts recovered.
+
+    A "contact" is a protein-ligand atom pair within *cutoff* Å in the
+    native structure.  Fnat = |predicted contacts ∩ native contacts| / |native contacts|.
+
+    This is the protein-ligand analogue of DockQ's Fnat component and
+    directly measures "界面接触恢复率" (ligand interface contact recovery rate).
+    """
+    from scipy.spatial import KDTree
+
+    if len(protein_coords) == 0 or len(ligand_coords) == 0:
+        return 0.0
+
+    # Native contacts: which protein-ligand pairs are within cutoff
+    tree_native = KDTree(protein_coords)
+    native_pairs = set()
+    for i, lig_pos in enumerate(native_ligand_coords):
+        idxs = tree_native.query_ball_point(lig_pos, cutoff)
+        for j in idxs:
+            native_pairs.add((i, j))
+
+    if len(native_pairs) == 0:
+        return 0.0  # no native contacts to recover
+
+    # Predicted contacts
+    tree_pred = KDTree(protein_coords)
+    pred_pairs = set()
+    for i, lig_pos in enumerate(ligand_coords):
+        idxs = tree_pred.query_ball_point(lig_pos, cutoff)
+        for j in idxs:
+            pred_pairs.add((i, j))
+
+    recovered = len(pred_pairs & native_pairs)
+    return recovered / len(native_pairs)
+
+
+def compute_dockq(model_pdb, native_pdb, protein_coords=None,
+                  ligand_coords=None, native_ligand_coords=None):
+    """Compute DockQ between predicted complex and native complex.
+
+    First attempts the standard DockQ protein-protein workflow via
+    cal_dockq.  When that fails (as expected for protein-ligand docking
+    — DockQ requires backbone atoms in both chains), falls back to a
+    manual Fnat computation that directly measures protein-ligand
+    contact recovery.
+    """
     from DockQ.dockq_util import cal_dockq
     try:
         fnat, irms, Lrms, dockq = cal_dockq(model_pdb, native_pdb)
@@ -328,10 +445,27 @@ def compute_dockq(model_pdb, native_pdb):
             "fnat": float(fnat),
             "irms": float(irms),
             "Lrms": float(Lrms),
+            "method": "cal_dockq",
         }
     except Exception as e:
+        # DockQ is designed for protein-protein docking; fall back to
+        # manual Fnat for protein-ligand contact recovery.
+        if protein_coords is not None and ligand_coords is not None \
+           and native_ligand_coords is not None:
+            fnat = compute_fnat(protein_coords, ligand_coords,
+                                native_ligand_coords)
+            print(f"  [WARN] cal_dockq failed ({e}), "
+                  f"using manual Fnat={fnat:.3f}", flush=True)
+            return {
+                "dockq": float(fnat),  # Fnat as dockq surrogate
+                "fnat": float(fnat),
+                "irms": 0.0,           # not meaningful for small molecule
+                "Lrms": 0.0,
+                "method": "manual_fnat",
+            }
         print(f"  [WARN] DockQ failed: {e}", flush=True)
-        return {"dockq": 0.0, "fnat": 0.0, "irms": 0.0, "Lrms": 0.0}
+        return {"dockq": 0.0, "fnat": 0.0, "irms": 0.0, "Lrms": 0.0,
+                "method": "failed"}
 
 
 def compute_rmsd(ligand_pos, native_ligand_pos):
@@ -361,6 +495,11 @@ def compute_clash_rate(protein_coords, ligand_coords, cutoff=3.0):
     """Fraction of ligand atoms that clash with protein atoms."""
     from scipy.spatial import KDTree
     if len(protein_coords) == 0 or len(ligand_coords) == 0:
+        return 1.0
+    # Guard against nan/inf from DiffDock instability
+    if not np.isfinite(ligand_coords).all():
+        return 1.0
+    if not np.isfinite(protein_coords).all():
         return 1.0
     tree = KDTree(protein_coords)
     dists, _ = tree.query(ligand_coords, distance_upper_bound=cutoff + 0.1)
@@ -449,7 +588,6 @@ def main():
             pair_label = f"{case_name}/{pair_name}"
             protein_path = str(protac_dir / case_name / f"{protein_name}.pdb")
             ligand_path = str(protac_dir / case_name / "ligand.sdf")
-            gt_complex_path = str(protac_dir / case_name / "complex.pdb")
             gt_ligand_path = str(protac_dir / case_name / "ligand.pdb")
 
             write_dir = out_dir / case_name / pair_name
@@ -457,6 +595,13 @@ def main():
                 print(f"  {pair_label}: skip (existing)", flush=True)
                 continue
             write_dir.mkdir(parents=True, exist_ok=True)
+
+            # Build per-pair ground-truth complex for DockQ.
+            # Uses protein + native ligand.pdb (both in crystal frame),
+            # with ligand on chain L, matching build_complex_pdb output.
+            gt_complex_path = str(write_dir / "gt_complex.pdb")
+            if os.path.exists(gt_ligand_path):
+                build_gt_complex_pdb(protein_path, gt_ligand_path, gt_complex_path)
 
             # Build precomputed embeddings in InferenceDataset format
             chain_embs = embeddings_map[protein_path]
@@ -589,7 +734,11 @@ def main():
                     dockq_result = {"dockq": 0.0, "fnat": 0.0,
                                     "irms": 0.0, "Lrms": 0.0}
                     if os.path.exists(gt_complex_path):
-                        dockq_result = compute_dockq(pdb_out, gt_complex_path)
+                        dockq_result = compute_dockq(
+                            pdb_out, gt_complex_path,
+                            protein_coords=prot_coords,
+                            ligand_coords=pos,
+                            native_ligand_coords=native_lig_coords)
 
                     sample_results.append({
                         "rank": rank + 1,
