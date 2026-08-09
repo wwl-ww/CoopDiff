@@ -60,8 +60,8 @@ class ESMEmbedder(nn.Module):
         self.device = device
         self.model_name = model_name
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name).to(device)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+        self.model = AutoModel.from_pretrained(model_name, local_files_only=True).to(device)
         self.model.eval()
 
         self.embed_dim = self.model.config.hidden_size
