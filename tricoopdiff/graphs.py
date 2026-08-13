@@ -50,6 +50,12 @@ def build_subgraph_e3l(
     graph['ligand'].pos = ligand_coords
     graph['ligand'].x = ligand_features
 
+    # Single-complex batching: DiffDock's CGModel indexes `data['ligand'].batch`
+    # and `data.num_graphs` in the score heads, so these MUST be set.
+    graph['receptor'].batch = torch.zeros(e3_coords.shape[0], dtype=torch.long)
+    graph['ligand'].batch = torch.zeros(ligand_coords.shape[0], dtype=torch.long)
+    graph.num_graphs = 1
+
     if rec_edge_index is not None:
         graph['receptor', 'receptor'].edge_index = rec_edge_index
 
@@ -103,6 +109,11 @@ def build_subgraph_pol(
 
     graph['ligand'].pos = ligand_coords_poi_frame
     graph['ligand'].x = ligand_features
+
+    # Single-complex batching (see build_subgraph_e3l).
+    graph['receptor'].batch = torch.zeros(poi_coords.shape[0], dtype=torch.long)
+    graph['ligand'].batch = torch.zeros(ligand_coords_poi_frame.shape[0], dtype=torch.long)
+    graph.num_graphs = 1
 
     if rec_edge_index is not None:
         graph['receptor', 'receptor'].edge_index = rec_edge_index

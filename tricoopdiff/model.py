@@ -39,7 +39,7 @@ class TriCoopDiff(nn.Module):
         self,
         frozen_expert: FrozenDiffDock,
         tribrain: TriBrain,
-        num_conv_layers: int = 6,
+        num_conv_layers: int = 11,
         use_film: bool = True,
         use_learned_merge: bool = False,
     ):
@@ -47,7 +47,7 @@ class TriCoopDiff(nn.Module):
         Args:
             frozen_expert: FrozenDiffDock wrapping DiffDock CGModel
             tribrain: TriBrain coordination network
-            num_conv_layers: number of conv layers in the expert
+            num_conv_layers: number of conv layers in the expert (11 for DiffDock-L)
             use_film: if False, skip FiLM modulation (L0 ablation)
             use_learned_merge: if True, use LearnedCoordinationLayer instead
                               of direct addition (Ablation B)
@@ -317,11 +317,16 @@ class TriCoopDiff(nn.Module):
                     edge_weight=edge_weight[:s2]
                 )
 
-            # --- FiLM modulation (only on ligand nodes) ---
+            # --- FiLM modulation (scalar block only, ligand nodes only) ---
             gamma, beta = film_params[l]
             lig_mask = torch.zeros(node_attr.shape[0], dtype=torch.bool, device=node_attr.device)
             lig_mask[:n_lig] = True
-            node_attr = apply_film(node_attr, gamma, beta, node_mask=lig_mask)
+            # Modulate only the leading scalar (0e) channels to preserve SE(3)
+            # equivariance. gamma/beta are [B, ns]; node_attr is [N, D] with
+            # D = ns + vector channels (118 for DiffDock-L).
+            node_attr = apply_film(
+                node_attr, gamma, beta, node_mask=lig_mask, scalar_dim=self.expert.ns
+            )
 
         # Extract ligand features
         lig_node_attr = node_attr[:n_lig]

@@ -36,11 +36,11 @@ class FrozenDiffDock(nn.Module):
     - Running the final score heads
     """
 
-    def __init__(self, cg_model: nn.Module, num_conv_layers: int = 6):
+    def __init__(self, cg_model: nn.Module, num_conv_layers: int = 11):
         """
         Args:
             cg_model: DiffDock's CGModel with pretrained weights loaded
-            num_conv_layers: number of conv layers (typically 6 for DiffDock-L)
+            num_conv_layers: number of conv layers (11 for DiffDock-L, NOT 6)
         """
         super().__init__()
         self.model = cg_model
@@ -192,13 +192,10 @@ class FrozenDiffDock(nn.Module):
                 edge_weight=tor_edge_weight
             )
             tor_pred = model.tor_final_layer(tor_pred).squeeze(1)
-            edge_sigma = tor_sigma[
-                data['ligand'].batch
-            ][
-                data['ligand', 'ligand'].edge_index[0]
-            ][
-                data['ligand'].edge_mask
-            ]
+            # Align with patched cg_model.py: index sigma by the source atoms of
+            # the rotatable bonds (tor_bonds[0]), which is guaranteed to match
+            # tor_pred's out_nodes, rather than the edge_index→edge_mask chain.
+            edge_sigma = tor_sigma[data['ligand'].batch][tor_bonds[0]]
 
             if model.scale_by_sigma:
                 tor_pred = tor_pred * torch.sqrt(
