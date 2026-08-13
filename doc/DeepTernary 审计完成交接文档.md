@@ -32,6 +32,7 @@
 | 平均聚类数 (40 seed, 2Å cutoff) | 37.4 |
 | 平均 Top-1 RMSD | 5.47 Å |
 | 平均 Linker 应变能 | 319.51 kcal/mol |
+| 平均冲突率（分子间） | 0.000099（~0.01%） |
 | Acceptable+ 率 (DockQ ≥ 0.23) | 62.05% |
 | CAPRI High/Medium/Acceptable/Incorrect | 2.4% / 18.9% / 40.8% / 38.0% |
 
