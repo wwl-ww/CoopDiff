@@ -5,6 +5,8 @@
 > 📄 **论文 PDF**: [DeepTernary_paper.pdf](DeepTernary_paper.pdf)（arXiv:2502.18875）
 > 📝 **论文 Markdown**: [DeepTernary_paper.md](DeepTernary_paper.md)（28页全文提取）
 > 📊 **审计数据**: `deepternary_audit.json`（22 cases × 40 seeds）
+>
+> ⚠️ **基线修正（2026-08-13）**：本文档 §三/§五 引用的审计 DockQ **0.555** 基于公开 `checkpoint.pth` + `FIX_TWO_ENDS=True` + `lig_kpt_mode_val='mask_pocket'`（信息泄露配置），已被 [[DeepTernary 审计完成交接文档]]（08-09）的最终审计取代——**0.6588**（SOTA 权重 `epoch_1000.pth` + `mask_predict` + `FIX_TWO_ENDS=False`）。§五的基线结论以 **0.6588** 为准。
 
 ---
 
@@ -177,23 +179,23 @@ Acceptable Rate: 1.0
 
 ### 5.1 基线修正
 
-| 维度 | 原定位（基于论文声称 0.65） | 修正后定位（基于审计 0.555） |
+| 维度 | 原定位（基于论文声称 0.65） | 修正后定位（基于最终审计 0.6588） |
 |------|--------------------------|---------------------------|
-| TriCoopDiff 正面追赶难度 | 需要 ≥0.65 | 需要 ≥0.555（降低 0.1） |
-| 与 DeepTernary 的结构预测差距 | 声称差距 0.1 | 实际差距取决于所用 checkpoint |
+| TriCoopDiff 正面追赶难度 | 需要 ≥0.65 | 需要 ≥0.66（仅需略超审计值） |
+| 与 DeepTernary 的结构预测差距 | 声称差距 0.1 | 实际差距取决于所用 checkpoint（最终审计 0.6588 已逼近官方 0.706） |
 | 功能排序壁垒 | DeepTernary 无此能力 | 壁垒不变 |
 
 ### 5.2 关键情报
 
-1. **论文报告值与公开权重的差距**：官方 SOTA 模型 (DockQ 0.706) 未公开发布，公开版本 (DockQ 0.555) 与论文声明有显著差距
-2. **这降低了 TriCoopDiff 结构预测方面的追赶难度**：目标从 "≥0.65" 修正为 "≥0.555 甚至 0.60+"
-3. **如果后续拿到官方 SOTA 权重**：需要重新校准基线
+1. **论文报告值与公开权重的差距**：官方 SOTA 模型 (DockQ 0.706) 的权重经 Zenodo 获取后，最终审计 (08-09) 复现为 **0.6588**，与官方仍差 0.047（归因于代码/数据 2024→2026 版本演进，非权重差异）
+2. **这降低了 TriCoopDiff 结构预测方面的追赶难度**：目标从 "≥0.65" 修正为 "≥0.66"
+3. **基线已确定**：以 [[DeepTernary 审计完成交接文档]]（08-09）的 **0.6588** 作为唯一对比基线，无需重新审计
 4. **困难 case 一致**：6BOY、6ZHC、7KHH、7JTP、7Q2J 在官方 SOTA 和审计版本下都是 DockQ 最低的几个
 
 ### 5.3 建议调整
 
-- 实验计划 Phase 1 的 DockQ 复现目标从 "确认 0.65 基线" 修正为 "确认公开版 0.555 基线，尝试复现 SOTA 0.706"
-- TriCoopDiff FT 版本的 DockQ 目标从 "≥ 0.65" 修正为 "≥ 0.60"，这已经超过公开版 DeepTernary
+- 实验计划 Phase 1 的 DockQ 复现目标从 "确认 0.65 基线" 修正为 "确认最终审计 0.6588 基线"（已完成，见审计完成交接文档）
+- TriCoopDiff FT 版本的 DockQ 目标从 "≥ 0.65" 修正为 "≥ 0.66"，这已追平本地审计基线
 - 长 linker 子集的预期优势保持不变（DeepTernary 的刚性对齐在长 linker 上系统性地表现更差）
 
 ---
@@ -268,9 +270,9 @@ SOTA 模型是用内部代码库 `projects.equibind`（见训练日志中的 `ty
 | `noise_initial` | 0 | 0 |
 | `translation_distance` | 5 | 5 |
 
-`FIX_TWO_ENDS=True` 在 RDKit 生成初始构象时固定 anchor + warhead 位置（仅生成 linker 构象），理论上给模型更多先验信息。这可能导致审计结果**偏高**（而非偏低），因此审计 DockQ 0.555 vs SOTA 0.706 的差距**几乎全部来自权重差异**（65MB checkpoint vs 200MB epoch_1000）。
+`FIX_TWO_ENDS=True` 在 RDKit 生成初始构象时固定 anchor + warhead 位置（仅生成 linker 构象），理论上给模型更多先验信息。这可能导致审计结果**偏高**（而非偏低）。注：08-09 最终审计改用 SOTA 权重 `epoch_1000.pth` + `FIX_TWO_ENDS=False` 后复现 **0.6588**——即 0.555→0.6588 的差距来自权重差异，而 0.6588→官方 0.706 的剩余 0.047 差距归因于代码/数据 2024→2026 版本演进（见 [[DeepTernary 审计完成交接文档]] §四）。
 
-### 7.4 下一步行动
+### 7.4 下一步行动（以下行动已于 08-09 完成，见 [[DeepTernary 审计完成交接文档]]）
 
 1. **下载 SOTA 权重**：从 Zenodo 下载 `public.zip` 中提取 `epoch_1000.pth`（199.78 MB）。Zenodo 支持 byte-range 下载，可以精确 range 请求 `270355142-479835258`，仅下载 ~200MB 而非完整 500MB。
 2. **重新运行审计**：使用 SOTA 权重替换 `checkpoint.pth`，设置 `FIX_TWO_ENDS=False`（对齐官方配置），预期复现 DockQ ~0.706。

@@ -4,7 +4,7 @@
 
 ## 1. 背景与当前状态
 
-Experiment 1 的目标：用冻结的 DiffDock-L（20M 参数）对 PROTAC 基准（23 个三元复合物，每个拆成 E3+PROTAC `e3l` 与 POI+PROTAC `poil` 两个配对，共 46 个配对）跑基线推理，得到 DockQ / RMSD / 冲突率等指标，作为 TriCoopDiff 的对比基准。
+Experiment 1 的目标：用冻结的 DiffDock-L（20M 参数）对 PROTAC 基准（22 个三元复合物，每个拆成 E3+PROTAC `e3l` 与 POI+PROTAC `poil` 两个配对，共 44 个配对）跑基线推理，得到 DockQ / RMSD / 冲突率等指标，作为 TriCoopDiff 的对比基准。
 
 经过多轮修复，成功率从最初的 27/46 提升到 **41/46（89.1%）**。剩下 5 个配对的失败模式从早期的 "No edges and no nodes"（受体被裁剪为空）变为纯数值问题：**预测配体坐标含 NaN**，报错 `'x' must be finite, check for nan or inf values`（在 `compute_fnat` → `query_ball_point` 处抛出，脚本第 433 行附近）。
 
@@ -49,7 +49,7 @@ Experiment 1 的目标：用冻结的 DiffDock-L（20M 参数）对 PROTAC 基�
 - **NaN 样本过滤**：计算指标时，跳过坐标非有限的样本（标记 `failed=True`），只在有限样本内按 DockQ 排序取 best；若全部样本 NaN 则记 `error: all_samples_nan`。每配对额外记录 `n_nan_samples`。
 - 更早修复：`_scatter_pytorch` OOB 索引保护；`build_complex_pdb` 双字母元素原子名修复；7PI4 配体 SDF→PDB 回退。
 
-### 5.2 DiffDock 依赖层（`../DiffDock`，分支 `nan-stability-fixes`）
+### 5.2 DiffDock 依赖层（`./DiffDock`，分支 `nan-stability-fixes`）
 
 - `models/cg_model.py`：修 `tor_bonds[0]` 的 `edge_sigma` 索引；注入 `[NaN DIAG]` 定位 NaN 来源。
 - `models/tensor_layers.py`：`TensorProductConvLayer` 对空 `edge_index` 的守卫 + 残差形状守卫。
@@ -85,13 +85,13 @@ Experiment 1 的目标：用冻结的 DiffDock-L（20M 参数）对 PROTAC 基�
 | `scripts/experiment1_diffdock_baseline.py` | 主脚本：NaN 过滤（~756-830 行）、`--crop-beyond` 与 crop_beyond 关闭逻辑（~561-571 行） |
 | `scripts/experiment1_nan_diag.slurm` | 5 案例诊断运行（已完成） |
 | `scripts/experiment1_full.slurm` / `_rerun_failed.slurm` | 完整 / 重跑失败案例的 SLURM 模板 |
-| `../DiffDock/models/cg_model.py` | `[NaN DIAG]`、cross-edge 硬编码 `tr_sigma*3+20`、tor_bonds[0] 修复 |
-| `../DiffDock/models/tensor_layers.py` | 空 edge_index 守卫（e3nn 卷积层） |
-| `../DiffDock/utils/sampling.py` | deepcopy + NaN score 回退 |
+| `./DiffDock/models/cg_model.py` | `[NaN DIAG]`、cross-edge 硬编码 `tr_sigma*3+20`、tor_bonds[0] 修复 |
+| `./DiffDock/models/tensor_layers.py` | 空 edge_index 守卫（e3nn 卷积层） |
+| `./DiffDock/utils/sampling.py` | deepcopy + NaN score 回退 |
 | `results/diffdock_baseline_v5.json` | 修复前完整基线（5 报错） |
 | `results/nan_diag_test.json` | 诊断运行结果（5 全恢复） |
 
 ## 9. Git 状态
 
-- **CoopDiff**（分支 `deepternary-paper-analysis`）：提交 `8c6e6e6`，含脚本 + 5 个 slurm 文件。
-- **DiffDock**（分支 `nan-stability-fixes`）：提交 `47eb91a`，含 `cg_model.py` / `tensor_layers.py` / `sampling.py`。
+- **CoopDiff**（分支 `deepternary-paper-analysis`）：提交 `8c6e6e6`，含脚本 + 5 个 slurm 文件。（该分支已合并入 `master`，当前 HEAD `b9c413a`）
+- **DiffDock**（分支 `nan-stability-fixes`）：提交 `47eb91a`，含 `cg_model.py` / `tensor_layers.py` / `sampling.py`。（已合并；DiffDock 现位于仓库内 `./DiffDock`）
