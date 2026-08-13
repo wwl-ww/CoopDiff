@@ -137,6 +137,15 @@ def _scatter_pytorch(src, index, dim_size=None, dim=0, reduce='sum'):
         return torch.zeros(shape, dtype=src.dtype, device=src.device)
     if reduce == 'sum':
         out = torch.zeros(dim_size, *src.shape[1:], dtype=src.dtype, device=src.device)
+        # Debug: check for out-of-bounds indices
+        if index.numel() > 0:
+            idx_max = int(index.max().item())
+            if idx_max >= dim_size:
+                import sys
+                print(f"[SCATTER OOB] dim_size={dim_size}, index_max={idx_max}, "
+                      f"index_min={int(index.min().item())}, "
+                      f"src_shape={list(src.shape)}, index_shape={list(index.shape)}",
+                      file=sys.stderr, flush=True)
         out.index_add_(0, index, src)
         return out
     elif reduce == 'mean':
@@ -205,6 +214,9 @@ def build_parser():
                    help="Specific cases to run (default: all)")
     p.add_argument("--skip-existing", action="store_true",
                    help="Skip cases with existing output SDFs")
+    p.add_argument("--crop-beyond", type=float, default=None,
+                   help="Override crop_beyond (None = disable dynamic cropping). "
+                        "DiffDock default is 20.")
     return p
 
 
@@ -315,7 +327,9 @@ def build_complex_pdb(protein_path, ligand_pos, ligand_mol, output_path):
                        float(ligand_pos[atom_idx, 2])
             name = atom.GetSymbol().strip()
             if len(name) == 1:
-                name = " " + name + "  "  # right-justified in cols 13-16
+                name = " " + name + "  "  # cols 13-16: space, elem, 2 blanks
+            elif len(name) == 2:
+                name = name + "  "        # cols 13-16: elem, 2 blanks
             lig_lines.append(_format_atom_line(
                 serial=10000 + atom_idx,
                 atom_name=name,
@@ -544,6 +558,21 @@ def main():
           f"num_conv_layers={score_model_args.num_conv_layers}, "
           f"sh_lmax={score_model_args.sh_lmax}", flush=True)
 
+    # Disable dynamic receptor cropping during sampling.
+    # With crop_beyond enabled, DiffDock crops receptor residues beyond
+    # (tr_sigma*3 + crop_beyond)Å at each diffusion step. For POI cases where
+    # the ligand starts far from the protein, intermediate steps can crop ALL
+    # receptor residues → "No edges and no nodes" ValueError.
+    # Setting crop_beyond=None keeps the initial receptor graph (built with
+    # receptor_radius=15Å) throughout sampling.
+    if args.crop_beyond is not None:
+        score_model_args.crop_beyond = args.crop_beyond
+        print(f"  crop_beyond overridden to {args.crop_beyond}", flush=True)
+    elif getattr(score_model_args, 'crop_beyond', None) is not None:
+        print(f"  Disabling crop_beyond (was {score_model_args.crop_beyond}) "
+              f"to prevent receptor cropping during sampling", flush=True)
+        score_model_args.crop_beyond = None
+
     t_to_sigma = partial(t_to_sigma_compl, args=score_model_args)
     model = get_model(score_model_args, device, t_to_sigma=t_to_sigma,
                       no_parallel=True, old=False)
@@ -587,7 +616,14 @@ def main():
         ]:
             pair_label = f"{case_name}/{pair_name}"
             protein_path = str(protac_dir / case_name / f"{protein_name}.pdb")
-            ligand_path = str(protac_dir / case_name / "ligand.sdf")
+            _sdf_path = protac_dir / case_name / "ligand.sdf"
+            _pdb_path = protac_dir / case_name / "ligand.pdb"
+            if _sdf_path.exists():
+                ligand_path = str(_sdf_path)
+            elif _pdb_path.exists():
+                ligand_path = str(_pdb_path)  # DiffDock's read_molecule supports .pdb
+            else:
+                ligand_path = str(_sdf_path)  # will fail with clear error
             gt_ligand_path = str(protac_dir / case_name / "ligand.pdb")
 
             write_dir = out_dir / case_name / pair_name
@@ -720,7 +756,23 @@ def main():
                     [a.get_coord() for a in prot_struct.get_atoms()])
 
                 sample_results = []
+                n_nan_samples = 0
                 for rank, pos in enumerate(ligand_pos_list):
+                    # Skip samples whose ligand coords overflowed to NaN/inf
+                    # during diffusion (e3nn tensor-product numerical overflow).
+                    # The remaining finite samples still yield a valid baseline.
+                    if not np.isfinite(pos).all():
+                        n_nan_samples += 1
+                        sample_results.append({
+                            "rank": rank + 1,
+                            "dockq": 0.0, "fnat": 0.0,
+                            "irms": 0.0, "Lrms": 0.0,
+                            "rmsd": float("nan"),
+                            "clash_rate": float("nan"),
+                            "failed": True,
+                        })
+                        continue
+
                     # RMSD
                     rmsd = float("nan")
                     if native_lig_coords is not None and len(pos) == len(native_lig_coords):
@@ -750,8 +802,16 @@ def main():
                         "clash_rate": clash,
                     })
 
-                # Best DockQ sample
-                best = max(sample_results, key=lambda r: r["dockq"])
+                finite_samples = [r for r in sample_results if not r.get("failed", False)]
+                if not finite_samples:
+                    per_case_results.append({
+                        "name": pair_label,
+                        "error": "all_samples_nan",
+                    })
+                    continue
+
+                # Best DockQ sample (over finite samples only)
+                best = max(finite_samples, key=lambda r: r["dockq"])
                 per_case_results.append({
                     "name": pair_label,
                     "case": case_name,
@@ -763,11 +823,13 @@ def main():
                     "rmsd": best["rmsd"],
                     "clash_rate": best["clash_rate"],
                     "samples": sample_results,
+                    "n_nan_samples": n_nan_samples,
                 })
 
                 print(f"  {pair_label}: best DockQ={best['dockq']:.4f}, "
                       f"RMSD={best['rmsd']:.2f}, "
                       f"clash={best['clash_rate']:.3f}",
+                      f" (NaN samples: {n_nan_samples})",
                       flush=True)
 
             except Exception as e:
