@@ -36,6 +36,8 @@ The `DeepTernary/` subdirectory is git-ignored (`DeepTernary/` is in `.gitignore
 
 ### Data Flow (one diffusion step)
 
+### Data Flow (one diffusion step)
+
 ```
 ternary graph (E3+POI+PROTAC)
     │
@@ -49,6 +51,22 @@ ternary graph (E3+POI+PROTAC)
 
 s_q = s_q1 + s_q2  (direct addition, see merging.py)
 ```
+
+DiffDock-L v1.1 (frozen): ns=48, nv=10, num_conv_layers=6, ~20M params (Corso et al. ICLR 2023). Two physically disconnected subgraphs with zero input-distribution OOD.
+
+### DiffDock-L Paper Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| ns / nv | 48 / 10 |
+| num_conv_layers | 6 |
+| sigma_embed_dim / distance_embed_dim / cross_distance_embed_dim | 64 / 64 / 64 |
+| dropout | 0.1 |
+| receptor_radius | 15 |
+| c_alpha_max_neighbors | 24 |
+| tr_sigma | 0.1 → 19 |
+| rot/tor_sigma | 0.03 → 1.55 |
+| train batch_size / lr / epochs | 16 / 1e-3 (Plateau) / 850 |
 
 ### Modules and What They Do
 
