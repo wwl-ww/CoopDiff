@@ -217,6 +217,8 @@ def build_parser():
     p.add_argument("--crop-beyond", type=float, default=None,
                    help="Override crop_beyond (None = disable dynamic cropping). "
                         "DiffDock default is 20.")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Random seed for numpy/torch (deterministic reproduction)")
     return p
 
 
@@ -682,6 +684,11 @@ def main():
                 # Prepare N data copies and randomize
                 N = args.samples
                 data_list = [copy.deepcopy(orig_graph) for _ in range(N)]
+                if args.seed is not None:
+                    np.random.seed(args.seed)
+                    torch.manual_seed(args.seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(args.seed)
                 randomize_position(
                     data_list,
                     score_model_args.no_torsion,
