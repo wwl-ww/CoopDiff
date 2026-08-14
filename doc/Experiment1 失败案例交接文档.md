@@ -60,7 +60,7 @@ Experiment 1 的目标：用冻结的 DiffDock-L（20M 参数）对 PROTAC 基�
 - **NaN 样本过滤**：计算指标时，跳过坐标非有限的样本（标记 `failed=True`），只在有限样本内按 DockQ 排序取 best；若全部样本 NaN 则记 `error: all_samples_nan`。每配对额外记录 `n_nan_samples`。
 - 更早修复：`_scatter_pytorch` OOB 索引保护；`build_complex_pdb` 双字母元素原子名修复；7PI4 配体 SDF→PDB 回退。
 
-### 5.2 DiffDock 依赖层（`../DiffDock`，分支 `nan-stability-fixes`）
+### 5.2 DiffDock 依赖层（`./DiffDock`，分支 `nan-stability-fixes`）
 
 - **根因修复（Bug A）**：`models/cg_model.py` 的 conv 循环每层后加 `node_attr = torch.clamp(node_attr, ±NAN_CLAMP)`，钳住反馈回路的状态变量，从源头消除 NaN。由环境变量 `NAN_CLAMP` 门控（缺省关闭，不改 DiffDock 默认行为）。阈值 `1e4` 比健康前向上限（~3e2）高 30 倍、比溢出起点（l=3 的 6e3）高，干净分离两个区间，健康案例完全不受影响（bit-identical）。
 - **回退门修复（Bug B）**：`utils/sampling.py` 的 NaN 回退原先只用 `torch.mean(tr_score)` 计数，`rot_score`/`tor_score` 里的 NaN 会漏过回退并传播到最终配体坐标。已改为对三者任一 NaN 都触发回退。
@@ -113,13 +113,13 @@ Experiment 1 的目标：用冻结的 DiffDock-L（20M 参数）对 PROTAC 基�
 | `scripts/experiment1_diffdock_baseline_v6.slurm` | 完整基线 v6（`NAN_CLAMP=10000 --seed 0`，待 GPU） |
 | `scripts/experiment1_nan_diag.slurm` | 早期兜底诊断运行（已被根因修复取代） |
 | `scripts/experiment1_full.slurm` / `_rerun_failed.slurm` | 完整 / 重跑失败案例的 SLURM 模板 |
-| `../DiffDock/models/cg_model.py` | conv 循环 `NAN_CLAMP` 钳位（根因修复）、`NAN_TRACE` 诊断、tor_bonds[0] 修复 |
-| `../DiffDock/models/tensor_layers.py` | `NAN_TRACE` TP 诊断、空 edge_index 守卫 |
-| `../DiffDock/utils/sampling.py` | deepcopy + NaN 回退门修复（Bug B） |
+| `./DiffDock/models/cg_model.py` | conv 循环 `NAN_CLAMP` 钳位（根因修复）、`NAN_TRACE` 诊断、tor_bonds[0] 修复 |
+| `./DiffDock/models/tensor_layers.py` | `NAN_TRACE` TP 诊断、空 edge_index 守卫 |
+| `./DiffDock/utils/sampling.py` | deepcopy + NaN 回退门修复（Bug B） |
 | `results/diffdock_baseline_v5.json` | 修复前完整基线（5 报错） |
 | `results/nan_fix_verify.json` | 根因修复验证结果（10/10 有限） |
 
 ## 9. Git 状态
 
-- **CoopDiff**（分支 `fix-nan-root-cause`）：脚本 + slurm 文件 + 本交接文档，未提交。
-- **DiffDock**（分支 `nan-stability-fixes`）：`cg_model.py` / `tensor_layers.py` / `sampling.py` 含未提交的根因修复与诊断代码。
+- **CoopDiff**（分支 `fix-nan-root-cause`）：已合并入 `master`。
+- **DiffDock**（分支 `nan-stability-fixes`）：已合并；DiffDock 现位于仓库内 `./DiffDock`。
