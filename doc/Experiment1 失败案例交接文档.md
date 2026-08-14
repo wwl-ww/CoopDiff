@@ -4,7 +4,7 @@
 
 ## 1. 背景与当前状态
 
-Experiment 1 的目标：用冻结的 DiffDock-L（20M 参数）对 PROTAC 基准（22 个三元复合物，每个拆成 E3+PROTAC `e3l` 与 POI+PROTAC `poil` 两个配对，共 44 个配对）跑基线推理，得到 DockQ / RMSD / 冲突率等指标，作为 TriCoopDiff 的对比基准。
+Experiment 1 的目标：用冻结的 DiffDock-L（20M 参数）对 PROTAC 基准（23 个三元复合物，每个拆成 E3+PROTAC `e3l` 与 POI+PROTAC `poil` 两个配对，共 46 个配对）跑基线推理，得到 DockQ / RMSD / 冲突率等指标，作为 TriCoopDiff 的对比基准。
 
 经过多轮修复，成功率从最初的 27/46 提升到 **41/46（89.1%）**。剩下 5 个配对的失败模式从早期的 "No edges and no nodes"（受体被裁剪为空）变为纯数值问题：**预测配体坐标含 NaN**，报错 `'x' must be finite, check for nan or inf values`（在 `compute_fnat` → `query_ball_point` 处抛出，脚本第 433 行附近）。
 

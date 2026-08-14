@@ -20,7 +20,7 @@
 | 文档 | 主题 | 过时点 |
 |------|------|--------|
 | `TriCoopDiff vs DeepTernary 竞争定位与实验计划.md` | 竞争定位 + 实验计划（v2.1） | 已回改：版本交叉引用、基线 0.65→0.6588、瓶颈 FiLM→逐层 FiLM、待办状态。§五实验计划的目标值仍偏乐观（0.6x 档），实际以 0.6588 基线校准。 |
-| `Experiment1 失败案例交接文档.md` | DiffDock 基线 NaN 诊断 | 已回改：DiffDock 路径 `./DiffDock`、基准规模 22/44、git 分支已合并。NaN 根因诊断与修复结论仍有效。 |
+| `Experiment1 失败案例交接文档.md` | DiffDock 基线 NaN 诊断 | 已回改：DiffDock 路径 `./DiffDock`、基准规模 23/46（含 7PI4，比 DeepTernary 的 22 多一个）、git 分支已合并。NaN 根因诊断与修复结论仍有效。 |
 
 ## 三、已被取代（仅供追溯）
 
@@ -43,7 +43,7 @@
 | DeepTernary 论文声称 DockQ | 0.65 | 论文（口径未明） |
 | DeepTernary 官方 SOTA 结果文件 DockQ | 0.706 | 未发布权重，经 Zenodo 获取后审计复现 0.6588 |
 | TriCoopDiff FT 版 DockQ 目标 | ≥ 0.66 | 竞争定位 §3.2（已回改） |
-| PROTAC benchmark 规模 | **22 复合物 / 44 配对**（`protac22.txt`） | DeepTernary 审计；DiffDock 基线同基准 |
+| PROTAC benchmark 规模 | DeepTernary 审计 **22**；DiffDock 基线 **23**（含 7PI4） | `protac22.txt` 22 个；DiffDock 基线多 1 个 7PI4 |
 | 可训练参数量 | ~2.2M（TriBrain） | 模型文档 v2.4 |
 | FiLM 方案 | 逐层独立 FiLM（6 层 × 2 子图 = 12 head，DiT adaLN-Zero） | 模型文档 v2.4 |
 | DiffDock 位置 | 仓库内 `./DiffDock` | 代码 + DiffDock 实验交接文档 |

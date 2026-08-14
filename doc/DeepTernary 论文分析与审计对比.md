@@ -275,8 +275,8 @@ SOTA 模型是用内部代码库 `projects.equibind`（见训练日志中的 `ty
 ### 7.4 下一步行动（以下行动已于 08-09 完成，见 [[DeepTernary 审计完成交接文档]]）
 
 1. **下载 SOTA 权重**：从 Zenodo 下载 `public.zip` 中提取 `epoch_1000.pth`（199.78 MB）。Zenodo 支持 byte-range 下载，可以精确 range 请求 `270355142-479835258`，仅下载 ~200MB 而非完整 500MB。
-2. **重新运行审计**：使用 SOTA 权重替换 `checkpoint.pth`，设置 `FIX_TWO_ENDS=False`（对齐官方配置），预期复现 DockQ ~0.706。
-3. **更新基线**：将 TriCoopDiff 的追赶目标校准为 SOTA 级别的 0.706。
+2. **重新运行审计（已完成）**：使用 SOTA 权重替换 `checkpoint.pth`，设置 `FIX_TWO_ENDS=False`（对齐官方配置），复现 DockQ **0.6588**（未达官方 0.706，差 0.047 归因于代码/数据 2024→2026 版本演进，见 [[DeepTernary 审计完成交接文档]] §四）。
+3. **更新基线（已完成）**：基线定为 **0.6588**，作为 TriCoopDiff 对比的唯一基准。
 
 ### 7.5 下载命令
 
