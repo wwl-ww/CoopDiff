@@ -146,7 +146,7 @@ class MultiRateDiffusion(nn.Module):
         t_tr: torch.Tensor,
         t_rot: torch.Tensor,
         t_tor: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Add Gaussian noise to PROTAC translation, rotation, and torsion.
 
@@ -158,6 +158,7 @@ class MultiRateDiffusion(nn.Module):
             noisy_pos: [B, N_lig, 3]
             tr_update: [B, 3] translation noise applied
             rot_update: [B, 3, 3] rotation matrix applied
+            rot_omega: [B, 3] so(3) rotation vector (pre-exp) for score target
         """
         B = ligand_pos.shape[0]
         device = ligand_pos.device
@@ -169,19 +170,19 @@ class MultiRateDiffusion(nn.Module):
         tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1) * lambda_q.unsqueeze(-1)
 
         # Rotation noise (SO(3))
-        rot_update = sample_so3_noise(B, rot_sigma * lambda_q, device)
+        rot_update, rot_omega = sample_so3_noise(B, rot_sigma * lambda_q, device)
 
         noisy_pos = ligand_pos + tr_update.unsqueeze(1)
         noisy_pos = torch.bmm(noisy_pos, rot_update)
 
-        return noisy_pos, tr_update, rot_update
+        return noisy_pos, tr_update, rot_update, rot_omega
 
     def add_noise_se3(
         self,
         poi_pos: torch.Tensor,
         t_se3_tr: torch.Tensor,
         t_se3_rot: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Add Gaussian noise to E3-POI rigid body transformation.
 
@@ -189,7 +190,8 @@ class MultiRateDiffusion(nn.Module):
             poi_pos: [B, N_poi, 3] clean POI positions (relative to E3 origin)
             t_se3_tr, t_se3_rot: [B] diffusion times for SE3 DOFs
         Returns:
-            noisy_pos, tr_update [B, 3], rot_update [B, 3, 3]
+            noisy_pos, tr_update [B, 3], rot_update [B, 3, 3],
+            rot_omega [B, 3] (so(3) rotation vector for score target)
         """
         B = poi_pos.shape[0]
         device = poi_pos.device
@@ -198,7 +200,7 @@ class MultiRateDiffusion(nn.Module):
         lambda_se3 = self.get_lambda_se3(t_se3_tr)
 
         tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1) * lambda_se3.unsqueeze(-1)
-        rot_update = sample_so3_noise(B, rot_sigma * lambda_se3, device)
+        rot_update, rot_omega = sample_so3_noise(B, rot_sigma * lambda_se3, device)
 
         # Apply to POI center of mass
         poi_center = poi_pos.mean(dim=1, keepdim=True)
@@ -207,7 +209,7 @@ class MultiRateDiffusion(nn.Module):
         noisy_centered = torch.bmm(poi_centered, rot_update)
         noisy_pos = noisy_center + noisy_centered
 
-        return noisy_pos, tr_update, rot_update
+        return noisy_pos, tr_update, rot_update, rot_omega
 
     # ------------------------------------------------------------------
     # Reverse diffusion step (score-based update)
@@ -456,7 +458,7 @@ class TernaryInitializer:
 
 def sample_so3_noise(
     batch_size: int, sigma: torch.Tensor, device: torch.device
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Sample noise on SO(3) manifold using the isotropic Gaussian distribution
     in the Lie algebra so(3).
@@ -466,11 +468,12 @@ def sample_so3_noise(
         sigma: [B] noise level per sample
         device: torch device
     Returns:
-        [B, 3, 3] rotation matrices
+        (rotation_matrices [B, 3, 3], omega [B, 3])
+        omega is the so(3) rotation vector (pre-exp) needed for score targets.
     """
     B = batch_size
     omega = torch.randn(B, 3, device=device) * sigma.unsqueeze(-1)
-    return so3_exp(omega)
+    return so3_exp(omega), omega
 
 
 def so3_exp(omega: torch.Tensor) -> torch.Tensor:
@@ -554,10 +557,13 @@ def _init_so3_cache(cache_dir=None):
     cache_dir = cache_dir or '.'
     omega_file = _os.path.join(cache_dir, '.so3_omegas_array4.npy')
     score_file = _os.path.join(cache_dir, '.so3_exp_score_norms4.npy')
+    score_norm_file = _os.path.join(cache_dir, '.so3_score_norms4.npy')
 
     if _os.path.exists(omega_file) and _os.path.exists(score_file):
         _omegas_array = np.load(omega_file)
         _exp_score_norms = np.load(score_file)
+        if _os.path.exists(score_norm_file):
+            _score_norms = np.load(score_norm_file)
         return
 
     _eps_array = 10 ** np.linspace(np.log10(_MIN_EPS), np.log10(_MAX_EPS), _N_EPS)
@@ -593,6 +599,8 @@ def _init_so3_cache(cache_dir=None):
     )
     np.save(omega_file, _omegas_array)
     np.save(score_file, _exp_score_norms)
+    np.save(score_norm_file, _score_norms)
+    np.save(_os.path.join(cache_dir, '.so3_cdf_vals4.npy'), _cdf_vals)
 
 
 def so3_score_norm(sigma, cache_dir=None):
@@ -608,4 +616,45 @@ def so3_score_norm(sigma, cache_dir=None):
     result = torch.from_numpy(_exp_score_norms[eps_idx]).float()
     if hasattr(sigma, 'device'):
         result = result.to(sigma.device)
+    return result
+
+
+def so3_score_vec(sigma, vec, cache_dir=None):
+    """
+    SO(3) score vector — matches DiffDock utils/so3.py `score_vec(eps, vec)`.
+
+    Given a sampled rotation vector `omega` and the noise level `sigma` that
+    produced it, returns the score of the isotropic-Gaussian-on-SO(3) density,
+    used as the rotation score-matching target.
+
+    Args:
+        sigma: [B] noise level (or scalar)
+        vec: [B, 3] rotation vector omega
+    Returns:
+        [B, 3] score vector
+    """
+    _init_so3_cache(cache_dir)
+    sigma_np = sigma.detach().cpu().numpy() if hasattr(sigma, 'cpu') else np.asarray(sigma)
+    vec_np = vec.detach().cpu().numpy() if hasattr(vec, 'cpu') else np.asarray(vec)
+    sigma_np = np.atleast_1d(sigma_np).astype(float)
+    vec_np = np.atleast_2d(vec_np).astype(float)
+
+    eps_idx = (np.log10(sigma_np) - np.log10(_MIN_EPS)) / (
+        np.log10(_MAX_EPS) - np.log10(_MIN_EPS)) * _N_EPS
+    eps_idx = np.clip(np.around(eps_idx).astype(int), 0, _N_EPS - 1)
+
+    om = np.linalg.norm(vec_np, axis=-1)  # [B]
+    om_safe = np.clip(om, 1e-8, None)
+    score_norm = np.array([
+        np.interp(om[i], _omegas_array, _score_norms[eps_idx[i]])
+        for i in range(len(om))
+    ])
+    out = score_norm[:, None] * vec_np / om_safe[:, None]
+
+    result = torch.from_numpy(out).float()
+    if hasattr(vec, 'device'):
+        result = result.to(vec.device)
+    # Match input rank: scalar sigma + [3] vec -> [3]
+    if not hasattr(sigma, 'shape') or len(sigma.shape) == 0:
+        result = result[0]
     return result

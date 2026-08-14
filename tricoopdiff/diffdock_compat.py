@@ -135,6 +135,10 @@ def _scatter_mean_pytorch(src, index, dim_size=None, dim=0):
     return _scatter_pytorch(src, index, dim_size, dim, reduce='mean')
 
 
+def _scatter_sum_pytorch(src, index, dim_size=None, dim=0):
+    return _scatter_pytorch(src, index, dim_size, dim, reduce='sum')
+
+
 def apply_patches():
     """Patch torch_cluster + torch_scatter with pure-PyTorch fallbacks.
 
@@ -147,6 +151,7 @@ def apply_patches():
     torch_cluster.knn_graph = _knn_graph_pytorch
     torch_scatter.scatter = _scatter_pytorch
     torch_scatter.scatter_mean = _scatter_mean_pytorch
+    torch_scatter.scatter_sum = _scatter_sum_pytorch
     return True
 
 

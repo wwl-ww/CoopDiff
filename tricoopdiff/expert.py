@@ -16,11 +16,20 @@ import numpy as np
 from e3nn import o3
 from torch_scatter import scatter_mean
 
+# Vendored DiffDock so3/torus score norms — single source of truth so the
+# FiLM-path score computation matches native CGModel.forward() exactly
+# (required for zero_film_verification to pass).
+from .diffdock.utils import so3, torus
+
 
 def torus_score_norm(sigma):
-    """Torus (torsion) score normalization: 1 / sigma^2."""
-    sigma = np.asarray(sigma)
-    return 1.0 / (sigma ** 2)
+    """Torsion score norm — matches DiffDock's torus.score_norm lookup table.
+
+    NOT 1/sigma^2: that approximation holds only for small sigma and diverges
+    from the wrapped-Gaussian score norm as sigma approaches pi (relevant at
+    high noise during diffusion, where tor_sigma reaches 1.55 rad).
+    """
+    return torus.score_norm(np.asarray(sigma))
 
 
 class FrozenDiffDock(nn.Module):
@@ -157,10 +166,9 @@ class FrozenDiffDock(nn.Module):
 
         if model.scale_by_sigma:
             tr_pred = tr_pred / tr_sigma.unsqueeze(1)
-            from .diffusion import so3_score_norm
             rot_pred = (
                 rot_pred
-                * so3_score_norm(rot_sigma.cpu()).unsqueeze(1).to(lig_node_attr.device)
+                * so3.score_norm(rot_sigma.cpu()).unsqueeze(1).to(lig_node_attr.device)
             )
 
         # Torsion scores
