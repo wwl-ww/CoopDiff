@@ -33,6 +33,8 @@ _DIFFDOCK_DIR = _PROJECT_ROOT.parent / "DiffDock"
 # script is run as `python scripts/mvp_smoke_test.py` (sys.path[0] = scripts/) or
 # from the root. `tricoopdiff` is not pip-installed (no setup.py / pyproject).
 sys.path.insert(0, str(_PROJECT_ROOT))
+# scripts/ is importable for the shared featurization module (sibling of this file).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # (1) Import diffdock_compat FIRST — its import-time side effect patches
 # torch_cluster / torch_scatter with pure-PyTorch fallbacks before the vendored
@@ -51,9 +53,13 @@ sys.path.insert(0, str(_DIFFDOCK_DIR))
 import torch
 import yaml
 from argparse import Namespace
-from torch_geometric.loader import DataLoader
 
-from utils.inference_utils import InferenceDataset, get_sequences
+from featurize_common import (
+    generate_esm_embeddings,
+    featurize_subgraph,
+    extract_receptor,
+    extract_ligand,
+)
 
 from tricoopdiff.expert_factory import build_diffdock_expert
 from tricoopdiff.tribrain import TriBrain
@@ -80,91 +86,6 @@ def build_parser():
     p.add_argument("--atol", type=float, default=1e-5,
                    help="Absolute tolerance for zero-FiLM transparency gate")
     return p
-
-
-def generate_esm_embeddings(protein_paths, device):
-    """Generate ESM2-650M embeddings for protein PDBs (mirrors experiment1).
-
-    Returns: dict {protein_path: [per-chain torch.Tensor (n_res, 1280)]}.
-    """
-    from tricoopdiff.esm_embedder import ESMEmbedder
-
-    print(f"Loading ESM2-650M on {device} via HF mirror...", flush=True)
-    embedder = ESMEmbedder(device=device)
-
-    print(f"Extracting sequences from {len(protein_paths)} proteins...", flush=True)
-    seqs_list = get_sequences(protein_paths, [None] * len(protein_paths))
-
-    per_protein_info = []
-    all_chain_seqs = []
-    for path, seq_str in zip(protein_paths, seqs_list):
-        chain_seqs = seq_str.split(":")
-        per_protein_info.append((path, chain_seqs))
-        all_chain_seqs.extend(chain_seqs)
-
-    unique_seqs = list(dict.fromkeys(all_chain_seqs))
-    print(f"  {len(all_chain_seqs)} chains, {len(unique_seqs)} unique", flush=True)
-
-    unique_embeddings = embedder.embed_from_fasta(unique_seqs, batch_size=4)
-    seq_to_emb = dict(zip(unique_seqs, unique_embeddings))
-
-    return {
-        path: [seq_to_emb[s].cpu() for s in chain_seqs]
-        for path, chain_seqs in per_protein_info
-    }
-
-
-def featurize_subgraph(case_label, protein_path, ligand_path, chain_embs, score_model_args):
-    """Featurize one two-body subgraph and return its Batch graph."""
-    precomputed = [[t for t in chain_embs]]  # keep on CPU
-    dataset = InferenceDataset(
-        out_dir=str(_PROJECT_ROOT / "results" / "smoke_tmp" / case_label.replace("/", "_")),
-        complex_names=[case_label],
-        protein_files=[protein_path],
-        ligand_descriptions=[ligand_path],
-        protein_sequences=[None],
-        lm_embeddings=True,
-        precomputed_lm_embeddings=precomputed,
-        receptor_radius=score_model_args.receptor_radius,
-        remove_hs=score_model_args.remove_hs,
-        c_alpha_max_neighbors=score_model_args.c_alpha_max_neighbors,
-        all_atoms=score_model_args.all_atoms,
-        atom_radius=score_model_args.atom_radius,
-        atom_max_neighbors=score_model_args.atom_max_neighbors,
-        knn_only_graph=(
-            False if not hasattr(score_model_args, "not_knn_only_graph")
-            else not score_model_args.not_knn_only_graph
-        ),
-    )
-    loader = DataLoader(dataset=dataset, batch_size=1, shuffle=False)
-    return next(iter(loader))
-
-
-def extract_receptor(batch_graph, device):
-    """Receptor tensors → the dict format TriCoopDiff.forward expects."""
-    return {
-        'coords': batch_graph['receptor'].pos.unsqueeze(0).to(device),
-        'features': batch_graph['receptor'].x.unsqueeze(0).to(device),
-        'edge_index': batch_graph['receptor', 'receptor'].edge_index.to(device),
-    }
-
-
-def extract_ligand(batch_graph, device):
-    """Ligand tensors → the dict format TriCoopDiff.forward expects."""
-    # mask_rotate (per-rotatable-bond atom mask, [n_rot, n_atoms] bool) is stored
-    # as a numpy array on the ligand node; torch_geometric collate wraps per-ligand
-    # arrays in a list (Batch) even at batch_size=1. Normalize to the single array.
-    mask_rotate = batch_graph['ligand'].mask_rotate
-    if isinstance(mask_rotate, (list, tuple)):
-        mask_rotate = mask_rotate[0]
-    return {
-        'coords': batch_graph['ligand'].pos.unsqueeze(0).to(device),
-        'features': batch_graph['ligand'].x.unsqueeze(0).to(device),
-        'edge_index': batch_graph['ligand', 'ligand'].edge_index.to(device),
-        'edge_attr': batch_graph['ligand', 'ligand'].edge_attr.to(device),
-        'edge_mask': batch_graph['ligand'].edge_mask.to(device),
-        'mask_rotate': mask_rotate,
-    }
 
 
 def _grad_ok(param):

@@ -154,9 +154,7 @@ python tricoopdiff/evaluate.py  # (CLI interface TBD)
 
 These functions are skeletons that need real implementations before training:
 
-- **`train.py:_compute_tor_score_target`** (line 222): Returns zeros. Needs DiffDock's `torus.score()` integration.
-- **`train.py:_physical_loss`** (line 236): Simplified center-of-mass clash penalty. Should use per-atom VDW repulsion via KD-tree.
-- **`model.py:zero_film_verification`** (line 337): Skeleton — returns `True` without actually verifying. **Critical** to implement before any training to confirm FiLM transparency.
+- **`train.py:_physical_loss`** (line 236): Uses a fixed 3.4 Å contact distance (per-atom via `torch.cdist`). Should use true per-atom VDW radii via KD-tree.
 - **`model.py:forward`** (line 58): Currently single-complex mode only (B=1). Multi-complex batching needs DataLoader/padding.
 - **`model.py:forward`** (line 110): Uses identity rotation for `ligand_coords_poi` transform. Needs proper SE(3) tracking during diffusion (current `R_E3→POI` estimate).
 - **`evaluate.py:evaluate_model`** (line 314): Skeleton placeholder. Needs actual multi-walker sampling loop.
