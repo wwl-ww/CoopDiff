@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 from scipy.spatial.transform import Rotation as R
 
+from .diffdock.utils.geometry import rigid_transform_Kabsch_3D_torch_batch
+
 
 class MultiRateDiffusion(nn.Module):
     """
@@ -148,7 +150,10 @@ class MultiRateDiffusion(nn.Module):
         t_tor: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Add Gaussian noise to PROTAC translation, rotation, and torsion.
+        Add Gaussian noise to PROTAC translation and rotation (rigid-body DOFs).
+
+        Torsion angles are perturbed separately by ``add_torsion_noise`` (applied
+        after this rigid transform), mirroring DiffDock's ``modify_conformer``.
 
         Args:
             ligand_pos: [B, N_lig, 3] clean ligand positions
@@ -210,6 +215,74 @@ class MultiRateDiffusion(nn.Module):
         noisy_pos = noisy_center + noisy_centered
 
         return noisy_pos, tr_update, rot_update, rot_omega
+
+    def add_torsion_noise(
+        self,
+        ligand_pos: torch.Tensor,
+        t_tor: torch.Tensor,
+        lig_edge_index: torch.Tensor,
+        lig_edge_mask: torch.Tensor,
+        lig_mask_rotate,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Add Gaussian noise to PROTAC rotatable-bond torsion angles.
+
+        Translation/rotation perturb the whole conformer; torsion rotates each
+        rotatable bond's downstream atoms around the bond axis. This mirrors
+        DiffDock's ``modify_conformer``: the torsion-perturbed conformer is
+        Kabsch-aligned back to its pre-torsion pose so the internal-coordinate
+        (torsion) perturbation does not leak a global drift into the tr/rot
+        score-matching targets. Applied AFTER ``add_noise_protac``.
+
+        Args:
+            ligand_pos: [B, N_lig, 3] conformer (already tr+rot noised)
+            t_tor: [B] torsion diffusion times
+            lig_edge_index: [2, E] ligand internal bond edges
+            lig_edge_mask: [E] bool — rotatable bond mask
+            lig_mask_rotate: [n_rot, N_lig] bool, or list of per-complex masks
+
+        Returns:
+            noisy_pos: [B, N_lig, 3] conformer with torsion angles perturbed
+            tor_update: [B, n_rot] torsion angle noise (used as the score target)
+        """
+        from .diffdock.utils.torsion import modify_conformer_torsion_angles
+
+        B = ligand_pos.shape[0]
+        device = ligand_pos.device
+
+        _, _, tor_sigma = self.t_to_sigma(t_tor, t_tor, t_tor)
+        lambda_q = self.get_lambda_q(t_tor)
+
+        # Rotatable bond edges (one direction each), same row order as mask_rotate.
+        rot_edges = lig_edge_index.T[lig_edge_mask]  # [n_rot, 2]
+        n_rot = rot_edges.shape[0]
+
+        tor_update = torch.randn(B, n_rot, device=device) * tor_sigma.unsqueeze(-1) * lambda_q.unsqueeze(-1)
+
+        # A batch of 1 may carry mask_rotate as a bare ndarray; a batch of N as a
+        # list of per-complex masks. Normalize to a per-element list.
+        if not isinstance(lig_mask_rotate, (list, tuple)):
+            lig_mask_rotate = [lig_mask_rotate] * B
+
+        noisy_pos = ligand_pos.clone()
+        for b in range(B):
+            rigid_pos = noisy_pos[b].unsqueeze(0)  # [1, N_lig, 3] pre-torsion pose
+            mr = lig_mask_rotate[b]
+            if isinstance(mr, torch.Tensor):
+                mr = mr.detach().cpu().numpy()
+            tu = tor_update[b].detach().cpu().numpy()
+            flexible_pos = modify_conformer_torsion_angles(
+                rigid_pos[0].detach().cpu(), rot_edges, mr, tu, as_numpy=False
+            ).to(device).unsqueeze(0)  # [1, N_lig, 3] torsion-perturbed pose
+
+            # Kabsch-align the torsion-perturbed conformer back to its pre-torsion
+            # pose (DiffDock's `modify_conformer` does exactly this): rotating
+            # downstream side-groups moves the global pose, which would otherwise
+            # contaminate the tr/rot score-matching targets.
+            R_align, t_align = rigid_transform_Kabsch_3D_torch_batch(flexible_pos, rigid_pos)
+            noisy_pos[b] = flexible_pos[0] @ R_align[0].T + t_align[0].T
+
+        return noisy_pos, tor_update
 
     # ------------------------------------------------------------------
     # Reverse diffusion step (score-based update)

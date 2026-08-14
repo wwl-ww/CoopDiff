@@ -151,12 +151,19 @@ def extract_receptor(batch_graph, device):
 
 def extract_ligand(batch_graph, device):
     """Ligand tensors → the dict format TriCoopDiff.forward expects."""
+    # mask_rotate (per-rotatable-bond atom mask, [n_rot, n_atoms] bool) is stored
+    # as a numpy array on the ligand node; torch_geometric collate wraps per-ligand
+    # arrays in a list (Batch) even at batch_size=1. Normalize to the single array.
+    mask_rotate = batch_graph['ligand'].mask_rotate
+    if isinstance(mask_rotate, (list, tuple)):
+        mask_rotate = mask_rotate[0]
     return {
         'coords': batch_graph['ligand'].pos.unsqueeze(0).to(device),
         'features': batch_graph['ligand'].x.unsqueeze(0).to(device),
         'edge_index': batch_graph['ligand', 'ligand'].edge_index.to(device),
         'edge_attr': batch_graph['ligand', 'ligand'].edge_attr.to(device),
         'edge_mask': batch_graph['ligand'].edge_mask.to(device),
+        'mask_rotate': mask_rotate,
     }
 
 
