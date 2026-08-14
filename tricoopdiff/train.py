@@ -90,11 +90,11 @@ class TriCoopDiffTrainer:
         t_se3 = torch.rand(B, device=device)
 
         # Add noise to PROTAC
-        noisy_ligand, tr_noise, rot_noise = self.diffusion.add_noise_protac(
+        noisy_ligand, tr_noise, rot_noise, rot_omega = self.diffusion.add_noise_protac(
             ligand_data['coords'].to(device), t, t, t,
         )
         # Add noise to POI (SE3)
-        noisy_poi, se3_tr_noise, se3_rot_noise = self.diffusion.add_noise_se3(
+        noisy_poi, se3_tr_noise, se3_rot_noise, se3_rot_omega = self.diffusion.add_noise_se3(
             poi_data['coords'].to(device), t_se3, t_se3,
         )
 
@@ -117,7 +117,7 @@ class TriCoopDiffTrainer:
         diff_tr = output['s_q']['tr'] - tr_score_target
         loss_score_tr = (diff_tr**2 * tr_sigma.unsqueeze(-1)**2).mean()
 
-        rot_score_target = self._compute_rot_score_target(rot_noise, rot_sigma)
+        rot_score_target = self._compute_rot_score_target(rot_omega, rot_sigma)
         rot_norm = so3_score_norm(rot_sigma).unsqueeze(-1)
         loss_score_rot = ((output['s_q']['rot'] - rot_score_target)**2 / rot_norm**2).mean()
 
@@ -135,7 +135,7 @@ class TriCoopDiffTrainer:
         diff_se3_tr = output['s_se3_components']['tr'] - se3_tr_target
         loss_se3_tr = (diff_se3_tr**2 * se3_tr_sigma.unsqueeze(-1)**2).mean()
 
-        se3_rot_target = self._compute_rot_score_target(se3_rot_noise, se3_rot_sigma)
+        se3_rot_target = self._compute_rot_score_target(se3_rot_omega, se3_rot_sigma)
         se3_rot_norm = so3_score_norm(se3_rot_sigma).unsqueeze(-1)
         loss_se3_rot = ((output['s_se3_components']['rot'] - se3_rot_target)**2 / se3_rot_norm**2).mean()
         loss_se3 = loss_se3_tr + loss_se3_rot
@@ -143,7 +143,9 @@ class TriCoopDiffTrainer:
         # Physical consistency loss
         denoised_ligand = self._estimate_denoised(noisy_ligand, output['s_q']['tr'], tr_sigma)
         denoised_poi = self._estimate_denoised_se3(noisy_poi, output['s_se3'], se3_tr_sigma)
-        loss_phys = self._physical_loss(denoised_ligand, denoised_poi)
+        loss_phys = self._physical_loss(
+            denoised_ligand, noisy_e3_data['coords'], denoised_poi
+        )
 
         loss_total = (
             self.loss_weights['score'] * loss_score
@@ -180,10 +182,15 @@ class TriCoopDiffTrainer:
         loss_dict = self.compute_loss(**batch)
         return {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
 
-    def _compute_rot_score_target(self, rot_noise, rot_sigma):
-        """Compute SO(3) score target for rotation noise."""
-        from .diffusion import so3_score_norm
-        return rot_noise * so3_score_norm(rot_sigma).unsqueeze(-1)
+    def _compute_rot_score_target(self, rot_omega, rot_sigma):
+        """Compute SO(3) score target from the sampled so(3) rotation vector.
+
+        Matches DiffDock `so3.score_vec(vec=omega, eps=sigma)`: the score of the
+        isotropic-Gaussian-on-SO(3) density evaluated at the sampled rotation
+        vector `omega`, returned in the same [B, 3] shape as the model's rot score.
+        """
+        from .diffusion import so3_score_vec
+        return so3_score_vec(rot_sigma, rot_omega)
 
     def _compute_tor_score_target(self, tor_sigma):
         """Compute torus score target. Placeholder for actual implementation."""
@@ -203,23 +210,24 @@ class TriCoopDiffTrainer:
         denoised_center = poi_center + sigma.unsqueeze(-1).unsqueeze(-1) ** 2 * tr_score.unsqueeze(1)
         return noisy_poi - poi_center + denoised_center
 
-    def _physical_loss(self, ligand_coords, poi_coords):
+    def _physical_loss(self, ligand_coords, e3_coords, poi_coords):
         """
         Physical consistency loss: penalize steric clashes between
-        PROTAC and proteins.
+        PROTAC and both proteins.
 
-        Simple repulsive VDW term: Σ max(0, vdw_sum - dist)²
+        Per-atom VDW repulsion: Σ max(0, vdw_sum - dist)² over all
+        PROTAC-protein atom pairs, using a fixed 3.4 Å contact distance.
+        O(N_lig × N_prot) via torch.cdist — sufficient at MVP scale.
         """
-        # This is a simplified version. Full implementation uses KD-tree
-        # and proper VDW radii for all atom pairs.
-        # For now: penalize ligand atoms that are too close to protein atoms
-        protac_center = ligand_coords.mean(dim=1)  # [B, 3]
-        poi_center = poi_coords.mean(dim=1)  # [B, 3]
-
-        # Penalize PROLONGED close contact (< 3Å) between PROTAC and POI
-        dist = torch.linalg.vector_norm(protac_center - poi_center, dim=-1)
-        clash = F.relu(3.0 - dist) ** 2
-        return clash.mean()
+        clash = torch.tensor(0.0, device=ligand_coords.device)
+        for protein_coords in (e3_coords, poi_coords):
+            if protein_coords is None:
+                continue
+            # [B, N_lig, N_prot] pairwise distances
+            dist = torch.cdist(ligand_coords, protein_coords)
+            # Repulsive term: atom pairs closer than 3.4 Å contribute
+            clash = clash + (F.relu(3.4 - dist) ** 2).mean()
+        return clash
 
     def scheduler_step(self):
         """Step the learning rate scheduler."""

@@ -387,7 +387,8 @@ class TriBrain(nn.Module):
         ns: int = 32,
         nv: int = 4,
         num_transformer_layers: int = 3,
-        num_conv_layers_per_expert: int = 6,
+        num_conv_layers_per_expert: int = 11,
+        film_dim: int = 48,
         dropout: float = 0.1,
     ):
         """
@@ -399,7 +400,12 @@ class TriBrain(nn.Module):
             nv: vector channel count
             num_transformer_layers: depth of equivariant transformer
             num_conv_layers_per_expert: number of conv layers in each DiffDock expert
-                                       (used to size the FiLM head list)
+                                       (used to size the FiLM head list). DiffDock-L
+                                       has 11 conv layers (NOT 6).
+            film_dim: number of scalar channels to modulate per conv layer.
+                      Must equal the expert's `ns` (48 for DiffDock-L). Only the
+                      scalar block `node_attr[:, :film_dim]` is FiLM-modulated to
+                      preserve SE(3) equivariance.
             dropout: dropout rate
         """
         super().__init__()
@@ -408,6 +414,7 @@ class TriBrain(nn.Module):
         self.node_dim = node_dim
         self.input_dim = input_dim
         self.num_conv_layers = num_conv_layers_per_expert
+        self.film_dim = film_dim
 
         # Multi-scale pooling: ~66k params
         self.pooling = MultiScalePooling(
@@ -436,11 +443,12 @@ class TriBrain(nn.Module):
             nn.Linear(node_dim, node_dim),
         )  # ~66k
 
-        # 12 independent FiLM heads (6 layers × 2 subgraphs)
-        # Each head: node_dim → node_dim*2 (gamma + beta), zero-initialized
+        # 2 × num_conv_layers_per_expert independent FiLM heads
+        # (num_conv_layers × 2 subgraphs). Each head: node_dim → film_dim*2
+        # (gamma + beta), zero-initialized for transparency at training start.
         self.film_heads = nn.ModuleList([
-            FiLMHead(node_dim) for _ in range(num_conv_layers_per_expert * 2)
-        ])  # ~500k for 6×2 heads
+            FiLMHead(node_dim, film_dim) for _ in range(num_conv_layers_per_expert * 2)
+        ])
 
     def forward(
         self,
@@ -499,9 +507,10 @@ class FiLMHead(nn.Module):
     Zero-initialized for transparency at training start (adaLN-Zero paradigm).
     """
 
-    def __init__(self, hidden_dim: int = 128):
+    def __init__(self, hidden_dim: int = 128, film_dim: int = 48):
         super().__init__()
-        self.net = nn.Linear(hidden_dim, hidden_dim * 2)
+        self.film_dim = film_dim
+        self.net = nn.Linear(hidden_dim, film_dim * 2)
         # Zero-initialize
         nn.init.zeros_(self.net.weight)
         nn.init.zeros_(self.net.bias)
@@ -511,7 +520,7 @@ class FiLMHead(nn.Module):
         Args:
             h: [B, hidden_dim] conditioning
         Returns:
-            gamma: [B, hidden_dim], beta: [B, hidden_dim]
+            gamma: [B, film_dim], beta: [B, film_dim]
         """
         out = self.net(h)
         gamma, beta = out.chunk(2, dim=-1)
