@@ -29,6 +29,11 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DIFFDOCK_DIR = _PROJECT_ROOT.parent / "DiffDock"
 
+# Make the project root importable so `import tricoopdiff.*` works whether this
+# script is run as `python scripts/mvp_smoke_test.py` (sys.path[0] = scripts/) or
+# from the root. `tricoopdiff` is not pip-installed (no setup.py / pyproject).
+sys.path.insert(0, str(_PROJECT_ROOT))
+
 # (1) Import diffdock_compat FIRST — its import-time side effect patches
 # torch_cluster / torch_scatter with pure-PyTorch fallbacks before the vendored
 # cg_model and ../DiffDock's process_mols bind those symbols at import time.
