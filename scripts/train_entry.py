@@ -59,12 +59,12 @@ def parse_args():
     # TriBrain params
     p.add_argument("--ns", type=int, default=32, help="TriBrain scalar channels")
     p.add_argument("--nv", type=int, default=4, help="TriBrain vector channels")
-    # DiffDock-L params (ns=48, nv=10, num_conv_layers=6 from paper)
-    p.add_argument("--expert_ns", type=int, default=48, help="DiffDock-L scalar channels")
-    p.add_argument("--expert_nv", type=int, default=10, help="DiffDock-L vector channels")
     p.add_argument("--num_transformer_layers", type=int, default=3)
-    p.add_argument("--num_conv_layers", type=int, default=6)
     p.add_argument("--node_dim", type=int, default=128)
+    # Frozen DiffDock-L expert (ns=48, nv=10, num_conv_layers=11). These are read
+    # from the checkpoint's model_parameters.yml, not hand-written here.
+    p.add_argument("--expert_model_dir", default="checkpoints/score_model",
+                   help="Dir with model_parameters.yml + best_ema_inference_epoch_model.pt")
 
     # Hardware
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -180,46 +180,29 @@ def build_trainer(args, device):
     """Build model, diffusion, and trainer."""
     from tricoopdiff import TriCoopDiff
     from tricoopdiff.tribrain import TriBrain
-    from tricoopdiff.expert import FrozenDiffDock
+    from tricoopdiff.expert_factory import build_diffdock_expert
     from tricoopdiff.diffusion import MultiRateDiffusion
     from tricoopdiff.train import TriCoopDiffTrainer
 
-    # Build TriBrain
+    # Build frozen DiffDock-L expert from pretrained weights (self-contained
+    # vendored core — no ../DiffDock dependency). num_conv_layers (11) and the
+    # full CGModel architecture come from model_parameters.yml.
+    frozen_expert = build_diffdock_expert(
+        model_dir=args.expert_model_dir,
+        device=str(device),
+    )
+    num_conv_layers = frozen_expert.num_conv_layers
+
+    # Build TriBrain (the only trainable module).
     tribrain = TriBrain(
         node_dim=args.node_dim,
         ns=args.ns,
         nv=args.nv,
         num_transformer_layers=args.num_transformer_layers,
-        num_conv_layers_per_expert=args.num_conv_layers,
+        num_conv_layers_per_expert=num_conv_layers,
     )
 
-    # Build frozen expert
-    diffdock_root = str(Path(__file__).parent.parent / "DiffDock")
-    sys.path.insert(0, diffdock_root)
-    from models.cg_model import CGModel
-
-    cg_model = CGModel(
-        t_to_sigma=lambda tr, rot, tor: (
-            torch.tensor(0.1) * (19.0 / 0.1) ** tr,
-            torch.tensor(0.03) * (1.55 / 0.03) ** rot,
-            torch.tensor(0.03) * (1.55 / 0.03) ** tor,
-        ),
-        device=device,
-        timestep_emb_func=_make_timestep_emb(64),
-        ns=args.expert_ns, nv=args.expert_nv,
-        num_conv_layers=args.num_conv_layers,
-        sigma_embed_dim=64,
-        distance_embed_dim=64,
-        cross_distance_embed_dim=64,
-        dropout=0.1,
-        receptor_radius=15,
-        c_alpha_max_neighbors=24,
-        scale_by_sigma=True,
-        separate_noise_schedule=False,
-    )
-
-    frozen_expert = FrozenDiffDock(cg_model, num_conv_layers=args.num_conv_layers)
-    model = TriCoopDiff(frozen_expert, tribrain, num_conv_layers=args.num_conv_layers)
+    model = TriCoopDiff(frozen_expert, tribrain, num_conv_layers=num_conv_layers)
 
     # Build diffusion
     diffusion = MultiRateDiffusion(inference_steps=20)
@@ -234,11 +217,6 @@ def build_trainer(args, device):
     )
 
     return model, diffusion, trainer
-
-
-def _make_timestep_emb(embedding_dim=32):
-    from utils.diffusion_utils import GaussianFourierProjection
-    return GaussianFourierProjection(embedding_size=embedding_dim)
 
 
 def validate(trainer, val_loader, device):

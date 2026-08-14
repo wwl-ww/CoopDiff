@@ -191,9 +191,9 @@ if _DEEPT not in sys.path:
     sys.path.insert(0, _DEEPT)
 
 from utils.inference_utils import InferenceDataset, get_sequences
-from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl, get_t_schedule
-from utils.sampling import randomize_position, sampling
-from utils.utils import get_model
+from tricoopdiff.diffdock.utils.diffusion_utils import t_to_sigma as t_to_sigma_compl, get_t_schedule
+from tricoopdiff.diffdock.sampling import randomize_position, sampling
+from tricoopdiff.diffdock.factory import build_cg_model
 from rdkit.Chem import RemoveAllHs
 from datasets.process_mols import write_mol_with_coords
 
@@ -576,8 +576,7 @@ def main():
         score_model_args.crop_beyond = None
 
     t_to_sigma = partial(t_to_sigma_compl, args=score_model_args)
-    model = get_model(score_model_args, device, t_to_sigma=t_to_sigma,
-                      no_parallel=True, old=False)
+    model = build_cg_model(score_model_args, device, t_to_sigma)
     ckpt_path = f"{model_dir}/{args.ckpt}"
     state_dict = torch.load(ckpt_path, map_location=torch.device("cpu"))
     model.load_state_dict(state_dict, strict=True)
