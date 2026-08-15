@@ -72,6 +72,7 @@ class TriCoopDiff(nn.Module):
         ligand_data: dict,
         t: torch.Tensor,
         t_se3: torch.Tensor = None,
+        r_e3_to_poi: torch.Tensor = None,
         pocket_guide: torch.Tensor = None,
     ) -> dict:
         """
@@ -85,6 +86,11 @@ class TriCoopDiff(nn.Module):
                          'edge_index', 'edge_attr', 'edge_mask', 'mask_rotate' (optional)
             t: [B] diffusion time for PROTAC DOFs
             t_se3: [B] diffusion time for SE3 DOFs (defaults to t if None)
+            r_e3_to_poi: [B,3,3] rotation from E3 frame to POI frame. Defaults to
+                identity (backward-compatible). This is the transpose of the
+                cumulative SE3 rotation applied to the POI (tracked by the
+                sampler / training loop), so subgraph2 sees the correct
+                PROTAC-POI relative geometry.
             pocket_guide: [B,3] optional pocket center for guidance potential
 
         Returns:
@@ -116,9 +122,13 @@ class TriCoopDiff(nn.Module):
             poi_center = poi_data['coords'][b].mean(dim=0)
             t_e3_to_poi = poi_center - e3_center
 
+            r_e3 = (
+                r_e3_to_poi[b]
+                if r_e3_to_poi is not None
+                else torch.eye(3, device=device)
+            )
             ligand_coords_poi = transform_ligand_to_poi_frame(
-                ligand_data['coords'][b], t_e3_to_poi,
-                torch.eye(3, device=device),
+                ligand_data['coords'][b], t_e3_to_poi, r_e3,
             )
 
             # Build subgraphs

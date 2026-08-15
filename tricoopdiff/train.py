@@ -110,8 +110,13 @@ class TriCoopDiffTrainer:
         noisy_poi_data = {**poi_data, 'coords': noisy_poi}
         noisy_ligand_data = {**ligand_data, 'coords': noisy_ligand}
 
-        # Model forward
-        output = self.model(noisy_e3_data, noisy_poi_data, noisy_ligand_data, t=t, t_se3=t_se3)
+        # Model forward. Pass the SE3 rotation applied to the POI so subgraph2
+        # (POI-L) sees the correct PROTAC-POI relative geometry: r_e3_to_poi is
+        # the inverse (= transpose) of the clean->noisy POI rotation.
+        output = self.model(
+            noisy_e3_data, noisy_poi_data, noisy_ligand_data, t=t, t_se3=t_se3,
+            r_e3_to_poi=se3_rot_noise.transpose(-1, -2),
+        )
 
         # Score matching loss — matches DiffDock paper §4
         # Translation: weighted by σ² (R³ Euclidean DSM)
