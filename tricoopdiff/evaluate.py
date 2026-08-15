@@ -340,6 +340,129 @@ def compute_poi_dockq(
     }
 
 
+def compute_poi_rmsd(
+    pred_poi: np.ndarray,
+    native_complex_pdb: str,
+) -> Optional[Dict[str, float]]:
+    """
+    Frame-aware POI placement metrics vs the native ternary complex.
+
+    ``featurize_common`` centers the E3 at its COM (so the featurized E3 frame
+    origin ≈ E3 COM), and the sampler emits POI relative to that same COM.
+    The native POI reduced to Cα (``_parse_native_complex``) is shifted by the
+    native E3 Cα COM to land in the same frame. Kabsch alignment inside
+    ``compute_rmsd`` absorbs any residual frame translation/rotation, and the
+    Cα atom order matches between ``poi_data['coords']`` and the parsed native
+    complex (both are one Cα per residue, in residue order).
+
+    Returns:
+        {'poi_rmsd': Å (Kabsch), 'poi_com_dist': Å (E3-POI COM placement error),
+         'native_e3_poi_com_dist': Å (reference E3-POI separation)},
+        or None when the native PDB is unavailable/unparseable or the POI atom
+        count does not match.
+    """
+    native = _parse_native_complex(native_complex_pdb)
+    if native is None or native['e3_ca'].shape[0] == 0:
+        return None
+    native_poi_e3 = native['poi_ca'] - native['e3_ca'].mean(axis=0)  # [N_poi, 3]
+    if pred_poi.shape[0] != native_poi_e3.shape[0]:
+        return None
+    rmsd = compute_rmsd(pred_poi, native_poi_e3, align_first=True)
+    com_dist = float(np.linalg.norm(pred_poi.mean(axis=0) - native_poi_e3.mean(axis=0)))
+    native_com_dist = float(np.linalg.norm(
+        native['poi_ca'].mean(axis=0) - native['e3_ca'].mean(axis=0)
+    ))
+    return {
+        'poi_rmsd': rmsd,
+        'poi_com_dist': com_dist,
+        'native_e3_poi_com_dist': native_com_dist,
+    }
+
+
+# ---------------------------------------------------------------------------
+# E3-PROTAC interface metrics (fixed-receptor frame)
+# ---------------------------------------------------------------------------
+
+def compute_e3_interface_dockq(
+    e3_ca: np.ndarray,
+    pred_ligand: np.ndarray,
+    native_ligand: np.ndarray,
+    cutoff: float = 8.0,
+) -> Optional[Dict[str, float]]:
+    """
+    E3-PROTAC interface quality (DockQ composite) in the fixed-receptor frame.
+
+    The sampler emits the PROTAC in the E3 frame with E3 fixed at its featurized
+    coordinates (``e3_data['coords']``), and the native PROTAC reference
+    (``ligand_data['coords']``) is featurized in the *same* E3-L subgraph — so no
+    superposition is needed. This is the E3-side analogue of the pure-DiffDock
+    baseline's ``dockq`` / ``fnat`` / ``Lrms``
+    (``scripts/experiment1_diffdock_baseline.py``, ``cal_dockq``).
+
+    Definitions (standard DockQ, d1=1.5 Å iRMS, d2=8.5 Å Lrms):
+      - Fnat  = fraction of native E3-PROTAC contacts (E3 Cα ↔ PROTAC atom within
+                ``cutoff``) recovered by the prediction.
+      - Lrms  = ligand RMSD in the fixed-receptor frame (no alignment).
+      - iRMS  = RMSD over the PROTAC atoms that make a native contact.
+      - DockQ = (Fnat + 1/(1+(iRMS/1.5)^2) + 1/(1+(Lrms/8.5)^2)) / 3
+
+    The receptor is featurized at Cα level (``all_atoms=False``), so ``cutoff``
+    is set to 8.0 Å — the Cα→ligand gap is larger than the all-atom→ligand gap
+    the baseline uses at 5.0 Å (at 5.0 Å this Cα-only metric has only ~12 native
+    contacts for a typical case, too sparse to be meaningful). This matches
+    ``compute_poi_dockq``'s PROTAC-POI Cα cutoff for consistency. Values are
+    therefore comparable to the baseline in spirit but not identical numerically
+    (the baseline's ``cal_dockq`` uses full-atom protein). Returns None when
+    there are no native contacts to recover (or atom counts mismatch).
+    """
+    from scipy.spatial import KDTree
+
+    if pred_ligand.shape != native_ligand.shape:
+        return None
+
+    tree = KDTree(e3_ca)
+    native_pairs = set()
+    for i, p in enumerate(native_ligand):
+        for j in tree.query_ball_point(p, cutoff):
+            native_pairs.add((i, j))
+    n_native = len(native_pairs)
+    if n_native == 0:
+        return None
+
+    pred_pairs = set()
+    for i, p in enumerate(pred_ligand):
+        for j in tree.query_ball_point(p, cutoff):
+            pred_pairs.add((i, j))
+    recovered = len(pred_pairs & native_pairs)
+    fnat = recovered / n_native
+
+    diff = pred_ligand - native_ligand
+    lrms = float(np.sqrt(np.mean(np.sum(diff ** 2, axis=1))))
+
+    iface_idx = np.asarray(sorted({i for i, _ in native_pairs}), dtype=int)
+    if iface_idx.size:
+        idiff = pred_ligand[iface_idx] - native_ligand[iface_idx]
+        irms = float(np.sqrt(np.mean(np.sum(idiff ** 2, axis=1))))
+    else:
+        irms = lrms
+
+    dockq = (
+        fnat
+        + 1.0 / (1.0 + (irms / 1.5) ** 2)
+        + 1.0 / (1.0 + (lrms / 8.5) ** 2)
+    ) / 3.0
+
+    return {
+        'dockq': float(dockq),
+        'fnat': float(fnat),
+        'lrms': lrms,
+        'irms': irms,
+        'n_native_contacts': n_native,
+        'n_recovered_contacts': recovered,
+        'n_pred_contacts': len(pred_pairs),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Ensemble Quality Metrics
 # ---------------------------------------------------------------------------
@@ -386,7 +509,6 @@ def compute_ensemble_diversity(
         dict with 'mean_pairwise_rmsd', 'std_pairwise_rmsd', 'n_clusters'
     """
     from scipy.cluster.hierarchy import fcluster, linkage
-    from scipy.spatial.distance import pdist, squareform
 
     n = len(ensemble_coords)
     if n < 2:
@@ -401,10 +523,11 @@ def compute_ensemble_diversity(
 
     pairwise_rmsd = np.array(pairwise_rmsd)
 
-    # Clustering at 2Å cutoff
+    # Clustering at 2Å cutoff. ``pairwise_rmsd`` is already the condensed (1-D)
+    # distance vector, so pass it straight to linkage (not squareform, which
+    # would produce a full matrix that linkage misreads as observations).
     if len(pairwise_rmsd) > 0:
-        condensed = squareform(pairwise_rmsd)
-        linkage_matrix = linkage(condensed, method='average')
+        linkage_matrix = linkage(pairwise_rmsd, method='average')
         clusters = fcluster(linkage_matrix, t=2.0, criterion='distance')
         n_clusters = len(set(clusters))
     else:
@@ -600,12 +723,20 @@ def evaluate_model(
     )
 
     ref_lig = ligand_data['coords'][0].detach().cpu().numpy()  # [N_lig, 3] native
+    e3_ca = e3_data['coords'][0].detach().cpu().numpy()        # [N_e3, 3] fixed E3 Cα
 
     protac_rmsds = []
     pocket_dists = []
     pred_ligs = []
+    e3_dockqs = []
+    e3_fnats = []
+    e3_lrms = []
+    e3_native_contacts = None
     poi_dockqs = []
     poi_native_contacts = None
+    poi_rmsds = []
+    poi_com_dists = []
+    poi_native_com_dist = None
     n_nan = 0
     for r in ensemble:
         pred = r['ligand_coords']  # [N_lig, 3] numpy
@@ -617,12 +748,24 @@ def evaluate_model(
         pocket_dists.append(
             float(np.linalg.norm(pred.mean(axis=0) - ref_lig.mean(axis=0)))
         )
+        e3_m = compute_e3_interface_dockq(e3_ca, pred, ref_lig)
+        if e3_m is not None:
+            e3_dockqs.append(e3_m['dockq'])
+            e3_fnats.append(e3_m['fnat'])
+            e3_lrms.append(e3_m['lrms'])
+            if e3_native_contacts is None:
+                e3_native_contacts = e3_m['n_native_contacts']
         if native_complex_pdb is not None:
             poi_m = compute_poi_dockq(r['poi_coords'], pred, native_complex_pdb)
             if poi_m is not None:
                 poi_dockqs.append(poi_m['dockq'])
                 if poi_native_contacts is None:
                     poi_native_contacts = poi_m['n_native_contacts']
+            poi_r = compute_poi_rmsd(r['poi_coords'], native_complex_pdb)
+            if poi_r is not None:
+                poi_rmsds.append(poi_r['poi_rmsd'])
+                poi_com_dists.append(poi_r['poi_com_dist'])
+                poi_native_com_dist = poi_r['native_e3_poi_com_dist']
     if n_nan:
         print(f"[evaluate] skipped {n_nan}/{len(ensemble)} walkers with non-finite coords")
 
@@ -671,6 +814,50 @@ def evaluate_model(
         structure['poi_dockq_median'] = None
         structure['poi_interface_native_contacts'] = None
 
+    # POI placement (frame-aware): Kabsch RMSD + E3-POI COM distance. None
+    # (never NaN) when the native complex PDB is unavailable/unparseable.
+    if poi_rmsds:
+        poi_rmsds = np.asarray(poi_rmsds)
+        poi_com_dists = np.asarray(poi_com_dists)
+        structure['poi_rmsd_best'] = float(poi_rmsds.min())
+        structure['poi_rmsd_mean'] = float(poi_rmsds.mean())
+        structure['poi_rmsd_median'] = float(np.median(poi_rmsds))
+        structure['poi_com_dist_best'] = float(poi_com_dists.min())
+        structure['poi_com_dist_mean'] = float(poi_com_dists.mean())
+        structure['native_e3_poi_com_dist'] = poi_native_com_dist
+    else:
+        structure['poi_rmsd_best'] = None
+        structure['poi_rmsd_mean'] = None
+        structure['poi_rmsd_median'] = None
+        structure['poi_com_dist_best'] = None
+        structure['poi_com_dist_mean'] = None
+        structure['native_e3_poi_com_dist'] = None
+
+    # E3-PROTAC interface quality (fixed-receptor frame), always available from
+    # the featurized native (no native PDB needed). Directly comparable to the
+    # pure-DiffDock baseline's dockq / fnat / Lrms.
+    if e3_dockqs:
+        e3_dockqs = np.asarray(e3_dockqs)
+        e3_fnats = np.asarray(e3_fnats)
+        e3_lrms = np.asarray(e3_lrms)
+        structure['e3_interface_dockq_best'] = float(e3_dockqs.max())
+        structure['e3_interface_dockq_mean'] = float(e3_dockqs.mean())
+        structure['e3_interface_dockq_median'] = float(np.median(e3_dockqs))
+        structure['e3_interface_fnat_best'] = float(e3_fnats.max())
+        structure['e3_interface_fnat_mean'] = float(e3_fnats.mean())
+        structure['e3_interface_lrms_best'] = float(e3_lrms.min())
+        structure['e3_interface_lrms_mean'] = float(e3_lrms.mean())
+        structure['e3_interface_native_contacts'] = e3_native_contacts
+    else:
+        structure['e3_interface_dockq_best'] = None
+        structure['e3_interface_dockq_mean'] = None
+        structure['e3_interface_dockq_median'] = None
+        structure['e3_interface_fnat_best'] = None
+        structure['e3_interface_fnat_mean'] = None
+        structure['e3_interface_lrms_best'] = None
+        structure['e3_interface_lrms_mean'] = None
+        structure['e3_interface_native_contacts'] = None
+
     ensemble_metrics = {
         'n_walkers': len(ensemble),
         'n_nan_walkers': n_nan,
@@ -718,12 +905,14 @@ def kabsch_align(mobile: np.ndarray, target: np.ndarray) -> np.ndarray:
         U, S, Vt = np.linalg.svd(H)
     except np.linalg.LinAlgError:
         return mobile
-    V = Vt.T
-
-    # Rotation matrix (handle reflection)
-    d = np.sign(np.linalg.det(V @ U.T))
+    # Rotation matrix (handle reflection). For covariance H = mobile_c.T @
+    # target_c the optimal rotation is R = U @ diag([1,1,d]) @ Vt. The previous
+    # form V @ D @ U.T is that rotation's *transpose*, which silently inflated
+    # every Kabsch-aligned RMSD (verified: a known rigid transform gave ~33 Å
+    # instead of ~0).
+    d = np.sign(np.linalg.det(U @ Vt))
     D = np.diag([1, 1, d])
-    R = V @ D @ U.T
+    R = U @ D @ Vt
 
     # Apply rotation
     aligned = mobile_c @ R + target_center
