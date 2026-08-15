@@ -31,6 +31,27 @@ VDW_RADII = {
     53: 1.98,  # I
 }
 
+# Covalent radii (Å) for common elements. Used to skip covalently bonded (1-2)
+# atom pairs in clash detection — a bonded pair sits near the sum of covalent
+# radii, well inside any VDW clash threshold, and is not a steric clash.
+COVALENT_RADII = {
+    1: 0.31,   # H
+    6: 0.76,   # C
+    7: 0.71,   # N
+    8: 0.66,   # O
+    9: 0.57,   # F
+    15: 1.07,  # P
+    16: 1.05,  # S
+    17: 1.02,  # Cl
+    35: 1.20,  # Br
+    53: 1.39,  # I
+}
+
+# Tolerance factor for "is this pair covalently bonded". A bonded pair has a
+# distance ≈ sum of covalent radii (within ~20%), so anything below 1.2× that
+# sum is treated as bonded and excluded from clash detection.
+BOND_DISTANCE_TOLERANCE = 1.2
+
 # Standard bond lengths (Å) for common bond types
 STANDARD_BOND_LENGTHS = {
     ('C', 'C', 1): 1.54,  # C-C single
@@ -58,6 +79,7 @@ def detect_clashes(
     coords: np.ndarray,
     atomic_numbers: np.ndarray,
     vdw_scale: float = 0.8,
+    bonds: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Detect steric clashes using KD-tree.
@@ -66,6 +88,12 @@ def detect_clashes(
         coords: [N, 3] atom coordinates
         atomic_numbers: [N] atomic numbers
         vdw_scale: scaling factor for VDW radii (0.8 = allow slight overlap)
+        bonds: optional bond graph — either a [2, E] int array of atom indices
+            or an iterable of (i, j) pairs. When given, atom pairs within three
+            bonds (1-2 / 1-3 / 1-4) are excluded, since those separations are
+            normal covalent geometry (ring geminals, vicinals) not clashes.
+            When None, only 1-2 pairs are excluded via a covalent-radius
+            heuristic (less accurate, e.g. ring 1-3 atoms still flagged).
 
     Returns:
         [N] bool array, True for atoms involved in clashes
@@ -73,6 +101,7 @@ def detect_clashes(
     N = coords.shape[0]
     tree = KDTree(coords)
     radii = np.array([VDW_RADII.get(z, 1.70) for z in atomic_numbers])
+    cov_radii = np.array([COVALENT_RADII.get(z, 0.76) for z in atomic_numbers])
 
     # Find all pairs within max possible VDW contact
     max_radius = np.max(radii) * vdw_scale * 2
@@ -81,17 +110,65 @@ def detect_clashes(
     if len(pairs) == 0:
         return np.zeros(N, dtype=bool)
 
+    # Bond separation matrix [N, N] (shortest path ≤ 3, else -1), or None to
+    # fall back to the covalent-radius 1-2 heuristic below.
+    skip_sep = _bond_separation_lookup(N, bonds) if bonds is not None else None
+
     clash_mask = np.zeros(N, dtype=bool)
 
     for i, j in pairs:
-        # Skip bonded atoms (1-2 pairs) — would need bond graph for accurate check
         dist = np.linalg.norm(coords[i] - coords[j])
+        if skip_sep is not None:
+            if skip_sep[i, j] != -1 and skip_sep[i, j] <= 3:
+                continue  # 1-2 / 1-3 / 1-4: normal covalent geometry
+        elif dist < (cov_radii[i] + cov_radii[j]) * BOND_DISTANCE_TOLERANCE:
+            continue  # no bond graph: covalent-radius heuristic for 1-2 only
         threshold = (radii[i] + radii[j]) * vdw_scale
         if dist < threshold:
             clash_mask[i] = True
             clash_mask[j] = True
 
     return clash_mask
+
+
+def _bond_separation_lookup(n_atoms: int, bonds) -> np.ndarray:
+    """
+    Shortest-path bond separation for all pairs, truncated at depth 3.
+
+    Returns an [N, N] int8 array where entry [i, j] is the number of bonds on
+    the shortest path between i and j (0 = self, 1 = bonded, 2 = geminal, 3 =
+    vicinal), or -1 if the separation exceeds 3 (treated as "not bonded nearby").
+    """
+    adj = [set() for _ in range(n_atoms)]
+    if getattr(bonds, "ndim", 1) == 2:
+        # [2, E] index array (e.g. torch_geometric edge_index converted to numpy)
+        for i, j in bonds.T:
+            i, j = int(i), int(j)
+            if 0 <= i < n_atoms and 0 <= j < n_atoms:
+                adj[i].add(j)
+                adj[j].add(i)
+    else:
+        for i, j in bonds:
+            i, j = int(i), int(j)
+            if 0 <= i < n_atoms and 0 <= j < n_atoms:
+                adj[i].add(j)
+                adj[j].add(i)
+
+    sep = np.full((n_atoms, n_atoms), -1, dtype=np.int8)
+    for src in range(n_atoms):
+        sep[src, src] = 0
+        frontier = [src]
+        for depth in range(1, 4):
+            nxt = []
+            for a in frontier:
+                for b in adj[a]:
+                    if sep[src, b] == -1:
+                        sep[src, b] = depth
+                        nxt.append(b)
+            frontier = nxt
+            if not frontier:
+                break
+    return sep
 
 
 def detect_bond_anomalies(
