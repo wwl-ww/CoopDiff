@@ -31,7 +31,7 @@ echo
 PYTHONUNBUFFERED=1 python scripts/train_entry.py \
     --train_data data/protac_index.json \
     --val_data data/protac_index.json \
-    --output_dir results/train_phase1 \
+    --output_dir results/train_phase1_v2 \
     --epochs 100 \
     --batch_size 1 \
     --lr 1e-4 \

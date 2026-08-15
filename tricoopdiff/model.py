@@ -166,11 +166,13 @@ class TriCoopDiff(nn.Module):
                 ligand_features=ligand_data['features'][b],
             )
 
-            # TriBrain forward (node features are 2D [N, D]; no batch dim)
+            # TriBrain forward (node features are 2D [N, D]; no batch dim).
+            # t_se3 conditions the SE3 head (score target is a function of σ(t_se3)).
             tri_out = self.tribrain(
                 node_features=tri_graph['node_features'],
                 node_coords=tri_graph['node_coords'],
                 node_types=tri_graph['node_types'],
+                t_se3=t_se3[b:b + 1],
             )
 
             film_params_b = tri_out['film_params']

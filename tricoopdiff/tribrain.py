@@ -310,16 +310,37 @@ class EquivariantTransformerLayer(nn.Module):
 # Output Heads
 # ---------------------------------------------------------------------------
 
+def fourier_time_embedding(t: torch.Tensor, n_freqs: int = 16) -> torch.Tensor:
+    """
+    Sinusoidal embedding of a scalar diffusion time ``t`` ∈ [0, 1].
+
+    Args:
+        t: [B] diffusion time (noise-schedule variable, not physical time)
+        n_freqs: number of geometric frequencies (1, 2, 4, …, 2^{n_freqs-1})
+
+    Returns:
+        [B, 2·n_freqs] concatenation of sin/cos at each frequency.
+    """
+    freqs = 2.0 ** torch.arange(n_freqs, device=t.device, dtype=t.dtype)
+    ang = math.pi * freqs[None, :] * t[:, None]   # [B, n_freqs]
+    return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
+
+
 class SE3ScoreHead(nn.Module):
     """
     Predicts the SE(3) score (6D: 3 translation + 3 rotation in so(3))
     for the E3-POI rigid body transformation.
+
+    The SE(3) score target depends on the diffusion time ``t_se3`` (through the
+    noise schedule σ_tr/σ_rot), so the head is fed ``h_cond`` concatenated with a
+    sinusoidal time embedding: ``in_dim = node_dim + 2·n_freqs``.
     """
 
-    def __init__(self, hidden_dim: int = 128):
+    def __init__(self, hidden_dim: int = 128, in_dim: int = None):
         super().__init__()
+        in_dim = in_dim if in_dim is not None else hidden_dim
         self.net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(in_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, 6),  # [tx, ty, tz, rx, ry, rz]
         )
@@ -431,7 +452,13 @@ class TriBrain(nn.Module):
         )
 
         # Output heads
-        self.se3_head = SE3ScoreHead(hidden_dim=node_dim)       # ~33k
+        # The SE3 head takes h_cond concatenated with the diffusion-time embedding
+        # (the SE3 score target depends on t_se3; without this the head cannot
+        # represent the t_se3-varying target — see diagnose_se3_timecond.py).
+        self.time_freqs = 16
+        self.se3_head = SE3ScoreHead(
+            hidden_dim=node_dim, in_dim=node_dim + 2 * self.time_freqs,
+        )
         self.judge_head = JudgeHead(hidden_dim=node_dim)         # ~16k
         self.state_head = StateHead(hidden_dim=node_dim)         # ~16k
 
@@ -456,6 +483,7 @@ class TriBrain(nn.Module):
         node_coords: torch.Tensor,
         node_types: torch.Tensor,
         batch: torch.Tensor = None,
+        t_se3: torch.Tensor = None,
     ) -> dict:
         """
         Args:
@@ -463,6 +491,10 @@ class TriBrain(nn.Module):
             node_coords: [N_total, 3] all node coordinates
             node_types: [N_total] 0=E3, 1=POI, 2=PROTAC
             batch: [N_total] batch index
+            t_se3: [B] SE3 diffusion time (noise-schedule variable). Conditions the
+                SE3 head, whose score target is a function of σ(t_se3). If None, a
+                zero-time embedding is used (backward-compatible; SE3 head sees only
+                geometry, as before this fix).
 
         Returns:
             dict with:
@@ -481,7 +513,17 @@ class TriBrain(nn.Module):
         h_cond = transformer_out['combined']  # [B, node_dim]
 
         # 3. Output heads
-        s_se3 = self.se3_head(h_cond)            # [B, 6]
+        # The SE3 head is conditioned on t_se3 so it can represent the
+        # t_se3-varying score target (σ_tr/σ_rot span 40×/20× across t_se3).
+        if t_se3 is not None:
+            t_emb = fourier_time_embedding(t_se3, self.time_freqs)  # [B, 2·n_freqs]
+        else:
+            t_emb = torch.zeros(
+                h_cond.shape[0], 2 * self.time_freqs,
+                device=h_cond.device, dtype=h_cond.dtype,
+            )
+        h_se3 = torch.cat([h_cond, t_emb], dim=-1)  # [B, node_dim + 2·n_freqs]
+        s_se3 = self.se3_head(h_se3)            # [B, 6]
         confidence = self.judge_head(h_cond)      # [B, 1]
         state = self.state_head(h_cond)           # [B, 2]
 
