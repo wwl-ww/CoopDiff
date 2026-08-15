@@ -5,22 +5,21 @@ Two-phase training:
   Phase 1: General ternary pretraining (FiLM + SE3 heads only)
   Phase 2: PROTAC fine-tuning (all TriBrain heads, low LR, LoRA)
 
-Usage:
-    # Phase 1: pretrain on general ternary data
-    python scripts/train_entry.py \
-        --train_data data/ternary_train.json \
-        --val_data data/ternary_val.json \
-        --output_dir checkpoints/phase1 \
-        --epochs 100 --batch_size 32 --lr 1e-4
+Current scope: **B=1 sequential training** on real PROTAC complexes. The
+featurized data is produced on the fly from a JSON index (``make_protac_index.py``)
+via ``featurize_common.featurize_complex`` and cached to disk so subsequent epochs
+skip the expensive ESM2 embedding step. Padded B>1 batching is a follow-up.
 
-    # Phase 2: fine-tune on PROTAC data
+Usage:
+    # Build the index once
+    python scripts/make_protac_index.py
+
+    # Phase 1 smoke: 3 epochs, B=1, single complex per step
     python scripts/train_entry.py \
-        --train_data data/protac_benchmark.json \
-        --val_data data/protac_benchmark_test.json \
-        --output_dir checkpoints/phase2 \
-        --epochs 50 --batch_size 8 --lr 2e-5 \
-        --resume checkpoints/phase1/tricoopdiff_zero.pt \
-        --phase 2
+        --train_data data/protac_index.json \
+        --val_data data/protac_index.json \
+        --output_dir results/train_smoke \
+        --epochs 3 --batch_size 1 --device cuda
 """
 
 import argparse
@@ -33,7 +32,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Make the project root importable for `import tricoopdiff.*`, and scripts/
+# importable for the shared featurization module (sibling of this file).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+from featurize_common import featurize_complex  # noqa: E402
 
 
 def parse_args():
@@ -66,6 +72,13 @@ def parse_args():
     p.add_argument("--expert_model_dir", default="checkpoints/score_model",
                    help="Dir with model_parameters.yml + best_ema_inference_epoch_model.pt")
 
+    # Featurization
+    p.add_argument("--receptor_feat_dim", type=int, default=1281,
+                   help="Fallback receptor feature dim (1281 for DiffDock-L) if "
+                        "the first-sample featurization cannot determine it")
+    p.add_argument("--cache_dir", default="results/featurize_cache",
+                   help="Dir for on-disk featurization cache (per-case .pt)")
+
     # Hardware
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--num_workers", type=int, default=4)
@@ -75,10 +88,30 @@ def parse_args():
     return p.parse_args()
 
 
+def _load_score_model_args(expert_model_dir):
+    """Load DiffDock's model_parameters.yml as an argparse.Namespace."""
+    import yaml
+    from argparse import Namespace
+    with open(Path(expert_model_dir) / "model_parameters.yml") as f:
+        return Namespace(**yaml.full_load(f))
+
+
+def _load_entries(data_json):
+    """Read a data index; accept either a flat list or {"entries": [...]}."""
+    with open(data_json) as f:
+        index = json.load(f)
+    if isinstance(index, dict):
+        return index.get("entries", [])
+    return index
+
+
 def main():
     args = parse_args()
     device = torch.device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # SO(3)/torus cache lookup resolves relative to CWD; chdir to project root.
+    os.chdir(_PROJECT_ROOT)
 
     # Save run config
     with open(os.path.join(args.output_dir, "config.json"), "w") as f:
@@ -91,32 +124,56 @@ def main():
     print(f"  Epochs: {args.epochs}, Batch: {args.batch_size}, LR: {args.lr}")
 
     # ----------------------------------------------------------------
+    # 0. Featurize the first sample to derive the receptor feature dim
+    #    (TriBrain's input_dim must match the featurized ternary nodes).
+    # ----------------------------------------------------------------
+    entries = _load_entries(args.train_data)
+    if not entries:
+        raise SystemExit(f"FATAL: no entries in {args.train_data}")
+
+    print("[0/6] Determining receptor feature dim from first sample...")
+    score_model_args = _load_score_model_args(args.expert_model_dir)
+    input_dim = None
+    first = entries[0]
+    try:
+        _, _, _, input_dim = featurize_complex(
+            first["case"], first["protein1"], first["protein2"], first["ligand"],
+            score_model_args, str(device), cache_dir=args.cache_dir,
+        )
+        print(f"  receptor_feat_dim={input_dim} (from {first['case']})")
+    except Exception as e:
+        print(f"[warn] first-sample featurize failed ({e}); "
+              f"falling back to --receptor_feat_dim={args.receptor_feat_dim}")
+    if input_dim is None:
+        input_dim = args.receptor_feat_dim
+
+    # ----------------------------------------------------------------
     # 1. Build model
     # ----------------------------------------------------------------
-    print("[1/5] Building model...")
-    model, diffusion, trainer = build_trainer(args, device)
+    print("[1/6] Building model...")
+    model, diffusion, trainer = build_trainer(args, device, input_dim=input_dim)
 
     # ----------------------------------------------------------------
     # 2. Load data
     # ----------------------------------------------------------------
-    print("[2/5] Loading data...")
+    print("[2/6] Loading data...")
     train_loader = TernaryDataLoader(
-        args.train_data, batch_size=args.batch_size,
-        shuffle=True, num_workers=args.num_workers,
+        args.train_data, score_model_args,
+        shuffle=True, device=str(device), cache_dir=args.cache_dir,
     )
     val_loader = TernaryDataLoader(
-        args.val_data, batch_size=args.batch_size,
-        shuffle=False, num_workers=args.num_workers,
+        args.val_data, score_model_args,
+        shuffle=False, device=str(device), cache_dir=args.cache_dir,
     )
 
     # ----------------------------------------------------------------
     # 3. Resume if specified
     # ----------------------------------------------------------------
     if args.resume:
-        print(f"[3/5] Resuming from {args.resume}...")
+        print(f"[3/6] Resuming from {args.resume}...")
         trainer.load_checkpoint(args.resume)
     else:
-        print("[3/5] Training from scratch...")
+        print("[3/6] Training from scratch...")
 
     # Set phase (freeze/unfreeze heads)
     trainer.set_phase(args.phase)
@@ -124,15 +181,20 @@ def main():
     # ----------------------------------------------------------------
     # 4. Training loop
     # ----------------------------------------------------------------
-    print(f"[4/5] Training {args.epochs} epochs...")
+    print(f"[4/6] Training {args.epochs} epochs...")
     best_val_loss = float('inf')
 
     for epoch in range(1, args.epochs + 1):
-        # Train
         train_losses = []
+        n_skipped = 0
         t0 = time.time()
         for batch_idx, batch in enumerate(train_loader):
-            loss_dict = trainer.train_step(**batch)
+            loss_dict = _guarded_train_step(trainer, batch)
+            if loss_dict is None:
+                n_skipped += 1
+                print(f"  Epoch {epoch} | Batch {batch_idx} | SKIP non-finite loss",
+                      flush=True)
+                continue
             train_losses.append(loss_dict)
 
             if batch_idx % args.log_interval == 0:
@@ -145,11 +207,12 @@ def main():
         trainer.scheduler_step()
 
         # Log
-        train_loss_avg = np.mean([d['loss_total'] for d in train_losses])
+        train_loss_avg = np.mean([d['loss_total'] for d in train_losses]) if train_losses else float('nan')
         dt = time.time() - t0
         print(f"  Epoch {epoch}/{args.epochs} | "
               f"train_loss={train_loss_avg:.4f} | "
               f"val_loss={val_loss:.4f} | "
+              f"skipped={n_skipped} | "
               f"lr={trainer.optimizer.param_groups[0]['lr']:.2e} | "
               f"time={dt:.1f}s")
 
@@ -167,7 +230,7 @@ def main():
     # ----------------------------------------------------------------
     # 5. Final save
     # ----------------------------------------------------------------
-    print("[5/5] Saving final model...")
+    print("[5/6] Saving final model...")
     final_path = os.path.join(
         args.output_dir,
         "tricoopdiff_zero.pt" if args.phase == 1 else "tricoopdiff_ft.pt"
@@ -176,7 +239,7 @@ def main():
     print(f"Done. Model saved to {final_path}")
 
 
-def build_trainer(args, device):
+def build_trainer(args, device, input_dim=None):
     """Build model, diffusion, and trainer."""
     from tricoopdiff import TriCoopDiff
     from tricoopdiff.tribrain import TriBrain
@@ -193,13 +256,24 @@ def build_trainer(args, device):
     )
     num_conv_layers = frozen_expert.num_conv_layers
 
-    # Build TriBrain (the only trainable module).
+    # input_dim must match the ternary node feature dim, which is the receptor
+    # feature dim (1281 = 1 amino-acid index + 1280 ESM2 for DiffDock-L). It is
+    # derived at runtime from the featurized data, never hardcoded.
+    if input_dim is None:
+        input_dim = args.node_dim
+        print(f"[warn] input_dim not provided; defaulting to node_dim={input_dim}")
+
+    # Build TriBrain (the only trainable module). film_dim MUST equal the expert's
+    # scalar channel count (ns=48 for DiffDock-L) — it is independent of TriBrain's
+    # own internal width (args.ns).
     tribrain = TriBrain(
         node_dim=args.node_dim,
+        input_dim=input_dim,
         ns=args.ns,
         nv=args.nv,
         num_transformer_layers=args.num_transformer_layers,
         num_conv_layers_per_expert=num_conv_layers,
+        film_dim=frozen_expert.ns,
     )
 
     model = TriCoopDiff(frozen_expert, tribrain, num_conv_layers=num_conv_layers)
@@ -219,6 +293,26 @@ def build_trainer(args, device):
     return model, diffusion, trainer
 
 
+def _guarded_train_step(trainer, batch):
+    """``trainer.train_step`` with a non-finite loss guard.
+
+    Skips (returns None) instead of stepping on NaN/Inf losses, so a handful of
+    known-NaN complexes can't poison the optimizer.
+    """
+    loss_dict = trainer.compute_loss(**batch)
+    total = loss_dict['loss_total']
+    if not torch.isfinite(total):
+        return None
+    trainer.optimizer.zero_grad()
+    total.backward()
+    torch.nn.utils.clip_grad_norm_(trainer.model.tribrain.parameters(), max_norm=1.0)
+    trainer.optimizer.step()
+    trainer.global_step += 1
+    result = {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
+    result['lr'] = trainer.optimizer.param_groups[0]['lr']
+    return result
+
+
 def validate(trainer, val_loader, device):
     """Run validation pass — no backward, no optimizer."""
     trainer.model.eval()
@@ -227,6 +321,8 @@ def validate(trainer, val_loader, device):
 
     for batch in val_loader:
         loss_dict = trainer.validate_step(**batch)
+        if not np.isfinite(loss_dict['loss_total']):
+            continue
         total_loss += loss_dict['loss_total']
         n_batches += 1
 
@@ -236,54 +332,59 @@ def validate(trainer, val_loader, device):
 
 class TernaryDataLoader:
     """
-    Minimal data loader for ternary complex data.
+    Real data loader for PROTAC ternary complexes.
 
-    Reads a JSON index file listing paths to processed HeteroData pickle files.
-    In production, use diffdock's DataLoader + our ternary wrapper.
+    Reads the JSON index written by ``scripts/make_protac_index.py``::
+        {"entries": [
+            {"case": ..., "protein1": ".../protein1.pdb",
+             "protein2": ".../protein2.pdb", "ligand": ".../ligand.sdf"}]}
+
+    Each entry is featurized on the fly via ``featurize_complex`` (with an
+    on-disk cache so subsequent epochs skip ESM2). The loader yields a **B=1**
+    batch dict whose keys match ``TriCoopDiffTrainer.compute_loss``::
+        {'e3_data': ..., 'poi_data': ..., 'ligand_data': ..., 't_se3_data': None}
+
+    Featurization failures (e.g. the known NaN cases) are skipped with a log
+    rather than aborting training.
     """
 
-    def __init__(self, data_json, batch_size=32, shuffle=True, num_workers=0):
-        with open(data_json) as f:
-            self.entries = json.load(f)
-        self.batch_size = batch_size
+    def __init__(self, data_json, score_model_args, shuffle=True, device="cuda",
+                 cache_dir=None, skip_on_error=True):
+        self.entries = _load_entries(data_json)
+        self.score_model_args = score_model_args
         self.shuffle = shuffle
-        self._idx = 0
+        self.device = device
+        self.cache_dir = cache_dir
+        self.skip_on_error = skip_on_error
+        self.skipped = []
 
     def __iter__(self):
         indices = list(range(len(self.entries)))
         if self.shuffle:
             np.random.shuffle(indices)
-
-        for start in range(0, len(indices), self.batch_size):
-            batch_indices = indices[start:start + self.batch_size]
-            batch_entries = [self.entries[i] for i in batch_indices]
-            yield self._collate(batch_entries)
+        for i in indices:
+            entry = self.entries[i]
+            try:
+                yield self._load_one(entry)
+            except Exception as e:
+                if not self.skip_on_error:
+                    raise
+                self.skipped.append(entry.get("case", str(i)))
+                print(f"[data] SKIP {entry.get('case', i)}: {e}", flush=True)
 
     def __len__(self):
-        return max(1, len(self.entries) // self.batch_size)
+        return len(self.entries)
 
-    def _collate(self, entries):
-        """Collate entries into batch dict. Override for actual data format."""
-        # Placeholder: real implementation loads HeteroData from pickle/disk
-        # For now returns dummy tensors matching expected shapes
-        B = len(entries)
+    def _load_one(self, entry):
+        e3_data, poi_data, ligand_data, _ = featurize_complex(
+            entry["case"], entry["protein1"], entry["protein2"], entry["ligand"],
+            self.score_model_args, self.device, cache_dir=self.cache_dir,
+        )
         return {
-            'e3_data': {
-                'coords': torch.randn(B, 200, 3),
-                'features': torch.randn(B, 200, 1),
-            },
-            'poi_data': {
-                'coords': torch.randn(B, 300, 3),
-                'features': torch.randn(B, 300, 1),
-            },
-            'ligand_data': {
-                'coords': torch.randn(B, 100, 3),
-                'features': torch.randn(B, 100, 1),
-            },
-            't_se3_data': {
-                'tr': torch.randn(B, 3),
-                'rot': torch.eye(3).unsqueeze(0).repeat(B, 1, 1),
-            },
+            'e3_data': e3_data,
+            'poi_data': poi_data,
+            'ligand_data': ligand_data,
+            't_se3_data': None,
         }
 
 

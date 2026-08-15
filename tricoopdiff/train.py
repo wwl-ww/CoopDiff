@@ -89,10 +89,17 @@ class TriCoopDiffTrainer:
         t = torch.rand(B, device=device)
         t_se3 = torch.rand(B, device=device)
 
-        # Add noise to PROTAC
+        # Add noise to PROTAC (rigid-body tr/rot DOFs only)
         noisy_ligand, tr_noise, rot_noise, rot_omega = self.diffusion.add_noise_protac(
             ligand_data['coords'].to(device), t, t, t,
         )
+        # Add torsion noise (rotatable-bond angles) — the PROTAC-specific DOF
+        tor_update = None
+        if ligand_data.get('edge_mask') is not None and ligand_data.get('mask_rotate') is not None:
+            noisy_ligand, tor_update = self.diffusion.add_torsion_noise(
+                noisy_ligand, t,
+                ligand_data['edge_index'], ligand_data['edge_mask'], ligand_data['mask_rotate'],
+            )
         # Add noise to POI (SE3)
         noisy_poi, se3_tr_noise, se3_rot_noise, se3_rot_omega = self.diffusion.add_noise_se3(
             poi_data['coords'].to(device), t_se3, t_se3,
@@ -103,8 +110,13 @@ class TriCoopDiffTrainer:
         noisy_poi_data = {**poi_data, 'coords': noisy_poi}
         noisy_ligand_data = {**ligand_data, 'coords': noisy_ligand}
 
-        # Model forward
-        output = self.model(noisy_e3_data, noisy_poi_data, noisy_ligand_data, t=t, t_se3=t_se3)
+        # Model forward. Pass the SE3 rotation applied to the POI so subgraph2
+        # (POI-L) sees the correct PROTAC-POI relative geometry: r_e3_to_poi is
+        # the inverse (= transpose) of the clean->noisy POI rotation.
+        output = self.model(
+            noisy_e3_data, noisy_poi_data, noisy_ligand_data, t=t, t_se3=t_se3,
+            r_e3_to_poi=se3_rot_noise.transpose(-1, -2),
+        )
 
         # Score matching loss — matches DiffDock paper §4
         # Translation: weighted by σ² (R³ Euclidean DSM)
@@ -121,9 +133,9 @@ class TriCoopDiffTrainer:
         rot_norm = so3_score_norm(rot_sigma).unsqueeze(-1)
         loss_score_rot = ((output['s_q']['rot'] - rot_score_target)**2 / rot_norm**2).mean()
 
-        if output['s_q']['tor'].numel() > 0:
-            tor_score_target = self._compute_tor_score_target(tor_sigma)
-            tor_norm = tor_sigma**2  # weight high-noise less (∝ 1/σ²)
+        if tor_update is not None and output['s_q']['tor'].numel() > 0:
+            tor_score_target = self._compute_tor_score_target(tor_update, tor_sigma)
+            tor_norm = self._compute_tor_score_norm(tor_sigma)  # E[score²], like so3
             loss_score_tor = ((output['s_q']['tor'] - tor_score_target)**2 / tor_norm).mean()
         else:
             loss_score_tor = torch.tensor(0.0, device=device)
@@ -192,11 +204,29 @@ class TriCoopDiffTrainer:
         from .diffusion import so3_score_vec
         return so3_score_vec(rot_sigma, rot_omega)
 
-    def _compute_tor_score_target(self, tor_sigma):
-        """Compute torus score target. Placeholder for actual implementation."""
-        # The actual implementation depends on DiffDock's torus.score()
-        # For now, return zeros (torsion score targets computed in data pipeline)
-        return torch.zeros(1, device=self.device)
+    def _compute_tor_score_target(self, tor_update, tor_sigma):
+        """Torus (SO(2)) score target from the sampled torsion-angle noise.
+
+        Matches DiffDock ``torus.score(torsion_updates, tor_sigma)``: the score of
+        the wrapped-Gaussian-on-SO(2) density evaluated at each sampled rotation
+        angle, returned in the same [B, n_rot] shape as the model's tor score.
+        """
+        from .diffdock.utils import torus
+        B = tor_update.shape[0]
+        targets = []
+        for b in range(B):
+            tgt = torus.score(
+                tor_update[b].detach().cpu().numpy(),
+                tor_sigma[b].detach().cpu().item(),
+            )
+            targets.append(torch.from_numpy(np.asarray(tgt, dtype=np.float32)).to(self.device))
+        return torch.stack(targets, dim=0)
+
+    def _compute_tor_score_norm(self, tor_sigma):
+        """Torus score norm E[score²] for torsion-loss normalization (DiffDock)."""
+        from .diffdock.utils import torus
+        norm = torus.score_norm(tor_sigma.detach().cpu().numpy())
+        return torch.from_numpy(np.asarray(norm, dtype=np.float32)).to(self.device).unsqueeze(-1)
 
     def _estimate_denoised(self, noisy_pos, score, sigma):
         """Tweedie's formula: x̂ = x_noisy + σ² * score"""

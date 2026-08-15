@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 from scipy.spatial.transform import Rotation as R
 
+from .diffdock.utils.geometry import rigid_transform_Kabsch_3D_torch_batch
+
 
 class MultiRateDiffusion(nn.Module):
     """
@@ -148,7 +150,10 @@ class MultiRateDiffusion(nn.Module):
         t_tor: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Add Gaussian noise to PROTAC translation, rotation, and torsion.
+        Add Gaussian noise to PROTAC translation and rotation (rigid-body DOFs).
+
+        Torsion angles are perturbed separately by ``add_torsion_noise`` (applied
+        after this rigid transform), mirroring DiffDock's ``modify_conformer``.
 
         Args:
             ligand_pos: [B, N_lig, 3] clean ligand positions
@@ -211,6 +216,74 @@ class MultiRateDiffusion(nn.Module):
 
         return noisy_pos, tr_update, rot_update, rot_omega
 
+    def add_torsion_noise(
+        self,
+        ligand_pos: torch.Tensor,
+        t_tor: torch.Tensor,
+        lig_edge_index: torch.Tensor,
+        lig_edge_mask: torch.Tensor,
+        lig_mask_rotate,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Add Gaussian noise to PROTAC rotatable-bond torsion angles.
+
+        Translation/rotation perturb the whole conformer; torsion rotates each
+        rotatable bond's downstream atoms around the bond axis. This mirrors
+        DiffDock's ``modify_conformer``: the torsion-perturbed conformer is
+        Kabsch-aligned back to its pre-torsion pose so the internal-coordinate
+        (torsion) perturbation does not leak a global drift into the tr/rot
+        score-matching targets. Applied AFTER ``add_noise_protac``.
+
+        Args:
+            ligand_pos: [B, N_lig, 3] conformer (already tr+rot noised)
+            t_tor: [B] torsion diffusion times
+            lig_edge_index: [2, E] ligand internal bond edges
+            lig_edge_mask: [E] bool — rotatable bond mask
+            lig_mask_rotate: [n_rot, N_lig] bool, or list of per-complex masks
+
+        Returns:
+            noisy_pos: [B, N_lig, 3] conformer with torsion angles perturbed
+            tor_update: [B, n_rot] torsion angle noise (used as the score target)
+        """
+        from .diffdock.utils.torsion import modify_conformer_torsion_angles
+
+        B = ligand_pos.shape[0]
+        device = ligand_pos.device
+
+        _, _, tor_sigma = self.t_to_sigma(t_tor, t_tor, t_tor)
+        lambda_q = self.get_lambda_q(t_tor)
+
+        # Rotatable bond edges (one direction each), same row order as mask_rotate.
+        rot_edges = lig_edge_index.T[lig_edge_mask]  # [n_rot, 2]
+        n_rot = rot_edges.shape[0]
+
+        tor_update = torch.randn(B, n_rot, device=device) * tor_sigma.unsqueeze(-1) * lambda_q.unsqueeze(-1)
+
+        # A batch of 1 may carry mask_rotate as a bare ndarray; a batch of N as a
+        # list of per-complex masks. Normalize to a per-element list.
+        if not isinstance(lig_mask_rotate, (list, tuple)):
+            lig_mask_rotate = [lig_mask_rotate] * B
+
+        noisy_pos = ligand_pos.clone()
+        for b in range(B):
+            rigid_pos = noisy_pos[b].unsqueeze(0)  # [1, N_lig, 3] pre-torsion pose
+            mr = lig_mask_rotate[b]
+            if isinstance(mr, torch.Tensor):
+                mr = mr.detach().cpu().numpy()
+            tu = tor_update[b].detach().cpu().numpy()
+            flexible_pos = modify_conformer_torsion_angles(
+                rigid_pos[0].detach().cpu(), rot_edges, mr, tu, as_numpy=False
+            ).to(device).unsqueeze(0)  # [1, N_lig, 3] torsion-perturbed pose
+
+            # Kabsch-align the torsion-perturbed conformer back to its pre-torsion
+            # pose (DiffDock's `modify_conformer` does exactly this): rotating
+            # downstream side-groups moves the global pose, which would otherwise
+            # contaminate the tr/rot score-matching targets.
+            R_align, t_align = rigid_transform_Kabsch_3D_torch_batch(flexible_pos, rigid_pos)
+            noisy_pos[b] = flexible_pos[0] @ R_align[0].T + t_align[0].T
+
+        return noisy_pos, tor_update
+
     # ------------------------------------------------------------------
     # Reverse diffusion step (score-based update)
     # ------------------------------------------------------------------
@@ -247,7 +320,10 @@ class MultiRateDiffusion(nn.Module):
             ts = self.temp_sampling[0]
             tpsi = self.temp_psi[0]
             tsd = self.temp_sigma_data[0]
-            tr_sigma_data = torch.exp(tsd * np.log(self.tr_sigma_max) + (1 - tsd) * np.log(self.tr_sigma_min))
+            tr_sigma_data = torch.exp(torch.tensor(
+                tsd * np.log(self.tr_sigma_max) + (1 - tsd) * np.log(self.tr_sigma_min),
+                device=device, dtype=tr_sigma.dtype,
+            ))
             lambda_tr = (tr_sigma_data + tr_sigma) / (tr_sigma_data + tr_sigma / ts)
             tr_perturb = (tr_g**2 * dt_tr.unsqueeze(-1) * (lambda_tr + ts * tpsi / 2) * tr_score)
             if add_noise:
@@ -264,7 +340,10 @@ class MultiRateDiffusion(nn.Module):
             ts = self.temp_sampling[1]
             tpsi = self.temp_psi[1]
             tsd = self.temp_sigma_data[1]
-            rot_sigma_data = torch.exp(tsd * np.log(self.rot_sigma_max) + (1 - tsd) * np.log(self.rot_sigma_min))
+            rot_sigma_data = torch.exp(torch.tensor(
+                tsd * np.log(self.rot_sigma_max) + (1 - tsd) * np.log(self.rot_sigma_min),
+                device=device, dtype=rot_sigma.dtype,
+            ))
             lambda_rot = (rot_sigma_data + rot_sigma) / (rot_sigma_data + rot_sigma / ts)
             rot_perturb = (rot_g**2 * dt_rot.unsqueeze(-1) * (lambda_rot + ts * tpsi / 2) * rot_score)
             if add_noise:
@@ -285,6 +364,74 @@ class MultiRateDiffusion(nn.Module):
 
         return ligand_pos
 
+    def reverse_step_torsion(
+        self,
+        ligand_pos: torch.Tensor,
+        tor_score: torch.Tensor,
+        t_tor: torch.Tensor,
+        dt_tor: torch.Tensor,
+        lig_edge_index: torch.Tensor,
+        lig_edge_mask: torch.Tensor,
+        lig_mask_rotate,
+        add_noise: bool = True,
+    ) -> torch.Tensor:
+        """
+        Single reverse SDE step for PROTAC torsion DOFs (Euler-Maruyama).
+
+        Complements ``reverse_step_protac`` (which handles tr/rot but ignores
+        ``tor_score``): updates rotatable-bond angles via the torsion score, then
+        Kabsch-aligns the result back to the pre-torsion pose — mirroring
+        ``add_torsion_noise`` — so the internal-coordinate update does not leak a
+        global drift into the already-denoised tr/rot DOFs.
+
+        Args:
+            ligand_pos: [B, N_lig, 3] current conformer (after tr/rot reverse)
+            tor_score: [B, n_rot] torsion score
+            t_tor: [B] torsion diffusion time
+            dt_tor: [B] reverse step size (t_i - t_{i+1} > 0)
+            lig_edge_index: [2, E] ligand internal bond edges
+            lig_edge_mask: [E] bool rotatable-bond mask
+            lig_mask_rotate: [n_rot, N_lig] bool, or per-complex list
+            add_noise: add stochastic noise (False on the final step)
+
+        Returns:
+            [B, N_lig, 3] conformer with torsion angles updated
+        """
+        from .diffdock.utils.torsion import modify_conformer_torsion_angles
+
+        B = ligand_pos.shape[0]
+        device = ligand_pos.device
+
+        _, _, tor_sigma = self.t_to_sigma(t_tor, t_tor, t_tor)
+        tor_g = tor_sigma * np.sqrt(2 * np.log(self.tor_sigma_max / self.tor_sigma_min))
+
+        tor_perturb = tor_g**2 * dt_tor.unsqueeze(-1) * tor_score
+        if add_noise:
+            tor_z = torch.randn(B, tor_score.shape[-1], device=device)
+            tor_perturb = tor_perturb + tor_g * torch.sqrt(dt_tor).unsqueeze(-1) * tor_z
+
+        rot_edges = lig_edge_index.T[lig_edge_mask]  # [n_rot, 2]
+        if not isinstance(lig_mask_rotate, (list, tuple)):
+            lig_mask_rotate = [lig_mask_rotate] * B
+
+        out_pos = ligand_pos.clone()
+        for b in range(B):
+            rigid_pos = out_pos[b].unsqueeze(0)  # [1, N_lig, 3] pre-torsion pose
+            mr = lig_mask_rotate[b]
+            if isinstance(mr, torch.Tensor):
+                mr = mr.detach().cpu().numpy()
+            tp = tor_perturb[b].detach().cpu().numpy()
+            flexible_pos = modify_conformer_torsion_angles(
+                rigid_pos[0].detach().cpu(), rot_edges, mr, tp, as_numpy=False
+            ).to(device).unsqueeze(0)  # [1, N_lig, 3] torsion-perturbed pose
+
+            # Kabsch-align back to the rigid pose so the torsion update stays an
+            # internal-coordinate change (no global drift into tr/rot).
+            R_align, t_align = rigid_transform_Kabsch_3D_torch_batch(flexible_pos, rigid_pos)
+            out_pos[b] = flexible_pos[0] @ R_align[0].T + t_align[0].T
+
+        return out_pos
+
     def reverse_step_se3(
         self,
         poi_pos: torch.Tensor,
@@ -294,11 +441,17 @@ class MultiRateDiffusion(nn.Module):
         dt_se3_tr: torch.Tensor,
         dt_se3_rot: torch.Tensor,
         add_noise: bool = True,
-    ) -> torch.Tensor:
+        return_rotation: bool = False,
+    ):
         """
         Single reverse SDE step for E3-POI rigid body DOFs.
 
         se3_score: [B, 6] = [tr_score(3), rot_score(3)]
+
+        Returns:
+            [B, N_poi, 3] updated POI positions. If ``return_rotation`` is True,
+            returns ``(poi_pos, rot_matrix)`` where ``rot_matrix`` [B,3,3] is the
+            rotation applied this step (for cumulative SE3 tracking).
         """
         B = poi_pos.shape[0]
         device = poi_pos.device
@@ -327,6 +480,8 @@ class MultiRateDiffusion(nn.Module):
         rot_matrix = so3_exp(rot_perturb)
         poi_pos = poi_center + torch.bmm(poi_centered, rot_matrix)
 
+        if return_rotation:
+            return poi_pos, rot_matrix
         return poi_pos
 
     # ------------------------------------------------------------------
@@ -422,7 +577,8 @@ class TernaryInitializer:
         self,
         e3_center: torch.Tensor,
         poi_template: torch.Tensor,
-    ) -> torch.Tensor:
+        return_rotation: bool = False,
+    ):
         """
         Initialize POI in a spherical shell around E3.
 
@@ -430,7 +586,9 @@ class TernaryInitializer:
             e3_center: [B, 3] E3 center (typically origin)
             poi_template: [N_poi, 3] template POI geometry
         Returns:
-            [B, N_poi, 3] initialized POI positions
+            [B, N_poi, 3] initialized POI positions. If ``return_rotation`` is
+            True, returns ``(poi_pos, rot)`` where ``rot`` [B,3,3] is the random
+            orientation applied to the template (for cumulative SE3 tracking).
         """
         B = e3_center.shape[0]
         N_poi = poi_template.shape[0]
@@ -449,6 +607,8 @@ class TernaryInitializer:
         poi_pos = poi_template.unsqueeze(0).repeat(B, 1, 1)
         poi_pos = torch.bmm(poi_pos, rot) + translation.unsqueeze(1)
 
+        if return_rotation:
+            return poi_pos, rot
         return poi_pos
 
 
