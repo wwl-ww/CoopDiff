@@ -176,6 +176,67 @@ def scatter_max_per_batch(feat, batch, n_batch):
 
 
 # ---------------------------------------------------------------------------
+# SE3 Geometry Encoder
+# ---------------------------------------------------------------------------
+
+class SE3GeometryEncoder(nn.Module):
+    """
+    Coordinate-aware set encoder → fixed-size geometry embedding for the SE3 head.
+
+    The SE3 score target (translation + so(3) rotation of POI relative to E3) is a
+    function of the NOISY ternary coordinates, not just the ESM features. The
+    feature-based ``h_cond`` is coordinate-blind (MultiScalePooling and
+    EquivariantTransformer both ignore ``node_coords``), so without this encoder
+    the SE3 head cannot regress the target — loss_se3 plateaus ~1.1 instead of
+    converging to 0.
+
+    Encodes per-node [E3-relative coords, node-type one-hot] through a small MLP,
+    then mean/max pools across nodes → [B, geo_dim]. Subtracting the E3 center
+    makes the encoding translation-invariant and directly exposes the POI's
+    (noisy) pose relative to the fixed E3 frame.
+    """
+
+    def __init__(self, geo_dim: int = 64, hidden: int = 64):
+        super().__init__()
+        self.geo_dim = geo_dim
+        self.node_net = nn.Sequential(
+            nn.Linear(6, hidden), nn.SiLU(), nn.Linear(hidden, hidden),
+        )
+        self.combine = nn.Linear(2 * hidden, geo_dim)
+
+    def forward(self, node_coords, node_types, batch=None):
+        if batch is None:
+            batch = torch.zeros(
+                node_coords.shape[0], dtype=torch.long, device=node_coords.device,
+            )
+        n_batch = batch.max().item() + 1
+        node_types = node_types.to(node_coords.device)
+
+        # E3 center per batch (node_type 0). E3 is fixed across the diffusion
+        # trajectory; subtracting it exposes the POI's pose relative to E3.
+        e3_mask = node_types == 0
+        e3_sum = torch.zeros(
+            n_batch, 3, device=node_coords.device, dtype=node_coords.dtype,
+        )
+        e3_cnt = torch.zeros(n_batch, device=node_coords.device, dtype=node_coords.dtype)
+        e3_sum.index_add_(0, batch[e3_mask], node_coords[e3_mask])
+        e3_cnt.index_add_(
+            0, batch[e3_mask],
+            torch.ones(int(e3_mask.sum()), device=node_coords.device, dtype=node_coords.dtype),
+        )
+        e3_center = e3_sum / e3_cnt.clamp(min=1).unsqueeze(-1)  # [B, 3]
+
+        rel = node_coords - e3_center[batch]                 # [N, 3]
+        onehot = F.one_hot(node_types, num_classes=3).to(node_coords.dtype)  # [N, 3]
+        feat = torch.cat([rel, onehot], dim=-1)              # [N, 6]
+
+        h = self.node_net(feat)                              # [N, hidden]
+        mean = scatter_mean(h, batch, dim=0, dim_size=n_batch)   # [B, hidden]
+        mx = scatter_max_per_batch(h, batch, n_batch)            # [B, hidden]
+        return self.combine(torch.cat([mean, mx], dim=-1))       # [B, geo_dim]
+
+
+# ---------------------------------------------------------------------------
 # Equivariant Transformer
 # ---------------------------------------------------------------------------
 
@@ -452,12 +513,15 @@ class TriBrain(nn.Module):
         )
 
         # Output heads
-        # The SE3 head takes h_cond concatenated with the diffusion-time embedding
-        # (the SE3 score target depends on t_se3; without this the head cannot
-        # represent the t_se3-varying target — see diagnose_se3_timecond.py).
+        # The SE3 head takes h_cond + geometry embedding + diffusion-time embedding:
+        # the SE3 score target depends on BOTH t_se3 (via σ_tr/σ_rot) and the noisy
+        # coordinates (via the POI pose relative to E3). Without the geometry
+        # encoder the head is coordinate-blind and cannot regress the target.
         self.time_freqs = 16
+        self.geo_dim = 64
+        self.geo_encoder = SE3GeometryEncoder(geo_dim=self.geo_dim)
         self.se3_head = SE3ScoreHead(
-            hidden_dim=node_dim, in_dim=node_dim + 2 * self.time_freqs,
+            hidden_dim=node_dim, in_dim=node_dim + self.geo_dim + 2 * self.time_freqs,
         )
         self.judge_head = JudgeHead(hidden_dim=node_dim)         # ~16k
         self.state_head = StateHead(hidden_dim=node_dim)         # ~16k
@@ -513,8 +577,11 @@ class TriBrain(nn.Module):
         h_cond = transformer_out['combined']  # [B, node_dim]
 
         # 3. Output heads
-        # The SE3 head is conditioned on t_se3 so it can represent the
-        # t_se3-varying score target (σ_tr/σ_rot span 40×/20× across t_se3).
+        # The SE3 head is conditioned on t_se3 (score target varies with σ) AND on
+        # the noisy coordinates (score target depends on the POI pose relative to
+        # E3). The geometry encoder supplies the latter; without it the SE3 head
+        # is coordinate-blind and cannot regress the target.
+        h_geo = self.geo_encoder(node_coords, node_types, batch)  # [B, geo_dim]
         if t_se3 is not None:
             t_emb = fourier_time_embedding(t_se3, self.time_freqs)  # [B, 2·n_freqs]
         else:
@@ -522,7 +589,7 @@ class TriBrain(nn.Module):
                 h_cond.shape[0], 2 * self.time_freqs,
                 device=h_cond.device, dtype=h_cond.dtype,
             )
-        h_se3 = torch.cat([h_cond, t_emb], dim=-1)  # [B, node_dim + 2·n_freqs]
+        h_se3 = torch.cat([h_cond, h_geo, t_emb], dim=-1)  # [B, node_dim+geo_dim+2·n_freqs]
         s_se3 = self.se3_head(h_se3)            # [B, 6]
         confidence = self.judge_head(h_cond)      # [B, 1]
         state = self.state_head(h_cond)           # [B, 2]
