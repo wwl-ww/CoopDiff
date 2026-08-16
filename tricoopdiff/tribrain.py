@@ -476,6 +476,28 @@ class StateHead(nn.Module):
         return self.net(x)
 
 
+class MergeGateHead(nn.Module):
+    """
+    Per-score-type residual gate for merging the two subgraph scores.
+
+    Produces ``g`` = [B, 3] (tr / rot / tor) such that the merged PROTAC score is
+    ``s_q = s_q1 + g * (s_q2 - s_q1)``. **Zero-initialized**, so at init ``g=0``
+    → ``s_q = s_q1`` (pure E3-L), restoring the zero-FiLM transparency baseline.
+    ``g`` scales how much of the POI-L two-body force field (``s_q2 - s_q1``) is
+    blended in — starting from none, matching FiLM's adaLN-Zero philosophy.
+    """
+
+    def __init__(self, hidden_dim: int = 128):
+        super().__init__()
+        self.net = nn.Linear(hidden_dim, 3)
+        nn.init.zeros_(self.net.weight)
+        nn.init.zeros_(self.net.bias)
+
+    def forward(self, h_cond: torch.Tensor) -> torch.Tensor:
+        """Returns [B, 3] residual gate (tr, rot, tor); =0 at init."""
+        return self.net(h_cond)
+
+
 # ---------------------------------------------------------------------------
 # Full TriBrain
 # ---------------------------------------------------------------------------
@@ -570,6 +592,9 @@ class TriBrain(nn.Module):
             FiLMHead(node_dim, film_dim) for _ in range(num_conv_layers_per_expert * 2)
         ])
 
+        # Residual merge gate: s_q = s_q1 + g * (s_q2 - s_q1), zero-init → transparent.
+        self.merge_gate_head = MergeGateHead(node_dim)
+
     def forward(
         self,
         node_features: torch.Tensor,
@@ -630,12 +655,16 @@ class TriBrain(nn.Module):
             gamma, beta = head(h_film)
             film_params.append((gamma, beta))
 
+        # 5. Residual merge gate (s_q = s_q1 + g * (s_q2 - s_q1)); zero at init.
+        merge_gate = self.merge_gate_head(h_cond)  # [B, 3]
+
         return {
             's_se3': s_se3,
             'confidence': confidence,
             'state': state,
             'film_params': film_params,  # list of (gamma, beta), len=num_conv_layers*2
             'h_cond': h_cond,
+            'merge_gate': merge_gate,  # [B, 3] residual gate (tr, rot, tor)
         }
 
 

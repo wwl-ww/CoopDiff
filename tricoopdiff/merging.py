@@ -1,30 +1,33 @@
 """
 Score merging strategies for combining two-body expert outputs.
 
-Default (MVP): Direct addition -> s_q = s_q1 + s_q2
-Upgrade (Ablation B): Learned coordination layer
+Default: Residual-gated merge -> s_q = s_q1 + g * (s_q2 - s_q1)
 
-The direct addition strategy is the MVP approach. Each two-body expert
-independently predicts how PROTAC should move relative to its protein.
-Adding them gives the combined effect.
+The residual gate ``g`` (one scalar per score type: tr / rot / tor) is predicted
+by TriBrain's zero-initialized ``MergeGateHead``. At init ``g=0`` → ``s_q = s_q1``
+(pure E3-L), which is what makes the zero-FiLM baseline transparent: without any
+learned coordination the model reproduces the frozen E3-L two-body expert exactly
+instead of double-counting both subgraphs. As training moves ``g`` away from 0,
+the POI-L force field (``s_q2 - s_q1``) is blended in — the same adaLN-Zero
+philosophy as FiLM.
 
-A learned coordination layer (e.g., attention-based weighting) is reserved
-as an ablation upgrade to measure whether learned merging helps over addition.
+``merge_direct_addition`` (s_q = s_q1 + s_q2) is kept only as an L0 ablation: it
+double-counts the shared PROTAC DOFs and breaks zero-FiLM transparency, which is
+exactly the bug the residual-gated merge fixes.
 """
 
 import torch
-import torch.nn as nn
 
 
 def merge_direct_addition(scores_1: dict, scores_2: dict) -> dict:
     """
-    Direct addition of scores from two subgraphs (MVP strategy).
+    Direct addition of scores from two subgraphs (L0 ablation, NOT default).
 
     s_q = s_q1 + s_q2
 
-    Rationale: Each two-body expert scores how PROTAC should move relative
-    to its protein. The combined effect is the sum of both independent
-    contributions.
+    Each two-body expert independently predicts how PROTAC should move relative
+    to its protein; adding them double-counts the shared PROTAC DOFs. Kept only
+    to measure the effect of the transparent residual-gated merge against it.
 
     Args:
         scores_1: {'tr_score': [B,3], 'rot_score': [B,3], 'tor_score': [B,K]}
@@ -44,57 +47,41 @@ def merge_direct_addition(scores_1: dict, scores_2: dict) -> dict:
     return merged
 
 
-class LearnedCoordinationLayer(nn.Module):
+def merge_residual_gated(scores_1: dict, scores_2: dict, gate: torch.Tensor) -> dict:
     """
-    Learned score coordination layer (Ablation B upgrade).
+    Residual-gated merge (default).
 
-    Instead of direct addition, uses attention-based weighting:
-      s_q = α * s_q1 + (1-α) * s_q2
+    s_q = s_q1 + g * (s_q2 - s_q1)
 
-    where α is predicted from the TriBrain conditioning vector.
+    ``gate`` = [B, 3] residual gate (tr, rot, tor), zero-initialized in TriBrain,
+    so at init ``gate=0`` → ``s_q = s_q1`` (pure E3-L). ``g=1`` → ``s_q = s_q2``
+    (pure POI-L); intermediate ``g`` interpolates the two two-body force fields.
 
-    This tests whether the model learns to weight the two subgraphs
-    differently depending on context (e.g., linker length, pocket depth).
+    Args:
+        scores_1: {'tr_score': [B,3], 'rot_score': [B,3], 'tor_score': [B,K]}
+        scores_2: same format (tr/rot already rotated back to the E3 frame by
+                  the caller)
+        gate: [B, 3] residual gate per score type (tr, rot, tor)
+
+    Returns:
+        merged scores dict
     """
+    g_tr, g_rot, g_tor = gate[:, 0], gate[:, 1], gate[:, 2]
+    gates = {'tr_score': g_tr, 'rot_score': g_rot, 'tor_score': g_tor}
 
-    def __init__(self, hidden_dim: int = 128):
-        super().__init__()
-        self.weight_net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 3),  # one weight per score type (tr, rot, tor)
-            nn.Sigmoid(),
-        )
+    merged = {}
+    for key in scores_1:
+        s1, s2 = scores_1[key], scores_2[key]
+        # Empty / None scores (e.g. tor when the conformer has no rotatable bonds)
+        # pass through ungated — gating an empty tensor is a no-op and would only
+        # change its shape via broadcasting.
+        if s1 is None or s1.numel() == 0:
+            merged[key] = s1 if s1 is not None else s2
+        elif s2 is None or s2.numel() == 0:
+            merged[key] = s1
+        else:
+            g = gates[key]
+            merged[key] = s1 + g.unsqueeze(-1) * (s2 - s1)
 
-    def forward(
-        self,
-        scores_1: dict,
-        scores_2: dict,
-        h_cond: torch.Tensor,
-    ) -> dict:
-        """
-        Args:
-            scores_1, scores_2: subgraph scores
-            h_cond: [B, hidden_dim] TriBrain conditioning vector
-        Returns:
-            merged scores
-        """
-        weights = self.weight_net(h_cond)  # [B, 3]
-        w_tr, w_rot, w_tor = weights[:, 0], weights[:, 1], weights[:, 2]
-
-        merged = {
-            'tr_score': (
-                w_tr.unsqueeze(-1) * scores_1['tr_score']
-                + (1 - w_tr.unsqueeze(-1)) * scores_2['tr_score']
-            ),
-            'rot_score': (
-                w_rot.unsqueeze(-1) * scores_1['rot_score']
-                + (1 - w_rot.unsqueeze(-1)) * scores_2['rot_score']
-            ),
-            'tor_score': (
-                w_tor.unsqueeze(-1) * scores_1['tor_score']
-                + (1 - w_tor.unsqueeze(-1)) * scores_2['tor_score']
-            ),
-            'merge_weights': {'tr': w_tr, 'rot': w_rot, 'tor': w_tor},
-        }
-        return merged
+    merged['merge_gates'] = {'tr': g_tr, 'rot': g_rot, 'tor': g_tor}
+    return merged

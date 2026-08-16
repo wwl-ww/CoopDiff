@@ -194,7 +194,8 @@ def main():
         tribrain=tribrain,
         num_conv_layers=num_conv_layers,
         use_film=True,
-        use_learned_merge=False,
+        # use_learned_merge defaults True: residual-gated merge (zero-init gate →
+        # s_q = s_q1) so the transparent default path is what GATE 2 exercises.
     )
     diffusion = MultiRateDiffusion()
     trainer = TriCoopDiffTrainer(model=model, diffusion=diffusion, device=device)

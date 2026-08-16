@@ -41,7 +41,7 @@ class TriCoopDiff(nn.Module):
         tribrain: TriBrain,
         num_conv_layers: int = 11,
         use_film: bool = True,
-        use_learned_merge: bool = False,
+        use_learned_merge: bool = True,
     ):
         """
         Args:
@@ -49,8 +49,10 @@ class TriCoopDiff(nn.Module):
             tribrain: TriBrain coordination network
             num_conv_layers: number of conv layers in the expert (11 for DiffDock-L)
             use_film: if False, skip FiLM modulation (L0 ablation)
-            use_learned_merge: if True, use LearnedCoordinationLayer instead
-                              of direct addition (Ablation B)
+            use_learned_merge: if True (default), merge via TriBrain's residual
+                gate ``s_q = s_q1 + g*(s_q2 - s_q1)`` (zero-init → transparent).
+                If False, fall back to ``merge_direct_addition`` (L0 ablation
+                that double-counts both subgraphs).
         """
         super().__init__()
         self.expert = frozen_expert
@@ -58,10 +60,6 @@ class TriCoopDiff(nn.Module):
         self.num_conv_layers = num_conv_layers
         self.use_film = use_film
         self.use_learned_merge = use_learned_merge
-
-        if use_learned_merge:
-            from .merging import LearnedCoordinationLayer
-            self.merge_layer = LearnedCoordinationLayer(hidden_dim=tribrain.node_dim)
 
         self._layer_cache = {}
 
@@ -202,9 +200,12 @@ class TriCoopDiff(nn.Module):
             scores_2['tr_score'] = scores_2['tr_score'] @ r_poi_to_e3
             scores_2['rot_score'] = scores_2['rot_score'] @ r_poi_to_e3
 
-            # Merge scores
+            # Merge scores. Default = residual-gated (transparent): s_q = s_q1 +
+            # g*(s_q2 - s_q1), g from TriBrain's zero-init MergeGateHead → at init
+            # s_q = s_q1 (pure E3-L). merge_direct_addition is the L0 ablation.
             if self.use_learned_merge:
-                merged = self.merge_layer(scores_1, scores_2, tri_out['h_cond'])
+                from .merging import merge_residual_gated
+                merged = merge_residual_gated(scores_1, scores_2, tri_out['merge_gate'])
             else:
                 from .merging import merge_direct_addition
                 merged = merge_direct_addition(scores_1, scores_2)
