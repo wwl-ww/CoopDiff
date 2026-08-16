@@ -174,8 +174,9 @@ class MultiRateDiffusion(nn.Module):
         # Translation noise
         tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1) * lambda_q.unsqueeze(-1)
 
-        # Rotation noise (SO(3))
-        rot_update, rot_omega = sample_so3_noise(B, rot_sigma * lambda_q, device)
+        # Rotation noise (SO(3)) — wrapped sampling, matching the frozen expert's
+        # and so3_score_vec's IGSO(3) convention (see sample_so3_noise_wrapped).
+        rot_update, rot_omega = sample_so3_noise_wrapped(B, rot_sigma * lambda_q, device)
 
         noisy_pos = ligand_pos + tr_update.unsqueeze(1)
         noisy_pos = torch.bmm(noisy_pos, rot_update)
@@ -642,6 +643,51 @@ def sample_so3_noise(
     return so3_exp(omega), omega
 
 
+def sample_so3_noise_wrapped(
+    batch_size: int, sigma: torch.Tensor, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sample noise on SO(3) matching DiffDock's wrapped `so3.sample_vec` convention.
+
+    Draws a uniform unit direction × a wrapped angle sampled from the IGSO(3)
+    CDF in [0, π], returning the wrapped so(3) vector ω and its rotation matrix.
+    This is the convention the frozen expert and `so3_score_vec` assume.
+
+    Contrast with `sample_so3_noise` (R³ Gaussian ω ~ N(0, σ²I)): that sampler is
+    only valid for the Euclidean DSM target (-ω/σ²) used by the SE3 head. For the
+    PROTAC rotation the target/expert use the wrapped IGSO(3) score, and an R³
+    sampler emits ‖ω‖ > π for σ > 1.0, where `so3_score_vec` extrapolates past
+    the valid [0, π] table — a systematic bias of up to ~64% at σ = 1.55.
+
+    Args:
+        batch_size: number of samples
+        sigma: [B] noise level per sample
+        device: torch device
+    Returns:
+        (rotation_matrices [B, 3, 3], omega [B, 3]) with ‖omega‖ ∈ [0, π]
+    """
+    _init_so3_cache()
+    B = batch_size
+    sigma_np = sigma.detach().cpu().numpy() if hasattr(sigma, 'cpu') else np.asarray(sigma)
+    sigma_np = np.clip(np.atleast_1d(sigma_np).astype(float), _MIN_EPS, _MAX_EPS)
+    eps_idx = (np.log10(sigma_np) - np.log10(_MIN_EPS)) / (
+        np.log10(_MAX_EPS) - np.log10(_MIN_EPS)) * _N_EPS
+    eps_idx = np.clip(np.around(eps_idx).astype(int), 0, _N_EPS - 1)
+
+    # Inverse-CDF sampling of the wrapped angle, mirroring so3.sample(): draw
+    # u ~ U[0,1) and linearly interpolate u against the CDF row → angle ∈ [0, π].
+    u = torch.rand(B, device=device).cpu().numpy()
+    angles_np = np.array([
+        np.interp(u[i], _cdf_vals[eps_idx[i]], _omegas_array) for i in range(B)
+    ])
+    angles = torch.from_numpy(angles_np).float().to(device)
+
+    direction = torch.randn(B, 3, device=device)
+    direction = direction / torch.linalg.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
+    omega = direction * angles.unsqueeze(-1)  # [B, 3], ‖ω‖ ∈ [0, π]
+    return so3_exp(omega), omega
+
+
 def so3_exp(omega: torch.Tensor) -> torch.Tensor:
     """
     Exponential map from so(3) to SO(3) using Rodrigues' formula.
@@ -730,6 +776,9 @@ def _init_so3_cache(cache_dir=None):
         _exp_score_norms = np.load(score_file)
         if _os.path.exists(score_norm_file):
             _score_norms = np.load(score_norm_file)
+        cdf_file = _os.path.join(cache_dir, '.so3_cdf_vals4.npy')
+        if _os.path.exists(cdf_file):
+            _cdf_vals = np.load(cdf_file)
         return
 
     _eps_array = 10 ** np.linspace(np.log10(_MIN_EPS), np.log10(_MAX_EPS), _N_EPS)
