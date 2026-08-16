@@ -213,11 +213,14 @@ def main():
         # Log
         train_loss_avg = np.mean([d['loss_total'] for d in train_losses]) if train_losses else float('nan')
         train_se3_avg = np.mean([d['loss_se3'] for d in train_losses]) if train_losses else float('nan')
+        train_se3_tr_avg = np.mean([d['loss_se3_tr'] for d in train_losses]) if train_losses else float('nan')
+        train_se3_rot_avg = np.mean([d['loss_se3_rot'] for d in train_losses]) if train_losses else float('nan')
         train_phys_avg = np.mean([d['loss_phys'] for d in train_losses]) if train_losses else float('nan')
         dt = time.time() - t0
         print(f"  Epoch {epoch}/{args.epochs} | "
               f"train_loss={train_loss_avg:.4f} | "
-              f"se3={train_se3_avg:.4f} | "
+              f"se3={train_se3_avg:.4f} "
+              f"(tr={train_se3_tr_avg:.4f}, rot={train_se3_rot_avg:.4f}) | "
               f"phys={train_phys_avg:.4f} | "
               f"val_loss={val_loss:.4f} | "
               f"skipped={n_skipped} | "
