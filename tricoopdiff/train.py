@@ -57,6 +57,15 @@ class TriCoopDiffTrainer:
             'se3': 0.3,
         }
 
+        # Per-component cap on the PROTAC score-matching loss. With B=1 (no
+        # cross-complex averaging) a single large PROTAC whose frozen-expert
+        # forward pass blows up (node features hitting the NAN_CLAMP ceiling,
+        # scores ~1e4 → loss ~1e6-1e8) produces a gradient that, after
+        # clip_grad_norm(max_norm=1.0), drowns out the SE3 signal. The σ²/norm²
+        # weighting makes a well-behaved score loss O(1); this cap is ~100x that
+        # and only bites on the blow-up regime.
+        self.score_loss_cap = 100.0
+
         # Only TriBrain is trainable; experts are frozen
         self.optimizer = AdamW(
             model.tribrain.parameters(),
@@ -139,6 +148,14 @@ class TriCoopDiffTrainer:
             loss_score_tor = ((output['s_q']['tor'] - tor_score_target)**2 / tor_norm).mean()
         else:
             loss_score_tor = torch.tensor(0.0, device=device)
+
+        # Bound the per-component score losses before summing (see
+        # self.score_loss_cap). Clamping a loss to a constant zeroes its
+        # gradient (flat region), which is exactly what we want for an outlier
+        # batch whose score output is unreliable.
+        loss_score_tr = loss_score_tr.clamp(max=self.score_loss_cap)
+        loss_score_rot = loss_score_rot.clamp(max=self.score_loss_cap)
+        loss_score_tor = loss_score_tor.clamp(max=self.score_loss_cap)
         loss_score = loss_score_tr + loss_score_rot + loss_score_tor
 
         # SE3 score matching loss — full-range (no λ_SE3 cutoff). add_noise_se3
