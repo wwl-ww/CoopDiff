@@ -191,6 +191,13 @@ class MultiRateDiffusion(nn.Module):
         """
         Add Gaussian noise to E3-POI rigid body transformation.
 
+        The SE3 forward process is FULL-RANGE: noise is sampled at the raw
+        σ(t) level for all t ∈ [0, 1], with NO λ_SE3 cutoff. This keeps the
+        forward process consistent with ``reverse_step_se3`` (which denoises at
+        the full σ schedule, never applying λ) and with the DSM training target.
+        The previous λ cutoff made the SE3 head train only on t ∈ (0.5, 1] while
+        inference queried t ∈ [0.05, 1.0], so the low-t regime was untrained.
+
         Args:
             poi_pos: [B, N_poi, 3] clean POI positions (relative to E3 origin)
             t_se3_tr, t_se3_rot: [B] diffusion times for SE3 DOFs
@@ -202,10 +209,9 @@ class MultiRateDiffusion(nn.Module):
         device = poi_pos.device
 
         tr_sigma, rot_sigma = self.se3_t_to_sigma(t_se3_tr, t_se3_rot)
-        lambda_se3 = self.get_lambda_se3(t_se3_tr)
 
-        tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1) * lambda_se3.unsqueeze(-1)
-        rot_update, rot_omega = sample_so3_noise(B, rot_sigma * lambda_se3, device)
+        tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1)
+        rot_update, rot_omega = sample_so3_noise(B, rot_sigma, device)
 
         # Apply to POI center of mass
         poi_center = poi_pos.mean(dim=1, keepdim=True)

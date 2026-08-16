@@ -141,20 +141,15 @@ class TriCoopDiffTrainer:
             loss_score_tor = torch.tensor(0.0, device=device)
         loss_score = loss_score_tr + loss_score_rot + loss_score_tor
 
-        # SE3 score matching loss — same pattern as PROTAC.
-        # The forward noise (add_noise_se3) is sampled at the EFFECTIVE level
-        # sigma_eff = sigma * lambda_se3, where lambda_se3(t) = 1 for t above the
-        # SE3 threshold and 0 below it. For lambda=0 samples the POI is NOT
-        # perturbed (noise == 0, target == 0), so the DSM weighting must use
-        # sigma_eff^2 = sigma^2 * lambda^2 (== sigma^2 * lambda for a 0/1 step).
-        # Without this mask, clean samples contribute pred^2 * sigma^2 (a spurious
-        # "predict 0" gradient) that pins the SE3 head at ~0 and produces the
-        # observed loss_se3 ~= 1.0 floor.
+        # SE3 score matching loss — full-range (no λ_SE3 cutoff). add_noise_se3
+        # samples noise at the raw σ(t) for all t, matching reverse_step_se3, so
+        # the head is trained on the whole t ∈ [0, 1] schedule instead of only
+        # t ∈ (0.5, 1]. (The earlier λ mask left the low-t regime untrained,
+        # which inference still queried.)
         se3_tr_sigma, se3_rot_sigma = self.diffusion.se3_t_to_sigma(t_se3, t_se3)
-        lambda_se3 = self.diffusion.get_lambda_se3(t_se3).unsqueeze(-1)  # [B,1] in {0,1}
         se3_tr_target = -se3_tr_noise / se3_tr_sigma.unsqueeze(-1)**2
         diff_se3_tr = output['s_se3_components']['tr'] - se3_tr_target
-        loss_se3_tr = (diff_se3_tr**2 * se3_tr_sigma.unsqueeze(-1)**2 * lambda_se3).mean()
+        loss_se3_tr = (diff_se3_tr**2 * se3_tr_sigma.unsqueeze(-1)**2).mean()
 
         # SE3 rotation uses Euclidean (R³) DSM, symmetric with translation.
         # add_noise_se3 samples ω ~ N(0, σ²I) in the unwrapped so(3) Lie algebra
@@ -164,7 +159,7 @@ class TriCoopDiffTrainer:
         # — starving the rotation head at the π≈3.14 zero-model floor.
         se3_rot_target = -se3_rot_omega / se3_rot_sigma.unsqueeze(-1)**2
         diff_se3_rot = output['s_se3_components']['rot'] - se3_rot_target
-        loss_se3_rot = (diff_se3_rot**2 * se3_rot_sigma.unsqueeze(-1)**2 * lambda_se3).mean()
+        loss_se3_rot = (diff_se3_rot**2 * se3_rot_sigma.unsqueeze(-1)**2).mean()
         loss_se3 = loss_se3_tr + loss_se3_rot
 
         # Physical consistency loss
