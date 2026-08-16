@@ -201,7 +201,9 @@ def main():
                 print(f"  Epoch {epoch} | Batch {batch_idx} | "
                       f"loss={loss_dict['loss_total']:.4f} | "
                       f"score={loss_dict['loss_score']:.4f} | "
-                      f"se3={loss_dict['loss_se3']:.4f} | "
+                      f"se3={loss_dict['loss_se3']:.4f} "
+                      f"(tr={loss_dict['loss_se3_tr']:.4f}, "
+                      f"rot={loss_dict['loss_se3_rot']:.4f}) | "
                       f"phys={loss_dict['loss_phys']:.4f}")
 
         # Validate

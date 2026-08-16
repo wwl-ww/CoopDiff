@@ -156,9 +156,15 @@ class TriCoopDiffTrainer:
         diff_se3_tr = output['s_se3_components']['tr'] - se3_tr_target
         loss_se3_tr = (diff_se3_tr**2 * se3_tr_sigma.unsqueeze(-1)**2 * lambda_se3).mean()
 
-        se3_rot_target = self._compute_rot_score_target(se3_rot_omega, se3_rot_sigma)
-        se3_rot_norm = so3_score_norm(se3_rot_sigma).unsqueeze(-1)
-        loss_se3_rot = ((output['s_se3_components']['rot'] - se3_rot_target)**2 / se3_rot_norm**2 * lambda_se3).mean()
+        # SE3 rotation uses Euclidean (R³) DSM, symmetric with translation.
+        # add_noise_se3 samples ω ~ N(0, σ²I) in the unwrapped so(3) Lie algebra
+        # via sample_so3_noise, whose exact score is -ω/σ². The previous wrapped
+        # so3_score_vec target both mismatched that sampler and, combined with the
+        # 1/norm² weighting, gave translation ~14-17× more gradient than rotation
+        # — starving the rotation head at the π≈3.14 zero-model floor.
+        se3_rot_target = -se3_rot_omega / se3_rot_sigma.unsqueeze(-1)**2
+        diff_se3_rot = output['s_se3_components']['rot'] - se3_rot_target
+        loss_se3_rot = (diff_se3_rot**2 * se3_rot_sigma.unsqueeze(-1)**2 * lambda_se3).mean()
         loss_se3 = loss_se3_tr + loss_se3_rot
 
         # Physical consistency loss
@@ -181,6 +187,8 @@ class TriCoopDiffTrainer:
             'loss_score_rot': loss_score_rot.item(),
             'loss_score_tor': loss_score_tor.item(),
             'loss_se3': loss_se3.item(),
+            'loss_se3_tr': loss_se3_tr.item(),
+            'loss_se3_rot': loss_se3_rot.item(),
             'loss_phys': loss_phys.item(),
         }
 
