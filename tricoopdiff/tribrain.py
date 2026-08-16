@@ -202,7 +202,11 @@ class SE3GeometryEncoder(nn.Module):
         self.node_net = nn.Sequential(
             nn.Linear(6, hidden), nn.SiLU(), nn.Linear(hidden, hidden),
         )
-        self.combine = nn.Linear(2 * hidden, geo_dim)
+        # +12 = 6-entry covariance (second-moment) vector for each of POI and E3.
+        # These are rotation-sensitive (R·C·Rᵀ in the fixed E3 frame) and recover
+        # the orientation info that symmetric scalar mean/max pooling destroys
+        # (the sole mean/max path capped rotation readout at R²≈0.51).
+        self.combine = nn.Linear(2 * hidden + 12, geo_dim)
 
     def forward(self, node_coords, node_types, batch=None):
         if batch is None:
@@ -233,7 +237,32 @@ class SE3GeometryEncoder(nn.Module):
         h = self.node_net(feat)                              # [N, hidden]
         mean = scatter_mean(h, batch, dim=0, dim_size=n_batch)   # [B, hidden]
         mx = scatter_max_per_batch(h, batch, n_batch)            # [B, hidden]
-        return self.combine(torch.cat([mean, mx], dim=-1))       # [B, geo_dim]
+        cov = self._second_moments(node_coords, node_types, batch, n_batch)  # [B, 12]
+        return self.combine(torch.cat([mean, mx, cov], dim=-1))               # [B, geo_dim]
+
+    def _second_moments(self, node_coords, node_types, batch, n_batch):
+        """Per-cloud covariance (6 unique entries) for POI (type 1) then E3 (type 0).
+
+        Computed about each cloud's own centroid → translation-invariant, and in
+        the fixed E3 frame the POI covariance is R·C·Rᵀ, i.e. directly
+        rotation-sensitive. Concatenated to [B, 12].
+        """
+        entries = []
+        for typ in (1, 0):
+            mask = node_types == typ
+            c = scatter_mean(node_coords[mask], batch[mask], dim=0, dim_size=n_batch)  # [B, 3]
+            rel_t = node_coords[mask] - c[batch[mask]]        # [N_t, 3]
+            outer = rel_t.unsqueeze(-1) * rel_t.unsqueeze(-2) # [N_t, 3, 3]
+            cov = scatter_mean(                               # [B, 3, 3]
+                outer.reshape(rel_t.shape[0], 9),
+                batch[mask], dim=0, dim_size=n_batch,
+            ).reshape(n_batch, 3, 3)
+            cov = (cov + cov.transpose(-1, -2)) / 2
+            entries.append(torch.stack([
+                cov[:, 0, 0], cov[:, 1, 1], cov[:, 2, 2],
+                cov[:, 0, 1], cov[:, 0, 2], cov[:, 1, 2],
+            ], dim=-1))                                       # [B, 6]
+        return torch.cat(entries, dim=-1)                     # [B, 12]
 
 
 # ---------------------------------------------------------------------------
