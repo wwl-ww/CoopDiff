@@ -178,8 +178,14 @@ class MultiRateDiffusion(nn.Module):
         # and so3_score_vec's IGSO(3) convention (see sample_so3_noise_wrapped).
         rot_update, rot_omega = sample_so3_noise_wrapped(B, rot_sigma * lambda_q, device)
 
-        noisy_pos = ligand_pos + tr_update.unsqueeze(1)
-        noisy_pos = torch.bmm(noisy_pos, rot_update)
+        # Rotate about the ligand centre, then translate in the world frame —
+        # mirrors DiffDock's modify_conformer: (pos - centre) @ Rᵀ + tr + centre.
+        # The previous (pos + tr) @ R rotated about the ORIGIN and rotated the
+        # translation vector too, so the wrapped sampler's near-π angles teleported
+        # the ligand away from its pocket — exploding the tr-score target mismatch
+        # (the effective translation became tr@R, not the tr the target expects).
+        lig_center = ligand_pos.mean(dim=1, keepdim=True)
+        noisy_pos = torch.bmm(ligand_pos - lig_center, rot_update) + tr_update.unsqueeze(1) + lig_center
 
         return noisy_pos, tr_update, rot_update, rot_omega
 
