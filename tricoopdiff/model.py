@@ -166,11 +166,13 @@ class TriCoopDiff(nn.Module):
                 ligand_features=ligand_data['features'][b],
             )
 
-            # TriBrain forward (node features are 2D [N, D]; no batch dim)
+            # TriBrain forward (node features are 2D [N, D]; no batch dim).
+            # t_se3 conditions the SE3 head (score target is a function of σ(t_se3)).
             tri_out = self.tribrain(
                 node_features=tri_graph['node_features'],
                 node_coords=tri_graph['node_coords'],
                 node_types=tri_graph['node_types'],
+                t_se3=t_se3[b:b + 1],
             )
 
             film_params_b = tri_out['film_params']
@@ -189,6 +191,16 @@ class TriCoopDiff(nn.Module):
                 raw_out2 = self.expert(sub2)
                 scores_1 = {'tr_score': raw_out1[0], 'rot_score': raw_out1[1], 'tor_score': raw_out1[2]}
                 scores_2 = {'tr_score': raw_out2[0], 'rot_score': raw_out2[1], 'tor_score': raw_out2[2]}
+
+            # --- Frame fix: rotate sub2's tr/rot scores back to E3 frame ---
+            # sub2's ligand was rotated into POI frame via r_e3_to_poi, so its
+            # tr/rot scores are POI-frame vectors. Rotate them into E3 frame
+            # before merging with sub1's E3-frame scores (tor is an internal
+            # torsion DOF, frame-invariant). r_e3 defaults to identity → no-op
+            # for callers that don't pass r_e3_to_poi.
+            r_poi_to_e3 = r_e3.transpose(-1, -2)
+            scores_2['tr_score'] = scores_2['tr_score'] @ r_poi_to_e3
+            scores_2['rot_score'] = scores_2['rot_score'] @ r_poi_to_e3
 
             # Merge scores
             if self.use_learned_merge:

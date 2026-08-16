@@ -131,6 +131,7 @@ def compute_clash_rate(
     ensemble_coords: List[np.ndarray],
     atomic_numbers: np.ndarray,
     vdw_scale: float = 0.8,
+    bonds: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """
     Compute steric clash statistics across a conformational ensemble.
@@ -139,6 +140,10 @@ def compute_clash_rate(
         ensemble_coords: list of [N, 3] coordinate arrays
         atomic_numbers: [N] atomic numbers
         vdw_scale: VDW radius scaling factor
+        bonds: optional bond graph ([2, E] int array or (i, j) iterable) so 1-2
+            / 1-3 / 1-4 pairs are excluded (normal covalent geometry). Without
+            it only 1-2 pairs are skipped via a covalent-radius heuristic, which
+            leaves ring 1-3 atoms flagged and inflates the rate.
 
     Returns:
         dict with 'mean_clash_rate', 'max_clash_rate', 'std_clash_rate'
@@ -147,7 +152,7 @@ def compute_clash_rate(
 
     clash_rates = []
     for coords in ensemble_coords:
-        clashes = detect_clashes(coords, atomic_numbers, vdw_scale)
+        clashes = detect_clashes(coords, atomic_numbers, vdw_scale, bonds)
         clash_rates.append(clashes.sum() / len(atomic_numbers))
 
     return {
@@ -340,23 +345,27 @@ def compute_poi_dockq(
     }
 
 
-def compute_poi_rmsd(
+def compute_poi_com_dist(
     pred_poi: np.ndarray,
     native_complex_pdb: str,
 ) -> Optional[Dict[str, float]]:
     """
-    Frame-aware POI placement metrics vs the native ternary complex.
+    Frame-aware POI placement (E3-POI COM distance) vs the native complex.
 
     ``featurize_common`` centers the E3 at its COM (so the featurized E3 frame
     origin ≈ E3 COM), and the sampler emits POI relative to that same COM.
     The native POI reduced to Cα (``_parse_native_complex``) is shifted by the
-    native E3 Cα COM to land in the same frame. Kabsch alignment inside
-    ``compute_rmsd`` absorbs any residual frame translation/rotation, and the
-    Cα atom order matches between ``poi_data['coords']`` and the parsed native
-    complex (both are one Cα per residue, in residue order).
+    native E3 Cα COM to land in the same frame, so the E3-POI separation can be
+    compared directly.
+
+    Note: this intentionally does NOT report a Kabsch-aligned POI RMSD. The POI
+    template is the native POI as a rigid body, so a Kabsch superposition always
+    recovers ~0 Å regardless of where the POI was actually placed — that number
+    carries no placement signal. The E3-POI COM distance (and ``compute_poi_dockq``)
+    are the meaningful POI metrics.
 
     Returns:
-        {'poi_rmsd': Å (Kabsch), 'poi_com_dist': Å (E3-POI COM placement error),
+        {'poi_com_dist': Å (E3-POI COM placement error),
          'native_e3_poi_com_dist': Å (reference E3-POI separation)},
         or None when the native PDB is unavailable/unparseable or the POI atom
         count does not match.
@@ -367,13 +376,11 @@ def compute_poi_rmsd(
     native_poi_e3 = native['poi_ca'] - native['e3_ca'].mean(axis=0)  # [N_poi, 3]
     if pred_poi.shape[0] != native_poi_e3.shape[0]:
         return None
-    rmsd = compute_rmsd(pred_poi, native_poi_e3, align_first=True)
     com_dist = float(np.linalg.norm(pred_poi.mean(axis=0) - native_poi_e3.mean(axis=0)))
     native_com_dist = float(np.linalg.norm(
         native['poi_ca'].mean(axis=0) - native['e3_ca'].mean(axis=0)
     ))
     return {
-        'poi_rmsd': rmsd,
         'poi_com_dist': com_dist,
         'native_e3_poi_com_dist': native_com_dist,
     }
@@ -724,18 +731,14 @@ def evaluate_model(
 
     ref_lig = ligand_data['coords'][0].detach().cpu().numpy()  # [N_lig, 3] native
     e3_ca = e3_data['coords'][0].detach().cpu().numpy()        # [N_e3, 3] fixed E3 Cα
+    lig_bonds = ligand_data['edge_index'].detach().cpu().numpy()  # [2, E] covalent graph
 
-    protac_rmsds = []
-    pocket_dists = []
-    pred_ligs = []
-    e3_dockqs = []
-    e3_fnats = []
-    e3_lrms = []
+    # Per-walker records (one per finite trajectory, aligned indices) so the
+    # "best" columns can report a single coherent pose instead of each metric's
+    # independent extremum (see the best-sample selection below).
+    walkers = []
     e3_native_contacts = None
-    poi_dockqs = []
     poi_native_contacts = None
-    poi_rmsds = []
-    poi_com_dists = []
     poi_native_com_dist = None
     n_nan = 0
     for r in ensemble:
@@ -743,120 +746,107 @@ def evaluate_model(
         if not np.isfinite(pred).all():
             n_nan += 1
             continue
-        pred_ligs.append(pred)
-        protac_rmsds.append(compute_rmsd(pred, ref_lig, align_first=True))
-        pocket_dists.append(
-            float(np.linalg.norm(pred.mean(axis=0) - ref_lig.mean(axis=0)))
-        )
+        rec = {
+            'pred': pred,
+            'protac_rmsd': compute_rmsd(pred, ref_lig, align_first=True),
+            'pocket_dist': float(np.linalg.norm(pred.mean(axis=0) - ref_lig.mean(axis=0))),
+        }
         e3_m = compute_e3_interface_dockq(e3_ca, pred, ref_lig)
         if e3_m is not None:
-            e3_dockqs.append(e3_m['dockq'])
-            e3_fnats.append(e3_m['fnat'])
-            e3_lrms.append(e3_m['lrms'])
+            rec['e3_dockq'] = e3_m['dockq']
+            rec['e3_fnat'] = e3_m['fnat']
+            rec['e3_lrms'] = e3_m['lrms']
             if e3_native_contacts is None:
                 e3_native_contacts = e3_m['n_native_contacts']
         if native_complex_pdb is not None:
             poi_m = compute_poi_dockq(r['poi_coords'], pred, native_complex_pdb)
             if poi_m is not None:
-                poi_dockqs.append(poi_m['dockq'])
+                rec['poi_dockq'] = poi_m['dockq']
                 if poi_native_contacts is None:
                     poi_native_contacts = poi_m['n_native_contacts']
-            poi_r = compute_poi_rmsd(r['poi_coords'], native_complex_pdb)
-            if poi_r is not None:
-                poi_rmsds.append(poi_r['poi_rmsd'])
-                poi_com_dists.append(poi_r['poi_com_dist'])
-                poi_native_com_dist = poi_r['native_e3_poi_com_dist']
+            poi_c = compute_poi_com_dist(r['poi_coords'], native_complex_pdb)
+            if poi_c is not None:
+                rec['poi_com_dist'] = poi_c['poi_com_dist']
+                poi_native_com_dist = poi_c['native_e3_poi_com_dist']
+        walkers.append(rec)
     if n_nan:
         print(f"[evaluate] skipped {n_nan}/{len(ensemble)} walkers with non-finite coords")
 
-    protac_rmsds = np.asarray(protac_rmsds)
-    pocket_dists = np.asarray(pocket_dists)
+    pred_ligs = [w['pred'] for w in walkers]
+    protac_rmsds = np.asarray([w['protac_rmsd'] for w in walkers])
+    pocket_dists = np.asarray([w['pocket_dist'] for w in walkers])
+    # Best sample = the walker with the highest E3-PROTAC interface DockQ (the
+    # primary quality metric); every "_best" key below reports that same walker.
+    best_idx = int(np.argmax([w.get('e3_dockq', -1.0) for w in walkers])) if walkers else 0
 
-    if len(protac_rmsds) == 0:
-        # All walkers failed to produce finite coords (should be rare after the
-        # score sanitization in sampler.py, but guard against a zero-size array).
-        structure = {
-            'protac_rmsd_best': float('nan'),
-            'protac_rmsd_mean': float('nan'),
-            'protac_rmsd_median': float('nan'),
-            'protac_pocket_dist_mean': float('nan'),
-            'protac_pocket_dist_best': float('nan'),
-        }
-    else:
-        structure = {
-            'protac_rmsd_best': float(protac_rmsds.min()),
-            'protac_rmsd_mean': float(protac_rmsds.mean()),
-            'protac_rmsd_median': float(np.median(protac_rmsds)),
-            'protac_pocket_dist_mean': float(pocket_dists.mean()),
-            'protac_pocket_dist_best': float(pocket_dists.min()),
-        }
+    # Initialize every metric to None; the finite-walker branch below fills in
+    # what it can. "best" always means "the single dockq-best walker's value"
+    # (see best_idx above) so the best column is one coherent pose, while
+    # mean/median are ensemble statistics over all finite walkers.
+    structure = {
+        'protac_rmsd_best': None, 'protac_rmsd_mean': None, 'protac_rmsd_median': None,
+        'protac_pocket_dist_mean': None, 'protac_pocket_dist_best': None,
+        'clash_rate': None,
+        'poi_dockq_best': None, 'poi_dockq_mean': None, 'poi_dockq_median': None,
+        'poi_interface_native_contacts': None,
+        'poi_com_dist_best': None, 'poi_com_dist_mean': None,
+        'native_e3_poi_com_dist': None,
+        'e3_interface_dockq_best': None, 'e3_interface_dockq_mean': None,
+        'e3_interface_dockq_median': None,
+        'e3_interface_fnat_best': None, 'e3_interface_fnat_mean': None,
+        'e3_interface_lrms_best': None, 'e3_interface_lrms_mean': None,
+        'e3_interface_native_contacts': None,
+    }
+
+    if walkers:
+        best = walkers[best_idx]
+        structure['protac_rmsd_best'] = float(best['protac_rmsd'])
+        structure['protac_rmsd_mean'] = float(protac_rmsds.mean())
+        structure['protac_rmsd_median'] = float(np.median(protac_rmsds))
+        structure['protac_pocket_dist_mean'] = float(pocket_dists.mean())
+        structure['protac_pocket_dist_best'] = float(best['pocket_dist'])
 
     # Steric clash over the PROTAC ensemble (atomic numbers unknown at MVP scale;
     # use carbon=6 as a proxy — same convention as the reflection post-processor).
+    # The ligand bond graph is passed so 1-2/1-3/1-4 covalent geometry is excluded.
     try:
         structure['clash_rate'] = compute_clash_rate(
-            pred_ligs, np.full(ref_lig.shape[0], 6)
+            pred_ligs, np.full(ref_lig.shape[0], 6), bonds=lig_bonds
         )
     except Exception:
         structure['clash_rate'] = None
 
-    # PROTAC-POI interface recovery (DockQ-style Fnat), frame-invariant. None
-    # (never NaN) when the native complex PDB is unavailable/unparseable.
-    if poi_dockqs:
-        poi_dockqs = np.asarray(poi_dockqs)
-        structure['poi_dockq_best'] = float(poi_dockqs.max())
-        structure['poi_dockq_mean'] = float(poi_dockqs.mean())
-        structure['poi_dockq_median'] = float(np.median(poi_dockqs))
+    if walkers:
+        best = walkers[best_idx]
+
+        # PROTAC-POI interface recovery (DockQ-style Fnat), frame-invariant.
+        poi_dockqs = np.asarray([w['poi_dockq'] for w in walkers if 'poi_dockq' in w])
+        structure['poi_dockq_best'] = float(best['poi_dockq']) if 'poi_dockq' in best else None
+        structure['poi_dockq_mean'] = float(poi_dockqs.mean()) if len(poi_dockqs) else None
+        structure['poi_dockq_median'] = float(np.median(poi_dockqs)) if len(poi_dockqs) else None
         structure['poi_interface_native_contacts'] = poi_native_contacts
-    else:
-        structure['poi_dockq_best'] = None
-        structure['poi_dockq_mean'] = None
-        structure['poi_dockq_median'] = None
-        structure['poi_interface_native_contacts'] = None
 
-    # POI placement (frame-aware): Kabsch RMSD + E3-POI COM distance. None
-    # (never NaN) when the native complex PDB is unavailable/unparseable.
-    if poi_rmsds:
-        poi_rmsds = np.asarray(poi_rmsds)
-        poi_com_dists = np.asarray(poi_com_dists)
-        structure['poi_rmsd_best'] = float(poi_rmsds.min())
-        structure['poi_rmsd_mean'] = float(poi_rmsds.mean())
-        structure['poi_rmsd_median'] = float(np.median(poi_rmsds))
-        structure['poi_com_dist_best'] = float(poi_com_dists.min())
-        structure['poi_com_dist_mean'] = float(poi_com_dists.mean())
+        # POI placement (frame-aware): E3-POI COM distance (no Kabsch RMSD — the
+        # POI template is the native rigid body, so a Kabsch superposition would
+        # trivially give ~0 and carry no placement signal).
+        poi_com_dists = np.asarray([w['poi_com_dist'] for w in walkers if 'poi_com_dist' in w])
+        structure['poi_com_dist_best'] = float(best['poi_com_dist']) if 'poi_com_dist' in best else None
+        structure['poi_com_dist_mean'] = float(poi_com_dists.mean()) if len(poi_com_dists) else None
         structure['native_e3_poi_com_dist'] = poi_native_com_dist
-    else:
-        structure['poi_rmsd_best'] = None
-        structure['poi_rmsd_mean'] = None
-        structure['poi_rmsd_median'] = None
-        structure['poi_com_dist_best'] = None
-        structure['poi_com_dist_mean'] = None
-        structure['native_e3_poi_com_dist'] = None
 
-    # E3-PROTAC interface quality (fixed-receptor frame), always available from
-    # the featurized native (no native PDB needed). Directly comparable to the
-    # pure-DiffDock baseline's dockq / fnat / Lrms.
-    if e3_dockqs:
-        e3_dockqs = np.asarray(e3_dockqs)
-        e3_fnats = np.asarray(e3_fnats)
-        e3_lrms = np.asarray(e3_lrms)
-        structure['e3_interface_dockq_best'] = float(e3_dockqs.max())
-        structure['e3_interface_dockq_mean'] = float(e3_dockqs.mean())
-        structure['e3_interface_dockq_median'] = float(np.median(e3_dockqs))
-        structure['e3_interface_fnat_best'] = float(e3_fnats.max())
-        structure['e3_interface_fnat_mean'] = float(e3_fnats.mean())
-        structure['e3_interface_lrms_best'] = float(e3_lrms.min())
-        structure['e3_interface_lrms_mean'] = float(e3_lrms.mean())
+        # E3-PROTAC interface quality (fixed-receptor frame), always available
+        # from the featurized native (no native PDB needed).
+        e3_dockqs = np.asarray([w['e3_dockq'] for w in walkers if 'e3_dockq' in w])
+        e3_fnats = np.asarray([w['e3_fnat'] for w in walkers if 'e3_fnat' in w])
+        e3_lrms = np.asarray([w['e3_lrms'] for w in walkers if 'e3_lrms' in w])
+        structure['e3_interface_dockq_best'] = float(best['e3_dockq']) if 'e3_dockq' in best else None
+        structure['e3_interface_dockq_mean'] = float(e3_dockqs.mean()) if len(e3_dockqs) else None
+        structure['e3_interface_dockq_median'] = float(np.median(e3_dockqs)) if len(e3_dockqs) else None
+        structure['e3_interface_fnat_best'] = float(best['e3_fnat']) if 'e3_fnat' in best else None
+        structure['e3_interface_fnat_mean'] = float(e3_fnats.mean()) if len(e3_fnats) else None
+        structure['e3_interface_lrms_best'] = float(best['e3_lrms']) if 'e3_lrms' in best else None
+        structure['e3_interface_lrms_mean'] = float(e3_lrms.mean()) if len(e3_lrms) else None
         structure['e3_interface_native_contacts'] = e3_native_contacts
-    else:
-        structure['e3_interface_dockq_best'] = None
-        structure['e3_interface_dockq_mean'] = None
-        structure['e3_interface_dockq_median'] = None
-        structure['e3_interface_fnat_best'] = None
-        structure['e3_interface_fnat_mean'] = None
-        structure['e3_interface_lrms_best'] = None
-        structure['e3_interface_lrms_mean'] = None
-        structure['e3_interface_native_contacts'] = None
 
     ensemble_metrics = {
         'n_walkers': len(ensemble),

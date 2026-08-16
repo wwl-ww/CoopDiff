@@ -14,6 +14,7 @@
 | `DeepTernary 审计完成交接文档.md` | DeepTernary 基线（08-09） | **唯一权威基线结论：mean best DockQ = 0.6588**。含 `lig_kpt_mode_val` 致命 bug 修复记录。 |
 | `DiffDock 审计文档.md` | DiffDock 源码+论文分析 | Corso et al. ICLR 2023 综合分析，二体专家参考。 |
 | `DeepTernary 论文分析与审计对比.md` | 论文分析 + 审计对比（08-08） | 已按 08-09 最终审计回改（顶部有修正 banner）。SOTA 权重（Zenodo）调查仍有效。 |
+| `Score合并 双重计数与零-FiLM基线 交接文档.md` | 问题 #1：`s_q1+s_q2` 合并 | **待办**。零-FiLM 基线 DockQ 0.153 vs 纯 DiffDock E3-L 0.844；根因=帧不一致（tr/rot）+ 双重计数（透明性）；候选方案 A/B/C，推荐方案 B（α 初始化=1）。 |
 
 ## 二、部分过时（以回改标注为准）
 
