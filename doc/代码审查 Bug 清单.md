@@ -8,6 +8,18 @@
 
 ## 🔴 严重
 
+### BUG-20 `featurize_common.py:20` / `evaluate_entry.py:35` 引用 `../DiffDock`（兄弟目录），但 DiffDock 实际在 `./DiffDock`（仓库内）
+
+```python
+# featurize_common.py / evaluate_entry.py:
+_DIFFDOCK_DIR = _PROJECT_ROOT.parent / "DiffDock"   # ← ../DiffDock（仓库外兄弟）
+```
+
+- 实测（本机）：`./DiffDock`（仓库内，git-ignored）**存在**，且含 featurization 所需 `datasets/process_mols.py`、`utils/inference_utils.py`；而 `../DiffDock`（兄弟）**不存在**。
+- `.gitignore` 里写的是 `DiffDock/`（仓库内），说明 canonical 位置是**仓库内**，但代码却找仓库外。
+- 后果：`featurize_common.py` 会 `raise RuntimeError("DiffDock checkout not found")`，`evaluate_entry.py` 会 FATAL 退出；`train_entry.py` 经由 `featurize_common` 也被连累。**训练/评估入口在本机直接跑不起来。**
+- 根因：路径改过（`../` ↔ `./`），`featurize_common`/`evaluate_entry` 没跟上，且新旧 CLAUDE.md 对此说法互相矛盾（docs/reorg 版写 `./DiffDock`，mvp 版写 `../DiffDock`）。
+
 ### BUG-1 `evaluate.py:20` `compute_dockq` 实现错误，且是死代码
 
 ```python
@@ -107,7 +119,7 @@ self.model.train()  # 注释说 "still need train mode for dropout consistency"
 
 ## 🟢 轻微 / 待验证
 
-### BUG-6 `model.py:201-203` frame fix 的 rot_score 旋转需验证
+### BUG-6 ~~`model.py:201-203` frame fix 的 rot_score 旋转~~（**误报，已核对正确**）
 
 ```python
 r_poi_to_e3 = r_e3.transpose(-1, -2)
@@ -115,11 +127,11 @@ scores_2['tr_score'] = scores_2['tr_score'] @ r_poi_to_e3
 scores_2['rot_score'] = scores_2['rot_score'] @ r_poi_to_e3
 ```
 
-- `rot_score` 是 so(3)（李代数）向量，换坐标系应当用**伴随作用**（adjoint），且行/列向量约定（`v @ R` vs `R @ v`）需要跟 DiffDock 的 rot_score 语义核对。`tr_score`（平移向量）直接 `@ R` 大概率对，`rot_score` 存疑。
+- ~~rot_score 是 so(3) 向量，需 adjoint~~。**已澄清**：SO(3) **真旋转**（det=+1）下，so(3) 轴向量与极向量变换**完全相同**，都按普通向量转；反射才区分两者，而这里不涉及反射。故 `rot_score @ r_poi_to_e3` 与 `tr_score @ r_poi_to_e3` 一样正确。详见 `doc/参考系与数值梯度专项分析.md` §1.3。
 
-### BUG-7 `train.py:118` `r_e3_to_poi = se3_rot_noise.transpose(-1,-2)` 约定需验证
+### BUG-7 ~~`train.py:118` `r_e3_to_poi` 约定~~（**误报，已核对正确**）
 
-- 把 SE3 旋转噪声的转置当成「E3→POI 帧旋转」传给 model，与 `sampler.py:120` 的 `R_cum.transpose(-1,-2)` 是两条不同的路径，两者约定是否一致需要跑通验证。
+- ~~与 sampler 的 R_cum.transpose 约定是否一致需验证~~。**已澄清**：`se3_rot_noise`（= `add_noise_se3` 加到 POI 的旋转矩阵）的转置，与 `sampler.py` 的 `R_cum.transpose(-1,-2)` 是**同一约定**（都是「POI 实际朝向的逆」），一致。详见 `doc/参考系与数值梯度专项分析.md` §1.3。
 
 ### BUG-8 `tribrain.py:141` MultiScalePooling 注释与代码不符
 
@@ -163,10 +175,28 @@ return out / count.clamp(min=1).unsqueeze(-1)
 
 - `out` 是 `[dim_size, *src.shape[1:]]`，`count` 是 `[dim_size]`。当 `src` 是 1-D `[N]` 时，`out` 是 `[dim_size]`，`count.unsqueeze(-1)` 是 `[dim_size,1]`，广播会得到 `[dim_size,dim_size]`（错）。当前 `scatter_mean` 都作用于 2-D 特征所以没触发，属于边界雷。
 
-### BUG-18 `featurize_common.py` E3/POI 分开 featurize，相对几何是否一致待验证
+### BUG-18 🔴🔴 **确证**：featurization 把每个分子**独立居中**，三元相对几何被彻底抹掉
 
-- `featurize_complex` 对 `e3l` 和 `poil` 分别调 `featurize_subgraph`（各自走 DiffDock `InferenceDataset`，各自做 recentering）。若两个子图的 recentering 中心不同（比如 e3l 以 E3 COM 为中心、poil 以 POI COM 为中心），则 E3 和 POI 落在**两个不同的坐标系**里，`ligand_data` 取的是 e3l 的（E3 系），而 `poi_data` 是 poil 系的——E3-POI 相对位姿就错了。
-- 需要确认 `../DiffDock` 的 `process_mols`/`InferenceDataset` 是否对两个子图用**同一个原点**（比如都以 ligand COM 为中心），否则三元几何从一开始就带一个系统误差。这跟 `model.py` 的 frame fix / `AgentB 交接文档` 是同一类「参考系」问题。
+已读到源码（`DiffDock/utils/inference_utils.py:231-237`），确凿：
+
+```python
+protein_center = torch.mean(complex_graph['receptor'].pos, dim=0, keepdim=True)
+complex_graph['receptor'].pos -= protein_center        # 受体（E3 或 POI）→ 自己的质心 = 0
+ligand_center  = torch.mean(complex_graph['ligand'].pos, dim=0, keepdim=True)
+complex_graph['ligand'].pos  -= ligand_center           # 配体 → 自己的质心 = 0
+```
+
+- `featurize_complex` 对 `e3l`、`poil` 各自调 `InferenceDataset`，于是：
+  - `e3_data`：E3 居中（e3_center = 0）
+  - `poi_data`：POI 居中（poi_center = 0）
+  - `ligand_data`：PROTAC 居中（ligand_center = 0）
+- **三个分子被各自独立平移到原点，E3↔POI、E3↔PROTAC、POI↔PROTAC 的相对平移全部丢失**（只保留了各自朝向，因为只平移、不旋转）。
+- 于是 `t_e3_to_poi = poi_center - e3_center = 0`，`transform_ligand_to_poi_frame` 的平移项恒为 0。
+- **训练后果（致命）**：`compute_loss` 里「干净」的 PROTAC/POI 坐标都是原点，score matching 的目标是"把配体/POI 去噪到**原点**"，而不是去噪到它们在三元复合物里相对 E3 的真实位置。模型学到的是"三分子堆在原点"这个物理上无意义的分布。
+
+**根因**：DiffDock 的 `InferenceDataset` 是给**推理**用的——推理时配体平移是随机初始化的扩散变量，所以初始位置无所谓、可以独立居中。但 TriCoopDiff 的**训练**需要保留配体/POI 相对 E3 的真实位姿作为监督信号，用了推理数据集就把信号抹了。正确做法是用 DiffDock 的**训练** featurization（`datasets/pdbbind.py` 那套，保留配体在受体坐标系里的位置），而不是 `InferenceDataset`。
+
+> 这一条比之前的「差一个 e3_center」严重得多：不是差一个偏移，而是**整个相对几何不存在了**。之前 §1.4 专项分析里"差 e3_center"的结论是在"坐标为晶体框架"的假设下推出的，实测源码后推翻——实际是各自居中、相对平移归零。
 
 ---
 
