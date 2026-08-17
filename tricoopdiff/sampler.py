@@ -84,12 +84,20 @@ def sample_single(
     poi_template = poi_data["coords"][0].detach()        # [N_poi, 3]
     e3_coords = e3_data["coords"][0].detach()            # [N_e3, 3]
 
-    # Pocket center proxy = native PROTAC COM (E3 frame); E3 center for POI shell.
-    pocket_center = ligand_template.mean(dim=0, keepdim=True)  # [1, 3]
+    # E3 center = receptor COM. Native randomize_position uses receptor.pos.mean(0).
     e3_center = e3_coords.mean(dim=0, keepdim=True)            # [1, 3]
 
-    # Initialize at t=1 (fully noised).
-    ligand_pos = initializer.initialize_protac(pocket_center, ligand_template)  # [1, N_lig, 3]
+    # Initialize at t=1 (fully noised). Passing the receptor COM + torsion metadata
+    # + tr_sigma_max makes initialize_protac replicate native randomize_position
+    # (uniform torsions, rotate about ligand COM, translate to receptor COM,
+    # Gaussian N(0, tr_sigma_max^2)) — sampling-fidelity hypothesis #3.
+    ligand_pos = initializer.initialize_protac(
+        e3_center, ligand_template,
+        lig_edge_index=ligand_data.get("edge_index"),
+        lig_edge_mask=ligand_data.get("edge_mask"),
+        lig_mask_rotate=ligand_data.get("mask_rotate"),
+        tr_sigma_max=diffusion.tr_sigma_max,
+    )  # [1, N_lig, 3]
     poi_pos, rot_init = initializer.initialize_poi(                           # [1, N_poi, 3], [1,3,3]
         e3_center, poi_template, return_rotation=True,
     )

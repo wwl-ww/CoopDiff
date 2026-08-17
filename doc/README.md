@@ -14,8 +14,9 @@
 | `DeepTernary 审计完成交接文档.md` | DeepTernary 基线（08-09） | **唯一权威基线结论：mean best DockQ = 0.6588**。含 `lig_kpt_mode_val` 致命 bug 修复记录。 |
 | `DiffDock 审计文档.md` | DiffDock 源码+论文分析 | Corso et al. ICLR 2023 综合分析，二体专家参考。 |
 | `DeepTernary 论文分析与审计对比.md` | 论文分析 + 审计对比（08-08） | 已按 08-09 最终审计回改（顶部有修正 banner）。SOTA 权重（Zenodo）调查仍有效。 |
-| `问题清单与修复状态 交接文档.md` | **当前问题总清单（08-17）** | 快照：旋转 sign bug、#1/#2/#3/#4 均已修；验证已跑（smoke PASS、零-FiLM 基线 DockQ 0.215 vs 0.844）→ **新问题：采样保真度未达标**，待 agent 调查。**先读这个**。 |
+| `问题清单与修复状态 交接文档.md` | **当前问题总清单（08-17）** | 快照：#1/#2 已修（`959867a`）、#3 已应用（工作树，待提交+重跑）、#4 仍开放；零-FiLM 基线 E3-interface DockQ **0.0925**（job 139693，回归）vs 原生 **0.844**，采样保真度仍未达标。**先读这个**。 |
 | `采样保真度调查任务 brief.md` | 采样保真度调查任务书 | **派给 agent 的只读诊断任务**。零-FiLM 基线 0.215→0.844 的逐项对照清单（TriCoopDiff 反向循环 vs DiffDock 原生 inference 六个对照点），含环境约束（SLURM-only、不改代码）。agent 只调查不改代码，报告后主线程决定是否修。 |
+| `假设3_初始化对齐_审查发现.md` | 假设 #3 patch 审查（08-17） | **只读审查发现（代码未改）**：F1（patch 文件已提交但代码未提交）、D1（`t_e3_to_poi`/`lig_offset` 混用）、P1（`initialize_poi` 仍绕原点）、D2–D5（文档矛盾/失效引用/BUG-10 提交状态）。文档侧 D1–D5 已在本轮回改。 |
 | `Score合并 双重计数与零-FiLM基线 交接文档.md` | 问题 #1：`s_q1+s_q2` 合并 | **已落地**。方案 B（residual-gate `s_q=s_q1+g*(s_q2-s_q1)`，g 零初始化）已实现于 `merging.py`/`model.py`/`tribrain.py`，帧修正（问题 A）也已落地；候选 A/B/C 讨论见《问题清单与修复状态 交接文档.md》。 |
 
 ## 二、部分过时（以回改标注为准）
