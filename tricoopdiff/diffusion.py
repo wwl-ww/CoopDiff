@@ -152,6 +152,12 @@ class MultiRateDiffusion(nn.Module):
         """
         Add Gaussian noise to PROTAC translation and rotation (rigid-body DOFs).
 
+        The PROTAC forward process is FULL-RANGE: noise is sampled at the raw
+        σ(t) level for all t ∈ [0, 1], with NO λ_q cutoff. This keeps the forward
+        process consistent with ``reverse_step_protac`` (which denoises at the full
+        σ schedule, never applying λ) and with the DSM training target. The previous
+        λ_q cutoff made the forward schedule asymmetric with the reverse step.
+
         Torsion angles are perturbed separately by ``add_torsion_noise`` (applied
         after this rigid transform), mirroring DiffDock's ``modify_conformer``.
 
@@ -169,23 +175,27 @@ class MultiRateDiffusion(nn.Module):
         device = ligand_pos.device
 
         tr_sigma, rot_sigma, tor_sigma = self.t_to_sigma(t_tr, t_rot, t_tor)
-        lambda_q = self.get_lambda_q(t_tr)
 
         # Translation noise
-        tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1) * lambda_q.unsqueeze(-1)
+        tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1)
 
         # Rotation noise (SO(3)) — wrapped sampling, matching the frozen expert's
         # and so3_score_vec's IGSO(3) convention (see sample_so3_noise_wrapped).
-        rot_update, rot_omega = sample_so3_noise_wrapped(B, rot_sigma * lambda_q, device)
+        rot_update, rot_omega = sample_so3_noise_wrapped(B, rot_sigma, device)
 
         # Rotate about the ligand centre, then translate in the world frame —
         # mirrors DiffDock's modify_conformer: (pos - centre) @ Rᵀ + tr + centre.
-        # The previous (pos + tr) @ R rotated about the ORIGIN and rotated the
+        # The transpose is REQUIRED: DiffDock applies the rotation as @ Rᵀ =
+        # @ exp(-[ω]×), while the frozen expert was trained on that convention. A
+        # bare @ R = @ exp([ω]×) makes the expert read the pose as rotation -ω and
+        # emit score_vec(σ,-ω) = -score_vec(σ,ω) — the sign opposite of the training
+        # target score_vec(σ,ω) — so reverse_step_protac amplifies |ω| (zero-FiLM
+        # PROTAC-rotation divergence, the documented DockQ collapse).
+        # (The previous (pos + tr) @ R rotated about the ORIGIN and rotated the
         # translation vector too, so the wrapped sampler's near-π angles teleported
-        # the ligand away from its pocket — exploding the tr-score target mismatch
-        # (the effective translation became tr@R, not the tr the target expects).
+        # the ligand away from its pocket — exploding the tr-score target mismatch.)
         lig_center = ligand_pos.mean(dim=1, keepdim=True)
-        noisy_pos = torch.bmm(ligand_pos - lig_center, rot_update) + tr_update.unsqueeze(1) + lig_center
+        noisy_pos = torch.bmm(ligand_pos - lig_center, rot_update.transpose(-1, -2)) + tr_update.unsqueeze(1) + lig_center
 
         return noisy_pos, tr_update, rot_update, rot_omega
 
@@ -240,6 +250,10 @@ class MultiRateDiffusion(nn.Module):
         """
         Add Gaussian noise to PROTAC rotatable-bond torsion angles.
 
+        Full-range (no λ_q cutoff), matching ``reverse_step_torsion`` and the
+        torsion DSM target over all t ∈ [0, 1] — the previous λ_q gate made the
+        forward schedule asymmetric with the reverse step.
+
         Translation/rotation perturb the whole conformer; torsion rotates each
         rotatable bond's downstream atoms around the bond axis. This mirrors
         DiffDock's ``modify_conformer``: the torsion-perturbed conformer is
@@ -264,13 +278,12 @@ class MultiRateDiffusion(nn.Module):
         device = ligand_pos.device
 
         _, _, tor_sigma = self.t_to_sigma(t_tor, t_tor, t_tor)
-        lambda_q = self.get_lambda_q(t_tor)
 
         # Rotatable bond edges (one direction each), same row order as mask_rotate.
         rot_edges = lig_edge_index.T[lig_edge_mask]  # [n_rot, 2]
         n_rot = rot_edges.shape[0]
 
-        tor_update = torch.randn(B, n_rot, device=device) * tor_sigma.unsqueeze(-1) * lambda_q.unsqueeze(-1)
+        tor_update = torch.randn(B, n_rot, device=device) * tor_sigma.unsqueeze(-1)
 
         # A batch of 1 may carry mask_rotate as a bare ndarray; a batch of N as a
         # list of per-complex masks. Normalize to a per-element list.
@@ -368,12 +381,15 @@ class MultiRateDiffusion(nn.Module):
                 rot_z = torch.randn(B, 3, device=device)
                 rot_perturb = rot_perturb + rot_g * torch.sqrt(dt_rot).unsqueeze(-1) * rot_z
 
-        # Apply updates
+        # Apply updates. Rotation is applied as @ Rᵀ = @ exp(-[rot_perturb]×) to
+        # match both the fixed add_noise_protac forward (which now applies the
+        # noise as @ Rᵀ) and DiffDock's modify_conformer convention — otherwise the
+        # reverse step rotates in the wrong sense and amplifies the PROTAC rotation.
         ligand_pos = ligand_pos + tr_perturb.unsqueeze(1)
         rot_matrix = so3_exp(rot_perturb)
         ligand_center = ligand_pos.mean(dim=1, keepdim=True)
         ligand_centered = ligand_pos - ligand_center
-        ligand_pos = ligand_center + torch.bmm(ligand_centered, rot_matrix)
+        ligand_pos = ligand_center + torch.bmm(ligand_centered, rot_matrix.transpose(-1, -2))
 
         return ligand_pos
 
@@ -505,8 +521,8 @@ class MultiRateDiffusion(nn.Module):
         """
         Returns time discretization for reverse diffusion.
 
-        PROTAC DOFs: linear schedule from t=1 to t=0
-        SE3 DOFs: linear schedule from t=1 to t=0 (but noise decays slower due to λ)
+        PROTAC DOFs: linear schedule from t=1 to t=0 (full-range, no λ_q cutoff)
+        SE3 DOFs: linear schedule from t=1 to t=0 (full-range, no λ_SE3 cutoff)
 
         Returns dict with:
             'tr_schedule': [steps+1] PROTAC translation times

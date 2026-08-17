@@ -45,10 +45,16 @@ class TriCoopDiffTrainer:
         weight_decay: float = 1e-4,
         loss_weights: Optional[Dict[str, float]] = None,
         device: str = 'cuda',
+        contact_distance: float = 3.4,
     ):
         self.model = model.to(device)
         self.diffusion = diffusion
         self.device = device
+
+        # Steric-clash contact distance (Å) for _physical_loss. Fixed 3.4 Å
+        # default (Cα-level coordinates); a true per-atom VDW radius would need
+        # element information, which is out of scope here.
+        self.contact_distance = contact_distance
 
         # Loss weights (from execution plan: score=1.0, phys=0.5, se3=0.3)
         self.loss_weights = loss_weights or {
@@ -181,7 +187,7 @@ class TriCoopDiffTrainer:
 
         # Physical consistency loss
         denoised_ligand = self._estimate_denoised(noisy_ligand, output['s_q']['tr'], tr_sigma)
-        denoised_poi = self._estimate_denoised_se3(noisy_poi, output['s_se3'], se3_tr_sigma)
+        denoised_poi = self._estimate_denoised_se3(noisy_poi, output['s_se3'], se3_tr_sigma, se3_rot_sigma)
         loss_phys = self._physical_loss(
             denoised_ligand, noisy_e3_data['coords'], denoised_poi
         )
@@ -261,13 +267,24 @@ class TriCoopDiffTrainer:
         """Tweedie's formula: x̂ = x_noisy + σ² * score"""
         return noisy_pos + sigma.unsqueeze(-1).unsqueeze(-1) ** 2 * score.unsqueeze(1)
 
-    def _estimate_denoised_se3(self, noisy_poi, se3_score, sigma):
-        """Estimate denoised POI positions using Tweedie's formula."""
+    def _estimate_denoised_se3(self, noisy_poi, se3_score, sigma_tr, sigma_rot):
+        """Estimate denoised POI positions using Tweedie's formula (translation + rotation).
+
+        The SE3 forward process is ``noisy = (clean - center) @ exp(ω) + center + tr``
+        (no transpose, i.e. the ``@ R`` convention) with score targets ``-tr/σ_tr²``
+        and ``-ω/σ_rot²``. Tweedie therefore gives ``tr̂ = σ_tr²·tr_score`` and
+        ``ω̂ = σ_rot²·rot_score``; the denoised rotation applies ``@ exp(-ω̂)``,
+        which equals ``@ exp(σ_rot²·rot_score)`` — again no transpose, matching the
+        SE3 ``@ R`` convention.
+        """
+        from .diffusion import so3_exp
         tr_score = se3_score[:, :3]
-        # Apply to POI center
+        rot_score = se3_score[:, 3:]
         poi_center = noisy_poi.mean(dim=1, keepdim=True)
-        denoised_center = poi_center + sigma.unsqueeze(-1).unsqueeze(-1) ** 2 * tr_score.unsqueeze(1)
-        return noisy_poi - poi_center + denoised_center
+        denoised_center = poi_center + sigma_tr.unsqueeze(-1).unsqueeze(-1) ** 2 * tr_score.unsqueeze(1)
+        rot_correction = so3_exp((sigma_rot.unsqueeze(-1) ** 2) * rot_score)  # [B,3,3]
+        denoised_centered = torch.bmm(noisy_poi - poi_center, rot_correction)
+        return denoised_centered + denoised_center
 
     def _physical_loss(self, ligand_coords, e3_coords, poi_coords):
         """
@@ -275,7 +292,8 @@ class TriCoopDiffTrainer:
         PROTAC and both proteins.
 
         Per-atom VDW repulsion: Σ max(0, vdw_sum - dist)² over all
-        PROTAC-protein atom pairs, using a fixed 3.4 Å contact distance.
+        PROTAC-protein atom pairs, using a configurable contact distance
+        (``self.contact_distance``, default 3.4 Å).
         O(N_lig × N_prot) via torch.cdist — sufficient at MVP scale.
         """
         clash = torch.tensor(0.0, device=ligand_coords.device)
@@ -284,8 +302,8 @@ class TriCoopDiffTrainer:
                 continue
             # [B, N_lig, N_prot] pairwise distances
             dist = torch.cdist(ligand_coords, protein_coords)
-            # Repulsive term: atom pairs closer than 3.4 Å contribute
-            clash = clash + (F.relu(3.4 - dist) ** 2).mean()
+            # Repulsive term: atom pairs closer than the contact distance contribute
+            clash = clash + (F.relu(self.contact_distance - dist) ** 2).mean()
         return clash
 
     def scheduler_step(self):
@@ -311,20 +329,33 @@ class TriCoopDiffTrainer:
                 param.requires_grad = True
 
     def save_checkpoint(self, path: str):
-        """Save model checkpoint."""
+        """Save model checkpoint.
+
+        Stores only the trainable TriBrain state (the frozen expert is ~131 MB and
+        never changes, so its full ``model_state_dict`` was redundant bloat), plus
+        optimizer/scheduler state and the global step for resumable training.
+        """
         torch.save({
             'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
             'tribrain_state_dict': self.model.tribrain.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
         }, path)
 
     def load_checkpoint(self, path: str):
-        """Load model checkpoint (for fine-tuning)."""
+        """Load model checkpoint (for fine-tuning / resume).
+
+        Restores TriBrain weights plus optimizer/scheduler state when present.
+        Older checkpoints without optimizer/scheduler keys are handled gracefully
+        (weights + global step only).
+        """
         ckpt = torch.load(path, map_location=self.device)
         self.model.tribrain.load_state_dict(ckpt['tribrain_state_dict'])
-        self.global_step = ckpt['global_step']
+        self.global_step = ckpt.get('global_step', 0)
+        if 'optimizer_state_dict' in ckpt:
+            self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if 'scheduler_state_dict' in ckpt:
+            self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
 
 
 # so3_score_norm — imported from tricoopdiff.diffusion where needed
