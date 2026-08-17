@@ -220,12 +220,11 @@ class TriCoopDiff(nn.Module):
             all_confidence.append(tri_out['confidence'])
             all_state.append(tri_out['state'])
 
-        # Stack batch results
-        s_q = {
-            k: torch.stack(v, dim=0).squeeze(0) if len(v[0].shape) <= 2
-            else torch.cat(v, dim=0)
-            for k, v in all_s_q.items()
-        }
+        # Stack batch results. Each v[b] carries a leading batch dim of 1
+        # (e.g. tr/rot are [1,3], tor is [1,K]), so torch.cat along dim 0
+        # yields [B,3]/[B,K] for both B=1 and B>1. (The previous
+        # torch.stack(...).squeeze(0) left a stray [B,1,3] for B>1.)
+        s_q = {k: torch.cat(v, dim=0) for k, v in all_s_q.items()}
 
         return {
             's_q': s_q,

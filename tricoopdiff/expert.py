@@ -14,7 +14,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 from e3nn import o3
-from torch_scatter import scatter_mean
 
 # Vendored DiffDock so3/torus score norms — single source of truth so the
 # FiLM-path score computation matches native CGModel.forward() exactly

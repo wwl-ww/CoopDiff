@@ -17,45 +17,11 @@ from typing import Dict, List, Optional, Tuple
 # Structure Quality Metrics
 # ---------------------------------------------------------------------------
 
-def compute_dockq(
-    pred_coords: np.ndarray,
-    ref_coords: np.ndarray,
-    interface_cutoff: float = 5.0,
-) -> float:
-    """
-    Compute DockQ score for ternary complex.
-
-    DockQ = fraction of native interface contacts recovered in the prediction.
-    An interface contact is defined as a pair of residues (one from each protein)
-    with Cβ-Cβ distance < cutoff in the reference structure.
-
-    Args:
-        pred_coords: [N_pred, 3] predicted Cβ coordinates
-        ref_coords: [N_ref, 3] reference Cβ coordinates
-        interface_cutoff: distance cutoff for interface contacts (Å)
-
-    Returns:
-        DockQ score in [0, 1], higher is better
-    """
-    from scipy.spatial.distance import cdist
-
-    # Compute pairwise distances
-    pred_dist = cdist(pred_coords, pred_coords)
-    ref_dist = cdist(ref_coords, ref_coords)
-
-    # Interface contacts in reference
-    ref_contacts = ref_dist < interface_cutoff
-
-    if ref_contacts.sum() == 0:
-        return 0.0
-
-    # Fraction of reference contacts recovered
-    pred_contacts = pred_dist < interface_cutoff
-    recovered = (ref_contacts & pred_contacts).sum()
-    dockq = recovered / ref_contacts.sum()
-
-    return float(dockq)
-
+# NOTE (BUG-1): `compute_dockq` was removed here. It computed *intra*-molecule
+# contact-map similarity (`cdist(coords, coords)` on a single coordinate set),
+# which is NOT DockQ (DockQ = Fnat across two proteins + iRMS/Lrms). It was
+# also dead code — `evaluate_model` uses `compute_e3_interface_dockq` /
+# `compute_poi_dockq` instead, and no other module imported or called it.
 
 def compute_rmsd(
     pred_coords: np.ndarray,
@@ -913,13 +879,23 @@ def _estimate_torsional_strain(
     coords: np.ndarray,
     dihedral_indices: List[Tuple[int, int, int, int]],
 ) -> float:
-    """Estimate torsional strain from dihedral angles."""
+    """
+    Estimate torsional strain from dihedral angles.
+
+    Uses a cos(3φ) torsional-potential proxy: staggered conformations (gauche
+    ±60°, anti 180°) are the low-energy minima (strain → 0), while eclipsed
+    conformations (0°, ±120°) are the torsional barriers (strain → 1).
+
+    This is a *geometric approximation*, not a real force-field torsional term:
+    it ignores substituent size, asymmetric barriers, and the differing well
+    depths of anti vs gauche, so treat it as a rough ranking of linker strain
+    rather than a physically exact energy (BUG-12).
+    """
     strains = []
     for i, j, k, l in dihedral_indices:
         angle = _compute_dihedral(coords[i], coords[j], coords[k], coords[l])
-        # Penalize near 0° or 180° (eclipsed conformations)
-        sin_sq = np.sin(angle) ** 2
-        strains.append(1.0 - sin_sq)  # 0 = staggered (good), 1 = eclipsed (bad)
+        # cos(3φ) = +1 at eclipsed (0°/120°/240°), -1 at staggered (60°/180°/300°)
+        strains.append(0.5 * (1.0 + np.cos(3.0 * angle)))
     return np.mean(strains) if strains else 0.0
 
 

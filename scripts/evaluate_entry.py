@@ -32,20 +32,39 @@ import sys
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_DIFFDOCK_DIR = _PROJECT_ROOT.parent / "DiffDock"
+
+
+def _resolve_diffdock_dir():
+    """Locate the DiffDock checkout used for *data featurization only*.
+
+    DiffDock is git-ignored and may be cloned either in-repo (``./DiffDock``) or
+    as a sibling (``../DiffDock``). Prefer the in-repo clone and fall back to the
+    sibling; both must contain ``utils/inference_utils.py`` and
+    ``datasets/process_mols.py``.
+    """
+    candidates = (_PROJECT_ROOT / "DiffDock", _PROJECT_ROOT.parent / "DiffDock")
+    for d in candidates:
+        if (d / "utils" / "inference_utils.py").exists() and \
+                (d / "datasets" / "process_mols.py").exists():
+            return d
+    raise RuntimeError(
+        "DiffDock checkout not found. Expected at either "
+        f"{candidates[0]} or {candidates[1]} (with utils/inference_utils.py and "
+        "datasets/process_mols.py). Clone DiffDock into one of those paths."
+    )
+
+
+_DIFFDOCK_DIR = _resolve_diffdock_dir()
 
 # Make the project root + this script's dir importable (not pip-installed).
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # (1) Import diffdock_compat FIRST — patches torch_cluster/torch_scatter before
-# the vendored cg_model and ../DiffDock bind those symbols at import time.
+# the vendored cg_model and the DiffDock checkout bind those symbols at import time.
 import tricoopdiff.diffdock_compat  # noqa: F401
 
-# (2) Add ../DiffDock to sys.path for data featurization ONLY.
-if not _DIFFDOCK_DIR.exists():
-    print(f"FATAL: DiffDock checkout not found at {_DIFFDOCK_DIR}", flush=True)
-    sys.exit(1)
+# (2) Add the DiffDock checkout to sys.path for data featurization ONLY.
 sys.path.insert(0, str(_DIFFDOCK_DIR))
 
 import torch

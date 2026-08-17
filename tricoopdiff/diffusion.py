@@ -1,12 +1,15 @@
 """
-Multi-rate diffusion process for TriCoopDiff.
+Diffusion process for TriCoopDiff.
 
-Different degrees of freedom use different noise decay rates:
-- PROTAC (translation, rotation, torsion): fast noise decay (λ_q, threshold t=0.7)
-- E3-POI rigid body: slow noise decay (λ_SE3, threshold t=0.5)
-
-This is an empirical noise schedule trick, not a strict SDE derivation.
-The threshold-based λ definition is a non-differentiable engineering approximation.
+PROTAC (translation, rotation, torsion) and the E3-POI rigid body (SE3: 3
+translation + 3 rotation) each follow an exponential σ(t) noise schedule, but
+with DIFFERENT σ bounds — faster noise decay for the PROTAC DOFs, slower for the
+SE3 rigid body. All schedules are FULL-RANGE: noise is sampled at the raw σ(t)
+for every t ∈ [0, 1], with no λ_q / λ_SE3 cutoff masking. (The earlier
+threshold-based λ multi-rate masking was removed in the debug-se3-loss work so
+that the forward noise process, the reverse denoising steps, and the DSM
+training target all use the same full σ schedule — the forward/reverse
+asymmetry that masking introduced left the low-t regime untrained at inference.)
 
 Reference frame: E3 fixed at origin. POI moves relative to E3. PROTAC is
 globally defined in the E3 reference frame.
@@ -35,13 +38,17 @@ class MultiRateDiffusion(nn.Module):
 
     def __init__(
         self,
-        # PROTAC noise parameters (from DiffDock-L paper: 0.1→19, 0.03→1.55)
+        # PROTAC noise parameters (from checkpoints/score_model/model_parameters.yml:
+        # tr 0.1→19, rot 0.03→1.55, tor 0.0314→3.14). The tor bounds MUST match the
+        # yml — the expert's baked-in score normalization (expert.py, via
+        # model.t_to_sigma) uses 0.0314/3.14, so a mismatched 0.03/1.55 here makes
+        # the reverse-step tor_g ~4.8× too weak and decouples forward/reverse σ.
         tr_sigma_min: float = 0.1,
         tr_sigma_max: float = 19.0,
         rot_sigma_min: float = 0.03,
         rot_sigma_max: float = 1.55,
-        tor_sigma_min: float = 0.03,
-        tor_sigma_max: float = 1.55,
+        tor_sigma_min: float = 0.0314,
+        tor_sigma_max: float = 3.14,
         # Temperature sampling (from DiffDock v1.1 default_inference_args.yaml)
         temp_sampling_tr: float = 1.17,
         temp_sampling_rot: float = 2.06,
@@ -57,9 +64,15 @@ class MultiRateDiffusion(nn.Module):
         se3_tr_sigma_max: float = 20.0,
         se3_rot_sigma_min: float = 0.05,
         se3_rot_sigma_max: float = 1.0,
-        # Multi-rate thresholds
-        lambda_q_threshold: float = 0.7,   # PROTAC noise cutoff
-        lambda_se3_threshold: float = 0.5,  # SE3 noise cutoff (slower)
+        # DEPRECATED multi-rate thresholds. The λ_q/λ_SE3 cutoff masking was
+        # removed from the forward/reverse path in the debug-se3-loss work
+        # (add_noise_* / reverse_step_* now use the full σ schedule for all t).
+        # Retained only so legacy diagnostic scripts and tests can still
+        # reference/override them (scripts/diagnose_loss_se3.py,
+        # scripts/verify_se3_sigma_consistency.py, scripts/inference.py,
+        # tests/test_model_build.py). Production code never consults them.
+        lambda_q_threshold: float = 0.7,   # deprecated PROTAC noise cutoff
+        lambda_se3_threshold: float = 0.5,  # deprecated SE3 noise cutoff (slower)
         # Schedule
         inference_steps: int = 20,
     ):
@@ -78,7 +91,9 @@ class MultiRateDiffusion(nn.Module):
         self.se3_rot_sigma_min = se3_rot_sigma_min
         self.se3_rot_sigma_max = se3_rot_sigma_max
 
-        # Multi-rate thresholds
+        # Deprecated multi-rate thresholds — see the constructor note above.
+        # Kept as attributes for backward compatibility with legacy diagnostic
+        # scripts; the production noise/reverse paths no longer consult them.
         self.lambda_q_threshold = lambda_q_threshold
         self.lambda_se3_threshold = lambda_se3_threshold
 
@@ -120,21 +135,31 @@ class MultiRateDiffusion(nn.Module):
         return tr_sigma, rot_sigma
 
     # ------------------------------------------------------------------
-    # Multi-rate λ masking
+    # Deprecated: multi-rate λ masking (removed from the production path)
     # ------------------------------------------------------------------
 
     def get_lambda_q(self, t: torch.Tensor) -> torch.Tensor:
         """
-        PROTAC noise multiplier λ_q(t).
-        λ_q(t) = 1 for t > threshold, 0 for t <= threshold.
-        This is a stepwise, non-differentiable engineering approximation.
+        DEPRECATED. PROTAC noise multiplier λ_q(t).
+
+        λ_q(t) = 1 for t > threshold, 0 for t <= threshold. This stepwise,
+        non-differentiable mask was removed from the production forward/reverse
+        path in the debug-se3-loss work: ``add_noise_protac`` and
+        ``reverse_step_protac`` now use the full σ schedule for all t. Retained
+        only for legacy diagnostic scripts/tests (e.g. scripts/diagnose_loss_se3.py,
+        tests/test_model_build.py); production code must not call it.
         """
         return (t > self.lambda_q_threshold).float()
 
     def get_lambda_se3(self, t: torch.Tensor) -> torch.Tensor:
         """
-        SE3 noise multiplier λ_SE3(t).
-        λ_SE3(t) = 1 for t > threshold, 0 for t <= threshold.
+        DEPRECATED. SE3 noise multiplier λ_SE3(t).
+
+        λ_SE3(t) = 1 for t > threshold, 0 for t <= threshold. Removed from the
+        production path (``add_noise_se3`` / ``reverse_step_se3`` now use the full
+        σ schedule). Retained only for legacy diagnostic scripts/tests (e.g.
+        scripts/verify_se3_sigma_consistency.py, scripts/inference.py); production
+        code must not call it.
         """
         return (t > self.lambda_se3_threshold).float()
 
@@ -434,10 +459,28 @@ class MultiRateDiffusion(nn.Module):
         _, _, tor_sigma = self.t_to_sigma(t_tor, t_tor, t_tor)
         tor_g = tor_sigma * np.sqrt(2 * np.log(self.tor_sigma_max / self.tor_sigma_min))
 
-        tor_perturb = tor_g**2 * dt_tor.unsqueeze(-1) * tor_score
-        if add_noise:
-            tor_z = torch.randn(B, tor_score.shape[-1], device=device)
-            tor_perturb = tor_perturb + tor_g * torch.sqrt(dt_tor).unsqueeze(-1) * tor_z
+        # Torsion update (with temperature sampling). Mirrors the tr/rot branches
+        # in reverse_step_protac and DiffDock's sampling.py:202-205. Without this,
+        # temp_sampling_tor=7.04 was defined but never read, collapsing the torsion
+        # drift to ~1/25 of native and letting noise dominate the denoising.
+        if self.temp_sampling[2] != 1.0:
+            ts = self.temp_sampling[2]
+            tpsi = self.temp_psi[2]
+            tsd = self.temp_sigma_data[2]
+            tor_sigma_data = torch.exp(torch.tensor(
+                tsd * np.log(self.tor_sigma_max) + (1 - tsd) * np.log(self.tor_sigma_min),
+                device=device, dtype=tor_sigma.dtype,
+            ))
+            lambda_tor = (tor_sigma_data + tor_sigma) / (tor_sigma_data + tor_sigma / ts)
+            tor_perturb = (tor_g**2 * dt_tor.unsqueeze(-1) * (lambda_tor + ts * tpsi / 2) * tor_score)
+            if add_noise:
+                tor_z = torch.randn(B, tor_score.shape[-1], device=device)
+                tor_perturb = tor_perturb + tor_g * torch.sqrt(dt_tor * (1 + tpsi)).unsqueeze(-1) * tor_z
+        else:
+            tor_perturb = tor_g**2 * dt_tor.unsqueeze(-1) * tor_score
+            if add_noise:
+                tor_z = torch.randn(B, tor_score.shape[-1], device=device)
+                tor_perturb = tor_perturb + tor_g * torch.sqrt(dt_tor).unsqueeze(-1) * tor_z
 
         rot_edges = lig_edge_index.T[lig_edge_mask]  # [n_rot, 2]
         if not isinstance(lig_mask_rotate, (list, tuple)):

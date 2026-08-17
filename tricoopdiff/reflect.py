@@ -4,7 +4,7 @@ TriReflect: Physical post-processing for ternary complex structures.
 Detects and optionally fixes physical rule violations in generated structures:
 1. Steric clashes (atom pairs closer than van der Waals radii)
 2. Bond length anomalies (> 1.5× standard bond length)
-3. Linker torsional strain (|dihedral| < 30° or > 150°)
+3. Linker torsional strain (near-eclipsed dihedrals, within 30° of 0° or ±120°)
 4. Local MMFF94 energy minimization (max 3 rounds)
 
 The "reflect" metaphor: the diffusion model generates, TriReflect reflects
@@ -70,9 +70,10 @@ STANDARD_BOND_LENGTHS = {
 # Default bond length tolerance factor
 BOND_LENGTH_TOLERANCE = 1.5
 
-# Linker strain thresholds (degrees)
-LINKER_STRAIN_MIN = 30.0   # |dihedral| below this = strained
-LINKER_STRAIN_MAX = 150.0  # |dihedral| above this = strained
+# Linker strain threshold (degrees): a dihedral within this angular distance of
+# an *eclipsed* conformation (0° or ±120°) is flagged as strained. Staggered
+# conformations (gauche ±60°, anti 180°) are the low-energy minima, not strain.
+LINKER_STRAIN_MIN = 30.0
 
 
 def detect_clashes(
@@ -216,21 +217,28 @@ def detect_bond_anomalies(
 def detect_linker_strain(
     dihedral_angles: np.ndarray,
     strain_min: float = LINKER_STRAIN_MIN,
-    strain_max: float = LINKER_STRAIN_MAX,
 ) -> np.ndarray:
     """
     Detect strained torsional angles in the PROTAC linker.
 
+    A dihedral is flagged as strained only when it is near an *eclipsed*
+    conformation (0° or ±120°), which is the torsional barrier. Staggered
+    conformations — gauche (±60°) and anti (180°) — are the low-energy minima
+    and are NOT strained; anti in particular was previously mis-flagged.
+
     Args:
         dihedral_angles: [K] dihedral angles in radians
-        strain_min: minimum acceptable |angle| in degrees
-        strain_max: maximum acceptable |angle| in degrees
+        strain_min: angular distance (degrees) from the nearest eclipsed
+            conformation below which a dihedral is flagged as strained
 
     Returns:
         [K] bool array, True for strained bonds
     """
     abs_deg = np.abs(np.degrees(dihedral_angles))
-    return (abs_deg < strain_min) | (abs_deg > strain_max)
+    # Dihedral is in (-π, π] so |φ| ∈ [0°, 180°]. Eclipsed conformations sit at
+    # 0° and 120° (240° ≡ -120° ≡ |120°|). Distance to the nearest one:
+    dist_to_eclipsed = np.minimum(abs_deg, np.abs(abs_deg - 120.0))
+    return dist_to_eclipsed < strain_min
 
 
 def local_minimization(
@@ -239,6 +247,7 @@ def local_minimization(
     clash_atoms: np.ndarray,
     max_rounds: int = 3,
     step_size: float = 0.01,
+    bonds: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Simple local energy minimization to resolve clashes.
@@ -253,6 +262,8 @@ def local_minimization(
         clash_atoms: [N] bool mask of clashing atoms
         max_rounds: maximum minimization rounds
         step_size: gradient step size
+        bonds: optional bond graph forwarded to `detect_clashes` so 1-2/1-3/1-4
+            pairs are excluded (see `detect_clashes` for accepted formats)
 
     Returns:
         [N, 3] adjusted coordinates
@@ -284,7 +295,7 @@ def local_minimization(
             coords[idx] += step_size * force
 
         # Re-check clashes
-        clash_atoms = detect_clashes(coords, atomic_numbers)
+        clash_atoms = detect_clashes(coords, atomic_numbers, bonds=bonds)
 
     return coords
 
@@ -321,7 +332,7 @@ def tricoop_reflect(
             'is_valid': bool True if no hard violations remain
     """
     # 1. Clash detection
-    clash_mask = detect_clashes(coords, atomic_numbers)
+    clash_mask = detect_clashes(coords, atomic_numbers, bonds=bonds)
     n_clashes = clash_mask.sum()
 
     # 2. Bond anomaly detection
@@ -340,9 +351,9 @@ def tricoop_reflect(
 
     # 4. (Optional) Local minimization
     if do_minimization and n_clashes > 0:
-        coords = local_minimization(coords, atomic_numbers, clash_mask)
+        coords = local_minimization(coords, atomic_numbers, clash_mask, bonds=bonds)
         # Re-check after minimization
-        clash_mask = detect_clashes(coords, atomic_numbers)
+        clash_mask = detect_clashes(coords, atomic_numbers, bonds=bonds)
         n_clashes = clash_mask.sum()
 
     # 5. Validity flag: no hard violations

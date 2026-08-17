@@ -1,6 +1,11 @@
 """
 TriCoopDiff inference script.
 
+LEGACY — DO NOT USE. This is a stale parallel entry point with placeholder
+zero-features, an out-of-date ``load_model`` path, and its own reverse-diffusion
+loop. Use ``scripts/evaluate_entry.py`` (featurize_common → expert_factory →
+sampler) instead. Invoking ``main()`` prints a loud banner and exits non-zero.
+
 Generates PROTAC ternary complex structures via multi-walker reverse diffusion.
 
 Usage:
@@ -35,6 +40,27 @@ import torch
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+_LEGACY_BANNER = """\
+======================================================================
+LEGACY — do not use; use evaluate_entry.py instead
+======================================================================
+scripts/inference.py is a stale parallel entry point that predates the
+real pipeline. It has placeholder zero-features (parse_protein returns
+torch.zeros for residue features), an out-of-date load_model path, and its
+own reverse-diffusion loop. It diverges from the supported evaluation path:
+
+    evaluate_entry.py -> featurize_common -> expert_factory -> sampler
+
+Refusing to run. Use scripts/evaluate_entry.py instead.
+======================================================================
+"""
+
+
+def _legacy_refuse():
+    """Print the legacy banner and exit non-zero (BUG-19)."""
+    print(_LEGACY_BANNER, file=sys.stderr)
+    sys.exit(2)
 
 
 def parse_args():
@@ -81,6 +107,7 @@ def parse_args():
 
 
 def main():
+    _legacy_refuse()
     args = parse_args()
 
     # ----------------------------------------------------------------

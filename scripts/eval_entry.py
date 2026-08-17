@@ -1,6 +1,11 @@
 """
 TriCoopDiff evaluation runner.
 
+LEGACY — DO NOT USE. This is a stale parallel entry point that imports the legacy
+``scripts/inference.py`` and has its own reverse-diffusion loop with placeholder
+``torch.randn``/``torch.zeros`` features. Use ``scripts/evaluate_entry.py``
+instead. Invoking ``main()`` prints a loud banner and exits non-zero.
+
 Runs multi-walker sampling → conformational ensemble → full metrics report.
 Outputs structured JSON for comparison with DeepTernary audit results.
 
@@ -28,6 +33,27 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+_LEGACY_BANNER = """\
+======================================================================
+LEGACY — do not use; use evaluate_entry.py instead
+======================================================================
+scripts/eval_entry.py is a stale parallel entry point that imports the legacy
+scripts/inference.py and runs its own reverse-diffusion loop with placeholder
+torch.randn/torch.zeros features. It diverges from the supported evaluation
+path:
+
+    evaluate_entry.py -> featurize_common -> expert_factory -> sampler
+
+Refusing to run. Use scripts/evaluate_entry.py instead.
+======================================================================
+"""
+
+
+def _legacy_refuse():
+    """Print the legacy banner and exit non-zero (BUG-19)."""
+    print(_LEGACY_BANNER, file=sys.stderr)
+    sys.exit(2)
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="TriCoopDiff evaluation runner")
@@ -44,6 +70,7 @@ def parse_args():
 
 
 def main():
+    _legacy_refuse()
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
     device = torch.device(args.device)

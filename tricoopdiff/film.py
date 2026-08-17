@@ -5,72 +5,14 @@ signals into the frozen two-body expert.
 Follows the DiT adaLN-Zero paradigm: each FiLM head is zero-initialized so that
 at training start, the FiLM modulation is transparent (h' = h, output identical
 to native DiffDock).
+
+NOTE: only ``apply_film`` from this module is used by the production path
+(model.py:_expert_forward_with_film). The actual FiLM (γ, β) heads live in
+``tribrain.py:FiLMHead``. The former standalone ``FiLMSharedMLP`` /
+``FiLMLayerHead`` classes here were dead code and have been removed.
 """
 
 import torch
-import torch.nn as nn
-
-
-class FiLMSharedMLP(nn.Module):
-    """
-    Shared MLP that maps TriBrain's pooled condition vector to a shared
-    conditioning embedding, which is then consumed by per-layer FiLM heads.
-    """
-
-    def __init__(self, cond_dim: int = 256, hidden_dim: int = 256):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(cond_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-    def forward(self, h_cond: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            h_cond: [B, cond_dim] pooled condition from TriBrain
-        Returns:
-            [B, hidden_dim] shared conditioning embedding
-        """
-        return self.mlp(h_cond)
-
-
-class FiLMLayerHead(nn.Module):
-    """
-    Per-layer FiLM head. Takes the shared conditioning embedding and produces
-    (gamma, beta) modulation parameters for one conv layer of one subgraph.
-
-    Zero-initialized: the last Linear weight and bias are zero, so at init:
-        h' = h * (1 + 0) + 0 = h  (transparent)
-    """
-
-    def __init__(self, node_dim: int, cond_dim: int = 256):
-        """
-        Args:
-            node_dim: dimension of node features being modulated
-            cond_dim: dimension of shared conditioning embedding
-        """
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(cond_dim, node_dim * 2),
-        )
-        # Zero-initialize for transparent modulation at training start
-        nn.init.zeros_(self.net[1].weight)
-        nn.init.zeros_(self.net[1].bias)
-
-    def forward(self, h_cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            h_cond: [B, cond_dim] or [N, cond_dim] conditioning
-        Returns:
-            gamma: [B/N, node_dim] scale modulation
-            beta:  [B/N, node_dim] shift modulation
-        """
-        out = self.net(h_cond)
-        gamma, beta = out.chunk(2, dim=-1)
-        return gamma, beta
 
 
 def apply_film(

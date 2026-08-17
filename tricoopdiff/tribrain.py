@@ -54,16 +54,22 @@ except ImportError:
 
 class MultiScalePooling(nn.Module):
     """
-    Three-scale pooling of the ternary graph into a compact token sequence.
+    Pool the ternary-graph node features into a single [B, token_dim] token.
 
-    - Short-range (<20Å): attention pooling on heavy atoms, d=64
-    - Mid-range (<50Å): Cα coarse-graining + attention pooling, d=64
-    - Global: mean + max pooling over all nodes, d=64
+    Despite the name, this is NOT distance-tiered pooling: there is no distance
+    cutoff and no Cα coarse-graining. All three branches below operate on the
+    SAME full node set (every E3 + POI + PROTAC node); they differ only in the
+    linear projection and the pooling operator:
 
-    Output: [N_tokens, 128] where the first dim is the 3 pooled tokens
-    concatenated along the feature dimension.
+    - ``short``:  ``short_proj``  + attention pooling (learnable ``short_query``)
+    - ``mid``:    ``mid_proj``    + attention pooling (learnable ``mid_query``)
+    - ``global``: ``global_proj`` + (mean + max) / 2 pooling
 
-    Total params: ~66k
+    The three pooled [B, token_dim] tokens are SUMMED (not concatenated) into the
+    final output. ``node_coords`` is accepted for interface compatibility but is
+    currently UNUSED — coordinate/geometry information is supplied separately by
+    ``SE3GeometryEncoder``. Real distance-tiered pooling would be a future
+    extension and is not implemented here.
     """
 
     def __init__(
@@ -110,21 +116,22 @@ class MultiScalePooling(nn.Module):
             batch: [N] batch index (optional, defaults to all zeros)
 
         Returns:
-            [B, 128] pooled token sequence (flattened 3×128→384 for now,
-                      split into separate heads downstream)
+            [B, token_dim] pooled token (the SUM of the three branch pools;
+            they are not concatenated, despite older comments claiming 3×128→384).
         """
         if batch is None:
             batch = torch.zeros(node_features.shape[0], dtype=torch.long, device=node_features.device)
         n_batch = batch.max().item() + 1
 
-        # Short-range: attention pooling over ligand + nearby residues
+        # Branch 1 ("short"): projection + attention pooling (learnable query).
         short_feat = self.short_proj(node_features)  # [N, token_dim]
         # Simple attention: dot product with learnable query
         attn_scores = torch.matmul(short_feat, self.short_query.T)  # [N, 1]
         attn_weights = torch_softmax_per_batch(attn_scores, batch, n_batch)  # [N, 1]
         short_pooled = scatter_sum(short_feat * attn_weights, batch, dim=0, dim_size=n_batch)  # [B, token_dim]
 
-        # Mid-range: also attention-pooled (Cα-level is handled by caller via input selection)
+        # Branch 2 ("mid"): projection + attention pooling (learnable query).
+        # (No Cα coarse-graining is performed; the caller passes the full node set.)
         mid_feat = self.mid_proj(node_features)
         attn_scores_mid = torch.matmul(mid_feat, self.mid_query.T)
         attn_weights_mid = torch_softmax_per_batch(attn_scores_mid, batch, n_batch)
@@ -135,9 +142,9 @@ class MultiScalePooling(nn.Module):
         global_mean = scatter_mean(global_feat, batch, dim=0, dim_size=n_batch)
         global_max = scatter_max_per_batch(global_feat, batch, n_batch)
 
-        # Concatenate all scales: [B, 128]
-        # Each scale contributes equally: short=43, mid=43, global=42 ≈ 128
-        # (dimensionality managed by splitting 128 across the three linear projections)
+        # Sum the three pooled [B, token_dim] tokens (NOT concatenation). The
+        # three branches are parallel views of the same node set, so their sum
+        # is the final pooled representation.
         pooled = short_pooled + mid_pooled + (global_mean + global_max) / 2.0
 
         return pooled  # [B, token_dim]
@@ -271,9 +278,19 @@ class SE3GeometryEncoder(nn.Module):
 
 class EquivariantTransformer(nn.Module):
     """
-    SE(3)-equivariant transformer for ternary graph processing.
+    Scalar/vector token processor operating on the SINGLE pooled token.
 
-    MVP configuration: 3 layers, single-head cross-attention,
+    NOTE ON THE NAME: "EquivariantTransformer" is a legacy/misleading name. This
+    is NOT an SE(3)-equivariant transformer over the ternary graph — it does not
+    read per-node coordinates or features and performs no cross-product /
+    geometric interaction. It only maps the pooled [B, node_dim] token through
+    scalar and vector linear projections and a stack of layers (scalar
+    self-attention + scalar-gated vector magnitude update). The vector channels
+    are updated equivariantly (see ``EquivariantTransformerLayer``), but all
+    geometry enters via ``SE3GeometryEncoder``, which is the coordinate-aware
+    module that compensates for this class's coordinate-blindness.
+
+    MVP configuration: 3 layers, single-head self-attention over the batch,
     32 scalar channels + 4 vector channels.
     """
 
@@ -304,22 +321,16 @@ class EquivariantTransformer(nn.Module):
         self.scalar_out = nn.Linear(ns, node_dim)
         self.vector_out = nn.Linear(nv * 3, node_dim)
 
-    def forward(
-        self,
-        pooled: torch.Tensor,
-        node_coords: torch.Tensor,
-        node_features: torch.Tensor,
-        batch: torch.Tensor = None,
-    ) -> dict:
+    def forward(self, pooled: torch.Tensor) -> dict:
         """
         Args:
-            pooled: [B, node_dim] pooled token from MultiScalePooling
-            node_coords: [N, 3]
-            node_features: [N, node_dim]
-            batch: [N]
+            pooled: [B, node_dim] pooled token from MultiScalePooling.
 
         Returns:
-            dict with 'scalar': [B, node_dim], 'vector': [B, nv*3]
+            dict with 'scalar': [B, node_dim], 'vector': [B, node_dim], and
+            'combined': [B, node_dim] (element-wise sum of the two). Note the
+            'vector' key holds a flat [B, node_dim] projection of the nv vector
+            channels, not the raw [B, nv, 3] channels.
         """
         B = pooled.shape[0]
 
@@ -360,7 +371,13 @@ class EquivariantTransformerLayer(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # Vector update: cross-product + scalar modulation
+        # Vector update: scalar-gated magnitude modulation (equivariant).
+        # NOTE: ``vector_norm`` (nn.LayerNorm over the flattened nv*3 components)
+        # is retained ONLY so that checkpoints saved before this fix still load
+        # under strict state_dict matching. It is intentionally NOT used in
+        # forward: LayerNorm over flattened x/y/z components mixes spatial
+        # directions and breaks O(3) equivariance. The equivariant replacement is
+        # per-vector magnitude normalization (F.normalize) in forward.
         self.vector_norm = nn.LayerNorm(nv * 3)
         self.vector_gate = nn.Linear(ns, nv)  # scalar → vector gate
 
@@ -386,11 +403,13 @@ class EquivariantTransformerLayer(nn.Module):
         s = s + self.scalar_ffn(self.scalar_norm2(s))
 
         # --- Vector update ---
-        # Gate: scalar features modulate vector magnitudes
+        # Gate: scalar features modulate vector magnitudes in an O(3)-equivariant
+        # way — each 3-vector is normalized to unit length (direction preserved,
+        # since rotations preserve norms and directions), then scaled by a
+        # per-channel scalar gate. The old flattened nn.LayerNorm(nv*3) mixed the
+        # x/y/z axes and broke equivariance; it is no longer used.
         gate = self.vector_gate(s).sigmoid()  # [B, nv]
-        v_flat = v.reshape(B, self.nv * 3)
-        v_flat = self.vector_norm(v_flat)
-        v = v_flat.reshape(B, self.nv, 3)
+        v = F.normalize(v, dim=-1, eps=1e-8)  # [B, nv, 3], unit direction
         v = v * gate.unsqueeze(-1)
 
         return s, v
@@ -626,8 +645,9 @@ class TriBrain(nn.Module):
         # 1. Pool the ternary graph to compact tokens
         pooled = self.pooling(node_features, node_coords, node_types, batch)
 
-        # 2. Equivariant transformer
-        transformer_out = self.transformer(pooled, node_coords, node_features, batch)
+        # 2. Scalar/vector token processor (pooled token only; geometry enters
+        #    separately via the SE3GeometryEncoder below).
+        transformer_out = self.transformer(pooled)
         h_cond = transformer_out['combined']  # [B, node_dim]
 
         # 3. Output heads

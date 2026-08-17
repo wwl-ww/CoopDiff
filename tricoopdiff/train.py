@@ -3,10 +3,13 @@ Training pipeline for TriCoopDiff.
 
 Multi-task loss: score matching (L_score) + physical consistency (L_phys) + SE3 (L_se3).
 
-Gradient flow:
-  L_score → score heads (both experts, but experts are frozen → only via FiLM)
-  L_phys  → x_denoised → s_tri_residual → TriBrain (direct path, not through FiLM)
-  L_se3   → TriBrain SE3 head
+Gradient flow (the two-body experts are frozen, requires_grad=False everywhere,
+so every gradient reaches TriBrain only through TriBrain's own outputs — the
+FiLM params and the SE3 head):
+  L_score → merged expert scores s_q (tr/rot/tor) → FiLM params → TriBrain
+  L_phys  → Tweedie-denoiséd PROTAC (from s_q['tr']) → FiLM params → TriBrain
+          → Tweedie-denoiséd POI (from s_se3) → TriBrain SE3 head (direct)
+  L_se3   → TriBrain SE3 head (direct)
 
 Two training phases:
   Phase 1: Train FiLM heads + SE3 head only (freeze judge/state heads)
@@ -96,7 +99,10 @@ class TriCoopDiffTrainer:
         Returns:
             dict of loss values and intermediate tensors
         """
-        self.model.train()  # still need train mode for dropout patterns consistency
+        # NOTE: this method intentionally does NOT set self.model.train()/eval().
+        # The caller owns the mode: train_step() sets train(), validate_step()
+        # sets eval(). Setting train() here would clobber the eval() mode that
+        # validate_step() establishes, keeping dropout active during validation.
         B = e3_data['coords'].shape[0]
         device = self.device
 
@@ -212,6 +218,7 @@ class TriCoopDiffTrainer:
 
     def train_step(self, **batch) -> dict:
         """Forward + backward + optimizer step."""
+        self.model.train()  # dropout / attention dropout active during training
         self.optimizer.zero_grad()
         loss_dict = self.compute_loss(**batch)
         loss_dict['loss_total'].backward()
@@ -226,6 +233,7 @@ class TriCoopDiffTrainer:
     @torch.no_grad()
     def validate_step(self, **batch) -> dict:
         """Forward + loss only, no backward."""
+        self.model.eval()  # dropout / attention dropout off during validation
         loss_dict = self.compute_loss(**batch)
         return {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
 
@@ -288,13 +296,22 @@ class TriCoopDiffTrainer:
 
     def _physical_loss(self, ligand_coords, e3_coords, poi_coords):
         """
-        Physical consistency loss: penalize steric clashes between
+        Physical consistency loss: penalize steric clashes between the
         PROTAC and both proteins.
 
-        Per-atom VDW repulsion: Σ max(0, vdw_sum - dist)² over all
-        PROTAC-protein atom pairs, using a configurable contact distance
-        (``self.contact_distance``, default 3.4 Å).
-        O(N_lig × N_prot) via torch.cdist — sufficient at MVP scale.
+        Soft repulsive term over all PROTAC-protein atom pairs:
+            Σ max(0, contact_distance - dist)²
+        with a single configurable contact distance (``self.contact_distance``,
+        default 3.4 Å), evaluated via torch.cdist — O(N_lig × N_prot),
+        sufficient at MVP scale.
+
+        NOTE (known limitation): this is NOT a true van-der-Waals repulsion. It
+        applies ONE scalar contact distance to every atom pair, ignoring
+        element-dependent VDW radii (a C···C pair is treated identically to an
+        H···O pair). Real per-element radii would require atomic-number/atom-type
+        information, which is out of scope here — and at the well-separated noise
+        level of Phase-1 smoke it would make the term ≈0 anyway. Kept purely as a
+        coarse clash penalty, not a physical force field.
         """
         clash = torch.tensor(0.0, device=ligand_coords.device)
         for protein_coords in (e3_coords, poi_coords):
