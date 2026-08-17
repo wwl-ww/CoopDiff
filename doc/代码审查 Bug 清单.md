@@ -6,6 +6,30 @@
 
 ---
 
+## 〇、2026-08-17 复审（post debug-se3-loss 合并，`bug-fix` 分支）
+
+对当前 `master`（含 debug-se3-loss 的 11 提交）逐条重验。结论：
+
+| 状态 | Bug |
+|------|-----|
+| ✅ **已修**（debug-se3-loss 带入） | BUG-3：`add_noise_protac`/`add_noise_se3` 已改**全区间**（docstring 明写 "no λ_q/λ_SE3 cutoff"），`reverse_step_*` 也全 σ 去噪，前后一致。`get_lambda_q/se` 仅剩诊断脚本引用，生产路径已死代码。 |
+| ✅ **误报**（确认正确） | BUG-6（rot_score 无需 adjoint）、BUG-7（`r_e3_to_poi` 约定一致）、BUG-9（DockQ d 值 = 标准 iRMS 1.5 / Lrms 8.5，`evaluate.py:457-459` 正确） |
+| 🔴 **仍存在** | BUG-18（featurization 独立居中，相对几何被抹）、BUG-20（`../DiffDock` 不存在，实为 `./DiffDock`） |
+| 🟡/🟢 **仍存在** | BUG-1、2、4、5、8、10、11、12、13、14、15、16、17、19（16 个） |
+
+行号漂移（仅标题里的行号过期，结论不变）：BUG-2 `224→225`、BUG-17 `84→99`、BUG-5 `335→364/392`、BUG-16 `116→121`。
+
+**优先修**：🔴 BUG-18（训练监督信号无意义，模型学会"三分子堆原点"）+ 🔴 BUG-20（本机训练/评估入口跑不起来）。
+
+**复审补充（逐函数读正文后新发现，均为 🟢 文档/死代码级）**：
+
+- **N-1** `diffusion.py:1-15` 模块 docstring 仍描述"λ_q（t=0.7）/ λ_SE3（t=0.5）multi-rate masking"，但该 masking 已被 debug-se3-loss 删除 → docstring 过时。
+- **N-2** `get_lambda_q`/`get_lambda_se3`（`diffusion.py:126-139`）+ `MultiRateDiffusion.__init__` 的 `lambda_q_threshold`/`lambda_se3_threshold` 参数已成**死代码**（生产路径不再调用，仅 `diagnose_loss_se3.py`/`verify_se3_sigma_consistency.py` 诊断脚本引用）。
+- **N-3** `train.py:6-8` docstring 的 `s_tri_residual` 是旧设计残留（已记于《参考系与数值梯度专项分析.md》§2.2），且"direct path, not through FiLM"与现状相反。
+- **N-4** BUG-8 加深：`MultiScalePooling` 的"short-range(<20Å)/mid-range(<50Å)"距离分层**根本没实现**——三次 pooling（`tribrain.py:121-141`）都作用在**同一个全节点集**上，只换线性投影/query，无距离 cutoff、无 Cα 粗粒化，`node_coords` 参数未被使用（与 BUG-4 同源：坐标盲）。
+
+---
+
 ## 🔴 严重
 
 ### BUG-20 `featurize_common.py:20` / `evaluate_entry.py:35` 引用 `../DiffDock`（兄弟目录），但 DiffDock 实际在 `./DiffDock`（仓库内）
@@ -39,7 +63,7 @@ dockq = recovered / ref_contacts.sum()
 
 ## 🟡 中等
 
-### BUG-2 `model.py:224` 批量堆叠用 `.squeeze(0)`，对 B>1 是错的
+### BUG-2 `model.py:225` 批量堆叠用 `.squeeze(0)`，对 B>1 是错的
 
 ```python
 s_q = {
@@ -54,7 +78,7 @@ s_q = {
   - B>1 → `.squeeze(0)` 不动（dim0 是 B≠1）→ `[B, 1, 3]` ❌（应该是 `[B, 3]`）
 - 当前 B=1 是唯一模式，所以暂时没炸，但这是埋着的雷。
 
-### BUG-3 多速率 λ 在 forward 有 mask、reverse 没有，前后不一致
+### BUG-3 ~~多速率 λ 在 forward 有 mask、reverse 没有，前后不一致~~（✅ **已修**，debug-se3-loss 合并）
 
 - **forward**：`diffusion.add_noise_protac` / `add_noise_se3` 用 `λ_q` / `λ_se3` 缩放噪声（`tr_update = randn * σ * λ`）。
 - **reverse**：`reverse_step_protac` / `reverse_step_se3` 用**全 σ**（`tr_sigma = t_to_sigma(t)`，不乘 λ）。
@@ -76,7 +100,7 @@ def forward(self, pooled, node_coords, node_features, batch=None):
 - 「等变 transformer」既不读坐标、也不读逐节点特征，只处理一个 `[B, node_dim]` 的 pooled token。向量通道只是 `Linear` 投影 + 标量门控，**没有 docstring 声称的 cross-product，也没有任何几何交互**。
 - 后来的 `SE3GeometryEncoder` 就是为弥补这个「坐标盲」才加的（代码注释也承认了），但 `EquivariantTransformer` 这个类名本身有误导性。
 
-### BUG-5 `tribrain.py:335` 向量更新的 `LayerNorm(nv*3)` 破坏等变性
+### BUG-5 `tribrain.py:364/392` 向量更新的 `LayerNorm(nv*3)` 破坏等变性
 
 ```python
 v_flat = v.reshape(B, self.nv * 3)
@@ -97,7 +121,7 @@ def tricoop_reflect(coords, atomic_numbers, bonds=None, ...):
 - 结果：冲突检测永远走「共价半径 1-2 启发式」，会**把环上的 1-3 原子误判成 clash**（`detect_clashes` 自己的 docstring 也写了这个后果）。
 - 对比：`evaluate.py:compute_clash_rate` 是正确地把 `bonds` 传下去的。`tricoop_reflect` 的 `bonds` 参数是死的。
 
-### BUG-17 `train.py:84` `compute_loss` 无条件 `self.model.train()`，把 validate 的 eval 模式顶掉了
+### BUG-17 `train.py:99` `compute_loss` 无条件 `self.model.train()`，把 validate 的 eval 模式顶掉了
 
 ```python
 # train.py compute_loss 开头：
@@ -137,7 +161,7 @@ scores_2['rot_score'] = scores_2['rot_score'] @ r_poi_to_e3
 
 - 注释说「concatenate 3 scales」「short=43/mid=43/global=42≈128」，但代码是**求和** `short + mid + (global_mean+global_max)/2`，三个都是 128 维。要么改注释，要么确认求和就是设计意图。
 
-### BUG-9 `evaluate.py:456` DockQ 的 d 值需核对标准
+### BUG-9 ~~`evaluate.py:456` DockQ 的 d 值需核对标准~~（✅ **误报**，`evaluate.py:457-459` = 标准 DockQ：iRMS d=1.5、Lrms d=8.5）
 
 - `dockq = (fnat + 1/(1+(irms/1.5)²) + 1/(1+(lrms/8.5)²)) / 3`。标准 DockQ 的缩放（iRMS 用哪个 d、Lrms 用哪个 d）需对照 Basu & Wallner 2016 原文确认是否写反。
 
@@ -166,7 +190,7 @@ return (abs_deg < strain_min) | (abs_deg > strain_max)   # strain_min=30, strain
 - `expert.py` 里 `scatter_mean` 没有被任何地方用到（`compute_scores` 调的是 model 内部方法）。
 - 顺带一个隐患：如果 `expert.py` 被**绕过 `__init__.py`/`expert_factory` 直接 import**，`torch_scatter` 是坏 stub 时这条导入会失败。依赖 `diffdock_compat` 先打补丁。
 
-### BUG-16 `diffdock_compat.py:116` `_scatter_pytorch` 的 mean 对 1-D src 会广播错
+### BUG-16 `diffdock_compat.py:121` `_scatter_pytorch` 的 mean 对 1-D src 会广播错
 
 ```python
 count = torch.zeros(dim_size, ...); count.index_add_(0, index, ones)
