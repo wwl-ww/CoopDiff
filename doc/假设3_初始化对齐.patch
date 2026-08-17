@@ -1,0 +1,156 @@
+diff --git a/tricoopdiff/diffusion.py b/tricoopdiff/diffusion.py
+index 57c2afb..1a5bcea 100644
+--- a/tricoopdiff/diffusion.py
++++ b/tricoopdiff/diffusion.py
+@@ -595,7 +595,9 @@ class TernaryInitializer:
+     Initializes the three-molecule system at t=1 (fully noised).
+ 
+     Reference: E3 fixed at origin (COM=0).
+-    PROTAC: randomly placed in a spherical shell around E3 pocket (±10Å).
++    PROTAC: legacy spherical shell around E3 pocket (±10Å), OR native DiffDock
++    ``randomize_position`` init (uniform torsions + receptor-COM + Gaussian
++    N(0, tr_sigma_max^2)) when ``initialize_protac(..., tr_sigma_max=...)``.
+     POI: randomly placed in a spherical shell 30-60Å from E3.
+     """
+ 
+@@ -613,35 +615,92 @@ class TernaryInitializer:
+ 
+     def initialize_protac(
+         self,
+-        e3_pocket_center: torch.Tensor,
++        e3_center: torch.Tensor,
+         ligand_template: torch.Tensor,
++        lig_edge_index=None,
++        lig_edge_mask=None,
++        lig_mask_rotate=None,
++        tr_sigma_max: float = None,
+     ) -> torch.Tensor:
+         """
+-        Initialize PROTAC near E3 pocket.
++        Initialize the PROTAC at t=1 (fully noised).
++
++        Two modes:
++
++        * **Legacy shell** (``tr_sigma_max is None``): random point on a
++          spherical shell ``[protac_shell_min, protac_shell_max]`` around
++          ``e3_center`` + a random rotation about the origin, keeping the
++          template torsion angles. Kept for backward compatibility with the old
++          call sites; NOT what native DiffDock does.
++
++        * **Native** (``tr_sigma_max`` given, matching DiffDock's
++          ``randomize_position`` — the 0.844 E3-L baseline path): (1) uniform
++          torsion angles in [-π, π] on all rotatable bonds (``no_torsion: false``),
++          (2) rotate the conformer about its own COM, (3) translate its COM onto
++          the receptor COM (``receptor.pos.mean(0)`` = ``e3_center``), (4) add a
++          Gaussian translation N(0, tr_sigma_max²). This is what makes the
++          zero-FiLM baseline seed-comparable to native DiffDock.
+ 
+         Args:
+-            e3_pocket_center: [B, 3] pocket center coordinates
+-            ligand_template: [N_lig, 3] template ligand geometry
++            e3_center: [B, 3] receptor (E3) centroid — native ``receptor.pos.mean(0)``.
++            ligand_template: [N_lig, 3] template ligand geometry.
++            lig_edge_index: [2, E] ligand internal bond edges (native init only).
++            lig_edge_mask: [E] bool rotatable-bond mask (native init only).
++            lig_mask_rotate: [n_rot, N_lig] bool, or list of per-complex masks.
++            tr_sigma_max: translation std for the native Gaussian step (DiffDock's
++                ``initial_noise_std_proportion=-1.0`` -> std = tr_sigma_max = 19.0).
++                When None, use the legacy spherical-shell init.
++
+         Returns:
+-            [B, N_lig, 3] initialized ligand positions
++            [B, N_lig, 3] initialized ligand positions.
+         """
+-        B = e3_pocket_center.shape[0]
++        B = e3_center.shape[0]
+         N_lig = ligand_template.shape[0]
+-        device = e3_pocket_center.device
+-
+-        # Random position on spherical shell + random rotation
+-        r = (
+-            self.protac_shell_min
+-            + torch.rand(B, device=device) * (self.protac_shell_max - self.protac_shell_min)
+-        )
+-        direction = torch.randn(B, 3, device=device)
+-        direction = direction / torch.linalg.vector_norm(direction, dim=-1, keepdim=True)
++        device = e3_center.device
+ 
+-        translation = e3_pocket_center + r.unsqueeze(-1) * direction
+-        rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)
++        # --- Legacy spherical-shell init -------------------------------------
++        if tr_sigma_max is None:
++            r = (
++                self.protac_shell_min
++                + torch.rand(B, device=device) * (self.protac_shell_max - self.protac_shell_min)
++            )
++            direction = torch.randn(B, 3, device=device)
++            direction = direction / torch.linalg.vector_norm(direction, dim=-1, keepdim=True)
++            translation = e3_center + r.unsqueeze(-1) * direction
++            rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)
++            ligand_pos = ligand_template.unsqueeze(0).repeat(B, 1, 1)
++            ligand_pos = torch.bmm(ligand_pos, rot) + translation.unsqueeze(1)
++            return ligand_pos
++
++        # --- Native DiffDock init (randomize_position) -----------------------
++        from .diffdock.utils.torsion import modify_conformer_torsion_angles
+ 
+-        ligand_pos = ligand_template.unsqueeze(0).repeat(B, 1, 1)
+-        ligand_pos = torch.bmm(ligand_pos, rot) + translation.unsqueeze(1)
++        ligand_pos = ligand_template.unsqueeze(0).repeat(B, 1, 1)  # [B, N_lig, 3]
++
++        # (1) uniform-random torsion angles in [-pi, pi] (no_torsion: false).
++        if lig_edge_mask is not None and bool(lig_edge_mask.any()):
++            rot_edges = lig_edge_index.T[lig_edge_mask]  # [n_rot, 2]
++            n_rot = rot_edges.shape[0]
++            if not isinstance(lig_mask_rotate, (list, tuple)):
++                lig_mask_rotate = [lig_mask_rotate] * B
++            torsion_updates = np.random.uniform(low=-np.pi, high=np.pi, size=(B, n_rot))
++            for b in range(B):
++                mr = lig_mask_rotate[b]
++                if isinstance(mr, torch.Tensor):
++                    mr = mr.detach().cpu().numpy()
++                ligand_pos[b] = modify_conformer_torsion_angles(
++                    ligand_pos[b].detach().cpu(), rot_edges, mr,
++                    torsion_updates[b], as_numpy=False,
++                ).to(device)
++
++        # (2) rotate about the ligand's own COM, then translate onto receptor COM.
++        ligand_center = ligand_pos.mean(dim=1, keepdim=True)  # [B, 1, 3]
++        rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)  # [B, 3, 3]
++        ligand_pos = torch.bmm(ligand_pos - ligand_center, rot.transpose(-1, -2)) + e3_center.unsqueeze(1)
++
++        # (3) Gaussian translation N(0, tr_sigma_max^2) (initial_noise_std_proportion=-1.0).
++        tr_update = torch.randn(B, 3, device=device) * tr_sigma_max
++        ligand_pos = ligand_pos + tr_update.unsqueeze(1)
+ 
+         return ligand_pos
+ 
+diff --git a/tricoopdiff/sampler.py b/tricoopdiff/sampler.py
+index 67ee305..ecb7440 100644
+--- a/tricoopdiff/sampler.py
++++ b/tricoopdiff/sampler.py
+@@ -84,12 +84,20 @@ def sample_single(
+     poi_template = poi_data["coords"][0].detach()        # [N_poi, 3]
+     e3_coords = e3_data["coords"][0].detach()            # [N_e3, 3]
+ 
+-    # Pocket center proxy = native PROTAC COM (E3 frame); E3 center for POI shell.
+-    pocket_center = ligand_template.mean(dim=0, keepdim=True)  # [1, 3]
++    # E3 center = receptor COM. Native randomize_position uses receptor.pos.mean(0).
+     e3_center = e3_coords.mean(dim=0, keepdim=True)            # [1, 3]
+ 
+-    # Initialize at t=1 (fully noised).
+-    ligand_pos = initializer.initialize_protac(pocket_center, ligand_template)  # [1, N_lig, 3]
++    # Initialize at t=1 (fully noised). Passing the receptor COM + torsion metadata
++    # + tr_sigma_max makes initialize_protac replicate native randomize_position
++    # (uniform torsions, rotate about ligand COM, translate to receptor COM,
++    # Gaussian N(0, tr_sigma_max^2)) — sampling-fidelity hypothesis #3.
++    ligand_pos = initializer.initialize_protac(
++        e3_center, ligand_template,
++        lig_edge_index=ligand_data.get("edge_index"),
++        lig_edge_mask=ligand_data.get("edge_mask"),
++        lig_mask_rotate=ligand_data.get("mask_rotate"),
++        tr_sigma_max=diffusion.tr_sigma_max,
++    )  # [1, N_lig, 3]
+     poi_pos, rot_init = initializer.initialize_poi(                           # [1, N_poi, 3], [1,3,3]
+         e3_center, poi_template, return_rotation=True,
+     )

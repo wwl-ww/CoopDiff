@@ -12,21 +12,23 @@
 
 | 状态 | Bug |
 |------|-----|
-| ✅ **已修**（debug-se3-loss 带入） | BUG-3：`add_noise_protac`/`add_noise_se3` 已改**全区间**（docstring 明写 "no λ_q/λ_SE3 cutoff"），`reverse_step_*` 也全 σ 去噪，前后一致。`get_lambda_q/se` 仅剩诊断脚本引用，生产路径已死代码。 |
-| ✅ **误报**（确认正确） | BUG-6（rot_score 无需 adjoint）、BUG-7（`r_e3_to_poi` 约定一致）、BUG-9（DockQ d 值 = 标准 iRMS 1.5 / Lrms 8.5，`evaluate.py:457-459` 正确） |
-| 🔴 **仍存在** | BUG-18（featurization 独立居中，相对几何被抹）、BUG-20（`../DiffDock` 不存在，实为 `./DiffDock`） |
-| 🟡/🟢 **仍存在** | BUG-1、2、4、5、8、10、11、12、13、14、15、16、17、19（16 个） |
+| ✅ **已修**（debug-se3-loss 带入） | BUG-3（λ 门控全区间化）、N-1（diffusion docstring 已更新） |
+| ✅ **误报**（确认正确） | BUG-6、BUG-7、BUG-9 |
+| ✅ **已修**（`959867a` 带入） | BUG-1、2、5、8、11、12、13、14、15、16、17、19、N-3 |
+| ✅ **已修**（`959867a` featurize + `d297eb9` vendoring） | BUG-18（共享 E3 系重表达）、BUG-20（完全 vendored） |
+| 🟢 **仍存在**（轻微/已知局限） | BUG-4/N-4（几何编码名不副实，已由 SE3GeometryEncoder 补偿）、N-2（λ 死代码） |
+| ✅ **已修**（`bug-fix` 工作树） | BUG-10（`_physical_loss` 按元素 VDW 半径，见下方条目） |
 
 行号漂移（仅标题里的行号过期，结论不变）：BUG-2 `224→225`、BUG-17 `84→99`、BUG-5 `335→364/392`、BUG-16 `116→121`。
 
-**优先修**：🔴 BUG-18（训练监督信号无意义，模型学会"三分子堆原点"）+ 🔴 BUG-20（本机训练/评估入口跑不起来）。
+**优先修**：原 🔴 BUG-18 / BUG-20 现已全部解决（见上表）。
 
-**复审补充（逐函数读正文后新发现，均为 🟢 文档/死代码级）**：
+**复审补充（逐函数读正文后新发现，均已归入上表）**：
 
-- **N-1** `diffusion.py:1-15` 模块 docstring 仍描述"λ_q（t=0.7）/ λ_SE3（t=0.5）multi-rate masking"，但该 masking 已被 debug-se3-loss 删除 → docstring 过时。
-- **N-2** `get_lambda_q`/`get_lambda_se3`（`diffusion.py:126-139`）+ `MultiRateDiffusion.__init__` 的 `lambda_q_threshold`/`lambda_se3_threshold` 参数已成**死代码**（生产路径不再调用，仅 `diagnose_loss_se3.py`/`verify_se3_sigma_consistency.py` 诊断脚本引用）。
-- **N-3** `train.py:6-8` docstring 的 `s_tri_residual` 是旧设计残留（已记于《参考系与数值梯度专项分析.md》§2.2），且"direct path, not through FiLM"与现状相反。
-- **N-4** BUG-8 加深：`MultiScalePooling` 的"short-range(<20Å)/mid-range(<50Å)"距离分层**根本没实现**——三次 pooling（`tribrain.py:121-141`）都作用在**同一个全节点集**上，只换线性投影/query，无距离 cutoff、无 Cα 粗粒化，`node_coords` 参数未被使用（与 BUG-4 同源：坐标盲）。
+- **N-1** ~~`diffusion.py` 模块 docstring 仍描述 λ masking~~ → ✅ 已修（`959867a` 更新）。
+- **N-2**（仍存在）`get_lambda_q`/`get_lambda_se3` + `lambda_q_threshold`/`lambda_se3_threshold` 死代码，仅 `diagnose_loss_se3.py`/`verify_se3_sigma_consistency.py` 诊断脚本引用。
+- **N-3** ~~`train.py:6-8` docstring 残留 `s_tri_residual` / "not through FiLM"~~ → ✅ 已修（`959867a` 更新）。
+- **N-4**（仍存在，与 BUG-4 同源）`MultiScalePooling` 的"short/mid/global"距离分层**未实现**——三次 pooling 都作用在**同一全节点集**上，`node_coords` 未用。
 
 ---
 
@@ -165,9 +167,10 @@ scores_2['rot_score'] = scores_2['rot_score'] @ r_poi_to_e3
 
 - `dockq = (fnat + 1/(1+(irms/1.5)²) + 1/(1+(lrms/8.5)²)) / 3`。标准 DockQ 的缩放（iRMS 用哪个 d、Lrms 用哪个 d）需对照 Basu & Wallner 2016 原文确认是否写反。
 
-### BUG-10 `train.py:252` `_physical_loss` 用固定 3.4 Å，非真实 VDW
+### BUG-10 `train.py` `_physical_loss` 用固定 3.4 Å，非真实 VDW（✅ **已修**，`bug-fix` 工作树）
 
-- `F.relu(3.4 - dist)²` 对所有原子对一视同仁，没有按元素 VDW 半径。CLAUDE.md 已标注为已知局限，但仍是「物理损失」名不副实的一处。
+- 旧：`F.relu(3.4 - dist)²` 对所有原子对一视同仁，没有按元素 VDW 半径。CLAUDE.md 已标注为已知局限，但仍是「物理损失」名不副实的一处。
+- 修复：`_physical_loss` 新增 `ligand_features` 入参，从配体原子序数（`features[..., 0]` 索引 `possible_atomic_num_list`，即原子序 = 列 + 1，118='misc'）解码 Bondi VDW 半径（`_ligand_vdw_radii`）；蛋白坐标是 Cα 级 → 碳半径 1.7 Å。碰撞项改为 `F.relu((r_i+r_j) - dist)²`。`ligand_features is None` 时回退到旧的单值 `contact_distance`（默认 3.4 Å == C···C Bondi 半径和，故元素感知路径是其严格泛化）。
 
 ### BUG-11 `film.py` 的 `FiLMSharedMLP` / `FiLMLayerHead` 是死代码
 

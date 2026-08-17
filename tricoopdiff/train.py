@@ -32,6 +32,41 @@ from .model import TriCoopDiff
 from .diffusion import MultiRateDiffusion
 
 
+# Bondi van-der-Waals radii (Å) for the elements that occur in PROTAC-like
+# small molecules. Anything else (metals, 'misc') falls back to carbon.
+_BONDI_VDW_RADII = {
+    1: 1.20,   # H
+    5: 1.92,   # B
+    6: 1.70,   # C
+    7: 1.55,   # N
+    8: 1.52,   # O
+    9: 1.47,   # F
+    15: 1.80,  # P
+    16: 1.80,  # S
+    17: 1.75,  # Cl
+    35: 1.85,  # Br
+    53: 1.98,  # I
+}
+_DEFAULT_VDW_RADIUS = 1.70  # carbon (also the Cα/protein radius)
+
+
+def _ligand_vdw_radii(ligand_features, device, dtype):
+    """Decode per-atom Bondi VDW radii from the index-encoded ligand features.
+
+    ``ligand_features`` is the ``[B, N_lig, 16]`` integer tensor stored under
+    ``ligand_data['features']`` (== ``batch_graph['ligand'].x`` from featurization).
+    Its first column indexes DiffDock's ``possible_atomic_num_list``
+    (``list(range(1, 119)) + ['misc']``), so the atomic number is ``col + 1`` and
+    the value 118 encodes 'misc'. The model consumes these as integer indices via
+    ``nn.Embedding`` (not one-hot), so this decodes the raw column directly.
+    """
+    z = ligand_features[0, :, 0].long()  # [N_lig] atomic-number index, 0-based
+    table = torch.full((120,), _DEFAULT_VDW_RADIUS, device=device, dtype=dtype)
+    for atomic_num, radius in _BONDI_VDW_RADII.items():
+        table[atomic_num] = radius
+    return table[z + 1]  # index+1 == atomic number; 119 == 'misc' -> default
+
+
 class TriCoopDiffTrainer:
     """
     Trainer for TriCoopDiff model.
@@ -54,9 +89,10 @@ class TriCoopDiffTrainer:
         self.diffusion = diffusion
         self.device = device
 
-        # Steric-clash contact distance (Å) for _physical_loss. Fixed 3.4 Å
-        # default (Cα-level coordinates); a true per-atom VDW radius would need
-        # element information, which is out of scope here.
+        # Fallback steric-clash contact distance (Å) for _physical_loss, used only
+        # when ligand element features are unavailable. Default 3.4 Å == the
+        # C···C Bondi-radius sum; the element-aware path derives pairwise radii
+        # from ligand atomic numbers (carbon for protein Cα) instead.
         self.contact_distance = contact_distance
 
         # Loss weights (from execution plan: score=1.0, phys=0.5, se3=0.3)
@@ -195,7 +231,8 @@ class TriCoopDiffTrainer:
         denoised_ligand = self._estimate_denoised(noisy_ligand, output['s_q']['tr'], tr_sigma)
         denoised_poi = self._estimate_denoised_se3(noisy_poi, output['s_se3'], se3_tr_sigma, se3_rot_sigma)
         loss_phys = self._physical_loss(
-            denoised_ligand, noisy_e3_data['coords'], denoised_poi
+            denoised_ligand, noisy_e3_data['coords'], denoised_poi,
+            ligand_features=ligand_data.get('features'),
         )
 
         loss_total = (
@@ -294,33 +331,44 @@ class TriCoopDiffTrainer:
         denoised_centered = torch.bmm(noisy_poi - poi_center, rot_correction)
         return denoised_centered + denoised_center
 
-    def _physical_loss(self, ligand_coords, e3_coords, poi_coords):
+    def _physical_loss(self, ligand_coords, e3_coords, poi_coords, ligand_features=None):
         """
         Physical consistency loss: penalize steric clashes between the
         PROTAC and both proteins.
 
         Soft repulsive term over all PROTAC-protein atom pairs:
-            Σ max(0, contact_distance - dist)²
-        with a single configurable contact distance (``self.contact_distance``,
-        default 3.4 Å), evaluated via torch.cdist — O(N_lig × N_prot),
+            Σ max(0, (r_i + r_j) - dist)²
+        where ``r_i``/``r_j`` are per-atom van-der-Waals radii. When
+        ``ligand_features`` is given, the PROTAC radii are decoded from the
+        ligand's atomic numbers (Bondi radii, ``_ligand_vdw_radii``) and the
+        protein radii are carbon (the receptor is Cα-level). Otherwise it falls
+        back to the single scalar ``self.contact_distance`` (default 3.4 Å == the
+        C···C Bondi-radius sum, so the element-aware path is a strict
+        generalization). Evaluated via torch.cdist — O(N_lig × N_prot),
         sufficient at MVP scale.
-
-        NOTE (known limitation): this is NOT a true van-der-Waals repulsion. It
-        applies ONE scalar contact distance to every atom pair, ignoring
-        element-dependent VDW radii (a C···C pair is treated identically to an
-        H···O pair). Real per-element radii would require atomic-number/atom-type
-        information, which is out of scope here — and at the well-separated noise
-        level of Phase-1 smoke it would make the term ≈0 anyway. Kept purely as a
-        coarse clash penalty, not a physical force field.
         """
         clash = torch.tensor(0.0, device=ligand_coords.device)
+        if ligand_features is not None:
+            lig_radii = _ligand_vdw_radii(
+                ligand_features, ligand_coords.device, ligand_coords.dtype
+            )  # [N_lig]
+        else:
+            lig_radii = None
         for protein_coords in (e3_coords, poi_coords):
             if protein_coords is None:
                 continue
             # [B, N_lig, N_prot] pairwise distances
             dist = torch.cdist(ligand_coords, protein_coords)
-            # Repulsive term: atom pairs closer than the contact distance contribute
-            clash = clash + (F.relu(self.contact_distance - dist) ** 2).mean()
+            if lig_radii is not None:
+                # Protein coords are Cα-level -> carbon radius for every residue.
+                prot_radii = torch.full(
+                    (protein_coords.shape[1],), _DEFAULT_VDW_RADIUS,
+                    device=ligand_coords.device, dtype=ligand_coords.dtype,
+                )
+                radii_sum = lig_radii.view(1, -1, 1) + prot_radii.view(1, 1, -1)
+                clash = clash + (F.relu(radii_sum - dist) ** 2).mean()
+            else:
+                clash = clash + (F.relu(self.contact_distance - dist) ** 2).mean()
         return clash
 
     def scheduler_step(self):

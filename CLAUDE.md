@@ -77,7 +77,7 @@ s_q = s_q1 + g·(s_q2 - s_q1)   (residual-gated merge, g zero-init → s_q = s_q
 | `graphs.py` | `build_subgraph_e3l`, `build_subgraph_pol`, `build_tribrain_graph`, `transform_ligand_to_poi_frame`. Constructs the two disconnected protein+ligand HeteroData subgraphs + one flat ternary dict. |
 | `tribrain.py` | `TriBrain`, `MultiScalePooling`, `EquivariantTransformer`, `EquivariantTransformerLayer`, `SE3ScoreHead`, `JudgeHead`, `StateHead`, `FiLMHead`, `MergeGateHead`. The only trainable module. `MergeGateHead` predicts the zero-init residual merge gate `g`. |
 | `model.py` | `TriCoopDiff`, `_expert_forward_with_film`, `zero_film_verification`. Orchestrates subgraphs → TriBrain → two expert FiLM passes → merge. `_expert_forward_with_film` replicates `CGModel.forward()` inline, accessing `model.conv_layers[l]` directly. |
-| `film.py` | `FiLMSharedMLP`, `FiLMLayerHead`, `apply_film`. Only `apply_film` is actually used (by `model.py:_expert_forward_with_film`); the MLP classes are unused. |
+| `film.py` | `apply_film` only (used by `model.py:_expert_forward_with_film`). The old `FiLMSharedMLP`/`FiLMLayerHead` classes were removed (`959867a`). |
 | `diffusion.py` | `MultiRateDiffusion`, `TernaryInitializer`, `so3_exp`, `sample_so3_noise`, `so3_score_norm`, `so3_score_vec`. Exponential σ(t) schedules for PROTAC (fast) and SE3 rigid body (slow); forward noise (`add_noise_protac`/`add_noise_se3`/`add_torsion_noise`) and reverse SDE steps (`reverse_step_protac`/`reverse_step_torsion`/`reverse_step_se3`). The old λ_q/λ_SE3 threshold masking is **removed** (full-range σ for all t); `get_lambda_q`/`get_lambda_se3` + the threshold params are dead code kept only for legacy diagnostic scripts. |
 | `sampler.py` | `sample_single` / `sample_ensemble` — composes the reverse steps into a t=1→0 denoising loop, rebuilding subgraphs inside `model.forward` at each step. Self-contained (does not import `../DiffDock`). |
 | `merging.py` | `merge_residual_gated` (**default**, `s_q = s_q1 + g·(s_q2 - s_q1)`), `merge_direct_addition` (L0 ablation only — double-counts the shared PROTAC DOFs). `LearnedCoordinationLayer` is the old Ablation B, now superseded. |
@@ -172,19 +172,19 @@ Output: `deepternary_audit.json`, `audit_results/`, `logs/`. Full instructions i
 
 ### 🔴 Active: sampling fidelity (open problem #1, re-scoped)
 
-The score-merge double-counting + frame mismatch are **fixed** (residual-gated merge, commit `cacbb7f`), but the zero-FiLM baseline E3-interface DockQ is still **0.215** vs pure DiffDock E3-L **0.844** (best of 32; old pre-fix value was 0.153). Since the merge is transparent at init, this means **TriCoopDiff's E3-L reverse-sampling loop does not reproduce native DiffDock inference**. The top hypotheses (see `doc/采样保真度诊断报告.md`) are, in confidence order — **#1 and #2 are now fixed in the working tree** (`diffusion.py`):
+The score-merge double-counting + frame mismatch are **fixed** (residual-gated merge, commit `cacbb7f`), but the zero-FiLM baseline E3-interface DockQ is still **0.215** vs pure DiffDock E3-L **0.844** (best of 32; old pre-fix value was 0.153). Since the merge is transparent at init, this means **TriCoopDiff's E3-L reverse-sampling loop does not reproduce native DiffDock inference**. The top hypotheses (see `doc/采样保真度诊断报告.md`) are, in confidence order — **#1 and #2 are now fixed** (committed in `959867a`, `diffusion.py`):
 
 1. **Torsion σ mismatch** (✅ fixed): `diffusion.py` hardcoded `tor_sigma_min/max = 0.03/1.55`, but the actual DiffDock-L weights use `model_parameters.yml`'s `0.0314/3.14` — the score is normalized on one σ range and the reverse step integrates another, so `tor_g²` was ~4.8× too weak. Now uses `0.0314/3.14`.
 2. **Missing torsion temperature sampling** (✅ fixed): `reverse_step_torsion` lacked the `temp_sampling[2]=7.04` branch that tr/rot have (the constant was defined but never read) → ~25× too-weak torsion drift, the likely driver of the 50 Å COM drift. Now mirrors the tr/rot temperature branch.
-3. **Initialization mismatch** (open): `initialize_protac` starts from the template pose (0–10 Å shell, template torsions) vs native uniform-random torsions + receptor-COM Gaussian.
+3. **Initialization mismatch** (pending patch `doc/假设3_初始化对齐.patch`): `initialize_protac` starts from the template pose (0–10 Å shell, template torsions) vs native uniform-random torsions + receptor-COM Gaussian (std = `tr_sigma_max` = 19.0).
 
 **Acceptance criterion**: zero-FiLM baseline E3-interface DockQ ≈ 0.844 (within 0.02, same seed). See `doc/问题清单与修复状态 交接文档.md` §2.
 
 ### 🔴 Critical bugs from the code review (`doc/代码审查 Bug 清单.md`)
 
-- **BUG-18 — featurization destroys relative geometry** (confirmed): `featurize_complex` uses DiffDock's `InferenceDataset`, which centers each molecule at its own centroid, so E3, POI and PROTAC each end up at the origin and `t_e3_to_poi = 0`. Training would learn to denoise everything onto the origin. **A fix is in the working tree**: `featurize_common.py` now recomputes true Cα/heavy-atom centroids from the raw PDB/SDF files and re-expresses POI + PROTAC in the shared E3 frame (with a `cache_version` bump to invalidate stale caches).
-- **BUG-20 — DiffDock path** (confirmed): code referenced the sibling `../DiffDock` checkout for featurization. **Resolved by full vendoring**: `datasets/` + `utils/inference_utils.py` are now vendored under `tricoopdiff/diffdock/`, and `_resolve_diffdock_dir()` was removed entirely — no external checkout needed.
-- 16 further 🟡/🟢 findings (BUG-1/2/4/5/8/10-17/19) remain open — see the bug list. Notable: BUG-2 (B>1 `.squeeze(0)` stack bug, fixed in working tree), BUG-17 (`compute_loss` calls `self.model.train()` unconditionally, breaking eval mode), BUG-19 (`scripts/inference.py` + `scripts/eval_entry.py` are stale/divergent entry points — use `scripts/evaluate_entry.py`).
+- **BUG-18 — featurization destroys relative geometry** (confirmed): `featurize_complex` uses DiffDock's `InferenceDataset`, which centers each molecule at its own centroid, so E3, POI and PROTAC each end up at the origin and `t_e3_to_poi = 0`. Training would learn to denoise everything onto the origin. **Fixed** (committed in `959867a`): `featurize_common.py` now recomputes true Cα/heavy-atom centroids from the raw PDB/SDF files and re-expresses POI + PROTAC in the shared E3 frame (with a `cache_version` bump to invalidate stale caches).
+- **BUG-20 — DiffDock path** (confirmed): code referenced the sibling `../DiffDock` checkout for featurization. **Resolved by full vendoring** (committed `d297eb9`): `datasets/` + `utils/inference_utils.py` are now vendored under `tricoopdiff/diffdock/`, and `_resolve_diffdock_dir()` was removed entirely — no external checkout needed.
+- The other 🟡 findings (BUG-1/2/5/8/11/12/13/14/15/16/17/19) are now fixed (committed `959867a`). BUG-10 (`_physical_loss` → per-element VDW radii) is fixed in the working tree. 2 🟢 items remain open: BUG-4/N-4 (`EquivariantTransformer`/`MultiScalePooling` geometry-blind, compensated by `SE3GeometryEncoder`), N-2 (dead λ code).
 
 ### Resolved (merged to master)
 
@@ -192,7 +192,7 @@ The score-merge double-counting + frame mismatch are **fixed** (residual-gated m
 
 ### Still open / follow-up
 
-- **`train.py:_physical_loss`**: uses a fixed 3.4 Å contact distance (now configurable via `self.contact_distance`, still not true per-element VDW radii). In Phase-1 smoke this makes `loss_phys ≈ 0` for well-separated complexes — no gradient until real VDW radii are used.
+- **`train.py:_physical_loss`**: now element-aware — decodes PROTAC atom numbers from `ligand_features` into Bondi VDW radii (`_ligand_vdw_radii`), uses carbon radius (1.7 Å) for protein Cα, and penalizes `F.relu((r_i+r_j) - dist)²`. Falls back to the single `contact_distance` (3.4 Å == C···C sum) when ligand features are absent. Still no per-element protein radii (receptor is Cα-level by construction), and no true force-field minimization (see `reflect.py`).
 - **B=1 only**: `model.forward` is single-complex per step; padded B>1 batching is a follow-up.
 - **`scripts/prepare_data.py:cluster_by_sequence_identity`**: greedy fallback; production should use MMseqs2.
 - **`reflect.py:local_minimization`**: simple repulsive gradient descent; production should use RDKit MMFF94.
@@ -201,9 +201,9 @@ The score-merge double-counting + frame mismatch are **fixed** (residual-gated m
 
 ## Code Duplication to Be Aware Of
 
-- **Two FiLM head implementations**: `tribrain.py:FiLMHead` (production — Linear, zero-init) and `film.py:FiLMLayerHead`/`FiLMSharedMLP` (standalone, unused). Only `apply_film` from `film.py` is called.
+- **Single FiLM head**: `tribrain.py:FiLMHead` (production — Linear, zero-init). `film.py` holds only `apply_film`; the standalone `FiLMSharedMLP`/`FiLMLayerHead` classes were removed (`959867a`).
 - **Score norm split**: `so3_score_norm` lives in `diffusion.py` (imported by `train.py` via `from .diffusion import so3_score_norm`); `expert.py` has a separate `torus_score_norm` (torsion). If the DiffDock normalization formula changes, update `diffusion.py`.
-- **Stale/divergent entry points** (BUG-19): `scripts/inference.py` and `scripts/eval_entry.py` use a `../DiffDock` legacy `CGModel` import, zero-feature placeholder proteins, and their own reverse-diffusion loop — they have **fully forked** from the real pipeline. The real inference/eval path is `scripts/evaluate_entry.py` → `featurize_common.featurize_complex` → `expert_factory.build_diffdock_expert` → `sampler.sample_ensemble`. Don't run or trust `inference.py`/`eval_entry.py` without flagging them as legacy.
+- **Stale/divergent entry points** (BUG-19): `scripts/inference.py` and `scripts/eval_entry.py` use a `../DiffDock` legacy `CGModel` import, zero-feature placeholder proteins, and their own reverse-diffusion loop — they have **fully forked** from the real pipeline and now **refuse to run** (LEGACY banner + `sys.exit(2)`). The real inference/eval path is `scripts/evaluate_entry.py` → `featurize_common.featurize_complex` → `expert_factory.build_diffdock_expert` → `sampler.sample_ensemble`.
 - **Dead λ code**: `diffusion.py`'s `get_lambda_q`/`get_lambda_se3` + `lambda_q_threshold`/`lambda_se3_threshold` are deprecated (production never consults them); only `scripts/diagnose_loss_se3.py`, `scripts/verify_se3_sigma_consistency.py`, and `tests/test_model_build.py` still reference them.
 
 ## Training Strategy
