@@ -23,14 +23,17 @@ def test_tribrain_build():
     )
 
     # Dummy ternary graph: 100 E3 residues + 150 POI residues + 80 PROTAC atoms
+    # TriBrain.forward expects UNBATCHED [N, ...] inputs (batch index derived
+    # internally); the leading dim here was a stray batch of 1 that broke
+    # per-batch softmax (result[mask] of shape [1] vs value [N]).
     N = 330
-    node_features = torch.randn(1, N, 128)
-    node_coords = torch.randn(1, N, 3)
+    node_features = torch.randn(N, 128)
+    node_coords = torch.randn(N, 3)
     node_types = torch.cat([
         torch.zeros(100, dtype=torch.long),
         torch.ones(150, dtype=torch.long),
         2 * torch.ones(80, dtype=torch.long),
-    ]).unsqueeze(0)
+    ])
 
     out = tribrain(node_features, node_coords, node_types)
 
@@ -39,13 +42,19 @@ def test_tribrain_build():
     assert out['state'].shape == (1, 2)
     assert len(out['film_params']) == 12  # 6 layers × 2 subgraphs
     for gamma, beta in out['film_params']:
-        assert gamma.shape == (1, 128)
-        assert beta.shape == (1, 128)
+        # FiLMHead outputs [B, film_dim] per (gamma, beta); film_dim defaults to
+        # 48 (the expert's scalar channel count), not node_dim=128.
+        assert gamma.shape == (1, tribrain.film_dim)
+        assert beta.shape == (1, tribrain.film_dim)
+    assert out['merge_gate'].shape == (1, 3), f"merge_gate shape: {out['merge_gate'].shape}"
 
     # Count parameters
     n_params = sum(p.numel() for p in tribrain.parameters())
     print(f"  TriBrain params: {n_params:,}")
-    assert 1_500_000 < n_params < 3_000_000, f"Expected ~2.2M params, got {n_params:,}"
+    # Small MVP config (ns=32, nv=4, 3 transformer layers — the TriBrain defaults
+    # used by the smoke test) is ~340k params. (The ~2.2M figure in early docs
+    # assumed ns=48, nv=10.) Sanity: non-trivial but not bloated.
+    assert 200_000 < n_params < 1_000_000, f"Unexpected TriBrain params: {n_params:,}"
 
     print("  [OK] TriBrain build")
 
@@ -138,13 +147,15 @@ def test_reflect_pipeline():
     """TriReflect detects clashes and runs minimization."""
     from tricoopdiff.reflect import detect_clashes, tricoop_reflect
 
-    # Create two overlapping atoms → should clash
-    coords = np.array([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]])
-    atomic_numbers = np.array([6, 6])  # both carbon, VDW=1.7
+    # Create two non-bonded atoms well inside VDW contact → should clash.
+    # (0.5Å is skipped by the covalent-radius 1-2 heuristic, which treats very
+    # close pairs as a possible bond when no bond graph is supplied.)
+    coords = np.array([[0.0, 0.0, 0.0], [2.5, 0.0, 0.0]])
+    atomic_numbers = np.array([6, 6])  # both carbon, VDW=1.7 → contact 3.4Å
 
     clashes = detect_clashes(coords, atomic_numbers, vdw_scale=1.0)
-    # C VDW radius = 1.7, 2*1.7=3.4, 0.5 < 3.4 → clash
-    assert clashes.sum() > 0, "Should detect clash for atoms 0.5Å apart"
+    # 2.5 < 3.4 (VDW contact) and 2.5 > 1.2×(0.76+0.76)=1.82 (not bonded) → clash
+    assert clashes.sum() > 0, "Should detect clash for non-bonded C atoms 2.5Å apart"
 
     # Non-clashing pair
     coords_far = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
@@ -160,8 +171,8 @@ def test_reflect_pipeline():
 
 
 def test_merging():
-    """Score merging by direct addition and learned coordination."""
-    from tricoopdiff.merging import merge_direct_addition, LearnedCoordinationLayer
+    """Score merging: direct addition (L0 ablation) + residual-gated (default)."""
+    from tricoopdiff.merging import merge_direct_addition, merge_residual_gated
 
     B = 4
     scores_1 = {
@@ -175,17 +186,24 @@ def test_merging():
         'tor_score': torch.randn(B, 10),
     }
 
-    # Direct addition
+    # Direct addition (L0 ablation): s_q = s_q1 + s_q2
     merged = merge_direct_addition(scores_1, scores_2)
     for k in ['tr_score', 'rot_score', 'tor_score']:
         expected = scores_1[k] + scores_2[k]
         assert torch.allclose(merged[k], expected)
 
-    # Learned coordination
-    coord = LearnedCoordinationLayer(hidden_dim=128)
-    h_cond = torch.randn(B, 128)
-    merged_c = coord(scores_1, scores_2, h_cond)
-    assert 'merge_weights' in merged_c
+    # Residual-gated merge (default). zero gate → s_q = s_q1 (transparent);
+    # unit gate → s_q = s_q2.
+    gate_zero = torch.zeros(B, 3)
+    merged_zero = merge_residual_gated(scores_1, scores_2, gate_zero)
+    assert 'merge_gates' in merged_zero
+    for k in ['tr_score', 'rot_score', 'tor_score']:
+        assert torch.allclose(merged_zero[k], scores_1[k]), k
+
+    gate_one = torch.ones(B, 3)
+    merged_one = merge_residual_gated(scores_1, scores_2, gate_one)
+    for k in ['tr_score', 'rot_score', 'tor_score']:
+        assert torch.allclose(merged_one[k], scores_2[k]), k
 
     print("  [OK] Score merging")
 

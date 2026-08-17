@@ -14,7 +14,9 @@
 | `DeepTernary 审计完成交接文档.md` | DeepTernary 基线（08-09） | **唯一权威基线结论：mean best DockQ = 0.6588**。含 `lig_kpt_mode_val` 致命 bug 修复记录。 |
 | `DiffDock 审计文档.md` | DiffDock 源码+论文分析 | Corso et al. ICLR 2023 综合分析，二体专家参考。 |
 | `DeepTernary 论文分析与审计对比.md` | 论文分析 + 审计对比（08-08） | 已按 08-09 最终审计回改（顶部有修正 banner）。SOTA 权重（Zenodo）调查仍有效。 |
-| `Score合并 双重计数与零-FiLM基线 交接文档.md` | 问题 #1：`s_q1+s_q2` 合并 | **待办**。零-FiLM 基线 DockQ 0.153 vs 纯 DiffDock E3-L 0.844；根因=帧不一致（tr/rot）+ 双重计数（透明性）；候选方案 A/B/C，推荐方案 B（α 初始化=1）。 |
+| `问题清单与修复状态 交接文档.md` | **当前问题总清单（08-17）** | 快照：旋转 sign bug、#1/#2/#3/#4 均已修；验证已跑（smoke PASS、零-FiLM 基线 DockQ 0.215 vs 0.844）→ **新问题：采样保真度未达标**，待 agent 调查。**先读这个**。 |
+| `采样保真度调查任务 brief.md` | 采样保真度调查任务书 | **派给 agent 的只读诊断任务**。零-FiLM 基线 0.215→0.844 的逐项对照清单（TriCoopDiff 反向循环 vs DiffDock 原生 inference 六个对照点），含环境约束（SLURM-only、不改代码）。agent 只调查不改代码，报告后主线程决定是否修。 |
+| `Score合并 双重计数与零-FiLM基线 交接文档.md` | 问题 #1：`s_q1+s_q2` 合并 | **已落地**。方案 B（residual-gate `s_q=s_q1+g*(s_q2-s_q1)`，g 零初始化）已实现于 `merging.py`/`model.py`/`tribrain.py`，帧修正（问题 A）也已落地；候选 A/B/C 讨论见《问题清单与修复状态 交接文档.md》。 |
 
 ## 二、部分过时（以回改标注为准）
 

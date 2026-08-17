@@ -6,20 +6,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **TriCoopDiff** is a deep learning research project: a physically-constrained diffusion generative model for PROTAC ternary complex structure prediction and functional ranking. The core idea is freezing a pretrained two-body expert (DiffDock-L, ~20M params) and training a lightweight coordination network (TriBrain, ~2.2M params) that modulates the expert via per-layer FiLM, enabling explicit three-body cooperative effects while preserving the expert's pretrained capabilities with zero input-distribution OOD.
 
-**Current status**: The MVP integration loop is wired end-to-end on real PROTAC data: featurize → train → sample → evaluate. `scripts/mvp_smoke_test.py` passes its two gates (zero-FiLM transparency + gradient flow to TriBrain). Training currently runs B=1 (sequential per-complex). The E3→POI rotation in `model.forward` is still an identity placeholder (open "Agent B" task). See `doc/` for the two most recent handoff notes.
+**Current status**: The MVP integration loop is wired end-to-end on real PROTAC data: featurize → train → sample → evaluate. `scripts/mvp_smoke_test.py` passes its two gates (zero-FiLM transparency + gradient flow to TriBrain). Training runs B=1 (sequential per-complex). The "Agent B" task (E3→POI rotation + POI/DockQ metrics) is **done** — `model.forward` now takes an `r_e3_to_poi` rotation (defaults to identity) and `evaluate.py` reports POI/E3-interface DockQ. The active open problem is now **score-merge double-counting**, and the SE3 loss is being debugged on branch `debug-se3-loss`. `doc/README.md` is the authoritative doc index — consult it first.
 
-Key design documents in `doc/` (Chinese):
-- `TriCoopDiff 模型交接文档.md` — Complete model architecture and design rationale
+Key design documents in `doc/` (Chinese). **`doc/README.md` is the authoritative index**, tiering each doc as current / partially-stale / superseded; consult it before trusting a doc:
+- `TriCoopDiff 模型交接文档.md` (v2.4) — the sole authoritative architecture doc (per-layer FiLM, multi-rate diffusion, SE3 rigid body, TriReflect)
 - `TriCoopDiff 执行计划.md` — 9-week execution plan with phase gates
-- `TriCoopDiff vs DeepTernary 竞争定位与实验计划.md` — Competitive positioning vs DeepTernary
 - `三分子初始化策略方案.md` — Three-molecule initialization strategy
-- `DeepTernary 审计交接文档.md` / `审计完成交接文档.md` / `论文分析与审计对比.md` — DeepTernary baseline audit
-- `AgentB 交接文档.md` — Open task: fix `model.py` E3→POI identity rotation + add POI/DockQ metrics
-- `训练入口 SLURM 与 Phase1 smoke 交接文档.md` — SLURM gotchas + Phase1 smoke observations (loss_phys/loss_se3 ≈ 0)
+- `DeepTernary 审计完成交接文档.md` — baseline audit (mean best DockQ **0.6588**, 22 cases × 40 seeds)
+- `Score合并 双重计数与零-FiLM基线 交接文档.md` — open problem #1: `s_q1+s_q2` merge double-counting (zero-FiLM baseline DockQ 0.153 vs pure DiffDock E3-L 0.844)
+- `DiffDock 审计文档.md` / `DiffDock 实验交接文档.md` — two-body expert reference
+- `公式推导参考.md` — formula derivations
+- `训练入口 SLURM 与 Phase1 smoke 交接文档.md` — SLURM gotchas + Phase1 smoke observations
 
 ## Build / Test / Lint
 
-There is **no build system, test suite, or linter**. No `setup.py`, `pyproject.toml`, `requirements.txt`, or `Makefile`. `tricoopdiff` is **not pip-installed** — entry scripts insert the project root onto `sys.path` manually. Validation is via the smoke test + SLURM entry points below.
+There is **no build system, dependency file, or linter** — no `setup.py`, `pyproject.toml`, `requirements.txt`, or `Makefile`. `tricoopdiff` is **not pip-installed** — entry scripts insert the project root onto `sys.path` manually. There is one standalone smoke-test file (`tests/test_model_build.py`, plain `assert`s, no pytest): `python tests/test_model_build.py`. The real validation gate is `scripts/mvp_smoke_test.py` + the SLURM entry points below.
 
 ## Environment & Setup
 
@@ -76,7 +77,7 @@ s_q = s_q1 + s_q2  (direct addition, see merging.py)
 | `merging.py` | `merge_direct_addition` (MVP default), `LearnedCoordinationLayer` (Ablation B). |
 | `reflect.py` | `tricoop_reflect`, `detect_clashes`, `detect_bond_anomalies`, `detect_linker_strain`, `local_minimization`. Post-processing clash/geometry checks + simple repulsive minimization. |
 | `train.py` | `TriCoopDiffTrainer` — multi-task loss (score + phys + se3), two-phase training, AdamW + CosineAnnealingLR. `compute_loss`/`train_step`/`validate_step`, `set_phase`, `save/load_checkpoint`. |
-| `evaluate.py` | Metric functions (`compute_dockq`, `compute_rmsd`, `compute_clash_rate`, `compute_ensemble_diversity`, `compute_cooperativity_ranking`, `kabsch_align`, …) + `evaluate_model` (MVP: PROTAC pose only) + `EnsembleAnalyzer`. |
+| `evaluate.py` | Metric functions (`compute_dockq`, `compute_rmsd`, `compute_clash_rate`, `compute_ensemble_diversity`, `compute_cooperativity_ranking`, `kabsch_align`, `compute_poi_dockq`, `compute_e3_interface_dockq`, `compute_poi_com_dist`, …) + `evaluate_model` + `EnsembleAnalyzer`. POI/E3-interface metrics need the native ternary PDB (`native_complex_pdb`); otherwise they report `None`, never NaN. |
 | `scripts/featurize_common.py` | Shared featurization: `featurize_complex`, `generate_esm_embeddings`, `featurize_subgraph`, `extract_receptor`, `extract_ligand`. Produces B=1 dicts with `coords`/`features`/`edge_index`/`edge_attr`/`edge_mask`/`mask_rotate`. |
 | `scripts/make_protac_index.py` | Scans `DeepTernary/output/protac22/` → `data/protac_index.json` (absolute paths, consumed by `train_entry.py`). |
 
@@ -132,7 +133,7 @@ sbatch scripts/evaluate_entry.slurm
 python scripts/evaluate_entry.py --case 5T35_D_A_759 --n-walkers 32 \
     --out results/eval_5T35.json
 ```
-Reports PROTAC RMSD / pocket distance / clash rate / ensemble diversity as JSON. The zero-FiLM baseline (no `--tribrain-ckpt`) is the Go/No-Go reference: it should reproduce native DiffDock-L two-body PROTAC distribution.
+Reports PROTAC RMSD / pocket distance / clash rate / ensemble diversity / E3-interface & POI DockQ (when the native PDB is available) as JSON. The zero-FiLM baseline (no `--tribrain-ckpt`) is the Go/No-Go reference: it should reproduce native DiffDock-L two-body PROTAC distribution. For full-benchmark comparison against the DeepTernary audit, use `scripts/eval_entry.py` (`--data data/protac_benchmark_test.json --checkpoint <ckpt> --outdir <dir> --deepternary_audit deepternary_audit.json`).
 
 ### DeepTernary baseline audit
 
@@ -151,7 +152,7 @@ Output: `deepternary_audit.json`, `audit_results/`, `logs/`. Full instructions i
 ## Critical Design Constraints
 
 - **Two subgraphs must be physically disconnected**: no protein-protein edges, no ligand-mediated bridging. Each subgraph = exactly one protein + PROTAC. Cross-edges are built dynamically by `CGModel` per forward pass.
-- **PROTAC coordinate sync**: PROTAC sampled once globally (E3 frame). Subgraph 1 uses it directly; subgraph 2 transforms via `t_e3_to_poi = poi_center - e3_center` (currently **identity rotation** — see known issues).
+- **PROTAC coordinate sync**: PROTAC sampled once globally (E3 frame). Subgraph 1 uses it directly; subgraph 2 transforms via `t_e3_to_poi = poi_center - e3_center` and the `r_e3_to_poi` rotation (defaults to identity; the sampler/trainer passes the cumulative SE3 rotation so subgraph 2 sees the correct PROTAC-POI relative geometry). Subgraph 2's tr/rot scores are rotated back into the E3 frame before merging (torsion is frame-invariant).
 - **FiLM zero-init is mandatory**: `FiLMHead` uses `nn.init.zeros_`. At training start `h' = h`. Verified by `zero_film_verification()` (GATE 1 of the smoke test).
 - **Gradient flow**: `loss_phys` backprops through `_estimate_denoised()` (Tweedie) → predicted scores → `model.forward()` → TriBrain — a direct path, not through FiLM. The two-body expert has `requires_grad=False` everywhere.
 - **Score merging**: direct addition `s_q = s_q1 + s_q2` is the MVP. `LearnedCoordinationLayer` is Ablation B.
@@ -163,10 +164,9 @@ Output: `deepternary_audit.json`, `audit_results/`, `logs/`. Full instructions i
 
 ## Known Incomplete / Open Items
 
-- **`model.py:forward` E3→POI rotation is `torch.eye(3)`** (identity). SE3 diffusion rotates POI, but subgraph 2 is rebuilt with an identity rotation, so the PROTAC-in-POI-frame orientation is wrong once POI is rotated/initialized randomly. This is the open "Agent B" task — see `doc/AgentB 交接文档.md`. Fix must default to identity so existing callers are unaffected.
-- **`evaluate.py:evaluate_model` reports PROTAC (E3-L) pose only**. POI RMSD / DockQ / E3-POI interface metrics are intentionally absent because the POI reference is featurized in a different frame. Also Agent B's task.
+- **Score-merge double-counting** (open problem #1): `s_q = s_q1 + s_q2` direct addition over-counts the shared PROTAC DOFs. Zero-FiLM baseline gives DockQ **0.153** vs pure DiffDock E3-L **0.844**; root cause = frame mismatch (tr/rot) + double-counting (transparency). Candidate fixes A/B/C, recommended B (α-init=1). See `doc/Score合并 双重计数与零-FiLM基线 交接文档.md`.
+- **`loss_se3` (was ≈0 / π-floored)** — root causes fixed on `debug-se3-loss`: (a) wrapped SO(3) sampler/score mismatch → Euclidean (R³) DSM for SE3 rotation, symmetric with translation; (b) λ_SE3 cutoff dropped so the head trains on the full t∈[0,1] schedule; (c) SE3 geometry encoder gained rotation-sensitive second-moment (covariance) features. Verif run 138510: `loss_se3_tr` 54→~3 (learns), `loss_se3_rot` active (0.02–5.4, ~1.3 avg, below the π≈3.14 wrapped floor). A **pre-existing score-loss blow-up** on large PROTACs (frozen-expert forward hitting `NAN_CLAMP=1e4` → loss ~1e6-1e8) was masking SE3 convergence at B=1; fixed with a per-component `score_loss_cap=100.0`. See commits `b20c238`/`4511ab0`/`cbbd5f0`/`f3b2736`/`c1f1dd0` and `scripts/diagnose_loss_se3.py`/`scripts/verify_se3_sigma_consistency.py`/`scripts/probe_se3_orientation.py`.
 - **`train.py:_physical_loss`**: fixed 3.4 Å contact distance (per-atom via `torch.cdist`), not true VDW radii. In Phase-1 smoke this makes `loss_phys ≈ 0` (well-separated complexes have no clash at noise level) — the physical term produces no gradient until real VDW radii are used.
-- **`loss_se3 ≈ 0` in Phase-1 smoke** — needs investigation (SE3 head is zero-init so output≈0; either σ weighting or target scale is wrong). Phase 1 effectively only trains score-matching through FiLM. See the handoff doc.
 - **B=1 only**: `model.forward` is single-complex per step; padded B>1 batching is a follow-up.
 - **Checkpoint bloat**: `save_checkpoint` writes full `model_state_dict` (~131 MB, includes frozen expert) but `load_checkpoint` only reads `tribrain_state_dict` (~9 MB). `load_checkpoint` also does not restore optimizer/scheduler.
 - **`scripts/prepare_data.py:cluster_by_sequence_identity`**: greedy fallback; production should use MMseqs2.

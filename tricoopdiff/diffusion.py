@@ -152,6 +152,12 @@ class MultiRateDiffusion(nn.Module):
         """
         Add Gaussian noise to PROTAC translation and rotation (rigid-body DOFs).
 
+        The PROTAC forward process is FULL-RANGE: noise is sampled at the raw
+        σ(t) level for all t ∈ [0, 1], with NO λ_q cutoff. This keeps the forward
+        process consistent with ``reverse_step_protac`` (which denoises at the full
+        σ schedule, never applying λ) and with the DSM training target. The previous
+        λ_q cutoff made the forward schedule asymmetric with the reverse step.
+
         Torsion angles are perturbed separately by ``add_torsion_noise`` (applied
         after this rigid transform), mirroring DiffDock's ``modify_conformer``.
 
@@ -169,16 +175,27 @@ class MultiRateDiffusion(nn.Module):
         device = ligand_pos.device
 
         tr_sigma, rot_sigma, tor_sigma = self.t_to_sigma(t_tr, t_rot, t_tor)
-        lambda_q = self.get_lambda_q(t_tr)
 
         # Translation noise
-        tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1) * lambda_q.unsqueeze(-1)
+        tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1)
 
-        # Rotation noise (SO(3))
-        rot_update, rot_omega = sample_so3_noise(B, rot_sigma * lambda_q, device)
+        # Rotation noise (SO(3)) — wrapped sampling, matching the frozen expert's
+        # and so3_score_vec's IGSO(3) convention (see sample_so3_noise_wrapped).
+        rot_update, rot_omega = sample_so3_noise_wrapped(B, rot_sigma, device)
 
-        noisy_pos = ligand_pos + tr_update.unsqueeze(1)
-        noisy_pos = torch.bmm(noisy_pos, rot_update)
+        # Rotate about the ligand centre, then translate in the world frame —
+        # mirrors DiffDock's modify_conformer: (pos - centre) @ Rᵀ + tr + centre.
+        # The transpose is REQUIRED: DiffDock applies the rotation as @ Rᵀ =
+        # @ exp(-[ω]×), while the frozen expert was trained on that convention. A
+        # bare @ R = @ exp([ω]×) makes the expert read the pose as rotation -ω and
+        # emit score_vec(σ,-ω) = -score_vec(σ,ω) — the sign opposite of the training
+        # target score_vec(σ,ω) — so reverse_step_protac amplifies |ω| (zero-FiLM
+        # PROTAC-rotation divergence, the documented DockQ collapse).
+        # (The previous (pos + tr) @ R rotated about the ORIGIN and rotated the
+        # translation vector too, so the wrapped sampler's near-π angles teleported
+        # the ligand away from its pocket — exploding the tr-score target mismatch.)
+        lig_center = ligand_pos.mean(dim=1, keepdim=True)
+        noisy_pos = torch.bmm(ligand_pos - lig_center, rot_update.transpose(-1, -2)) + tr_update.unsqueeze(1) + lig_center
 
         return noisy_pos, tr_update, rot_update, rot_omega
 
@@ -191,6 +208,13 @@ class MultiRateDiffusion(nn.Module):
         """
         Add Gaussian noise to E3-POI rigid body transformation.
 
+        The SE3 forward process is FULL-RANGE: noise is sampled at the raw
+        σ(t) level for all t ∈ [0, 1], with NO λ_SE3 cutoff. This keeps the
+        forward process consistent with ``reverse_step_se3`` (which denoises at
+        the full σ schedule, never applying λ) and with the DSM training target.
+        The previous λ cutoff made the SE3 head train only on t ∈ (0.5, 1] while
+        inference queried t ∈ [0.05, 1.0], so the low-t regime was untrained.
+
         Args:
             poi_pos: [B, N_poi, 3] clean POI positions (relative to E3 origin)
             t_se3_tr, t_se3_rot: [B] diffusion times for SE3 DOFs
@@ -202,10 +226,9 @@ class MultiRateDiffusion(nn.Module):
         device = poi_pos.device
 
         tr_sigma, rot_sigma = self.se3_t_to_sigma(t_se3_tr, t_se3_rot)
-        lambda_se3 = self.get_lambda_se3(t_se3_tr)
 
-        tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1) * lambda_se3.unsqueeze(-1)
-        rot_update, rot_omega = sample_so3_noise(B, rot_sigma * lambda_se3, device)
+        tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1)
+        rot_update, rot_omega = sample_so3_noise(B, rot_sigma, device)
 
         # Apply to POI center of mass
         poi_center = poi_pos.mean(dim=1, keepdim=True)
@@ -226,6 +249,10 @@ class MultiRateDiffusion(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Add Gaussian noise to PROTAC rotatable-bond torsion angles.
+
+        Full-range (no λ_q cutoff), matching ``reverse_step_torsion`` and the
+        torsion DSM target over all t ∈ [0, 1] — the previous λ_q gate made the
+        forward schedule asymmetric with the reverse step.
 
         Translation/rotation perturb the whole conformer; torsion rotates each
         rotatable bond's downstream atoms around the bond axis. This mirrors
@@ -251,13 +278,12 @@ class MultiRateDiffusion(nn.Module):
         device = ligand_pos.device
 
         _, _, tor_sigma = self.t_to_sigma(t_tor, t_tor, t_tor)
-        lambda_q = self.get_lambda_q(t_tor)
 
         # Rotatable bond edges (one direction each), same row order as mask_rotate.
         rot_edges = lig_edge_index.T[lig_edge_mask]  # [n_rot, 2]
         n_rot = rot_edges.shape[0]
 
-        tor_update = torch.randn(B, n_rot, device=device) * tor_sigma.unsqueeze(-1) * lambda_q.unsqueeze(-1)
+        tor_update = torch.randn(B, n_rot, device=device) * tor_sigma.unsqueeze(-1)
 
         # A batch of 1 may carry mask_rotate as a bare ndarray; a batch of N as a
         # list of per-complex masks. Normalize to a per-element list.
@@ -355,12 +381,15 @@ class MultiRateDiffusion(nn.Module):
                 rot_z = torch.randn(B, 3, device=device)
                 rot_perturb = rot_perturb + rot_g * torch.sqrt(dt_rot).unsqueeze(-1) * rot_z
 
-        # Apply updates
+        # Apply updates. Rotation is applied as @ Rᵀ = @ exp(-[rot_perturb]×) to
+        # match both the fixed add_noise_protac forward (which now applies the
+        # noise as @ Rᵀ) and DiffDock's modify_conformer convention — otherwise the
+        # reverse step rotates in the wrong sense and amplifies the PROTAC rotation.
         ligand_pos = ligand_pos + tr_perturb.unsqueeze(1)
         rot_matrix = so3_exp(rot_perturb)
         ligand_center = ligand_pos.mean(dim=1, keepdim=True)
         ligand_centered = ligand_pos - ligand_center
-        ligand_pos = ligand_center + torch.bmm(ligand_centered, rot_matrix)
+        ligand_pos = ligand_center + torch.bmm(ligand_centered, rot_matrix.transpose(-1, -2))
 
         return ligand_pos
 
@@ -492,8 +521,8 @@ class MultiRateDiffusion(nn.Module):
         """
         Returns time discretization for reverse diffusion.
 
-        PROTAC DOFs: linear schedule from t=1 to t=0
-        SE3 DOFs: linear schedule from t=1 to t=0 (but noise decays slower due to λ)
+        PROTAC DOFs: linear schedule from t=1 to t=0 (full-range, no λ_q cutoff)
+        SE3 DOFs: linear schedule from t=1 to t=0 (full-range, no λ_SE3 cutoff)
 
         Returns dict with:
             'tr_schedule': [steps+1] PROTAC translation times
@@ -636,6 +665,51 @@ def sample_so3_noise(
     return so3_exp(omega), omega
 
 
+def sample_so3_noise_wrapped(
+    batch_size: int, sigma: torch.Tensor, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sample noise on SO(3) matching DiffDock's wrapped `so3.sample_vec` convention.
+
+    Draws a uniform unit direction × a wrapped angle sampled from the IGSO(3)
+    CDF in [0, π], returning the wrapped so(3) vector ω and its rotation matrix.
+    This is the convention the frozen expert and `so3_score_vec` assume.
+
+    Contrast with `sample_so3_noise` (R³ Gaussian ω ~ N(0, σ²I)): that sampler is
+    only valid for the Euclidean DSM target (-ω/σ²) used by the SE3 head. For the
+    PROTAC rotation the target/expert use the wrapped IGSO(3) score, and an R³
+    sampler emits ‖ω‖ > π for σ > 1.0, where `so3_score_vec` extrapolates past
+    the valid [0, π] table — a systematic bias of up to ~64% at σ = 1.55.
+
+    Args:
+        batch_size: number of samples
+        sigma: [B] noise level per sample
+        device: torch device
+    Returns:
+        (rotation_matrices [B, 3, 3], omega [B, 3]) with ‖omega‖ ∈ [0, π]
+    """
+    _init_so3_cache()
+    B = batch_size
+    sigma_np = sigma.detach().cpu().numpy() if hasattr(sigma, 'cpu') else np.asarray(sigma)
+    sigma_np = np.clip(np.atleast_1d(sigma_np).astype(float), _MIN_EPS, _MAX_EPS)
+    eps_idx = (np.log10(sigma_np) - np.log10(_MIN_EPS)) / (
+        np.log10(_MAX_EPS) - np.log10(_MIN_EPS)) * _N_EPS
+    eps_idx = np.clip(np.around(eps_idx).astype(int), 0, _N_EPS - 1)
+
+    # Inverse-CDF sampling of the wrapped angle, mirroring so3.sample(): draw
+    # u ~ U[0,1) and linearly interpolate u against the CDF row → angle ∈ [0, π].
+    u = torch.rand(B, device=device).cpu().numpy()
+    angles_np = np.array([
+        np.interp(u[i], _cdf_vals[eps_idx[i]], _omegas_array) for i in range(B)
+    ])
+    angles = torch.from_numpy(angles_np).float().to(device)
+
+    direction = torch.randn(B, 3, device=device)
+    direction = direction / torch.linalg.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
+    omega = direction * angles.unsqueeze(-1)  # [B, 3], ‖ω‖ ∈ [0, π]
+    return so3_exp(omega), omega
+
+
 def so3_exp(omega: torch.Tensor) -> torch.Tensor:
     """
     Exponential map from so(3) to SO(3) using Rodrigues' formula.
@@ -724,6 +798,9 @@ def _init_so3_cache(cache_dir=None):
         _exp_score_norms = np.load(score_file)
         if _os.path.exists(score_norm_file):
             _score_norms = np.load(score_norm_file)
+        cdf_file = _os.path.join(cache_dir, '.so3_cdf_vals4.npy')
+        if _os.path.exists(cdf_file):
+            _cdf_vals = np.load(cdf_file)
         return
 
     _eps_array = 10 ** np.linspace(np.log10(_MIN_EPS), np.log10(_MAX_EPS), _N_EPS)

@@ -45,10 +45,16 @@ class TriCoopDiffTrainer:
         weight_decay: float = 1e-4,
         loss_weights: Optional[Dict[str, float]] = None,
         device: str = 'cuda',
+        contact_distance: float = 3.4,
     ):
         self.model = model.to(device)
         self.diffusion = diffusion
         self.device = device
+
+        # Steric-clash contact distance (Å) for _physical_loss. Fixed 3.4 Å
+        # default (Cα-level coordinates); a true per-atom VDW radius would need
+        # element information, which is out of scope here.
+        self.contact_distance = contact_distance
 
         # Loss weights (from execution plan: score=1.0, phys=0.5, se3=0.3)
         self.loss_weights = loss_weights or {
@@ -56,6 +62,15 @@ class TriCoopDiffTrainer:
             'phys': 0.5,
             'se3': 0.3,
         }
+
+        # Per-component cap on the PROTAC score-matching loss. With B=1 (no
+        # cross-complex averaging) a single large PROTAC whose frozen-expert
+        # forward pass blows up (node features hitting the NAN_CLAMP ceiling,
+        # scores ~1e4 → loss ~1e6-1e8) produces a gradient that, after
+        # clip_grad_norm(max_norm=1.0), drowns out the SE3 signal. The σ²/norm²
+        # weighting makes a well-behaved score loss O(1); this cap is ~100x that
+        # and only bites on the blow-up regime.
+        self.score_loss_cap = 100.0
 
         # Only TriBrain is trainable; experts are frozen
         self.optimizer = AdamW(
@@ -139,31 +154,40 @@ class TriCoopDiffTrainer:
             loss_score_tor = ((output['s_q']['tor'] - tor_score_target)**2 / tor_norm).mean()
         else:
             loss_score_tor = torch.tensor(0.0, device=device)
+
+        # Bound the per-component score losses before summing (see
+        # self.score_loss_cap). Clamping a loss to a constant zeroes its
+        # gradient (flat region), which is exactly what we want for an outlier
+        # batch whose score output is unreliable.
+        loss_score_tr = loss_score_tr.clamp(max=self.score_loss_cap)
+        loss_score_rot = loss_score_rot.clamp(max=self.score_loss_cap)
+        loss_score_tor = loss_score_tor.clamp(max=self.score_loss_cap)
         loss_score = loss_score_tr + loss_score_rot + loss_score_tor
 
-        # SE3 score matching loss — same pattern as PROTAC.
-        # The forward noise (add_noise_se3) is sampled at the EFFECTIVE level
-        # sigma_eff = sigma * lambda_se3, where lambda_se3(t) = 1 for t above the
-        # SE3 threshold and 0 below it. For lambda=0 samples the POI is NOT
-        # perturbed (noise == 0, target == 0), so the DSM weighting must use
-        # sigma_eff^2 = sigma^2 * lambda^2 (== sigma^2 * lambda for a 0/1 step).
-        # Without this mask, clean samples contribute pred^2 * sigma^2 (a spurious
-        # "predict 0" gradient) that pins the SE3 head at ~0 and produces the
-        # observed loss_se3 ~= 1.0 floor.
+        # SE3 score matching loss — full-range (no λ_SE3 cutoff). add_noise_se3
+        # samples noise at the raw σ(t) for all t, matching reverse_step_se3, so
+        # the head is trained on the whole t ∈ [0, 1] schedule instead of only
+        # t ∈ (0.5, 1]. (The earlier λ mask left the low-t regime untrained,
+        # which inference still queried.)
         se3_tr_sigma, se3_rot_sigma = self.diffusion.se3_t_to_sigma(t_se3, t_se3)
-        lambda_se3 = self.diffusion.get_lambda_se3(t_se3).unsqueeze(-1)  # [B,1] in {0,1}
         se3_tr_target = -se3_tr_noise / se3_tr_sigma.unsqueeze(-1)**2
         diff_se3_tr = output['s_se3_components']['tr'] - se3_tr_target
-        loss_se3_tr = (diff_se3_tr**2 * se3_tr_sigma.unsqueeze(-1)**2 * lambda_se3).mean()
+        loss_se3_tr = (diff_se3_tr**2 * se3_tr_sigma.unsqueeze(-1)**2).mean()
 
-        se3_rot_target = self._compute_rot_score_target(se3_rot_omega, se3_rot_sigma)
-        se3_rot_norm = so3_score_norm(se3_rot_sigma).unsqueeze(-1)
-        loss_se3_rot = ((output['s_se3_components']['rot'] - se3_rot_target)**2 / se3_rot_norm**2 * lambda_se3).mean()
+        # SE3 rotation uses Euclidean (R³) DSM, symmetric with translation.
+        # add_noise_se3 samples ω ~ N(0, σ²I) in the unwrapped so(3) Lie algebra
+        # via sample_so3_noise, whose exact score is -ω/σ². The previous wrapped
+        # so3_score_vec target both mismatched that sampler and, combined with the
+        # 1/norm² weighting, gave translation ~14-17× more gradient than rotation
+        # — starving the rotation head at the π≈3.14 zero-model floor.
+        se3_rot_target = -se3_rot_omega / se3_rot_sigma.unsqueeze(-1)**2
+        diff_se3_rot = output['s_se3_components']['rot'] - se3_rot_target
+        loss_se3_rot = (diff_se3_rot**2 * se3_rot_sigma.unsqueeze(-1)**2).mean()
         loss_se3 = loss_se3_tr + loss_se3_rot
 
         # Physical consistency loss
         denoised_ligand = self._estimate_denoised(noisy_ligand, output['s_q']['tr'], tr_sigma)
-        denoised_poi = self._estimate_denoised_se3(noisy_poi, output['s_se3'], se3_tr_sigma)
+        denoised_poi = self._estimate_denoised_se3(noisy_poi, output['s_se3'], se3_tr_sigma, se3_rot_sigma)
         loss_phys = self._physical_loss(
             denoised_ligand, noisy_e3_data['coords'], denoised_poi
         )
@@ -181,6 +205,8 @@ class TriCoopDiffTrainer:
             'loss_score_rot': loss_score_rot.item(),
             'loss_score_tor': loss_score_tor.item(),
             'loss_se3': loss_se3.item(),
+            'loss_se3_tr': loss_se3_tr.item(),
+            'loss_se3_rot': loss_se3_rot.item(),
             'loss_phys': loss_phys.item(),
         }
 
@@ -241,13 +267,24 @@ class TriCoopDiffTrainer:
         """Tweedie's formula: x̂ = x_noisy + σ² * score"""
         return noisy_pos + sigma.unsqueeze(-1).unsqueeze(-1) ** 2 * score.unsqueeze(1)
 
-    def _estimate_denoised_se3(self, noisy_poi, se3_score, sigma):
-        """Estimate denoised POI positions using Tweedie's formula."""
+    def _estimate_denoised_se3(self, noisy_poi, se3_score, sigma_tr, sigma_rot):
+        """Estimate denoised POI positions using Tweedie's formula (translation + rotation).
+
+        The SE3 forward process is ``noisy = (clean - center) @ exp(ω) + center + tr``
+        (no transpose, i.e. the ``@ R`` convention) with score targets ``-tr/σ_tr²``
+        and ``-ω/σ_rot²``. Tweedie therefore gives ``tr̂ = σ_tr²·tr_score`` and
+        ``ω̂ = σ_rot²·rot_score``; the denoised rotation applies ``@ exp(-ω̂)``,
+        which equals ``@ exp(σ_rot²·rot_score)`` — again no transpose, matching the
+        SE3 ``@ R`` convention.
+        """
+        from .diffusion import so3_exp
         tr_score = se3_score[:, :3]
-        # Apply to POI center
+        rot_score = se3_score[:, 3:]
         poi_center = noisy_poi.mean(dim=1, keepdim=True)
-        denoised_center = poi_center + sigma.unsqueeze(-1).unsqueeze(-1) ** 2 * tr_score.unsqueeze(1)
-        return noisy_poi - poi_center + denoised_center
+        denoised_center = poi_center + sigma_tr.unsqueeze(-1).unsqueeze(-1) ** 2 * tr_score.unsqueeze(1)
+        rot_correction = so3_exp((sigma_rot.unsqueeze(-1) ** 2) * rot_score)  # [B,3,3]
+        denoised_centered = torch.bmm(noisy_poi - poi_center, rot_correction)
+        return denoised_centered + denoised_center
 
     def _physical_loss(self, ligand_coords, e3_coords, poi_coords):
         """
@@ -255,7 +292,8 @@ class TriCoopDiffTrainer:
         PROTAC and both proteins.
 
         Per-atom VDW repulsion: Σ max(0, vdw_sum - dist)² over all
-        PROTAC-protein atom pairs, using a fixed 3.4 Å contact distance.
+        PROTAC-protein atom pairs, using a configurable contact distance
+        (``self.contact_distance``, default 3.4 Å).
         O(N_lig × N_prot) via torch.cdist — sufficient at MVP scale.
         """
         clash = torch.tensor(0.0, device=ligand_coords.device)
@@ -264,8 +302,8 @@ class TriCoopDiffTrainer:
                 continue
             # [B, N_lig, N_prot] pairwise distances
             dist = torch.cdist(ligand_coords, protein_coords)
-            # Repulsive term: atom pairs closer than 3.4 Å contribute
-            clash = clash + (F.relu(3.4 - dist) ** 2).mean()
+            # Repulsive term: atom pairs closer than the contact distance contribute
+            clash = clash + (F.relu(self.contact_distance - dist) ** 2).mean()
         return clash
 
     def scheduler_step(self):
@@ -291,20 +329,33 @@ class TriCoopDiffTrainer:
                 param.requires_grad = True
 
     def save_checkpoint(self, path: str):
-        """Save model checkpoint."""
+        """Save model checkpoint.
+
+        Stores only the trainable TriBrain state (the frozen expert is ~131 MB and
+        never changes, so its full ``model_state_dict`` was redundant bloat), plus
+        optimizer/scheduler state and the global step for resumable training.
+        """
         torch.save({
             'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
             'tribrain_state_dict': self.model.tribrain.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
         }, path)
 
     def load_checkpoint(self, path: str):
-        """Load model checkpoint (for fine-tuning)."""
+        """Load model checkpoint (for fine-tuning / resume).
+
+        Restores TriBrain weights plus optimizer/scheduler state when present.
+        Older checkpoints without optimizer/scheduler keys are handled gracefully
+        (weights + global step only).
+        """
         ckpt = torch.load(path, map_location=self.device)
         self.model.tribrain.load_state_dict(ckpt['tribrain_state_dict'])
-        self.global_step = ckpt['global_step']
+        self.global_step = ckpt.get('global_step', 0)
+        if 'optimizer_state_dict' in ckpt:
+            self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if 'scheduler_state_dict' in ckpt:
+            self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
 
 
 # so3_score_norm — imported from tricoopdiff.diffusion where needed

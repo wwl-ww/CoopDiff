@@ -202,7 +202,11 @@ class SE3GeometryEncoder(nn.Module):
         self.node_net = nn.Sequential(
             nn.Linear(6, hidden), nn.SiLU(), nn.Linear(hidden, hidden),
         )
-        self.combine = nn.Linear(2 * hidden, geo_dim)
+        # +12 = 6-entry covariance (second-moment) vector for each of POI and E3.
+        # These are rotation-sensitive (R·C·Rᵀ in the fixed E3 frame) and recover
+        # the orientation info that symmetric scalar mean/max pooling destroys
+        # (the sole mean/max path capped rotation readout at R²≈0.51).
+        self.combine = nn.Linear(2 * hidden + 12, geo_dim)
 
     def forward(self, node_coords, node_types, batch=None):
         if batch is None:
@@ -233,7 +237,32 @@ class SE3GeometryEncoder(nn.Module):
         h = self.node_net(feat)                              # [N, hidden]
         mean = scatter_mean(h, batch, dim=0, dim_size=n_batch)   # [B, hidden]
         mx = scatter_max_per_batch(h, batch, n_batch)            # [B, hidden]
-        return self.combine(torch.cat([mean, mx], dim=-1))       # [B, geo_dim]
+        cov = self._second_moments(node_coords, node_types, batch, n_batch)  # [B, 12]
+        return self.combine(torch.cat([mean, mx, cov], dim=-1))               # [B, geo_dim]
+
+    def _second_moments(self, node_coords, node_types, batch, n_batch):
+        """Per-cloud covariance (6 unique entries) for POI (type 1) then E3 (type 0).
+
+        Computed about each cloud's own centroid → translation-invariant, and in
+        the fixed E3 frame the POI covariance is R·C·Rᵀ, i.e. directly
+        rotation-sensitive. Concatenated to [B, 12].
+        """
+        entries = []
+        for typ in (1, 0):
+            mask = node_types == typ
+            c = scatter_mean(node_coords[mask], batch[mask], dim=0, dim_size=n_batch)  # [B, 3]
+            rel_t = node_coords[mask] - c[batch[mask]]        # [N_t, 3]
+            outer = rel_t.unsqueeze(-1) * rel_t.unsqueeze(-2) # [N_t, 3, 3]
+            cov = scatter_mean(                               # [B, 3, 3]
+                outer.reshape(rel_t.shape[0], 9),
+                batch[mask], dim=0, dim_size=n_batch,
+            ).reshape(n_batch, 3, 3)
+            cov = (cov + cov.transpose(-1, -2)) / 2
+            entries.append(torch.stack([
+                cov[:, 0, 0], cov[:, 1, 1], cov[:, 2, 2],
+                cov[:, 0, 1], cov[:, 0, 2], cov[:, 1, 2],
+            ], dim=-1))                                       # [B, 6]
+        return torch.cat(entries, dim=-1)                     # [B, 12]
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +476,28 @@ class StateHead(nn.Module):
         return self.net(x)
 
 
+class MergeGateHead(nn.Module):
+    """
+    Per-score-type residual gate for merging the two subgraph scores.
+
+    Produces ``g`` = [B, 3] (tr / rot / tor) such that the merged PROTAC score is
+    ``s_q = s_q1 + g * (s_q2 - s_q1)``. **Zero-initialized**, so at init ``g=0``
+    → ``s_q = s_q1`` (pure E3-L), restoring the zero-FiLM transparency baseline.
+    ``g`` scales how much of the POI-L two-body force field (``s_q2 - s_q1``) is
+    blended in — starting from none, matching FiLM's adaLN-Zero philosophy.
+    """
+
+    def __init__(self, hidden_dim: int = 128):
+        super().__init__()
+        self.net = nn.Linear(hidden_dim, 3)
+        nn.init.zeros_(self.net.weight)
+        nn.init.zeros_(self.net.bias)
+
+    def forward(self, h_cond: torch.Tensor) -> torch.Tensor:
+        """Returns [B, 3] residual gate (tr, rot, tor); =0 at init."""
+        return self.net(h_cond)
+
+
 # ---------------------------------------------------------------------------
 # Full TriBrain
 # ---------------------------------------------------------------------------
@@ -541,6 +592,9 @@ class TriBrain(nn.Module):
             FiLMHead(node_dim, film_dim) for _ in range(num_conv_layers_per_expert * 2)
         ])
 
+        # Residual merge gate: s_q = s_q1 + g * (s_q2 - s_q1), zero-init → transparent.
+        self.merge_gate_head = MergeGateHead(node_dim)
+
     def forward(
         self,
         node_features: torch.Tensor,
@@ -601,12 +655,16 @@ class TriBrain(nn.Module):
             gamma, beta = head(h_film)
             film_params.append((gamma, beta))
 
+        # 5. Residual merge gate (s_q = s_q1 + g * (s_q2 - s_q1)); zero at init.
+        merge_gate = self.merge_gate_head(h_cond)  # [B, 3]
+
         return {
             's_se3': s_se3,
             'confidence': confidence,
             'state': state,
             'film_params': film_params,  # list of (gamma, beta), len=num_conv_layers*2
             'h_cond': h_cond,
+            'merge_gate': merge_gate,  # [B, 3] residual gate (tr, rot, tor)
         }
 
 
