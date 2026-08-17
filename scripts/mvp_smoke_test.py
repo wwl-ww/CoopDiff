@@ -16,9 +16,9 @@ Runs the full pipeline ONCE on a single real ternary complex:
 
 Exit code 0 = both gates pass; 1 = any failure.
 
-The model + sampling run entirely on the vendored ``tricoopdiff.diffdock.*``.
-``../DiffDock`` is only imported for *data featurization*
-(``InferenceDataset`` / ``get_sequences``), which stays out of the vendor scope.
+The model + sampling + data featurization all run on the vendored
+``tricoopdiff.diffdock.*`` (including ``InferenceDataset`` / ``get_sequences``),
+so no external DiffDock checkout is required.
 """
 
 import argparse
@@ -27,7 +27,6 @@ import sys
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_DIFFDOCK_DIR = _PROJECT_ROOT.parent / "DiffDock"
 
 # Make the project root importable so `import tricoopdiff.*` works whether this
 # script is run as `python scripts/mvp_smoke_test.py` (sys.path[0] = scripts/) or
@@ -36,19 +35,13 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 # scripts/ is importable for the shared featurization module (sibling of this file).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# (1) Import diffdock_compat FIRST — its import-time side effect patches
+# Import diffdock_compat FIRST — its import-time side effect patches
 # torch_cluster / torch_scatter with pure-PyTorch fallbacks before the vendored
-# cg_model and ../DiffDock's process_mols bind those symbols at import time.
+# cg_model and the vendored process_mols bind those symbols at import time.
 # NOTE: importing any `tricoopdiff.*` submodule runs tricoopdiff/__init__.py,
 # which itself imports diffdock_compat before model/graphs/diffusion, so the
 # patch is guaranteed to be in place for tribrain.py / expert.py too.
 import tricoopdiff.diffdock_compat  # noqa: F401
-
-# (2) Add ../DiffDock to sys.path for data featurization ONLY.
-if not _DIFFDOCK_DIR.exists():
-    print(f"FATAL: DiffDock checkout not found at {_DIFFDOCK_DIR}", flush=True)
-    sys.exit(1)
-sys.path.insert(0, str(_DIFFDOCK_DIR))
 
 import torch
 import yaml

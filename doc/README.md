@@ -49,4 +49,4 @@
 | PROTAC benchmark 规模 | DeepTernary 审计 **22**；DiffDock 基线 **23**（含 7PI4） | `protac22.txt` 22 个；DiffDock 基线多 1 个 7PI4 |
 | 可训练参数量 | ~2.2M（TriBrain） | 模型文档 v2.4 |
 | FiLM 方案 | 逐层独立 FiLM（6 层 × 2 子图 = 12 head，DiT adaLN-Zero） | 模型文档 v2.4 |
-| DiffDock 位置 | 仓库内 `./DiffDock` | 代码 + DiffDock 实验交接文档 |
+| DiffDock 位置 | **已完全 vendor 到 `tricoopdiff/diffdock/`**（模型核心 + 特征化 `datasets/`/`utils/inference_utils.py`），无需外部 checkout | 代码 + DiffDock 实验交接文档 |

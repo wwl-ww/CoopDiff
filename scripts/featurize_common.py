@@ -6,11 +6,12 @@ Extracts the featurization path that ``scripts/mvp_smoke_test.py`` validated
 (receptor/ligand subgraph featurization via DiffDock's ``InferenceDataset`` +
 on-the-fly ESM2-650M embeddings) into a single reusable module.
 
-These functions depend on the DiffDock checkout (git-ignored; in-repo
-``./DiffDock`` or sibling ``../DiffDock``) for *data featurization only*
-(``InferenceDataset`` / ``get_sequences``), which is why they live under
-``scripts/`` rather than the self-contained ``tricoopdiff/`` package. The model
-itself runs entirely on the vendored ``tricoopdiff.diffdock.*``.
+The featurization modules (``InferenceDataset`` / ``get_sequences`` /
+``datasets.process_mols``) are vendored under ``tricoopdiff.diffdock``
+(``.datasets`` + ``.utils.inference_utils``), so these functions import them via
+``tricoopdiff.diffdock.*`` and no longer need the external DiffDock checkout.
+They still live under ``scripts/`` rather than ``tricoopdiff/`` because they mix
+project data paths (``DeepTernary/output/...``) with the vendored featurization.
 """
 
 import os
@@ -20,48 +21,20 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _resolve_diffdock_dir():
-    """Locate the DiffDock checkout used for *data featurization only*.
-
-    DiffDock is git-ignored and may be cloned either in-repo (``./DiffDock``,
-    the canonical ``.gitignore`` location) or as a sibling (``../DiffDock``).
-    Prefer the in-repo clone and fall back to the sibling; both must contain the
-    featurization modules ``utils/inference_utils.py`` and
-    ``datasets/process_mols.py`` (where ``InferenceDataset`` / ``get_sequences``
-    live).
-    """
-    candidates = (_PROJECT_ROOT / "DiffDock", _PROJECT_ROOT.parent / "DiffDock")
-    for d in candidates:
-        if (d / "utils" / "inference_utils.py").exists() and \
-                (d / "datasets" / "process_mols.py").exists():
-            return d
-    raise RuntimeError(
-        "DiffDock checkout not found. Expected at either "
-        f"{candidates[0]} or {candidates[1]} (with utils/inference_utils.py and "
-        "datasets/process_mols.py). Clone DiffDock into one of those paths."
-    )
-
-
-_DIFFDOCK_DIR = _resolve_diffdock_dir()
-
 # Make the project root importable so `import tricoopdiff.*` works regardless of
 # how this module is invoked (it is not pip-installed).
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-# (1) Import diffdock_compat FIRST — its import-time side effect patches
+# Import diffdock_compat FIRST — its import-time side effect patches
 # torch_cluster / torch_scatter with pure-PyTorch fallbacks before the vendored
-# cg_model and the DiffDock checkout's process_mols bind those symbols at import
-# time.
+# cg_model and the vendored process_mols bind those symbols at import time.
 import tricoopdiff.diffdock_compat  # noqa: F401
-
-# (2) Add the DiffDock checkout to sys.path for data featurization ONLY.
-sys.path.insert(0, str(_DIFFDOCK_DIR))
 
 import numpy as np
 import torch
 from torch_geometric.loader import DataLoader
 
-from utils.inference_utils import InferenceDataset, get_sequences
+from tricoopdiff.diffdock.utils.inference_utils import InferenceDataset, get_sequences
 
 # DiffDock's SO(3)/torus cache lookup resolves relative to CWD; the cache files
 # live in the project root. Chdir there so score lookups find them (SLURM also
@@ -82,7 +55,7 @@ def _protein_ca_centroid(pdb_path):
     centroid that ``inference_utils`` subtracts is their mean. Returns float32 [3].
     """
     import prody as pr
-    from datasets.parse_chi import get_coords
+    from tricoopdiff.diffdock.datasets.parse_chi import get_coords
 
     pdb = pr.parsePDB(pdb_path)
     coords = get_coords(pdb)          # [n_res, 14, 3]; column 1 = Cα
