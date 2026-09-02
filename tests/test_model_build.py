@@ -221,6 +221,29 @@ def test_merging():
     print("  [OK] Score merging")
 
 
+def test_deepternary_dockq_alignment():
+    """Primary DockQ matches DeepTernary's ternary-coordinate convention."""
+    from tricoopdiff.evaluate import compute_deepternary_dockq
+
+    e3 = np.array([[0.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 6.0, 0.0]])
+    ligand = np.array([[2.0, 0.0, 0.0], [2.0, 3.0, 0.0]])
+    poi = np.array([[4.0, 0.0, 0.0], [4.0, 3.0, 0.0]])
+    perfect = compute_deepternary_dockq(ligand, e3, poi, ligand, e3, poi)
+    assert perfect is not None
+    assert abs(perfect["dockq"] - 1.0) < 1e-7
+    assert abs(perfect["fnat"] - 1.0) < 1e-7
+    assert perfect["lrms"] < 1e-7
+    assert perfect["irms"] < 1e-7
+
+    displaced = compute_deepternary_dockq(
+        ligand, e3, poi, ligand + 20.0, e3, poi + 20.0
+    )
+    assert displaced is not None
+    assert displaced["dockq"] < perfect["dockq"]
+
+    print("  [OK] DeepTernary DockQ alignment")
+
+
 if __name__ == "__main__":
     print("=== TriCoopDiff Smoke Tests ===\n")
 
@@ -230,5 +253,6 @@ if __name__ == "__main__":
     test_graph_construction()
     test_reflect_pipeline()
     test_merging()
+    test_deepternary_dockq_alignment()
 
     print("\n=== All tests passed ===")

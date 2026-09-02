@@ -154,6 +154,84 @@ def compute_linker_strain_energy(
 # POI / ternary interface metrics (frame-invariant)
 # ---------------------------------------------------------------------------
 
+def compute_deepternary_dockq(
+    native_ligand: np.ndarray,
+    native_e3: np.ndarray,
+    native_poi: np.ndarray,
+    pred_ligand: np.ndarray,
+    pred_e3: np.ndarray,
+    pred_poi: np.ndarray,
+    cutoff: float = 5.0,
+) -> Optional[Dict[str, float]]:
+    """Match DeepTernary's ``simple_dockq.cal_approx_dockq`` convention.
+
+    E3 is the receptor; PROTAC and POI are concatenated as the mobile partner.
+    Fnat is recovery of native interface-node identities (not contact pairs),
+    Lrms is measured in the fixed-E3 frame, and iRMS uses a Kabsch fit of the
+    native-interface nodes. This intentionally mirrors DeepTernary's benchmark
+    helper so the reported primary DockQ has the same meaning.
+    """
+    from scipy.spatial.distance import cdist
+
+    arrays = (native_ligand, native_e3, native_poi, pred_ligand, pred_e3, pred_poi)
+    if any(array.ndim != 2 or array.shape[1] != 3 for array in arrays):
+        return None
+    if (
+        native_ligand.shape != pred_ligand.shape
+        or native_e3.shape != pred_e3.shape
+        or native_poi.shape != pred_poi.shape
+    ):
+        return None
+
+    native_mobile = np.concatenate([native_ligand, native_poi], axis=0)
+    pred_mobile = np.concatenate([pred_ligand, pred_poi], axis=0)
+
+    def pocket_indices(mobile, receptor):
+        distances = cdist(mobile, receptor)
+        mobile_ids = np.flatnonzero(distances.min(axis=1) <= cutoff)
+        receptor_ids = np.flatnonzero(distances.min(axis=0) <= cutoff)
+        return mobile_ids, receptor_ids
+
+    native_mobile_ids, native_receptor_ids = pocket_indices(native_mobile, native_e3)
+    pred_mobile_ids, pred_receptor_ids = pocket_indices(pred_mobile, pred_e3)
+    native_nodes = {
+        *(f"{index}_lig" for index in native_mobile_ids.tolist()),
+        *(f"{index}_rec" for index in native_receptor_ids.tolist()),
+    }
+    if not native_nodes:
+        return None
+    pred_nodes = {
+        *(f"{index}_lig" for index in pred_mobile_ids.tolist()),
+        *(f"{index}_rec" for index in pred_receptor_ids.tolist()),
+    }
+    fnat = len(native_nodes & pred_nodes) / len(native_nodes)
+
+    lrms = float(np.sqrt(np.mean(np.sum((native_mobile - pred_mobile) ** 2, axis=1))))
+    native_interface = np.concatenate(
+        [native_mobile[native_mobile_ids], native_e3[native_receptor_ids]], axis=0
+    )
+    pred_interface = np.concatenate(
+        [pred_mobile[native_mobile_ids], pred_e3[native_receptor_ids]], axis=0
+    )
+    aligned_interface = kabsch_align(pred_interface, native_interface)
+    irms = float(
+        np.sqrt(np.mean(np.sum((native_interface - aligned_interface) ** 2, axis=1)))
+    )
+    dockq = (
+        fnat
+        + 1.0 / (1.0 + (irms / 1.5) ** 2)
+        + 1.0 / (1.0 + (lrms / 8.5) ** 2)
+    ) / 3.0
+    return {
+        "dockq": float(dockq),
+        "fnat": float(fnat),
+        "lrms": lrms,
+        "irms": irms,
+        "n_native_interface_nodes": len(native_nodes),
+        "n_recovered_interface_nodes": len(native_nodes & pred_nodes),
+        "cutoff": float(cutoff),
+    }
+
 def _parse_native_complex(pdb_path: str) -> Optional[Dict[str, np.ndarray]]:
     """
     Parse a native ternary complex PDB into PROTAC / E3 / POI coordinates.
@@ -706,6 +784,7 @@ def evaluate_model(
 
     ref_lig = ligand_data['coords'][0].detach().cpu().numpy()  # [N_lig, 3] native
     e3_ca = e3_data['coords'][0].detach().cpu().numpy()        # [N_e3, 3] fixed E3 Cα
+    ref_poi = poi_data['coords'][0].detach().cpu().numpy()     # [N_poi, 3] native POI Cα
     lig_bonds = ligand_data['edge_index'].detach().cpu().numpy()  # [2, E] covalent graph
 
     # Per-walker records (one per finite trajectory, aligned indices) so the
@@ -726,6 +805,15 @@ def evaluate_model(
             'protac_rmsd': compute_rmsd(pred, ref_lig, align_first=True),
             'pocket_dist': float(np.linalg.norm(pred.mean(axis=0) - ref_lig.mean(axis=0))),
         }
+        deepternary_m = compute_deepternary_dockq(
+            ref_lig, e3_ca, ref_poi,
+            pred, e3_ca, r['poi_coords'],
+        )
+        if deepternary_m is not None:
+            rec['dockq'] = deepternary_m['dockq']
+            rec['dockq_fnat'] = deepternary_m['fnat']
+            rec['dockq_lrms'] = deepternary_m['lrms']
+            rec['dockq_irms'] = deepternary_m['irms']
         e3_m = compute_e3_interface_dockq(e3_ca, pred, ref_lig)
         if e3_m is not None:
             rec['e3_dockq'] = e3_m['dockq']
@@ -750,15 +838,19 @@ def evaluate_model(
     pred_ligs = [w['pred'] for w in walkers]
     protac_rmsds = np.asarray([w['protac_rmsd'] for w in walkers])
     pocket_dists = np.asarray([w['pocket_dist'] for w in walkers])
-    # Best sample = the walker with the highest E3-PROTAC interface DockQ (the
-    # primary quality metric); every "_best" key below reports that same walker.
-    best_idx = int(np.argmax([w.get('e3_dockq', -1.0) for w in walkers])) if walkers else 0
+    # Best sample follows DeepTernary's ternary DockQ convention. Every "_best"
+    # field below refers to this same coherent walker.
+    best_idx = int(np.argmax([w.get('dockq', -1.0) for w in walkers])) if walkers else 0
 
     # Initialize every metric to None; the finite-walker branch below fills in
     # what it can. "best" always means "the single dockq-best walker's value"
     # (see best_idx above) so the best column is one coherent pose, while
     # mean/median are ensemble statistics over all finite walkers.
     structure = {
+        'dockq_best': None, 'dockq_mean': None, 'dockq_median': None,
+        'dockq_fnat_best': None, 'dockq_fnat_mean': None,
+        'dockq_lrms_best': None, 'dockq_lrms_mean': None,
+        'dockq_irms_best': None, 'dockq_irms_mean': None,
         'protac_rmsd_best': None, 'protac_rmsd_mean': None, 'protac_rmsd_median': None,
         'protac_pocket_dist_mean': None, 'protac_pocket_dist_best': None,
         'clash_rate': None,
@@ -775,6 +867,19 @@ def evaluate_model(
 
     if walkers:
         best = walkers[best_idx]
+        dockqs = np.asarray([w['dockq'] for w in walkers if 'dockq' in w])
+        dockq_fnats = np.asarray([w['dockq_fnat'] for w in walkers if 'dockq_fnat' in w])
+        dockq_lrms = np.asarray([w['dockq_lrms'] for w in walkers if 'dockq_lrms' in w])
+        dockq_irms = np.asarray([w['dockq_irms'] for w in walkers if 'dockq_irms' in w])
+        structure['dockq_best'] = float(best['dockq']) if 'dockq' in best else None
+        structure['dockq_mean'] = float(dockqs.mean()) if len(dockqs) else None
+        structure['dockq_median'] = float(np.median(dockqs)) if len(dockqs) else None
+        structure['dockq_fnat_best'] = float(best['dockq_fnat']) if 'dockq_fnat' in best else None
+        structure['dockq_fnat_mean'] = float(dockq_fnats.mean()) if len(dockq_fnats) else None
+        structure['dockq_lrms_best'] = float(best['dockq_lrms']) if 'dockq_lrms' in best else None
+        structure['dockq_lrms_mean'] = float(dockq_lrms.mean()) if len(dockq_lrms) else None
+        structure['dockq_irms_best'] = float(best['dockq_irms']) if 'dockq_irms' in best else None
+        structure['dockq_irms_mean'] = float(dockq_irms.mean()) if len(dockq_irms) else None
         structure['protac_rmsd_best'] = float(best['protac_rmsd'])
         structure['protac_rmsd_mean'] = float(protac_rmsds.mean())
         structure['protac_rmsd_median'] = float(np.median(protac_rmsds))

@@ -9,6 +9,12 @@ from pathlib import Path
 
 
 METRICS = (
+    "dockq_best",
+    "dockq_mean",
+    "dockq_median",
+    "dockq_fnat_best",
+    "dockq_lrms_best",
+    "dockq_irms_best",
     "protac_rmsd_best",
     "protac_rmsd_mean",
     "protac_pocket_dist_best",
