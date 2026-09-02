@@ -146,6 +146,11 @@ def _build_step0_subgraph(args, expert):
     poi_center0 = poi_pos[0].mean(dim=0)
     t_e3_to_poi = poi_center0 - e3_center0
     ligand_coords_poi = transform_ligand_to_poi_frame(ligand_coords_e3, t_e3_to_poi, torch.eye(3, device=ligand_coords_e3.device))
+    poi_coords_poi = transform_ligand_to_poi_frame(
+        poi_data["coords"][0],
+        t_e3_to_poi,
+        torch.eye(3, device=ligand_coords_e3.device),
+    )
 
     use_native_step_crop = bool(getattr(expert.model, "dynamic_max_cross", False))
     crop_cutoff_b = receptor_crop_cutoff[0] if receptor_crop_cutoff is not None and use_native_step_crop else None
@@ -163,7 +168,7 @@ def _build_step0_subgraph(args, expert):
         require_internal_edges=True,
     )
     poi_crop = crop_receptor_to_ligand(
-        receptor_coords=poi_data["coords"][0],
+        receptor_coords=poi_coords_poi,
         receptor_features=poi_data["features"][0],
         ligand_coords=ligand_coords_poi,
         rec_edge_index=poi_data.get("edge_index"),
@@ -206,6 +211,7 @@ def _build_step0_subgraph(args, expert):
             "poi_crop_residues": int(poi_crop["coords"].shape[0]),
             "ligand_com_e3": ligand_coords_e3.mean(dim=0).detach().cpu().tolist(),
             "ligand_com_poi": ligand_coords_poi.mean(dim=0).detach().cpu().tolist(),
+            "poi_com_poi": poi_coords_poi.mean(dim=0).detach().cpu().tolist(),
         }
     }
 

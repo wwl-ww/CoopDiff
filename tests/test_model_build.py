@@ -133,6 +133,19 @@ def test_graph_construction():
     assert sub2['receptor'].pos.shape == (N_poi, 3)
     assert sub2['ligand'].pos.shape == (N_lig, 3)
 
+    # POI and ligand must undergo the same frame change before entering the
+    # POI-L expert. Their relative vectors are preserved by the shared rigid
+    # transform; transforming only the ligand recreates the historical sub2 NaN.
+    translation = torch.tensor([4.0, -2.0, 7.0])
+    rotation = torch.tensor([[0.0, -1.0, 0.0],
+                             [1.0, 0.0, 0.0],
+                             [0.0, 0.0, 1.0]])
+    poi_local = transform_ligand_to_poi_frame(poi_coords, translation, rotation)
+    lig_local = transform_ligand_to_poi_frame(lig_coords, translation, rotation)
+    before = lig_coords[0] - poi_coords[0]
+    after = lig_local[0] - poi_local[0]
+    assert torch.allclose(after, before @ rotation, atol=1e-6)
+
     # Ternary graph
     tri = build_tribrain_graph(e3_coords, e3_feat, poi_coords, poi_feat, lig_coords, lig_feat)
     assert tri['node_coords'].shape == (N_e3 + N_poi + N_lig, 3)

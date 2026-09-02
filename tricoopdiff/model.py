@@ -138,6 +138,14 @@ class TriCoopDiff(nn.Module):
             ligand_coords_poi = transform_ligand_to_poi_frame(
                 ligand_data['coords'][b], t_e3_to_poi, r_e3,
             )
+            # Both sides of the POI-L expert graph must use the same local POI
+            # frame. Previously only the ligand was transformed while the POI
+            # receptor remained in the global E3 frame. At noisy initial poses
+            # that artificial frame split produced sparse, extreme-distance
+            # graphs and NaNs in both native and inline expert forwards.
+            poi_coords_poi = transform_ligand_to_poi_frame(
+                poi_data['coords'][b], t_e3_to_poi, r_e3,
+            )
 
             # Native DiffDock's driver only does step-level receptor cropping when
             # the expert itself is in dynamic-cross mode (`dynamic_max_cross=True`).
@@ -172,7 +180,7 @@ class TriCoopDiff(nn.Module):
                 require_internal_edges=True,
             )
             poi_crop = crop_receptor_to_ligand(
-                receptor_coords=poi_data['coords'][b],
+                receptor_coords=poi_coords_poi,
                 receptor_features=poi_data['features'][b],
                 ligand_coords=ligand_coords_poi,
                 rec_edge_index=poi_data.get('edge_index'),
@@ -281,6 +289,7 @@ class TriCoopDiff(nn.Module):
                         'r_e3_to_poi': r_e3.detach().cpu().tolist(),
                         'ligand_com_e3': ligand_data['coords'][b].mean(dim=0).detach().cpu().tolist(),
                         'ligand_com_poi_frame': ligand_coords_poi.mean(dim=0).detach().cpu().tolist(),
+                        'poi_com_poi_frame': poi_coords_poi.mean(dim=0).detach().cpu().tolist(),
                     },
                     'sub1': sub1_probe,
                     'sub2': sub2_probe,
