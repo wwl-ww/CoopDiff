@@ -210,6 +210,15 @@ def main():
         freeze_poi=args.freeze_poi,
     )
     report["case"] = args.case
+    report["run_config"] = {
+        "seed": args.seed,
+        "n_walkers": args.n_walkers,
+        "steps": args.steps if args.steps is not None else diffusion.inference_steps,
+        "freeze_poi": args.freeze_poi,
+        "tribrain_checkpoint": args.tribrain_ckpt,
+        "expert_model_dir": args.model_dir,
+        "expert_checkpoint": args.ckpt,
+    }
 
     print("\n" + "=" * 72, flush=True)
     print("REPORT", flush=True)
