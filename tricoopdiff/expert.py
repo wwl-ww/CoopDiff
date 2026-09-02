@@ -153,13 +153,20 @@ class FrozenDiffDock(nn.Module):
             global_pred[:, 9:] if not model.odd_parity else 0
         )
 
-        # Fix magnitude of tr/rot scores
+        # Fix magnitude of tr/rot scores. The vendored CGModel uses the same
+        # normalization pattern but does not guard zero norms; in TriCoopDiff that
+        # can surface during smoke/training as NaNs in score loss / Tweedie phys
+        # loss when a pathological graph makes final_conv emit an all-zero vector.
+        # Keep the raw norm for the magnitude head (native semantics) but clamp the
+        # divisor so direction normalization itself never divides by zero.
         tr_norm = torch.linalg.vector_norm(tr_pred, dim=1).unsqueeze(1)
-        tr_pred = tr_pred / tr_norm * model.tr_final_layer(
+        tr_unit = tr_pred / tr_norm.clamp_min(1e-8)
+        tr_pred = tr_unit * model.tr_final_layer(
             torch.cat([tr_norm, graph_sigma_emb], dim=1)
         )
         rot_norm = torch.linalg.vector_norm(rot_pred, dim=1).unsqueeze(1)
-        rot_pred = rot_pred / rot_norm * model.rot_final_layer(
+        rot_unit = rot_pred / rot_norm.clamp_min(1e-8)
+        rot_pred = rot_unit * model.rot_final_layer(
             torch.cat([rot_norm, graph_sigma_emb], dim=1)
         )
 

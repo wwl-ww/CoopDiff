@@ -352,11 +352,14 @@ class MultiRateDiffusion(nn.Module):
         dt_rot: torch.Tensor,
         dt_tor: torch.Tensor,
         add_noise: bool = True,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Single reverse SDE step for PROTAC DOFs (Euler-Maruyama).
+        Single reverse SDE step for PROTAC rigid-body DOFs (Euler-Maruyama).
 
-        dx = [score * σ² + noise] * dt
+        Mirrors DiffDock's ``modify_conformer_batch(...)`` rigid stage exactly:
+        compute tr/rot perturbations, apply the rotation about the ligand COM,
+        and return both the updated coordinates and the rigid-frame target that
+        the torsion step should Kabsch-align back to.
         """
         B = ligand_pos.shape[0]
         device = ligand_pos.device
@@ -406,17 +409,17 @@ class MultiRateDiffusion(nn.Module):
                 rot_z = torch.randn(B, 3, device=device)
                 rot_perturb = rot_perturb + rot_g * torch.sqrt(dt_rot).unsqueeze(-1) * rot_z
 
-        # Apply updates. Rotation is applied as @ Rᵀ = @ exp(-[rot_perturb]×) to
-        # match both the fixed add_noise_protac forward (which now applies the
-        # noise as @ Rᵀ) and DiffDock's modify_conformer convention — otherwise the
-        # reverse step rotates in the wrong sense and amplifies the PROTAC rotation.
-        ligand_pos = ligand_pos + tr_perturb.unsqueeze(1)
-        rot_matrix = so3_exp(rot_perturb)
+        # Apply rigid-body updates in the same order as native DiffDock:
+        # rotate about the ligand COM, then translate in world coordinates.
+        # The returned rigid pose is the pre-torsion reference that the native
+        # torsion branch Kabsch-aligns back to. ``tor_score`` is intentionally
+        # unused here because native ``modify_conformer_batch(...)`` applies
+        # torsion in a second stage after the rigid update.
         ligand_center = ligand_pos.mean(dim=1, keepdim=True)
-        ligand_centered = ligand_pos - ligand_center
-        ligand_pos = ligand_center + torch.bmm(ligand_centered, rot_matrix.transpose(-1, -2))
+        rot_matrix = so3_exp(rot_perturb)
+        rigid_pos = torch.bmm(ligand_pos - ligand_center, rot_matrix.transpose(-1, -2)) + tr_perturb.unsqueeze(1) + ligand_center
 
-        return ligand_pos
+        return rigid_pos, rigid_pos.clone()
 
     def reverse_step_torsion(
         self,
@@ -428,6 +431,7 @@ class MultiRateDiffusion(nn.Module):
         lig_edge_mask: torch.Tensor,
         lig_mask_rotate,
         add_noise: bool = True,
+        rigid_target_pos: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Single reverse SDE step for PROTAC torsion DOFs (Euler-Maruyama).
@@ -439,7 +443,7 @@ class MultiRateDiffusion(nn.Module):
         global drift into the already-denoised tr/rot DOFs.
 
         Args:
-            ligand_pos: [B, N_lig, 3] current conformer (after tr/rot reverse)
+            ligand_pos: [B, N_lig, 3] current rigid-body conformer (after tr/rot reverse)
             tor_score: [B, n_rot] torsion score
             t_tor: [B] torsion diffusion time
             dt_tor: [B] reverse step size (t_i - t_{i+1} > 0)
@@ -447,6 +451,8 @@ class MultiRateDiffusion(nn.Module):
             lig_edge_mask: [E] bool rotatable-bond mask
             lig_mask_rotate: [n_rot, N_lig] bool, or per-complex list
             add_noise: add stochastic noise (False on the final step)
+            rigid_target_pos: [B, N_lig, 3] optional pre-torsion rigid pose to
+                align back to. When None, defaults to ``ligand_pos``.
 
         Returns:
             [B, N_lig, 3] conformer with torsion angles updated
@@ -455,6 +461,9 @@ class MultiRateDiffusion(nn.Module):
 
         B = ligand_pos.shape[0]
         device = ligand_pos.device
+
+        if rigid_target_pos is None:
+            rigid_target_pos = ligand_pos
 
         _, _, tor_sigma = self.t_to_sigma(t_tor, t_tor, t_tor)
         tor_g = tor_sigma * np.sqrt(2 * np.log(self.tor_sigma_max / self.tor_sigma_min))
@@ -488,17 +497,18 @@ class MultiRateDiffusion(nn.Module):
 
         out_pos = ligand_pos.clone()
         for b in range(B):
-            rigid_pos = out_pos[b].unsqueeze(0)  # [1, N_lig, 3] pre-torsion pose
+            rigid_pos = rigid_target_pos[b].unsqueeze(0)  # [1, N_lig, 3] native rigid reference
+            torsion_input = ligand_pos[b].unsqueeze(0)    # [1, N_lig, 3] pose to deform torsionally
             mr = lig_mask_rotate[b]
             if isinstance(mr, torch.Tensor):
                 mr = mr.detach().cpu().numpy()
             tp = tor_perturb[b].detach().cpu().numpy()
             flexible_pos = modify_conformer_torsion_angles(
-                rigid_pos[0].detach().cpu(), rot_edges, mr, tp, as_numpy=False
+                torsion_input[0].detach().cpu(), rot_edges, mr, tp, as_numpy=False
             ).to(device).unsqueeze(0)  # [1, N_lig, 3] torsion-perturbed pose
 
-            # Kabsch-align back to the rigid pose so the torsion update stays an
-            # internal-coordinate change (no global drift into tr/rot).
+            # Kabsch-align back to the native rigid reference so the torsion update
+            # stays an internal-coordinate change (no global drift into tr/rot).
             R_align, t_align = rigid_transform_Kabsch_3D_torch_batch(flexible_pos, rigid_pos)
             out_pos[b] = flexible_pos[0] @ R_align[0].T + t_align[0].T
 
@@ -545,12 +555,16 @@ class MultiRateDiffusion(nn.Module):
             rot_z = torch.randn(B, 3, device=device)
             rot_perturb = rot_perturb + rot_g * torch.sqrt(dt_se3_rot).unsqueeze(-1) * rot_z
 
-        # Apply to POI
+        # Apply to POI. Use the same rigid-body convention as DiffDock's ligand
+        # updates: rotate about the current COM with @ Rᵀ, then translate in world
+        # coordinates. Keeping the SE3 sampler on the same convention as the
+        # cumulative `R_cum = rot_matrix @ R_cum` bookkeeping avoids a one-step
+        # frame drift between the POI body frame and the `r_e3_to_poi=R_cumᵀ`
+        # transform passed back into model.forward().
         poi_center = poi_pos.mean(dim=1, keepdim=True)
         poi_centered = poi_pos - poi_center
-        poi_center = poi_center + tr_perturb.unsqueeze(1)
         rot_matrix = so3_exp(rot_perturb)
-        poi_pos = poi_center + torch.bmm(poi_centered, rot_matrix)
+        poi_pos = torch.bmm(poi_centered, rot_matrix.transpose(-1, -2)) + tr_perturb.unsqueeze(1) + poi_center
 
         if return_rotation:
             return poi_pos, rot_matrix
@@ -694,6 +708,10 @@ class TernaryInitializer:
                 ).to(device)
 
         # (2) rotate about the ligand's own COM, then translate onto receptor COM.
+        # Match vendored DiffDock randomize_position exactly: it draws a single
+        # rotation matrix, applies `@ random_rotation.T`, and then centers onto the
+        # receptor COM before the Gaussian translation. Keeping the transpose here
+        # is important for seed-level parity with the native initialization path.
         ligand_center = ligand_pos.mean(dim=1, keepdim=True)  # [B, 1, 3]
         rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)  # [B, 3, 3]
         ligand_pos = torch.bmm(ligand_pos - ligand_center, rot.transpose(-1, -2)) + e3_center.unsqueeze(1)
@@ -736,7 +754,8 @@ class TernaryInitializer:
         rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)
 
         poi_pos = poi_template.unsqueeze(0).repeat(B, 1, 1)
-        poi_pos = torch.bmm(poi_pos, rot) + translation.unsqueeze(1)
+        poi_center = poi_pos.mean(dim=1, keepdim=True)
+        poi_pos = torch.bmm(poi_pos - poi_center, rot.transpose(-1, -2)) + translation.unsqueeze(1)
 
         if return_rotation:
             return poi_pos, rot

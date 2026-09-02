@@ -654,6 +654,9 @@ def evaluate_model(
     n_walkers: int = 32,
     steps: int = None,
     native_complex_pdb: Optional[str] = None,
+    debug_trace: bool = False,
+    debug_seed: int = 0,
+    freeze_poi: bool = False,
 ) -> dict:
     """
     Sample a conformational ensemble and score structure quality vs the native
@@ -680,12 +683,15 @@ def evaluate_model(
         native_complex_pdb: optional path to the native ternary complex PDB
             (e.g. ``DeepTernary/output/protac22/<case>/gt_complex.pdb``). When
             None, POI metrics are skipped.
+        debug_trace: when True, also run a single-walker trajectory-level trace
+            for parity debugging (seeded by ``debug_seed``).
+        debug_seed: RNG seed for the single debug trace.
 
     Returns:
-        {'structure': {...}, 'ensemble': {...}, 'functional': {}}
+        {'structure': {...}, 'ensemble': {...}, 'functional': {}, 'debug_trace': ...}
     """
     from .diffusion import TernaryInitializer
-    from .sampler import sample_ensemble
+    from .sampler import sample_ensemble, sample_single
 
     if initializer is None:
         initializer = TernaryInitializer()
@@ -693,6 +699,7 @@ def evaluate_model(
     ensemble = sample_ensemble(
         model, diffusion, initializer, e3_data, poi_data, ligand_data,
         steps=steps, device=device, n_walkers=n_walkers,
+        freeze_poi=freeze_poi,
     )
 
     ref_lig = ligand_data['coords'][0].detach().cpu().numpy()  # [N_lig, 3] native
@@ -822,13 +829,29 @@ def evaluate_model(
     if len(pred_ligs) > 1:
         ensemble_metrics['diversity'] = compute_ensemble_diversity(pred_ligs)
 
-    return {
+    debug_trace_report = None
+    if debug_trace:
+        debug_trace_report = sample_single(
+            model, diffusion, initializer, e3_data, poi_data, ligand_data,
+            steps=steps, device=device, seed=debug_seed, return_trace=True,
+            freeze_poi=freeze_poi,
+        )
+
+    report = {
         'structure': structure,
         'ensemble': ensemble_metrics,
         # Functional ranking (α, Top-20% hit rate, AUROC) requires predicted
         # productivity per complex — wired in a later phase.
         'functional': {},
     }
+    if debug_trace_report is not None:
+        report['debug_trace'] = {
+            'seed': debug_seed,
+            'trace': debug_trace_report.get('trace', []),
+            'final_ligand_coords': debug_trace_report['ligand_coords'].tolist(),
+            'final_poi_coords': debug_trace_report['poi_coords'].tolist(),
+        }
+    return report
 
 
 # ---------------------------------------------------------------------------

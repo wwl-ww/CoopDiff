@@ -81,6 +81,15 @@ def build_parser():
                         "(shared with train_entry.py)")
     p.add_argument("--out", default=None,
                    help="Path to dump the JSON report (default: stdout only)")
+    p.add_argument("--debug-trace", action="store_true",
+                   help="Also emit a single-walker per-step trajectory trace for parity debugging")
+    p.add_argument("--debug-seed", type=int, default=0,
+                   help="Seed used by --debug-trace single-walker trajectory")
+    p.add_argument(
+        "--freeze-poi",
+        action="store_true",
+        help="Keep the POI fixed and disable SE3 reverse updates for strict E3-L parity evaluation.",
+    )
     return p
 
 
@@ -197,6 +206,8 @@ def main():
         initializer=initializer, device=device,
         n_walkers=args.n_walkers, steps=args.steps,
         native_complex_pdb=native_complex_pdb,
+        debug_trace=args.debug_trace, debug_seed=args.debug_seed,
+        freeze_poi=args.freeze_poi,
     )
     report["case"] = args.case
 

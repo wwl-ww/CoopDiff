@@ -20,12 +20,14 @@ export HF_ENDPOINT=https://hf-mirror.com
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export NAN_CLAMP=10000
+export NAN_TRACE="${NAN_TRACE:-}"
 
 # Overridable via: sbatch --export=CASE=5T35_D_A_759,NWALKERS=32,STEPS=20
 CASE="${CASE:-5T35_D_A_759}"
 NWALKERS="${NWALKERS:-32}"
 STEPS="${STEPS:-20}"
 OUT="${OUT:-results/eval_${CASE}.json}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 echo "=== TriCoopDiff MVP evaluation (zero-FiLM baseline) ==="
 echo "Date: $(date)"
@@ -45,7 +47,8 @@ PYTHONUNBUFFERED=1 python scripts/evaluate_entry.py \
     --case "${CASE}" \
     --n-walkers "${NWALKERS}" \
     "${STEPS_ARG[@]}" \
-    --out "${OUT}"
+    --out "${OUT}" \
+    ${EXTRA_ARGS}
 
 echo
 echo "=== Done at $(date) ==="

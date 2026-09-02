@@ -32,6 +32,27 @@ from .model import TriCoopDiff
 from .diffusion import MultiRateDiffusion
 
 
+def _sanitize_score(score):
+    """Mirror sampler-side non-finite defense for training diagnostics.
+
+    The frozen expert can occasionally emit NaN/inf scores on pathological noisy
+    geometries (e.g. degenerate tr/rot score-head normalization). Sampling
+    already sanitizes those outputs before reverse updates; training needs the
+    same backstop so one bad batch does not turn GATE2 into NaN before we can
+    inspect the underlying geometry.
+    """
+    if score is None or score.numel() == 0:
+        return score
+    if torch.isnan(score).any() or torch.isinf(score).any():
+        eps = 0.01 * score.abs().nanmean()
+        if torch.isnan(eps):
+            eps = torch.tensor(0.01, device=score.device, dtype=score.dtype)
+        score = torch.nan_to_num(
+            score, nan=eps.item(), posinf=eps.item(), neginf=-eps.item()
+        )
+    return score
+
+
 # Bondi van-der-Waals radii (Å) for the elements that occur in PROTAC-like
 # small molecules. Anything else (metals, 'misc') falls back to carbon.
 _BONDI_VDW_RADII = {
@@ -174,6 +195,15 @@ class TriCoopDiffTrainer:
             noisy_e3_data, noisy_poi_data, noisy_ligand_data, t=t, t_se3=t_se3,
             r_e3_to_poi=se3_rot_noise.transpose(-1, -2),
         )
+
+        nonfinite_components = []
+        for name in ('tr', 'rot', 'tor'):
+            score = output['s_q'][name]
+            if score is not None and score.numel() > 0 and not torch.isfinite(score).all():
+                nonfinite_components.append(name)
+            output['s_q'][name] = _sanitize_score(score)
+        if nonfinite_components:
+            print(f"[compute_loss] sanitized non-finite s_q components: {','.join(nonfinite_components)}")
 
         # Score matching loss — matches DiffDock paper §4
         # Translation: weighted by σ² (R³ Euclidean DSM)

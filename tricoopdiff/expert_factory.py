@@ -34,7 +34,7 @@ def build_diffdock_expert(
     device: str = "cuda",
     ckpt: str = "best_ema_inference_epoch_model.pt",
     num_conv_layers: int = None,
-    crop_beyond=None,
+    crop_beyond="native",
 ) -> FrozenDiffDock:
     """
     Build and freeze a DiffDock score model from pretrained weights.
@@ -45,9 +45,11 @@ def build_diffdock_expert(
         ckpt: checkpoint filename inside model_dir.
         num_conv_layers: override (defaults to the value in model_parameters.yml;
             11 for DiffDock-L).
-        crop_beyond: pass None to disable dynamic receptor cropping (recommended
-            for POI subgraphs where the ligand starts far from the protein and
-            cropping can remove ALL residues → "No edges and no nodes").
+        crop_beyond: receptor-crop policy for the frozen expert. ``"native"``
+            (default) preserves the checkpoint's `model_parameters.yml` setting so
+            the expert stays on vendored DiffDock's native inference path.
+            Pass ``None`` to force the old full-receptor fallback, or a numeric
+            value to override the crop radius explicitly.
 
     Returns:
         FrozenDiffDock wrapping the loaded CGModel (all params frozen).
@@ -59,10 +61,19 @@ def build_diffdock_expert(
     if num_conv_layers is None:
         num_conv_layers = getattr(args, "num_conv_layers", 11)
 
-    # Disable dynamic receptor cropping (see docstring).
-    if crop_beyond is None and getattr(args, "crop_beyond", None) is not None:
+    # Keep the frozen expert on the same crop/dynamic-cross regime as the
+    # vendored DiffDock checkpoint unless the caller explicitly overrides it.
+    # Previous versions forced ``args.crop_beyond = None`` here, which silently
+    # downgraded native inference from
+    #   crop_beyond(...) + dynamic_max_cross=True
+    # to
+    #   full receptor + dynamic_max_cross=False,
+    # creating a persistent parity gap for the zero-FiLM baseline.
+    if crop_beyond == "native":
+        pass
+    elif crop_beyond is None:
         args.crop_beyond = None
-    elif crop_beyond is not None:
+    else:
         args.crop_beyond = crop_beyond
 
     t_to_sigma = partial(t_to_sigma_compl, args=args)
