@@ -51,6 +51,8 @@ def build_parser():
     p.add_argument("--branch", choices=["sub1", "sub2"], default="sub1")
     p.add_argument("--atol", type=float, default=1e-5)
     p.add_argument("--rtol", type=float, default=1e-4)
+    p.add_argument("--nan-trace", action="store_true",
+                   help="Print native and inline per-layer finite/max diagnostics")
     p.add_argument("--out", default=None)
     return p
 
@@ -227,6 +229,8 @@ def _build_step0_subgraph(args, expert):
 
 def main():
     args = build_parser().parse_args()
+    if args.nan_trace:
+        os.environ["NAN_TRACE"] = "1"
     if args.device == "cuda" and not torch.cuda.is_available():
         print("FATAL: --device cuda requested but CUDA is unavailable", flush=True)
         sys.exit(1)

@@ -56,7 +56,18 @@ def inspect_index(path):
         missing = [key for key in required if not entry.get(key)]
         if missing:
             return False, len(entries), f"entry {position} missing keys: {missing}"
-        missing_files = [entry[key] for key in required[1:] if not Path(entry[key]).is_file()]
+        resolved_paths = []
+        for key in required[1:]:
+            candidate = Path(entry[key])
+            if not candidate.is_absolute():
+                candidate = PROJECT_ROOT / candidate
+            if not candidate.is_file():
+                candidate = (
+                    PROJECT_ROOT / "DeepTernary" / "output" / "protac22"
+                    / entry["case"] / Path(entry[key]).name
+                )
+            resolved_paths.append(candidate)
+        missing_files = [str(candidate) for candidate in resolved_paths if not candidate.is_file()]
         if missing_files:
             return False, len(entries), f"entry {position} missing files: {missing_files}"
     return True, len(entries), "pass"

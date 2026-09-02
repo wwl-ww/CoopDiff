@@ -97,12 +97,27 @@ def _load_score_model_args(expert_model_dir):
 
 
 def _load_entries(data_json):
-    """Read a data index; accept either a flat list or {"entries": [...]}."""
+    """Read an index and resolve portable or stale-checkout input paths."""
     with open(data_json) as f:
         index = json.load(f)
-    if isinstance(index, dict):
-        return index.get("entries", [])
-    return index
+    entries = index.get("entries", []) if isinstance(index, dict) else index
+    resolved = []
+    for raw_entry in entries:
+        entry = dict(raw_entry)
+        for key in ("protein1", "protein2", "ligand"):
+            path = Path(entry[key])
+            if not path.is_absolute():
+                path = _PROJECT_ROOT / path
+            if not path.is_file():
+                # Backward compatibility for indices created in another clone:
+                # reconstruct the canonical in-repo case path from stable fields.
+                path = (
+                    _PROJECT_ROOT / "DeepTernary" / "output" / "protac22"
+                    / entry["case"] / Path(entry[key]).name
+                )
+            entry[key] = str(path.resolve())
+        resolved.append(entry)
+    return resolved
 
 
 def main():

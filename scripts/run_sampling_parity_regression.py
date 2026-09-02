@@ -30,6 +30,7 @@ def build_parser():
     parser.add_argument("--cache-dir", default="results/featurize_cache")
     parser.add_argument("--atol", type=float, default=1e-5)
     parser.add_argument("--rtol", type=float, default=1e-4)
+    parser.add_argument("--nan-trace", action="store_true")
     parser.add_argument("--out", default="results/sampling_parity_regression.json")
     return parser
 
@@ -51,6 +52,8 @@ def run_branch(args, branch, output_path):
         "--rtol", str(args.rtol),
         "--out", str(output_path),
     ]
+    if args.nan_trace:
+        command.append("--nan-trace")
     completed = subprocess.run(command, cwd=PROJECT_ROOT, check=False)
     if not output_path.exists():
         return {
