@@ -560,6 +560,16 @@ def _expert_forward_with_film(
                 edge_weight=edge_weight[:s2]
             )
 
+        # Keep the inline expert path numerically identical to the vendored
+        # CGModel.forward() path. The production entry point enables NAN_CLAMP
+        # after every convolution; omitting it here meant zero-FiLM native and
+        # inline forwards diverged only on the high-magnitude POI branch.
+        nan_clamp = os.environ.get("NAN_CLAMP")
+        if nan_clamp:
+            node_attr = torch.clamp(
+                node_attr, min=-float(nan_clamp), max=float(nan_clamp)
+            )
+
         # --- FiLM modulation (scalar block only, ligand nodes only) ---
         gamma, beta = film_params[l]
         lig_mask = torch.zeros(node_attr.shape[0], dtype=torch.bool, device=node_attr.device)
