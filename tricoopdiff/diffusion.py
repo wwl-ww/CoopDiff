@@ -621,11 +621,13 @@ class TernaryInitializer:
         protac_shell_max: float = 10.0,
         poi_shell_min: float = 30.0,
         poi_shell_max: float = 60.0,
+        coupled_radius: float = 5.0,
     ):
         self.protac_shell_min = protac_shell_min
         self.protac_shell_max = protac_shell_max
         self.poi_shell_min = poi_shell_min
         self.poi_shell_max = poi_shell_max
+        self.coupled_radius = coupled_radius
 
     def initialize_protac(
         self,
@@ -635,6 +637,7 @@ class TernaryInitializer:
         lig_edge_mask=None,
         lig_mask_rotate=None,
         tr_sigma_max: float = None,
+        init_mode: str = "native",
     ) -> torch.Tensor:
         """
         Initialize the PROTAC at t=1 (fully noised).
@@ -668,6 +671,8 @@ class TernaryInitializer:
         Returns:
             [B, N_lig, 3] initialized ligand positions.
         """
+        if init_mode not in {"native", "coupled5a"}:
+            raise ValueError(f"unknown initialization mode: {init_mode}")
         B = e3_center.shape[0]
         N_lig = ligand_template.shape[0]
         device = e3_center.device
@@ -717,7 +722,13 @@ class TernaryInitializer:
         ligand_pos = torch.bmm(ligand_pos - ligand_center, rot.transpose(-1, -2)) + e3_center.unsqueeze(1)
 
         # (3) Gaussian translation N(0, tr_sigma_max^2) (initial_noise_std_proportion=-1.0).
-        tr_update = torch.randn(B, 3, device=device) * tr_sigma_max
+        if init_mode == "coupled5a":
+            radius = torch.rand(B, device=device) * self.coupled_radius
+            direction = torch.randn(B, 3, device=device)
+            direction = direction / torch.linalg.vector_norm(direction, dim=-1, keepdim=True)
+            tr_update = direction * radius.unsqueeze(-1)
+        else:
+            tr_update = torch.randn(B, 3, device=device) * tr_sigma_max
         ligand_pos = ligand_pos + tr_update.unsqueeze(1)
 
         return ligand_pos
@@ -727,6 +738,7 @@ class TernaryInitializer:
         e3_center: torch.Tensor,
         poi_template: torch.Tensor,
         return_rotation: bool = False,
+        init_mode: str = "native",
     ):
         """
         Initialize POI in a spherical shell around E3.
@@ -739,14 +751,16 @@ class TernaryInitializer:
             True, returns ``(poi_pos, rot)`` where ``rot`` [B,3,3] is the random
             orientation applied to the template (for cumulative SE3 tracking).
         """
+        if init_mode not in {"native", "coupled5a"}:
+            raise ValueError(f"unknown initialization mode: {init_mode}")
         B = e3_center.shape[0]
         N_poi = poi_template.shape[0]
         device = e3_center.device
 
-        r = (
-            self.poi_shell_min
-            + torch.rand(B, device=device) * (self.poi_shell_max - self.poi_shell_min)
-        )
+        if init_mode == "coupled5a":
+            r = torch.rand(B, device=device) * self.coupled_radius
+        else:
+            r = self.poi_shell_min + torch.rand(B, device=device) * (self.poi_shell_max - self.poi_shell_min)
         direction = torch.randn(B, 3, device=device)
         direction = direction / torch.linalg.vector_norm(direction, dim=-1, keepdim=True)
 

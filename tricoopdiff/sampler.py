@@ -71,6 +71,7 @@ def sample_single(
     return_trajectory: bool = False,
     return_trace: bool = False,
     freeze_poi: bool = False,
+    init_mode: str = "native",
 ) -> dict:
     """
     Run one reverse-diffusion trajectory (single walker) from t=1 to t=0.
@@ -89,6 +90,7 @@ def sample_single(
             disable the SE3 reverse updates. This defines the strict zero-FiLM
             E3-L parity baseline: the sampler reduces to native-style DiffDock on
             the PROTAC branch instead of running an extra ternary POI dynamics.
+        init_mode: ``native`` or ``coupled5a`` initialization prior.
 
     Returns:
         dict with 'ligand_coords' [N_lig, 3], 'poi_coords' [N_poi, 3] (CPU numpy),
@@ -121,9 +123,10 @@ def sample_single(
         lig_edge_mask=ligand_data.get("edge_mask"),
         lig_mask_rotate=ligand_data.get("mask_rotate"),
         tr_sigma_max=diffusion.tr_sigma_max,
+        init_mode=init_mode,
     )  # [1, N_lig, 3]
     poi_pos, rot_init = initializer.initialize_poi(
-        e3_center, poi_template, return_rotation=True,
+        e3_center, poi_template, return_rotation=True, init_mode=init_mode,
     )
 
     if freeze_poi:
@@ -339,6 +342,7 @@ def sample_ensemble(
     n_walkers: int = 32,
     seeds=None,
     freeze_poi: bool = False,
+    init_mode: str = "native",
 ) -> list:
     """
     Run ``n_walkers`` independent reverse-diffusion trajectories.
@@ -362,6 +366,7 @@ def sample_ensemble(
             sample_single(
                 model, diffusion, initializer, e3_data, poi_data, ligand_data,
                 steps=steps, device=device, seed=seeds[i], freeze_poi=freeze_poi,
+                init_mode=init_mode,
             )
         )
     return results

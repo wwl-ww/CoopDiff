@@ -49,6 +49,7 @@ def build_parser():
     p.add_argument("--steps", type=int, default=3)
     p.add_argument("--cache-dir", default="results/featurize_cache")
     p.add_argument("--branch", choices=["sub1", "sub2"], default="sub1")
+    p.add_argument("--init-mode", choices=["native", "coupled5a"], default="native")
     p.add_argument("--atol", type=float, default=1e-5)
     p.add_argument("--rtol", type=float, default=1e-4)
     p.add_argument("--nan-trace", action="store_true",
@@ -136,8 +137,11 @@ def _build_step0_subgraph(args, expert):
         lig_edge_mask=ligand_data.get("edge_mask"),
         lig_mask_rotate=ligand_data.get("mask_rotate"),
         tr_sigma_max=diffusion.tr_sigma_max,
+        init_mode=args.init_mode,
     )
-    poi_pos, rot_init = initializer.initialize_poi(e3_center, poi_template, return_rotation=True)
+    poi_pos, rot_init = initializer.initialize_poi(
+        e3_center, poi_template, return_rotation=True, init_mode=args.init_mode
+    )
 
     schedule = diffusion.get_inference_schedule(args.steps)
     t_tr = torch.tensor([schedule["tr_schedule"][0]], device=args.device, dtype=torch.float32)
@@ -293,6 +297,7 @@ def main():
         "branch": args.branch,
         "seed": args.seed,
         "steps": args.steps,
+        "init_mode": args.init_mode,
         "meta": meta,
         "tolerance": {"atol": args.atol, "rtol": args.rtol},
         "nan_clamp": os.environ.get("NAN_CLAMP"),

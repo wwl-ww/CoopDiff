@@ -657,6 +657,7 @@ def evaluate_model(
     debug_trace: bool = False,
     debug_seed: int = 0,
     freeze_poi: bool = False,
+    init_mode: str = "native",
 ) -> dict:
     """
     Sample a conformational ensemble and score structure quality vs the native
@@ -700,6 +701,7 @@ def evaluate_model(
         model, diffusion, initializer, e3_data, poi_data, ligand_data,
         steps=steps, device=device, n_walkers=n_walkers,
         freeze_poi=freeze_poi,
+        init_mode=init_mode,
     )
 
     ref_lig = ligand_data['coords'][0].detach().cpu().numpy()  # [N_lig, 3] native
@@ -835,6 +837,7 @@ def evaluate_model(
             model, diffusion, initializer, e3_data, poi_data, ligand_data,
             steps=steps, device=device, seed=debug_seed, return_trace=True,
             freeze_poi=freeze_poi,
+            init_mode=init_mode,
         )
 
     report = {

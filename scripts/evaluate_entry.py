@@ -90,6 +90,8 @@ def build_parser():
         action="store_true",
         help="Keep the POI fixed and disable SE3 reverse updates for strict E3-L parity evaluation.",
     )
+    p.add_argument("--init-mode", choices=["native", "coupled5a"], default="native",
+                   help="Ternary initialization prior")
     return p
 
 
@@ -208,6 +210,7 @@ def main():
         native_complex_pdb=native_complex_pdb,
         debug_trace=args.debug_trace, debug_seed=args.debug_seed,
         freeze_poi=args.freeze_poi,
+        init_mode=args.init_mode,
     )
     report["case"] = args.case
     report["run_config"] = {
@@ -215,6 +218,7 @@ def main():
         "n_walkers": args.n_walkers,
         "steps": args.steps if args.steps is not None else diffusion.inference_steps,
         "freeze_poi": args.freeze_poi,
+        "init_mode": args.init_mode,
         "tribrain_checkpoint": args.tribrain_ckpt,
         "expert_model_dir": args.model_dir,
         "expert_checkpoint": args.ckpt,
