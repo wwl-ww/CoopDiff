@@ -132,6 +132,24 @@ def sample_single(
         e3_center, poi_template, return_rotation=True, init_mode=init_mode,
     )
 
+    if not torch.isfinite(ligand_pos).all() or not torch.isfinite(poi_pos).all():
+        raise FloatingPointError(
+            f"non-finite {init_mode} initialization for ligand or POI"
+        )
+    if init_mode == "coupled5a":
+        ligand_dist = torch.linalg.vector_norm(
+            ligand_pos.mean(dim=1) - e3_center, dim=-1
+        )
+        poi_dist = torch.linalg.vector_norm(
+            poi_pos.mean(dim=1) - e3_center, dim=-1
+        )
+        max_radius = initializer.coupled_radius + 1e-4
+        if bool((ligand_dist > max_radius).any()) or bool((poi_dist > max_radius).any()):
+            raise ValueError(
+                "coupled5a initialization escaped its 0-5 A pocket radius: "
+                f"ligand={ligand_dist.tolist()}, poi={poi_dist.tolist()}"
+            )
+
     if freeze_poi:
         poi_pos = poi_data["coords"].clone().detach()
         r_e3_to_poi = torch.eye(3, device=device, dtype=poi_pos.dtype).unsqueeze(0)
