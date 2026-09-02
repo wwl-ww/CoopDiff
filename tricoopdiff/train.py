@@ -15,9 +15,8 @@ Two training phases:
   Phase 1: Train FiLM heads + SE3 head only (freeze judge/state heads)
   Phase 2: Unfreeze all TriBrain heads
 
-Training strategy:
-  - General ternary pretraining: 50-100 epochs, batch=32, lr=1e-4
-  - PROTAC fine-tuning: 30-50 epochs, batch=8, lr=2e-5, LoRA (rank=4)
+Current implementation uses B=1 sequential optimization; batched variable-size
+graphs and LoRA are not implemented yet.
 """
 
 import torch
@@ -26,31 +25,14 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Optional, Dict
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from .model import TriCoopDiff
 from .diffusion import MultiRateDiffusion
 
 
-def _sanitize_score(score):
-    """Mirror sampler-side non-finite defense for training diagnostics.
-
-    The frozen expert can occasionally emit NaN/inf scores on pathological noisy
-    geometries (e.g. degenerate tr/rot score-head normalization). Sampling
-    already sanitizes those outputs before reverse updates; training needs the
-    same backstop so one bad batch does not turn GATE2 into NaN before we can
-    inspect the underlying geometry.
-    """
-    if score is None or score.numel() == 0:
-        return score
-    if torch.isnan(score).any() or torch.isinf(score).any():
-        eps = 0.01 * score.abs().nanmean()
-        if torch.isnan(eps):
-            eps = torch.tensor(0.01, device=score.device, dtype=score.dtype)
-        score = torch.nan_to_num(
-            score, nan=eps.item(), posinf=eps.item(), neginf=-eps.item()
-        )
-    return score
+class NonFiniteTrainingError(FloatingPointError):
+    """Raised when a training sample cannot produce a valid optimization step."""
 
 
 # Bondi van-der-Waals radii (Å) for the elements that occur in PROTAC-like
@@ -123,22 +105,15 @@ class TriCoopDiffTrainer:
             'se3': 0.3,
         }
 
-        # Per-component cap on the PROTAC score-matching loss. With B=1 (no
-        # cross-complex averaging) a single large PROTAC whose frozen-expert
-        # forward pass blows up (node features hitting the NAN_CLAMP ceiling,
-        # scores ~1e4 → loss ~1e6-1e8) produces a gradient that, after
-        # clip_grad_norm(max_norm=1.0), drowns out the SE3 signal. The σ²/norm²
-        # weighting makes a well-behaved score loss O(1); this cap is ~100x that
-        # and only bites on the blow-up regime.
-        self.score_loss_cap = 100.0
-
         # Only TriBrain is trainable; experts are frozen
         self.optimizer = AdamW(
             model.tribrain.parameters(),
             lr=lr,
             weight_decay=weight_decay,
         )
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=100)
+        self.scheduler = ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-7,
+        )
 
         self.global_step = 0
 
@@ -148,6 +123,7 @@ class TriCoopDiffTrainer:
         poi_data: dict,
         ligand_data: dict,
         t_se3_data: dict,
+        case: str = "unknown",
     ) -> dict:
         """
         Compute forward pass + losses without backward.
@@ -201,9 +177,12 @@ class TriCoopDiffTrainer:
             score = output['s_q'][name]
             if score is not None and score.numel() > 0 and not torch.isfinite(score).all():
                 nonfinite_components.append(name)
-            output['s_q'][name] = _sanitize_score(score)
+        if not torch.isfinite(output['s_se3']).all():
+            nonfinite_components.append('se3')
         if nonfinite_components:
-            print(f"[compute_loss] sanitized non-finite s_q components: {','.join(nonfinite_components)}")
+            raise NonFiniteTrainingError(
+                f"case={case}: non-finite model scores: {','.join(nonfinite_components)}"
+            )
 
         # Score matching loss — matches DiffDock paper §4
         # Translation: weighted by σ² (R³ Euclidean DSM)
@@ -227,13 +206,6 @@ class TriCoopDiffTrainer:
         else:
             loss_score_tor = torch.tensor(0.0, device=device)
 
-        # Bound the per-component score losses before summing (see
-        # self.score_loss_cap). Clamping a loss to a constant zeroes its
-        # gradient (flat region), which is exactly what we want for an outlier
-        # batch whose score output is unreliable.
-        loss_score_tr = loss_score_tr.clamp(max=self.score_loss_cap)
-        loss_score_rot = loss_score_rot.clamp(max=self.score_loss_cap)
-        loss_score_tor = loss_score_tor.clamp(max=self.score_loss_cap)
         loss_score = loss_score_tr + loss_score_rot + loss_score_tor
 
         # SE3 score matching loss — full-range (no λ_SE3 cutoff). add_noise_se3
@@ -288,8 +260,16 @@ class TriCoopDiffTrainer:
         self.model.train()  # dropout / attention dropout active during training
         self.optimizer.zero_grad()
         loss_dict = self.compute_loss(**batch)
-        loss_dict['loss_total'].backward()
-        torch.nn.utils.clip_grad_norm_(self.model.tribrain.parameters(), max_norm=1.0)
+        total = loss_dict['loss_total']
+        if not torch.isfinite(total):
+            raise NonFiniteTrainingError("non-finite total loss")
+        total.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.tribrain.parameters(), max_norm=1.0,
+        )
+        if not torch.isfinite(grad_norm):
+            self.optimizer.zero_grad(set_to_none=True)
+            raise NonFiniteTrainingError("non-finite TriBrain gradients")
         self.optimizer.step()
         self.global_step += 1
 
@@ -401,9 +381,9 @@ class TriCoopDiffTrainer:
                 clash = clash + (F.relu(self.contact_distance - dist) ** 2).mean()
         return clash
 
-    def scheduler_step(self):
-        """Step the learning rate scheduler."""
-        self.scheduler.step()
+    def scheduler_step(self, validation_loss: float):
+        """Update the plateau scheduler from the completed validation pass."""
+        self.scheduler.step(validation_loss)
 
     def set_phase(self, phase: int):
         """
@@ -431,10 +411,12 @@ class TriCoopDiffTrainer:
         optimizer/scheduler state and the global step for resumable training.
         """
         torch.save({
+            'checkpoint_version': 2,
             'global_step': self.global_step,
             'tribrain_state_dict': self.model.tribrain.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
+            'scheduler_type': type(self.scheduler).__name__,
         }, path)
 
     def load_checkpoint(self, path: str):
@@ -449,7 +431,10 @@ class TriCoopDiffTrainer:
         self.global_step = ckpt.get('global_step', 0)
         if 'optimizer_state_dict' in ckpt:
             self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        if 'scheduler_state_dict' in ckpt:
+        if (
+            'scheduler_state_dict' in ckpt
+            and ckpt.get('scheduler_type') == type(self.scheduler).__name__
+        ):
             self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
 
 

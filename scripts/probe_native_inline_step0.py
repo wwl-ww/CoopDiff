@@ -49,7 +49,7 @@ def build_parser():
     p.add_argument("--steps", type=int, default=3)
     p.add_argument("--cache-dir", default="results/featurize_cache")
     p.add_argument("--branch", choices=["sub1", "sub2"], default="sub1")
-    p.add_argument("--init-mode", choices=["native", "coupled5a"], default="native")
+    p.add_argument("--init-mode", choices=["native", "coupled5a"], default="coupled5a")
     p.add_argument("--atol", type=float, default=1e-5)
     p.add_argument("--rtol", type=float, default=1e-4)
     p.add_argument("--nan-trace", action="store_true",
@@ -152,9 +152,9 @@ def _build_step0_subgraph(args, expert):
     e3_center0 = e3_data["coords"][0].mean(dim=0)
     poi_center0 = poi_pos[0].mean(dim=0)
     t_e3_to_poi = poi_center0 - e3_center0
-    # Match sample_single(): R_cum starts at rot_init and model.forward receives
-    # its transpose as the E3-to-POI row-vector transform.
-    r_e3_to_poi = rot_init[0].transpose(-1, -2)
+    # initialize_poi applies ``template @ rot_init.T``; rot_init is therefore
+    # already the inverse/body-frame map expected by model.forward.
+    r_e3_to_poi = rot_init[0]
     ligand_coords_poi = transform_ligand_to_poi_frame(
         ligand_coords_e3, t_e3_to_poi, r_e3_to_poi
     )

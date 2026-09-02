@@ -22,7 +22,7 @@ pip install torch torch_geometric e3nn torchdiffeq torch_scatter rdkit biopython
 # Download DiffDock-L weights to checkpoints/score_model/ (model_parameters.yml + best_ema_inference_epoch_model.pt)
 ```
 
-- **DiffDock is fully vendored** at `tricoopdiff/diffdock/` — both the model core (`factory`, `models/`, `utils/{so3,torus,torsion,crop,diffusion_utils}`, `sampling.py`) **and** the data-featurization modules (`datasets/` + `utils/inference_utils.py`: `InferenceDataset`, `get_sequences`, `process_mols`, etc.). The frozen expert is built from the vendored core via `expert_factory.build_diffdock_expert` (`load_state_dict(strict=True)`); featurization imports `tricoopdiff.diffdock.datasets.*` / `tricoopdiff.diffdock.utils.inference_utils`. **No external `../DiffDock` checkout is needed anywhere** (BUG-20 fully resolved). Only `scripts/experiment3_ood_verify.py` still references `../DiffDock` by design (it compares vendored vs *native* DiffDock via `get_model`); `scripts/inference.py` / `scripts/eval_entry.py` are BUG-19 legacy (exit non-zero) with a stale `../DiffDock` import.
+- **DiffDock is fully vendored** at `tricoopdiff/diffdock/` — both the model core (`factory`, `models/`, `utils/{so3,torus,torsion,crop,diffusion_utils}`, `sampling.py`) **and** the data-featurization modules (`datasets/` + `utils/inference_utils.py`: `InferenceDataset`, `get_sequences`, `process_mols`, etc.). The frozen expert is built from the vendored core via `expert_factory.build_diffdock_expert` (`load_state_dict(strict=True)`); featurization imports `tricoopdiff.diffdock.datasets.*` / `tricoopdiff.diffdock.utils.inference_utils`. **No external `../DiffDock` checkout is needed anywhere** (BUG-20 fully resolved). Only `scripts/experiment3_ood_verify.py` still references `../DiffDock` by design (it compares vendored vs *native* DiffDock via `get_model`). The former legacy entry points were removed; use `scripts/evaluate_entry.py`.
 - **`DeepTernary/`** (git-ignored) holds the baseline; data lives at `DeepTernary/output/protac22/<case>/` with `protein1.pdb` (E3), `protein2.pdb` (POI), `ligand.sdf`/`ligand.pdb` (PROTAC).
 - **conda env name is `tricoopdiff`** (SLURM scripts hardcode `/data/home/scwb792/run/miniconda3/bin/conda`).
 - **HuggingFace is offline + mirrored**: SLURM scripts `export HF_ENDPOINT=https://hf-mirror.com HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`. ESM2-650M must already be cached locally (`local_files_only=True` in `esm_embedder.py`).
@@ -125,7 +125,7 @@ sbatch scripts/evaluate_entry.slurm
 python scripts/evaluate_entry.py --case 5T35_D_A_759 --n-walkers 32 \
     --out results/eval_5T35.json
 ```
-Reports PROTAC RMSD / pocket distance / clash rate / ensemble diversity / E3-interface & POI DockQ (when the native PDB is available) as JSON. The zero-FiLM baseline (no `--tribrain-ckpt`) is the Go/No-Go reference: it should reproduce native DiffDock-L two-body PROTAC distribution. `evaluate_entry.py` is single-complex; `scripts/eval_entry.py` and `scripts/inference.py` are **legacy and exit non-zero** (BUG-19) — don't use them for the full-benchmark comparison.
+Reports PROTAC RMSD / pocket distance / clash rate / ensemble diversity / E3-interface & POI DockQ (when the native PDB is available) as JSON. The zero-FiLM baseline (no `--tribrain-ckpt`) is the Go/No-Go reference: it should reproduce native DiffDock-L two-body PROTAC distribution. `evaluate_entry.py` is the single-complex evaluation entry point.
 
 ### DeepTernary baseline audit
 
@@ -167,7 +167,7 @@ Output: `deepternary_audit.json`, `audit_results/`, `logs/`. Full instructions i
 
 - **Single FiLM head**: `tribrain.py:FiLMHead` (production — Linear, zero-init). `film.py` holds only `apply_film`; the standalone `FiLMSharedMLP`/`FiLMLayerHead` classes were removed (`959867a`).
 - **Score norm split**: `so3_score_norm` lives in `diffusion.py` (imported by `train.py` via `from .diffusion import so3_score_norm`); `expert.py` has a separate `torus_score_norm` (torsion). If the DiffDock normalization formula changes, update `diffusion.py`.
-- **Stale/divergent entry points** (BUG-19): `scripts/inference.py` and `scripts/eval_entry.py` use a `../DiffDock` legacy `CGModel` import, zero-feature placeholder proteins, and their own reverse-diffusion loop — they have **fully forked** from the real pipeline and now **refuse to run** (LEGACY banner + `sys.exit(2)`). The real inference/eval path is `scripts/evaluate_entry.py` → `featurize_common.featurize_complex` → `expert_factory.build_diffdock_expert` → `sampler.sample_ensemble`.
+- **Stale/divergent entry points** (BUG-19): the former legacy scripts were removed because they had forked `../DiffDock` imports, placeholder protein features, and a separate reverse-diffusion loop. The real inference/eval path is `scripts/evaluate_entry.py` → `featurize_common.featurize_complex` → `expert_factory.build_diffdock_expert` → `sampler.sample_ensemble`.
 - **Dead λ code**: `diffusion.py`'s `get_lambda_q`/`get_lambda_se3` + `lambda_q_threshold`/`lambda_se3_threshold` are deprecated (production never consults them); only `scripts/diagnose_loss_se3.py`, `scripts/verify_se3_sigma_consistency.py`, and `tests/test_model_build.py` still reference them.
 
 ## Training Strategy

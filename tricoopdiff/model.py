@@ -34,7 +34,7 @@ class TriCoopDiff(nn.Module):
     - Two frozen DiffDock experts (shared weights, two subgraphs)
     - One trainable TriBrain (~2.2M params)
     - Multi-rate diffusion process
-    - Score merging by direct addition
+    - Score merging by a zero-initialized residual gate
     """
 
     def __init__(
@@ -88,9 +88,8 @@ class TriCoopDiff(nn.Module):
             t: [B] diffusion time for PROTAC DOFs
             t_se3: [B] diffusion time for SE3 DOFs (defaults to t if None)
             r_e3_to_poi: [B,3,3] rotation from E3 frame to POI frame. Defaults to
-                identity (backward-compatible). This is the transpose of the
-                cumulative SE3 rotation applied to the POI (tracked by the
-                sampler / training loop), so subgraph2 sees the correct
+                identity (backward-compatible). The sampler tracks this inverse
+                body-frame map directly so subgraph2 sees the correct
                 PROTAC-POI relative geometry.
             pocket_guide: [B,3] optional pocket center for guidance potential
             receptor_crop_cutoff: [B] optional native-style receptor crop radius

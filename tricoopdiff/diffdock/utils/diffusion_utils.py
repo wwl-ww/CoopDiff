@@ -131,7 +131,7 @@ def get_timestep_embedding(embedding_type, embedding_dim, embedding_scale=10000)
     elif embedding_type == 'fourier':
         emb_func = GaussianFourierProjection(embedding_size=embedding_dim, scale=embedding_scale)
     else:
-        raise NotImplemented
+        raise ValueError(f"unsupported timestep embedding type: {embedding_type!r}")
     return emb_func
 
 
@@ -140,7 +140,7 @@ def get_t_schedule(sigma_schedule, inference_steps, inf_sched_alpha=1, inf_sched
         lin_max = beta.cdf(t_max, a=inf_sched_alpha, b=inf_sched_beta)
         c = np.linspace(lin_max, 0, inference_steps + 1)[:-1]
         return beta.ppf(c, a=inf_sched_alpha, b=inf_sched_beta)
-    raise Exception()
+    raise ValueError(f"unsupported sigma schedule: {sigma_schedule!r}")
 
 
 def set_time(complex_graphs, t, t_tr, t_rot, t_tor, batchsize, all_atoms, device, include_miscellaneous_atoms=False):

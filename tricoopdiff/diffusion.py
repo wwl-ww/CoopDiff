@@ -69,7 +69,7 @@ class MultiRateDiffusion(nn.Module):
         # (add_noise_* / reverse_step_* now use the full σ schedule for all t).
         # Retained only so legacy diagnostic scripts and tests can still
         # reference/override them (scripts/diagnose_loss_se3.py,
-        # scripts/verify_se3_sigma_consistency.py, scripts/inference.py,
+        # scripts/verify_se3_sigma_consistency.py,
         # tests/test_model_build.py). Production code never consults them.
         lambda_q_threshold: float = 0.7,   # deprecated PROTAC noise cutoff
         lambda_se3_threshold: float = 0.5,  # deprecated SE3 noise cutoff (slower)
@@ -158,7 +158,7 @@ class MultiRateDiffusion(nn.Module):
         λ_SE3(t) = 1 for t > threshold, 0 for t <= threshold. Removed from the
         production path (``add_noise_se3`` / ``reverse_step_se3`` now use the full
         σ schedule). Retained only for legacy diagnostic scripts/tests (e.g.
-        scripts/verify_se3_sigma_consistency.py, scripts/inference.py); production
+        scripts/verify_se3_sigma_consistency.py); production
         code must not call it.
         """
         return (t > self.lambda_se3_threshold).float()
@@ -555,12 +555,9 @@ class MultiRateDiffusion(nn.Module):
             rot_z = torch.randn(B, 3, device=device)
             rot_perturb = rot_perturb + rot_g * torch.sqrt(dt_se3_rot).unsqueeze(-1) * rot_z
 
-        # Apply to POI. Use the same rigid-body convention as DiffDock's ligand
-        # updates: rotate about the current COM with @ Rᵀ, then translate in world
-        # coordinates. Keeping the SE3 sampler on the same convention as the
-        # cumulative `R_cum = rot_matrix @ R_cum` bookkeeping avoids a one-step
-        # frame drift between the POI body frame and the `r_e3_to_poi=R_cumᵀ`
-        # transform passed back into model.forward().
+        # Apply to POI using the same row-vector rigid-body convention as the
+        # ligand update. The sampler tracks the inverse/body-frame map as
+        # ``rot_matrix @ previous_inverse``.
         poi_center = poi_pos.mean(dim=1, keepdim=True)
         poi_centered = poi_pos - poi_center
         rot_matrix = so3_exp(rot_perturb)
@@ -609,10 +606,9 @@ class TernaryInitializer:
     Initializes the three-molecule system at t=1 (fully noised).
 
     Reference: E3 fixed at origin (COM=0).
-    PROTAC: legacy spherical shell around E3 pocket (±10Å), OR native DiffDock
-    ``randomize_position`` init (uniform torsions + receptor-COM + Gaussian
-    N(0, tr_sigma_max^2)) when ``initialize_protac(..., tr_sigma_max=...)``.
-    POI: randomly placed in a spherical shell 30-60Å from E3.
+    ``native`` reproduces DiffDock's wide PROTAC prior and places POI on a
+    30-60 Å shell. ``coupled5a`` keeps both moving partners within 5 Å of
+    the E3 pocket, which is the stable default for ternary sampling entry points.
     """
 
     def __init__(
@@ -684,7 +680,9 @@ class TernaryInitializer:
                 + torch.rand(B, device=device) * (self.protac_shell_max - self.protac_shell_min)
             )
             direction = torch.randn(B, 3, device=device)
-            direction = direction / torch.linalg.vector_norm(direction, dim=-1, keepdim=True)
+            direction = direction / torch.linalg.vector_norm(
+                direction, dim=-1, keepdim=True
+            ).clamp_min(1e-8)
             translation = e3_center + r.unsqueeze(-1) * direction
             rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)
             ligand_pos = ligand_template.unsqueeze(0).repeat(B, 1, 1)
@@ -725,7 +723,9 @@ class TernaryInitializer:
         if init_mode == "coupled5a":
             radius = torch.rand(B, device=device) * self.coupled_radius
             direction = torch.randn(B, 3, device=device)
-            direction = direction / torch.linalg.vector_norm(direction, dim=-1, keepdim=True)
+            direction = direction / torch.linalg.vector_norm(
+                direction, dim=-1, keepdim=True
+            ).clamp_min(1e-8)
             tr_update = direction * radius.unsqueeze(-1)
         else:
             tr_update = torch.randn(B, 3, device=device) * tr_sigma_max
@@ -741,15 +741,15 @@ class TernaryInitializer:
         init_mode: str = "native",
     ):
         """
-        Initialize POI in a spherical shell around E3.
+        Initialize POI around E3 using the selected prior.
 
         Args:
             e3_center: [B, 3] E3 center (typically origin)
             poi_template: [N_poi, 3] template POI geometry
         Returns:
             [B, N_poi, 3] initialized POI positions. If ``return_rotation`` is
-            True, returns ``(poi_pos, rot)`` where ``rot`` [B,3,3] is the random
-            orientation applied to the template (for cumulative SE3 tracking).
+            True, returns ``(poi_pos, rot)`` where ``rot`` [B,3,3] maps current
+            E3-frame row vectors back into the POI template/body frame.
         """
         if init_mode not in {"native", "coupled5a"}:
             raise ValueError(f"unknown initialization mode: {init_mode}")
@@ -762,7 +762,9 @@ class TernaryInitializer:
         else:
             r = self.poi_shell_min + torch.rand(B, device=device) * (self.poi_shell_max - self.poi_shell_min)
         direction = torch.randn(B, 3, device=device)
-        direction = direction / torch.linalg.vector_norm(direction, dim=-1, keepdim=True)
+        direction = direction / torch.linalg.vector_norm(
+            direction, dim=-1, keepdim=True
+        ).clamp_min(1e-8)
 
         translation = e3_center + r.unsqueeze(-1) * direction
         rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)

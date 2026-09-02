@@ -30,7 +30,7 @@ def load_json(path):
         return json.load(handle)
 
 
-def report_gate(path, key):
+def report_gate(path, key, validator=None):
     if not path.is_file():
         return False, f"missing report: {path}"
     try:
@@ -38,7 +38,33 @@ def report_gate(path, key):
     except (OSError, json.JSONDecodeError) as error:
         return False, f"invalid JSON report: {error}"
     passed = report.get(key) is True
-    return passed, "pass" if passed else f"{key} is not true"
+    if not passed:
+        return False, f"{key} is not true"
+    if validator is not None:
+        validation_error = validator(report)
+        if validation_error:
+            return False, validation_error
+    return True, "pass"
+
+
+def validate_parity_report(report):
+    if report.get("init_mode") != "coupled5a":
+        return "parity report was not generated with init_mode=coupled5a"
+    if str(report.get("nan_clamp")).lower() != "none":
+        return "parity report was not generated with nan_clamp=none"
+    return None
+
+
+def validate_frame_report(report):
+    if report.get("init_mode") != "coupled5a":
+        return "frame report was not generated with init_mode=coupled5a"
+    checks = report.get("checks", {})
+    if checks.get("poi_body_frame") is not True:
+        return "frame report does not verify the POI body-frame rotation"
+    metrics = report.get("metrics", {})
+    if metrics.get("cache_version") != metrics.get("expected_cache_version"):
+        return "frame report used a stale featurization cache"
+    return None
 
 
 def inspect_index(path):
@@ -80,8 +106,12 @@ def main():
     index_path = resolve(args.data_index)
     model_dir = resolve(args.model_dir)
 
-    parity_ok, parity_detail = report_gate(parity_path, "parity_pass")
-    frame_ok, frame_detail = report_gate(frame_path, "pass")
+    parity_ok, parity_detail = report_gate(
+        parity_path, "parity_pass", validate_parity_report
+    )
+    frame_ok, frame_detail = report_gate(
+        frame_path, "pass", validate_frame_report
+    )
     index_ok, entry_count, index_detail = inspect_index(index_path)
     checkpoint_files = {
         "parameters": model_dir / "model_parameters.yml",

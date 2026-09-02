@@ -33,6 +33,9 @@ def build_parser():
     parser.add_argument("--cache-dir", default="results/featurize_cache")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--init-mode", choices=["native", "coupled5a"], default="coupled5a"
+    )
     parser.add_argument("--atol", type=float, default=1e-4)
     parser.add_argument("--out", default="results/initialization_frame_check.json")
     return parser
@@ -111,7 +114,8 @@ def main():
 
     initializer = TernaryInitializer()
     poi_initialized, poi_rotation = initializer.initialize_poi(
-        e3_center[None], poi["coords"][0], return_rotation=True
+        e3_center[None], poi["coords"][0], return_rotation=True,
+        init_mode=args.init_mode,
     )
     poi_shell_radius = float(
         torch.linalg.vector_norm(poi_initialized.mean(1)[0] - e3_center).item()
@@ -123,6 +127,11 @@ def main():
         .item()
     )
     rotation_det = float(torch.linalg.det(poi_rotation[0]).item())
+    initialized_body = (
+        poi_initialized[0] - poi_initialized[0].mean(dim=0, keepdim=True)
+    ) @ poi_rotation[0]
+    template_body = poi["coords"][0] - poi["coords"][0].mean(dim=0, keepdim=True)
+    body_frame_error = float((initialized_body - template_body).abs().max().item())
 
     diffusion = MultiRateDiffusion()
     ligand_initialized = initializer.initialize_protac(
@@ -132,6 +141,7 @@ def main():
         lig_edge_mask=ligand.get("edge_mask"),
         lig_mask_rotate=ligand.get("mask_rotate"),
         tr_sigma_max=diffusion.tr_sigma_max,
+        init_mode=args.init_mode,
     )
     ligand_init_finite = bool(torch.isfinite(ligand_initialized).all().item())
 
@@ -146,12 +156,18 @@ def main():
         "frame_roundtrip": roundtrip_error <= args.atol,
         "poi_local_centered": poi_local_center_error <= args.atol,
         "sub2_relative_distances": relative_distance_error <= args.atol,
-        "poi_shell": initializer.poi_shell_min <= poi_shell_radius <= initializer.poi_shell_max,
+        "poi_initial_radius": (
+            0.0 <= poi_shell_radius <= initializer.coupled_radius
+            if args.init_mode == "coupled5a"
+            else initializer.poi_shell_min <= poi_shell_radius <= initializer.poi_shell_max
+        ),
         "poi_rotation": orthogonality_error <= args.atol and abs(rotation_det - 1.0) <= args.atol,
+        "poi_body_frame": body_frame_error <= args.atol,
         "ligand_init_finite": ligand_init_finite,
     }
     report = {
         "case": args.case,
+        "init_mode": args.init_mode,
         "pass": all(checks.values()),
         "checks": checks,
         "metrics": {
@@ -166,6 +182,7 @@ def main():
             "poi_shell_radius": poi_shell_radius,
             "poi_rotation_orthogonality_error": orthogonality_error,
             "poi_rotation_determinant": rotation_det,
+            "poi_body_frame_max_error": body_frame_error,
         },
     }
     output_path = PROJECT_ROOT / args.out

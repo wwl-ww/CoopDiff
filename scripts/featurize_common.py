@@ -14,6 +14,8 @@ They still live under ``scripts/`` rather than ``tricoopdiff/`` because they mix
 project data paths (``DeepTernary/output/...``) with the vendored featurization.
 """
 
+import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -44,7 +46,22 @@ os.chdir(_PROJECT_ROOT)
 # Featurization cache schema version. Bump whenever the geometry/frame handling
 # of the produced data changes, so stale on-disk caches (written before the
 # shared-reference-frame fix) are invalidated instead of silently reused.
-_FEATURIZE_CACHE_VERSION = 2
+_FEATURIZE_CACHE_VERSION = 3
+
+
+def _featurize_signature(protein1, protein2, ligand_path, score_model_args):
+    """Fingerprint source structures and model preprocessing arguments."""
+    digest = hashlib.sha256()
+    for path in (protein1, protein2, ligand_path):
+        resolved = Path(path).resolve()
+        digest.update(str(resolved).encode())
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    digest.update(
+        json.dumps(vars(score_model_args), sort_keys=True, default=str).encode()
+    )
+    return digest.hexdigest()
 
 
 def _protein_ca_centroid(pdb_path):
@@ -254,6 +271,9 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
             raise ValueError(f"expected absolute path, got: {p}")
 
     cache_path = None
+    cache_signature = _featurize_signature(
+        protein1, protein2, ligand_path, score_model_args
+    )
     if cache_dir is not None:
         cache_path = Path(cache_dir) / f"{case_label.replace('/', '_')}.pt"
         if cache_path.exists():
@@ -261,7 +281,10 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
             # which PyTorch 2.6's default weights_only=True refuses to unpickle.
             # The file is written by us (trusted), so full unpickling is safe.
             cached = torch.load(cache_path, map_location="cpu", weights_only=False)
-            if cached.get('cache_version') == _FEATURIZE_CACHE_VERSION:
+            if (
+                cached.get('cache_version') == _FEATURIZE_CACHE_VERSION
+                and cached.get('source_signature') == cache_signature
+            ):
                 e3 = _to_device_and_batch(cached['e3_data'], device)
                 poi = _to_device_and_batch(cached['poi_data'], device)
                 lig = _to_device_and_batch(cached['ligand_data'], device)
@@ -316,6 +339,7 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
             'receptor_feat_dim': receptor_feat_dim,
             't_e3_to_poi': torch.tensor(t_e3_to_poi, dtype=torch.float32),
             'cache_version': _FEATURIZE_CACHE_VERSION,
+            'source_signature': cache_signature,
         }, cache_path)
 
     return e3_data, poi_data, ligand_data, receptor_feat_dim

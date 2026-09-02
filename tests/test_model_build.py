@@ -156,6 +156,69 @@ def test_graph_construction():
     print("  [OK] Graph construction")
 
 
+def test_initializer_body_frame():
+    """The rotation returned by POI initialization is the inverse frame map."""
+    from tricoopdiff.diffusion import TernaryInitializer
+    from tricoopdiff.graphs import transform_ligand_to_poi_frame
+
+    np.random.seed(7)
+    torch.manual_seed(7)
+    template = torch.tensor([
+        [0.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 3.0],
+    ])
+    e3_center = torch.zeros(1, 3)
+    initialized, body_rotation = TernaryInitializer().initialize_poi(
+        e3_center, template, return_rotation=True, init_mode="coupled5a",
+    )
+    translation = initialized[0].mean(0) - e3_center[0]
+    local = transform_ligand_to_poi_frame(
+        initialized[0], translation, body_rotation[0],
+    )
+    expected = template - template.mean(0)
+    assert torch.allclose(local, expected, atol=1e-5), (local, expected)
+
+    print("  [OK] Initializer body-frame rotation")
+
+
+def test_frozen_expert_stays_eval():
+    """Parent train mode must not reactivate a frozen pretrained expert."""
+    import torch.nn as nn
+    from tricoopdiff.expert import FrozenDiffDock
+
+    class DummyExpert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dropout = nn.Dropout(0.5)
+            self.ns, self.nv = 4, 1
+            self.sh_irreps = None
+            self.device = "cpu"
+
+    frozen = FrozenDiffDock(DummyExpert(), num_conv_layers=1)
+    parent = nn.Module()
+    parent.add_module("expert", frozen)
+    parent.train()
+    assert not frozen.training
+    assert not frozen.model.training
+    assert all(not parameter.requires_grad for parameter in frozen.parameters())
+
+    print("  [OK] Frozen expert remains in eval mode")
+
+
+def test_score_sanitizer_handles_infinity():
+    """Inference fallback must replace NaN and both infinities with finite values."""
+    from tricoopdiff.sampler import _sanitize_score
+
+    score = torch.tensor([[1.0, float("nan"), float("inf"), -float("inf")]])
+    sanitized, changed = _sanitize_score(score)
+    assert changed
+    assert torch.isfinite(sanitized).all()
+
+    print("  [OK] Score sanitizer handles infinities")
+
+
 def test_reflect_pipeline():
     """TriReflect detects clashes and runs minimization."""
     from tricoopdiff.reflect import detect_clashes, tricoop_reflect
@@ -251,6 +314,9 @@ if __name__ == "__main__":
     test_film_zero_init()
     test_diffusion_schedules()
     test_graph_construction()
+    test_initializer_body_frame()
+    test_frozen_expert_stays_eval()
+    test_score_sanitizer_handles_infinity()
     test_reflect_pipeline()
     test_merging()
     test_deepternary_dockq_alignment()

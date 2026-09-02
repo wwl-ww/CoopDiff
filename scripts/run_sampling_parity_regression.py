@@ -31,8 +31,8 @@ def build_parser():
     parser.add_argument("--atol", type=float, default=1e-5)
     parser.add_argument("--rtol", type=float, default=1e-4)
     parser.add_argument("--nan-trace", action="store_true")
-    parser.add_argument("--nan-clamp", default="10000")
-    parser.add_argument("--init-mode", choices=["native", "coupled5a"], default="native")
+    parser.add_argument("--nan-clamp", default="none")
+    parser.add_argument("--init-mode", choices=["native", "coupled5a"], default="coupled5a")
     parser.add_argument("--out", default="results/sampling_parity_regression.json")
     return parser
 
@@ -90,6 +90,10 @@ def main():
         "seed": args.seed,
         "steps": args.steps,
         "device": args.device,
+        "init_mode": args.init_mode,
+        "nan_clamp": args.nan_clamp,
+        "atol": args.atol,
+        "rtol": args.rtol,
         "parity_pass": passed,
         "branches": branches,
     }

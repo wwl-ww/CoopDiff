@@ -48,9 +48,12 @@ def _sanitize_score(score):
         return score, False
     had_nonfinite = bool(torch.isnan(score).any() or torch.isinf(score).any())
     if had_nonfinite:
-        eps = 0.01 * score.abs().nanmean()
-        if torch.isnan(eps):
-            eps = torch.tensor(0.01, device=score.device, dtype=score.dtype)
+        finite_values = score[torch.isfinite(score)].abs()
+        eps = (
+            0.01 * finite_values.mean()
+            if finite_values.numel()
+            else torch.tensor(0.01, device=score.device, dtype=score.dtype)
+        )
         score = torch.nan_to_num(
             score, nan=eps.item(), posinf=eps.item(), neginf=-eps.item()
         )
@@ -71,7 +74,7 @@ def sample_single(
     return_trajectory: bool = False,
     return_trace: bool = False,
     freeze_poi: bool = False,
-    init_mode: str = "native",
+    init_mode: str = "coupled5a",
 ) -> dict:
     """
     Run one reverse-diffusion trajectory (single walker) from t=1 to t=0.
@@ -131,16 +134,18 @@ def sample_single(
 
     if freeze_poi:
         poi_pos = poi_data["coords"].clone().detach()
-        R_cum = torch.eye(3, device=device, dtype=poi_pos.dtype).unsqueeze(0)
+        r_e3_to_poi = torch.eye(3, device=device, dtype=poi_pos.dtype).unsqueeze(0)
     else:
-        # Cumulative SE3 rotation applied to the POI (template -> current frame).
-        # r_e3_to_poi = R_cum^T rotates the PROTAC into the POI body frame so that
-        # subgraph2 sees the correct PROTAC-POI relative geometry (see model.forward).
-        R_cum = rot_init  # [1, 3, 3]
+        # initialize_poi applies ``template_centered @ rot_init.T``. Therefore
+        # ``rot_init`` itself is the inverse/body-frame map that converts E3-frame
+        # row vectors into the current POI frame. Track that inverse directly;
+        # transposing it again would apply the forward rotation twice.
+        r_e3_to_poi = rot_init  # [1, 3, 3]
 
     schedule = diffusion.get_inference_schedule(steps)
     trajectory = [] if return_trajectory else None
     trace = [] if return_trace else None
+    nonfinite_score_steps = []
 
     init_ligand_com = ligand_pos.mean(dim=1)[0]
     init_poi_com = poi_pos.mean(dim=1)[0]
@@ -215,7 +220,7 @@ def sample_single(
             setattr(model, '_last_step0_probe', None)
         out = model(
             e3_data, poi_d, lig_d, t=t_tr, t_se3=t_se3_tr,
-            r_e3_to_poi=R_cum.transpose(-1, -2),
+            r_e3_to_poi=r_e3_to_poi,
             receptor_crop_cutoff=receptor_crop_cutoff,
         )
         if return_trace:
@@ -233,6 +238,12 @@ def sample_single(
         if freeze_poi:
             s_se3 = torch.zeros_like(s_se3)
             se3_had_nonfinite = False
+        if sanitized_components or se3_had_nonfinite:
+            nonfinite_score_steps.append({
+                "step": i,
+                "s_q": sanitized_components,
+                "s_se3": bool(se3_had_nonfinite),
+            })
 
         add_noise = i < steps - 1  # no stochastic noise on the final step
 
@@ -261,11 +272,10 @@ def sample_single(
                 poi_pos, s_se3, t_se3_tr, t_se3_rot, dt_se3_tr, dt_se3_rot,
                 add_noise=add_noise, return_rotation=True,
             )
-            # `rot_matrix` is the applied POI-body rotation. Accumulate it on the
-            # left so `R_cum` stays the template->current body-frame transform, and
-            # the next forward pass can still recover the current POI frame via
-            # `r_e3_to_poi = R_cumᵀ`.
-            R_cum = rot_matrix @ R_cum
+            # reverse_step_se3 applies ``current_centered @ rot_matrix.T``.
+            # Consequently the new inverse/body-frame map is
+            # ``rot_matrix @ old_inverse`` for row-vector coordinates.
+            r_e3_to_poi = rot_matrix @ r_e3_to_poi
 
         if return_trace:
             lig_com = ligand_pos.mean(dim=1)[0]
@@ -303,7 +313,10 @@ def sample_single(
                 "poi_com": poi_com.detach().cpu().numpy().tolist(),
                 "ligand_pocket_dist": float(torch.linalg.vector_norm(lig_com - e3_center[0]).item()),
                 "poi_e3_dist": float(torch.linalg.vector_norm(poi_com - e3_center[0]).item()),
-                "r_cum_det": float(torch.det(R_cum[0]).item()),
+                # Keep the historical key for report compatibility; the value
+                # is the determinant of the inverse/body-frame rotation.
+                "r_cum_det": float(torch.det(r_e3_to_poi[0]).item()),
+                "r_e3_to_poi_det": float(torch.det(r_e3_to_poi[0]).item()),
                 "score_summary": {
                     "tr": _tensor_summary(s_q["tr"]),
                     "rot": _tensor_summary(s_q["rot"]),
@@ -322,6 +335,8 @@ def sample_single(
     result = {
         "ligand_coords": ligand_pos[0].detach().cpu().numpy(),
         "poi_coords": poi_pos[0].detach().cpu().numpy(),
+        "valid": not nonfinite_score_steps,
+        "nonfinite_score_steps": nonfinite_score_steps,
     }
     if return_trajectory:
         result["trajectory"] = trajectory
@@ -342,7 +357,7 @@ def sample_ensemble(
     n_walkers: int = 32,
     seeds=None,
     freeze_poi: bool = False,
-    init_mode: str = "native",
+    init_mode: str = "coupled5a",
 ) -> list:
     """
     Run ``n_walkers`` independent reverse-diffusion trajectories.

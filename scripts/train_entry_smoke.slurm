@@ -24,7 +24,7 @@ mkdir -p logs results "$RUNTIME_ROOT/triton" "$RUNTIME_ROOT/torchinductor" "$RUN
 export HF_ENDPOINT=https://hf-mirror.com
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export NAN_CLAMP=10000
+unset NAN_CLAMP
 # Compiled kernels can exceed the home-directory quota. Keep all transient
 # compiler files on the project filesystem, which has substantially more room.
 export TRITON_CACHE_DIR="$RUNTIME_ROOT/triton"
@@ -55,6 +55,8 @@ probe.write_text("ok", encoding="utf-8")
 probe.unlink()
 print(f"Preflight OK: torch={torch.__version__}, cuda={torch.version.cuda}")
 PY
+
+python scripts/check_phase1_readiness.py
 
 echo "=== TriCoopDiff train_entry smoke (3 epochs, B=1) ==="
 echo "Date: $(date)"

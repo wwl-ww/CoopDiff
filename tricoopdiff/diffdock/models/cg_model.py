@@ -427,8 +427,12 @@ class CGModel(torch.nn.Module):
                   f"rot_norm={rot_norm.squeeze().detach().cpu().tolist()} | "
                   f"tr_sigma={tr_sigma.detach().cpu().tolist()}",
                   file=sys.stderr, flush=True)
-        tr_pred = tr_pred / tr_norm * self.tr_final_layer(torch.cat([tr_norm, data.graph_sigma_emb], dim=1))
-        rot_pred = rot_pred / rot_norm * self.rot_final_layer(torch.cat([rot_norm, data.graph_sigma_emb], dim=1))
+        # A zero direction vector has no defined orientation; dividing by its
+        # norm used to produce NaN even when every upstream activation was
+        # finite. Match the inline FiLM path and use a zero unit vector in this
+        # degenerate case while preserving the raw norm for the magnitude head.
+        tr_pred = tr_pred / tr_norm.clamp_min(1e-8) * self.tr_final_layer(torch.cat([tr_norm, data.graph_sigma_emb], dim=1))
+        rot_pred = rot_pred / rot_norm.clamp_min(1e-8) * self.rot_final_layer(torch.cat([rot_norm, data.graph_sigma_emb], dim=1))
 
         if self.scale_by_sigma:
             tr_pred = tr_pred / tr_sigma.unsqueeze(1)
@@ -693,4 +697,3 @@ class CGModel(torch.nn.Module):
         edge_weight = self.get_edge_weight(edge_vec, self.lig_max_radius)
 
         return bonds, edge_index, edge_attr, edge_sh, edge_weight
-

@@ -798,7 +798,12 @@ def evaluate_model(
     n_nan = 0
     for r in ensemble:
         pred = r['ligand_coords']  # [N_lig, 3] numpy
-        if not np.isfinite(pred).all():
+        pred_poi = r['poi_coords']
+        if (
+            not r.get('valid', True)
+            or not np.isfinite(pred).all()
+            or not np.isfinite(pred_poi).all()
+        ):
             n_nan += 1
             continue
         rec = {
@@ -808,7 +813,7 @@ def evaluate_model(
         }
         deepternary_m = compute_deepternary_dockq(
             ref_lig, e3_ca, ref_poi,
-            pred, e3_ca, r['poi_coords'],
+            pred, e3_ca, pred_poi,
         )
         if deepternary_m is not None:
             rec['approx_dockq'] = deepternary_m['dockq']
@@ -817,7 +822,7 @@ def evaluate_model(
                 from .deepternary_metrics import compute_fullatom_dockq
                 exact_m = compute_fullatom_dockq(
                     pred_ligand=pred,
-                    pred_poi_ca=r['poi_coords'],
+                    pred_poi_ca=pred_poi,
                     featurized_e3_ca=e3_ca,
                     native_complex_pdb=native_complex_pdb,
                     **deepternary_dockq_paths,
@@ -836,27 +841,37 @@ def evaluate_model(
             if e3_native_contacts is None:
                 e3_native_contacts = e3_m['n_native_contacts']
         if native_complex_pdb is not None:
-            poi_m = compute_poi_dockq(r['poi_coords'], pred, native_complex_pdb)
+            poi_m = compute_poi_dockq(pred_poi, pred, native_complex_pdb)
             if poi_m is not None:
                 rec['poi_dockq'] = poi_m['dockq']
                 if poi_native_contacts is None:
                     poi_native_contacts = poi_m['n_native_contacts']
-            poi_c = compute_poi_com_dist(r['poi_coords'], native_complex_pdb)
+            poi_c = compute_poi_com_dist(pred_poi, native_complex_pdb)
             if poi_c is not None:
                 rec['poi_com_dist'] = poi_c['poi_com_dist']
                 poi_native_com_dist = poi_c['native_e3_poi_com_dist']
         walkers.append(rec)
     if n_nan:
-        print(f"[evaluate] skipped {n_nan}/{len(ensemble)} walkers with non-finite coords")
+        print(
+            f"[evaluate] skipped {n_nan}/{len(ensemble)} walkers with non-finite "
+            "scores or coordinates"
+        )
 
     pred_ligs = [w['pred'] for w in walkers]
     protac_rmsds = np.asarray([w['protac_rmsd'] for w in walkers])
     pocket_dists = np.asarray([w['pocket_dist'] for w in walkers])
     # Best sample follows DeepTernary's ternary DockQ convention. Every "_best"
     # field below refers to this same coherent walker.
-    best_idx = int(np.argmax([
-        w.get('dockq', w.get('approx_dockq', -1.0)) for w in walkers
-    ])) if walkers else 0
+    exact_indices = [index for index, walker in enumerate(walkers) if 'dockq' in walker]
+    if exact_indices:
+        best_idx = max(exact_indices, key=lambda index: walkers[index]['dockq'])
+        selection_metric = 'dockq'
+    elif walkers:
+        best_idx = int(np.argmax([w.get('approx_dockq', -1.0) for w in walkers]))
+        selection_metric = 'approx_dockq'
+    else:
+        best_idx = 0
+        selection_metric = None
 
     # Initialize every metric to None; the finite-walker branch below fills in
     # what it can. "best" always means "the single dockq-best walker's value"
@@ -946,7 +961,9 @@ def evaluate_model(
 
     ensemble_metrics = {
         'n_walkers': len(ensemble),
+        'n_valid_walkers': len(walkers),
         'n_nan_walkers': n_nan,
+        'selection_metric': selection_metric,
         'protac_rmsd_std': float(protac_rmsds.std()) if len(protac_rmsds) > 1 else 0.0,
     }
     if len(pred_ligs) > 1:

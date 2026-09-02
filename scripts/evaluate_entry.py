@@ -90,8 +90,8 @@ def build_parser():
         action="store_true",
         help="Keep the POI fixed and disable SE3 reverse updates for strict E3-L parity evaluation.",
     )
-    p.add_argument("--init-mode", choices=["native", "coupled5a"], default="native",
-                   help="Ternary initialization prior")
+    p.add_argument("--init-mode", choices=["native", "coupled5a"], default="coupled5a",
+                   help="Ternary initialization prior (default: stable 0-5 A coupled prior)")
     return p
 
 

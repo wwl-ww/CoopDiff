@@ -19,7 +19,7 @@ mkdir -p logs results
 export HF_ENDPOINT=https://hf-mirror.com
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export NAN_CLAMP=10000
+unset NAN_CLAMP
 export NAN_TRACE="${NAN_TRACE:-}"
 
 # Overridable via: sbatch --export=CASE=5T35_D_A_759,NWALKERS=32,STEPS=20

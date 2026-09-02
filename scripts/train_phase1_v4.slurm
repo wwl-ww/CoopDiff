@@ -19,15 +19,17 @@ mkdir -p logs results
 export HF_ENDPOINT=https://hf-mirror.com
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export NAN_CLAMP=10000
+unset NAN_CLAMP
 
 echo "=== TriCoopDiff Phase-1 training v4 (100 epochs, B=1, lr=1e-4) ==="
-echo "  changes vs v3: mask SE3 loss by lambda_se3 (remove spurious pull-to-0)"
+echo "  full-range SE3 loss; coupled5a sampling gates; no activation clamp"
 echo "Date: $(date)"
 echo "Node: $(hostname)"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'unknown')"
 echo "=================================================="
 echo
+
+python scripts/check_phase1_readiness.py
 
 PYTHONUNBUFFERED=1 python scripts/train_entry.py \
     --train_data data/protac_index.json \

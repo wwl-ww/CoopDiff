@@ -73,6 +73,18 @@ class FrozenDiffDock(nn.Module):
         """
         return self.model.embedding(data)
 
+    def train(self, mode: bool = True):
+        """Keep the frozen expert in evaluation mode.
+
+        ``requires_grad=False`` prevents parameter updates but does not disable
+        dropout or other training-mode behavior. Parent ``model.train()`` calls
+        recurse into children, so override it here to keep the pretrained expert
+        deterministic while still allowing TriBrain to train.
+        """
+        super().train(False)
+        self.model.eval()
+        return self
+
     def build_cross_graph(self, data, cross_cutoff):
         """Build cross edges between ligand and receptor."""
         return self.model.build_cross_conv_graph(data, cross_cutoff)
