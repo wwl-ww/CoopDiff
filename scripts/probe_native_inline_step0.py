@@ -53,6 +53,8 @@ def build_parser():
     p.add_argument("--rtol", type=float, default=1e-4)
     p.add_argument("--nan-trace", action="store_true",
                    help="Print native and inline per-layer finite/max diagnostics")
+    p.add_argument("--nan-clamp", default="10000",
+                   help="Per-layer node activation clamp (default: runtime 10000)")
     p.add_argument("--out", default=None)
     return p
 
@@ -229,6 +231,12 @@ def _build_step0_subgraph(args, expert):
 
 def main():
     args = build_parser().parse_args()
+    # The canonical SLURM evaluation entry sets this same guard. Keep the
+    # standalone parity probe on the production numerical path by default.
+    if args.nan_clamp.lower() not in {"none", "off", "0"}:
+        os.environ["NAN_CLAMP"] = args.nan_clamp
+    else:
+        os.environ.pop("NAN_CLAMP", None)
     if args.nan_trace:
         os.environ["NAN_TRACE"] = "1"
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -287,6 +295,7 @@ def main():
         "steps": args.steps,
         "meta": meta,
         "tolerance": {"atol": args.atol, "rtol": args.rtol},
+        "nan_clamp": os.environ.get("NAN_CLAMP"),
         "parity_pass": parity_pass,
         "comparison": comparisons,
         "native": {key: _tensor_stats(value) for key, value in native_scores.items()},

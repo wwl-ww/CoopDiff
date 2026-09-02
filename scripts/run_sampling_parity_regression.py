@@ -31,6 +31,7 @@ def build_parser():
     parser.add_argument("--atol", type=float, default=1e-5)
     parser.add_argument("--rtol", type=float, default=1e-4)
     parser.add_argument("--nan-trace", action="store_true")
+    parser.add_argument("--nan-clamp", default="10000")
     parser.add_argument("--out", default="results/sampling_parity_regression.json")
     return parser
 
@@ -50,6 +51,7 @@ def run_branch(args, branch, output_path):
         "--branch", branch,
         "--atol", str(args.atol),
         "--rtol", str(args.rtol),
+        "--nan-clamp", str(args.nan_clamp),
         "--out", str(output_path),
     ]
     if args.nan_trace:
