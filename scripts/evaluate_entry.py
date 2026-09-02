@@ -211,6 +211,12 @@ def main():
         debug_trace=args.debug_trace, debug_seed=args.debug_seed,
         freeze_poi=args.freeze_poi,
         init_mode=args.init_mode,
+        deepternary_dockq_paths={
+            "protein1_pdb": protein1,
+            "protein2_pdb": protein2,
+            "ligand_pdb": str(case_dir / "ligand.pdb"),
+            "deepternary_root": str(_PROJECT_ROOT / "DeepTernary"),
+        },
     )
     report["case"] = args.case
     report["run_config"] = {

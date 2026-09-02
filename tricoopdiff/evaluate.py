@@ -736,6 +736,7 @@ def evaluate_model(
     debug_seed: int = 0,
     freeze_poi: bool = False,
     init_mode: str = "native",
+    deepternary_dockq_paths: Optional[Dict[str, str]] = None,
 ) -> dict:
     """
     Sample a conformational ensemble and score structure quality vs the native
@@ -810,10 +811,23 @@ def evaluate_model(
             pred, e3_ca, r['poi_coords'],
         )
         if deepternary_m is not None:
-            rec['dockq'] = deepternary_m['dockq']
-            rec['dockq_fnat'] = deepternary_m['fnat']
-            rec['dockq_lrms'] = deepternary_m['lrms']
-            rec['dockq_irms'] = deepternary_m['irms']
+            rec['approx_dockq'] = deepternary_m['dockq']
+        if deepternary_dockq_paths is not None and native_complex_pdb is not None:
+            try:
+                from .deepternary_metrics import compute_fullatom_dockq
+                exact_m = compute_fullatom_dockq(
+                    pred_ligand=pred,
+                    pred_poi_ca=r['poi_coords'],
+                    featurized_e3_ca=e3_ca,
+                    native_complex_pdb=native_complex_pdb,
+                    **deepternary_dockq_paths,
+                )
+                rec['dockq'] = exact_m['dockq']
+                rec['dockq_fnat'] = exact_m['fnat']
+                rec['dockq_lrms'] = exact_m['lrms']
+                rec['dockq_irms'] = exact_m['irms']
+            except Exception as error:
+                print(f"[evaluate] DeepTernary full-atom DockQ failed: {error}")
         e3_m = compute_e3_interface_dockq(e3_ca, pred, ref_lig)
         if e3_m is not None:
             rec['e3_dockq'] = e3_m['dockq']
@@ -840,7 +854,9 @@ def evaluate_model(
     pocket_dists = np.asarray([w['pocket_dist'] for w in walkers])
     # Best sample follows DeepTernary's ternary DockQ convention. Every "_best"
     # field below refers to this same coherent walker.
-    best_idx = int(np.argmax([w.get('dockq', -1.0) for w in walkers])) if walkers else 0
+    best_idx = int(np.argmax([
+        w.get('dockq', w.get('approx_dockq', -1.0)) for w in walkers
+    ])) if walkers else 0
 
     # Initialize every metric to None; the finite-walker branch below fills in
     # what it can. "best" always means "the single dockq-best walker's value"
