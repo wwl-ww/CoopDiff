@@ -93,8 +93,21 @@ def main():
     ligand_poi = transform_ligand_to_poi_frame(
         ligand["coords"][0], poi_center - e3_center, rotation
     )
+    poi_poi = transform_ligand_to_poi_frame(
+        poi["coords"][0], poi_center - e3_center, rotation
+    )
     ligand_roundtrip = ligand_poi @ rotation.T + (poi_center - e3_center)
     roundtrip_error = float((ligand_roundtrip - ligand["coords"][0]).abs().max().item())
+    poi_local_center_error = float(torch.linalg.vector_norm(poi_poi.mean(0) - e3_center).item())
+    relative_distance_error = float(
+        (
+            torch.cdist(ligand["coords"][0], poi["coords"][0])
+            - torch.cdist(ligand_poi, poi_poi)
+        )
+        .abs()
+        .max()
+        .item()
+    )
 
     initializer = TernaryInitializer()
     poi_initialized, poi_rotation = initializer.initialize_poi(
@@ -131,6 +144,8 @@ def main():
         "poi_offset": poi_offset_error <= args.atol,
         "ligand_offset": ligand_offset_error <= args.atol,
         "frame_roundtrip": roundtrip_error <= args.atol,
+        "poi_local_centered": poi_local_center_error <= args.atol,
+        "sub2_relative_distances": relative_distance_error <= args.atol,
         "poi_shell": initializer.poi_shell_min <= poi_shell_radius <= initializer.poi_shell_max,
         "poi_rotation": orthogonality_error <= args.atol and abs(rotation_det - 1.0) <= args.atol,
         "ligand_init_finite": ligand_init_finite,
@@ -146,6 +161,8 @@ def main():
             "poi_offset_error": poi_offset_error,
             "ligand_offset_error": ligand_offset_error,
             "frame_roundtrip_max_error": roundtrip_error,
+            "poi_local_center_error": poi_local_center_error,
+            "sub2_relative_distance_max_error": relative_distance_error,
             "poi_shell_radius": poi_shell_radius,
             "poi_rotation_orthogonality_error": orthogonality_error,
             "poi_rotation_determinant": rotation_det,
