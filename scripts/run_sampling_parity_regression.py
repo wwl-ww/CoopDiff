@@ -32,7 +32,8 @@ def build_parser():
     parser.add_argument("--rtol", type=float, default=1e-4)
     parser.add_argument("--nan-trace", action="store_true")
     parser.add_argument("--nan-clamp", default="none")
-    parser.add_argument("--init-mode", choices=["native", "coupled5a"], default="coupled5a")
+    parser.add_argument("--init-mode", choices=["native", "coupled5a", "anchor_local"], default="coupled5a")
+    parser.add_argument("--t-anchor", type=float, default=None)
     parser.add_argument("--out", default="results/sampling_parity_regression.json")
     return parser
 
@@ -54,6 +55,7 @@ def run_branch(args, branch, output_path):
         "--rtol", str(args.rtol),
         "--nan-clamp", str(args.nan_clamp),
         "--init-mode", args.init_mode,
+        "--t-anchor", str(args.t_anchor) if args.t_anchor is not None else ("0.7" if args.init_mode == "anchor_local" else "1.0"),
         "--out", str(output_path),
     ]
     if args.nan_trace:
@@ -92,6 +94,7 @@ def main():
         "device": args.device,
         "init_mode": args.init_mode,
         "nan_clamp": args.nan_clamp,
+        "t_anchor": args.t_anchor if args.t_anchor is not None else (0.7 if args.init_mode == "anchor_local" else 1.0),
         "atol": args.atol,
         "rtol": args.rtol,
         "parity_pass": passed,

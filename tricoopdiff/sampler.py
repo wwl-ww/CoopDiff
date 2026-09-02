@@ -60,6 +60,15 @@ def _sanitize_score(score):
     return score, had_nonfinite
 
 
+def _nearest_interface_anchor(e3_coords: torch.Tensor, poi_coords: torch.Tensor) -> torch.Tensor:
+    """Return the midpoint of the closest E3/POI residue pair."""
+    distances = torch.cdist(e3_coords, poi_coords)
+    flat_index = torch.argmin(distances)
+    e3_index = flat_index // poi_coords.shape[0]
+    poi_index = flat_index % poi_coords.shape[0]
+    return (e3_coords[e3_index] + poi_coords[poi_index]) / 2
+
+
 @torch.no_grad()
 def sample_single(
     model,
@@ -75,6 +84,7 @@ def sample_single(
     return_trace: bool = False,
     freeze_poi: bool = False,
     init_mode: str = "coupled5a",
+    t_anchor: float = None,
 ) -> dict:
     """
     Run one reverse-diffusion trajectory (single walker) from t=1 to t=0.
@@ -93,7 +103,9 @@ def sample_single(
             disable the SE3 reverse updates. This defines the strict zero-FiLM
             E3-L parity baseline: the sampler reduces to native-style DiffDock on
             the PROTAC branch instead of running an extra ternary POI dynamics.
-        init_mode: ``native`` or ``coupled5a`` initialization prior.
+        init_mode: ``native``, ``coupled5a`` or ``anchor_local`` initialization prior.
+        t_anchor: starting diffusion time. ``anchor_local`` defaults to 0.7;
+            other modes default to 1.0.
 
     Returns:
         dict with 'ligand_coords' [N_lig, 3], 'poi_coords' [N_poi, 3] (CPU numpy),
@@ -115,6 +127,11 @@ def sample_single(
 
     # E3 center = receptor COM. Native randomize_position uses receptor.pos.mean(0).
     e3_center = e3_coords.mean(dim=0, keepdim=True)            # [1, 3]
+    if t_anchor is None:
+        t_anchor = 0.7 if init_mode == "anchor_local" else 1.0
+    if not 0.0 < t_anchor <= 1.0:
+        raise ValueError(f"t_anchor must be in (0, 1], got {t_anchor}")
+    anchor_center = _nearest_interface_anchor(e3_coords, poi_template)
 
     # Initialize at t=1 (fully noised). Passing the receptor COM + torsion metadata
     # + tr_sigma_max makes initialize_protac replicate native randomize_position
@@ -127,6 +144,7 @@ def sample_single(
         lig_mask_rotate=ligand_data.get("mask_rotate"),
         tr_sigma_max=diffusion.tr_sigma_max,
         init_mode=init_mode,
+        anchor_center=anchor_center.unsqueeze(0),
     )  # [1, N_lig, 3]
     poi_pos, rot_init = initializer.initialize_poi(
         e3_center, poi_template, return_rotation=True, init_mode=init_mode,
@@ -136,17 +154,18 @@ def sample_single(
         raise FloatingPointError(
             f"non-finite {init_mode} initialization for ligand or POI"
         )
-    if init_mode == "coupled5a":
+    if init_mode in {"coupled5a", "anchor_local"}:
         ligand_dist = torch.linalg.vector_norm(
-            ligand_pos.mean(dim=1) - e3_center, dim=-1
+            ligand_pos.mean(dim=1) - (
+                e3_center if init_mode == "coupled5a" else anchor_center.unsqueeze(0)
+            ), dim=-1
         )
-        poi_dist = torch.linalg.vector_norm(
-            poi_pos.mean(dim=1) - e3_center, dim=-1
-        )
+        poi_reference = e3_center if init_mode == "coupled5a" else poi_template.mean(dim=0, keepdim=True)
+        poi_dist = torch.linalg.vector_norm(poi_pos.mean(dim=1) - poi_reference, dim=-1)
         max_radius = initializer.coupled_radius + 1e-4
         if bool((ligand_dist > max_radius).any()) or bool((poi_dist > max_radius).any()):
             raise ValueError(
-                "coupled5a initialization escaped its 0-5 A pocket radius: "
+                f"{init_mode} initialization escaped its 0-5 A local radius: "
                 f"ligand={ligand_dist.tolist()}, poi={poi_dist.tolist()}"
             )
 
@@ -160,7 +179,7 @@ def sample_single(
         # transposing it again would apply the forward rotation twice.
         r_e3_to_poi = rot_init  # [1, 3, 3]
 
-    schedule = diffusion.get_inference_schedule(steps)
+    schedule = diffusion.get_inference_schedule(steps, t_start=t_anchor)
     trajectory = [] if return_trajectory else None
     trace = [] if return_trace else None
     nonfinite_score_steps = []
@@ -179,6 +198,9 @@ def sample_single(
         "poi_e3_dist": float(torch.linalg.vector_norm(init_poi_com - e3_center[0]).item()),
         "n_rotatable_bonds": int(ligand_data.get("edge_mask").sum().item())
         if ligand_data.get("edge_mask") is not None else 0,
+        "init_mode": init_mode,
+        "t_anchor": float(t_anchor),
+        "interface_anchor": anchor_center.detach().cpu().numpy().tolist(),
     }
     if return_trace:
         trace.append(init_record)
@@ -376,6 +398,7 @@ def sample_ensemble(
     seeds=None,
     freeze_poi: bool = False,
     init_mode: str = "coupled5a",
+    t_anchor: float = None,
 ) -> list:
     """
     Run ``n_walkers`` independent reverse-diffusion trajectories.
@@ -400,6 +423,7 @@ def sample_ensemble(
                 model, diffusion, initializer, e3_data, poi_data, ligand_data,
                 steps=steps, device=device, seed=seeds[i], freeze_poi=freeze_poi,
                 init_mode=init_mode,
+                t_anchor=t_anchor,
             )
         )
     return results

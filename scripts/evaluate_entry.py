@@ -90,8 +90,10 @@ def build_parser():
         action="store_true",
         help="Keep the POI fixed and disable SE3 reverse updates for strict E3-L parity evaluation.",
     )
-    p.add_argument("--init-mode", choices=["native", "coupled5a"], default="coupled5a",
+    p.add_argument("--init-mode", choices=["native", "coupled5a", "anchor_local"], default="coupled5a",
                    help="Ternary initialization prior (default: stable 0-5 A coupled prior)")
+    p.add_argument("--t-anchor", type=float, default=None,
+                   help="Starting diffusion time for anchor_local (default: 0.7)")
     return p
 
 
@@ -211,6 +213,7 @@ def main():
         debug_trace=args.debug_trace, debug_seed=args.debug_seed,
         freeze_poi=args.freeze_poi,
         init_mode=args.init_mode,
+        t_anchor=args.t_anchor,
         deepternary_dockq_paths={
             "protein1_pdb": protein1,
             "protein2_pdb": protein2,
@@ -225,6 +228,7 @@ def main():
         "steps": args.steps if args.steps is not None else diffusion.inference_steps,
         "freeze_poi": args.freeze_poi,
         "init_mode": args.init_mode,
+        "t_anchor": args.t_anchor if args.t_anchor is not None else (0.7 if args.init_mode == "anchor_local" else 1.0),
         "tribrain_checkpoint": args.tribrain_ckpt,
         "expert_model_dir": args.model_dir,
         "expert_checkpoint": args.ckpt,

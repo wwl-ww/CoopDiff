@@ -23,6 +23,7 @@ from featurize_common import (  # noqa: E402
 )
 from tricoopdiff.diffusion import MultiRateDiffusion, TernaryInitializer  # noqa: E402
 from tricoopdiff.graphs import transform_ligand_to_poi_frame  # noqa: E402
+from tricoopdiff.sampler import _nearest_interface_anchor  # noqa: E402
 
 
 def build_parser():
@@ -34,7 +35,7 @@ def build_parser():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
-        "--init-mode", choices=["native", "coupled5a"], default="coupled5a"
+        "--init-mode", choices=["native", "coupled5a", "anchor_local"], default="coupled5a"
     )
     parser.add_argument("--atol", type=float, default=1e-4)
     parser.add_argument("--out", default="results/initialization_frame_check.json")
@@ -120,6 +121,11 @@ def main():
     poi_shell_radius = float(
         torch.linalg.vector_norm(poi_initialized.mean(1)[0] - e3_center).item()
     )
+    poi_local_radius = float(
+        torch.linalg.vector_norm(
+            poi_initialized.mean(1)[0] - poi["coords"][0].mean(0)
+        ).item()
+    )
     orthogonality_error = float(
         (poi_rotation @ poi_rotation.transpose(-1, -2) - torch.eye(3, device=args.device))
         .abs()
@@ -142,6 +148,9 @@ def main():
         lig_mask_rotate=ligand.get("mask_rotate"),
         tr_sigma_max=diffusion.tr_sigma_max,
         init_mode=args.init_mode,
+        anchor_center=_nearest_interface_anchor(
+            e3["coords"][0], poi["coords"][0]
+        ).unsqueeze(0),
     )
     ligand_init_finite = bool(torch.isfinite(ligand_initialized).all().item())
 
@@ -159,6 +168,8 @@ def main():
         "poi_initial_radius": (
             0.0 <= poi_shell_radius <= initializer.coupled_radius
             if args.init_mode == "coupled5a"
+            else poi_local_radius <= initializer.coupled_radius
+            if args.init_mode == "anchor_local"
             else initializer.poi_shell_min <= poi_shell_radius <= initializer.poi_shell_max
         ),
         "poi_rotation": orthogonality_error <= args.atol and abs(rotation_det - 1.0) <= args.atol,
@@ -180,6 +191,7 @@ def main():
             "poi_local_center_error": poi_local_center_error,
             "sub2_relative_distance_max_error": relative_distance_error,
             "poi_shell_radius": poi_shell_radius,
+            "poi_local_radius": poi_local_radius,
             "poi_rotation_orthogonality_error": orthogonality_error,
             "poi_rotation_determinant": rotation_det,
             "poi_body_frame_max_error": body_frame_error,

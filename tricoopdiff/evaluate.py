@@ -735,7 +735,8 @@ def evaluate_model(
     debug_trace: bool = False,
     debug_seed: int = 0,
     freeze_poi: bool = False,
-    init_mode: str = "native",
+    init_mode: str = "coupled5a",
+    t_anchor: float = None,
     deepternary_dockq_paths: Optional[Dict[str, str]] = None,
 ) -> dict:
     """
@@ -781,6 +782,7 @@ def evaluate_model(
         steps=steps, device=device, n_walkers=n_walkers,
         freeze_poi=freeze_poi,
         init_mode=init_mode,
+        t_anchor=t_anchor,
     )
 
     ref_lig = ligand_data['coords'][0].detach().cpu().numpy()  # [N_lig, 3] native
@@ -976,6 +978,7 @@ def evaluate_model(
             steps=steps, device=device, seed=debug_seed, return_trace=True,
             freeze_poi=freeze_poi,
             init_mode=init_mode,
+            t_anchor=t_anchor,
         )
 
     report = {

@@ -571,7 +571,7 @@ class MultiRateDiffusion(nn.Module):
     # Inference schedules
     # ------------------------------------------------------------------
 
-    def get_inference_schedule(self, steps: int = None) -> dict:
+    def get_inference_schedule(self, steps: int = None, t_start: float = 1.0) -> dict:
         """
         Returns time discretization for reverse diffusion.
 
@@ -587,7 +587,9 @@ class MultiRateDiffusion(nn.Module):
         """
         if steps is None:
             steps = self.inference_steps
-        schedule = np.linspace(1.0, 0.0, steps + 1)
+        if not 0.0 < t_start <= 1.0:
+            raise ValueError(f"t_start must be in (0, 1], got {t_start}")
+        schedule = np.linspace(float(t_start), 0.0, steps + 1)
         return {
             'tr_schedule': schedule.copy(),
             'rot_schedule': schedule.copy(),
@@ -607,8 +609,9 @@ class TernaryInitializer:
 
     Reference: E3 fixed at origin (COM=0).
     ``native`` reproduces DiffDock's wide PROTAC prior and places POI on a
-    30-60 Å shell. ``coupled5a`` keeps both moving partners within 5 Å of
-    the E3 pocket, which is the stable default for ternary sampling entry points.
+    30-60 Å shell. ``coupled5a`` is the validated numerical fallback. The
+    ``anchor_local`` mode preserves the observed E3-POI separation and places
+    PROTAC near a predicted interface anchor with bounded local perturbations.
     """
 
     def __init__(
@@ -634,6 +637,8 @@ class TernaryInitializer:
         lig_mask_rotate=None,
         tr_sigma_max: float = None,
         init_mode: str = "native",
+        anchor_center: torch.Tensor = None,
+        local_radius: float = 5.0,
     ) -> torch.Tensor:
         """
         Initialize the PROTAC at t=1 (fully noised).
@@ -667,7 +672,7 @@ class TernaryInitializer:
         Returns:
             [B, N_lig, 3] initialized ligand positions.
         """
-        if init_mode not in {"native", "coupled5a"}:
+        if init_mode not in {"native", "coupled5a", "anchor_local"}:
             raise ValueError(f"unknown initialization mode: {init_mode}")
         B = e3_center.shape[0]
         N_lig = ligand_template.shape[0]
@@ -710,23 +715,34 @@ class TernaryInitializer:
                     torsion_updates[b], as_numpy=False,
                 ).to(device)
 
-        # (2) rotate about the ligand's own COM, then translate onto receptor COM.
+        # (2) rotate about the ligand's own COM, then translate onto the selected
+        # anchor. ``anchor_local`` uses a small-angle rotation and a bounded
+        # displacement; ``native``/``coupled5a`` retain their historical priors.
         # Match vendored DiffDock randomize_position exactly: it draws a single
         # rotation matrix, applies `@ random_rotation.T`, and then centers onto the
         # receptor COM before the Gaussian translation. Keeping the transpose here
         # is important for seed-level parity with the native initialization path.
         ligand_center = ligand_pos.mean(dim=1, keepdim=True)  # [B, 1, 3]
-        rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)  # [B, 3, 3]
+        if init_mode == "anchor_local":
+            rot = so3_exp(
+                torch.randn(B, 3, device=device, dtype=ligand_pos.dtype) * 0.25
+            )
+        else:
+            rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)  # [B, 3, 3]
         ligand_pos = torch.bmm(ligand_pos - ligand_center, rot.transpose(-1, -2)) + e3_center.unsqueeze(1)
 
         # (3) Gaussian translation N(0, tr_sigma_max^2) (initial_noise_std_proportion=-1.0).
-        if init_mode == "coupled5a":
-            radius = torch.rand(B, device=device) * self.coupled_radius
+        if init_mode in {"coupled5a", "anchor_local"}:
+            radius = torch.rand(B, device=device) * (self.coupled_radius if init_mode == "coupled5a" else local_radius)
             direction = torch.randn(B, 3, device=device)
             direction = direction / torch.linalg.vector_norm(
                 direction, dim=-1, keepdim=True
             ).clamp_min(1e-8)
             tr_update = direction * radius.unsqueeze(-1)
+            if init_mode == "anchor_local":
+                if anchor_center is None:
+                    raise ValueError("anchor_local requires anchor_center")
+                ligand_pos = ligand_pos - e3_center.unsqueeze(1) + anchor_center.unsqueeze(1)
         else:
             tr_update = torch.randn(B, 3, device=device) * tr_sigma_max
         ligand_pos = ligand_pos + tr_update.unsqueeze(1)
@@ -739,9 +755,11 @@ class TernaryInitializer:
         poi_template: torch.Tensor,
         return_rotation: bool = False,
         init_mode: str = "native",
+        local_radius: float = 5.0,
     ):
         """
-        Initialize POI around E3 using the selected prior.
+        Initialize POI using the selected prior. ``anchor_local`` preserves its
+        current E3-frame center and only applies a bounded local perturbation.
 
         Args:
             e3_center: [B, 3] E3 center (typically origin)
@@ -751,7 +769,7 @@ class TernaryInitializer:
             True, returns ``(poi_pos, rot)`` where ``rot`` [B,3,3] maps current
             E3-frame row vectors back into the POI template/body frame.
         """
-        if init_mode not in {"native", "coupled5a"}:
+        if init_mode not in {"native", "coupled5a", "anchor_local"}:
             raise ValueError(f"unknown initialization mode: {init_mode}")
         B = e3_center.shape[0]
         N_poi = poi_template.shape[0]
@@ -759,6 +777,8 @@ class TernaryInitializer:
 
         if init_mode == "coupled5a":
             r = torch.rand(B, device=device) * self.coupled_radius
+        elif init_mode == "anchor_local":
+            r = torch.rand(B, device=device) * local_radius
         else:
             r = self.poi_shell_min + torch.rand(B, device=device) * (self.poi_shell_max - self.poi_shell_min)
         direction = torch.randn(B, 3, device=device)
@@ -766,11 +786,16 @@ class TernaryInitializer:
             direction, dim=-1, keepdim=True
         ).clamp_min(1e-8)
 
-        translation = e3_center + r.unsqueeze(-1) * direction
-        rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)
-
         poi_pos = poi_template.unsqueeze(0).repeat(B, 1, 1)
         poi_center = poi_pos.mean(dim=1, keepdim=True)
+        if init_mode == "anchor_local":
+            rot = so3_exp(
+                torch.randn(B, 3, device=device, dtype=poi_pos.dtype) * 0.25
+            )
+            translation = poi_center.squeeze(1) + r.unsqueeze(-1) * direction
+        else:
+            translation = e3_center + r.unsqueeze(-1) * direction
+            rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)
         poi_pos = torch.bmm(poi_pos - poi_center, rot.transpose(-1, -2)) + translation.unsqueeze(1)
 
         if return_rotation:

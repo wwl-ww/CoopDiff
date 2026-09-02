@@ -34,6 +34,7 @@ from tricoopdiff.diffusion import MultiRateDiffusion, TernaryInitializer
 from tricoopdiff.expert_factory import build_diffdock_expert
 from tricoopdiff.graphs import crop_receptor_to_ligand, build_subgraph_e3l, build_subgraph_pol, transform_ligand_to_poi_frame
 from tricoopdiff.model import _expert_forward_with_film, _set_time_embeddings
+from tricoopdiff.sampler import _nearest_interface_anchor
 
 os.chdir(_PROJECT_ROOT)
 
@@ -49,7 +50,8 @@ def build_parser():
     p.add_argument("--steps", type=int, default=3)
     p.add_argument("--cache-dir", default="results/featurize_cache")
     p.add_argument("--branch", choices=["sub1", "sub2"], default="sub1")
-    p.add_argument("--init-mode", choices=["native", "coupled5a"], default="coupled5a")
+    p.add_argument("--init-mode", choices=["native", "coupled5a", "anchor_local"], default="coupled5a")
+    p.add_argument("--t-anchor", type=float, default=None)
     p.add_argument("--atol", type=float, default=1e-5)
     p.add_argument("--rtol", type=float, default=1e-4)
     p.add_argument("--nan-trace", action="store_true",
@@ -129,6 +131,7 @@ def _build_step0_subgraph(args, expert):
     poi_template = poi_data["coords"][0].detach()
     e3_coords = e3_data["coords"][0].detach()
     e3_center = e3_coords.mean(dim=0, keepdim=True)
+    anchor_center = _nearest_interface_anchor(e3_coords, poi_template)
 
     ligand_pos = initializer.initialize_protac(
         e3_center,
@@ -138,12 +141,14 @@ def _build_step0_subgraph(args, expert):
         lig_mask_rotate=ligand_data.get("mask_rotate"),
         tr_sigma_max=diffusion.tr_sigma_max,
         init_mode=args.init_mode,
+        anchor_center=anchor_center.unsqueeze(0),
     )
     poi_pos, rot_init = initializer.initialize_poi(
         e3_center, poi_template, return_rotation=True, init_mode=args.init_mode
     )
 
-    schedule = diffusion.get_inference_schedule(args.steps)
+    t_anchor = args.t_anchor if args.t_anchor is not None else (0.7 if args.init_mode == "anchor_local" else 1.0)
+    schedule = diffusion.get_inference_schedule(args.steps, t_start=t_anchor)
     t_tr = torch.tensor([schedule["tr_schedule"][0]], device=args.device, dtype=torch.float32)
     tr_sigma, _, _ = diffusion.t_to_sigma(t_tr, t_tr, t_tr)
     receptor_crop_cutoff = tr_sigma * 3 + 20 if bool(getattr(expert.model, "dynamic_max_cross", False)) else None
@@ -298,6 +303,7 @@ def main():
         "seed": args.seed,
         "steps": args.steps,
         "init_mode": args.init_mode,
+        "t_anchor": t_anchor,
         "meta": meta,
         "tolerance": {"atol": args.atol, "rtol": args.rtol},
         "nan_clamp": os.environ.get("NAN_CLAMP"),
