@@ -134,7 +134,6 @@ def _build_step0_subgraph(args, expert):
         tr_sigma_max=diffusion.tr_sigma_max,
     )
     poi_pos, rot_init = initializer.initialize_poi(e3_center, poi_template, return_rotation=True)
-    _ = rot_init
 
     schedule = diffusion.get_inference_schedule(args.steps)
     t_tr = torch.tensor([schedule["tr_schedule"][0]], device=args.device, dtype=torch.float32)
@@ -145,11 +144,20 @@ def _build_step0_subgraph(args, expert):
     e3_center0 = e3_data["coords"][0].mean(dim=0)
     poi_center0 = poi_pos[0].mean(dim=0)
     t_e3_to_poi = poi_center0 - e3_center0
-    ligand_coords_poi = transform_ligand_to_poi_frame(ligand_coords_e3, t_e3_to_poi, torch.eye(3, device=ligand_coords_e3.device))
+    # Match sample_single(): R_cum starts at rot_init and model.forward receives
+    # its transpose as the E3-to-POI row-vector transform.
+    r_e3_to_poi = rot_init[0].transpose(-1, -2)
+    ligand_coords_poi = transform_ligand_to_poi_frame(
+        ligand_coords_e3, t_e3_to_poi, r_e3_to_poi
+    )
+    # Use the current initialized POI pose, exactly as sample_single() passes it
+    # into model.forward(). Using the featurized template here while deriving the
+    # translation from `poi_pos` creates a hybrid graph and leaves the reported
+    # POI local COM far from the origin.
     poi_coords_poi = transform_ligand_to_poi_frame(
-        poi_data["coords"][0],
+        poi_pos[0],
         t_e3_to_poi,
-        torch.eye(3, device=ligand_coords_e3.device),
+        r_e3_to_poi,
     )
 
     use_native_step_crop = bool(getattr(expert.model, "dynamic_max_cross", False))
@@ -212,6 +220,7 @@ def _build_step0_subgraph(args, expert):
             "ligand_com_e3": ligand_coords_e3.mean(dim=0).detach().cpu().tolist(),
             "ligand_com_poi": ligand_coords_poi.mean(dim=0).detach().cpu().tolist(),
             "poi_com_poi": poi_coords_poi.mean(dim=0).detach().cpu().tolist(),
+            "poi_local_com_norm": float(poi_coords_poi.mean(dim=0).norm().item()),
         }
     }
 
