@@ -1,6 +1,7 @@
 import numpy as np
 import tqdm
 import os
+from pathlib import Path
 
 """
     Preprocessing for the SO(2)/torus sampling and score computations, truncated infinite series are computed and then
@@ -28,16 +29,24 @@ SIGMA_MIN, SIGMA_MAX, SIGMA_N = 3e-3, 2, 5000  # relative to pi
 x = 10 ** np.linspace(np.log10(X_MIN), 0, X_N + 1) * np.pi
 sigma = 10 ** np.linspace(np.log10(SIGMA_MIN), np.log10(SIGMA_MAX), SIGMA_N + 1) * np.pi
 
-if os.path.exists('.p.npy'):
-    p_ = np.load('.p.npy')
-    score_ = np.load('.score.npy')
+_CACHE_DIR = Path(os.environ.get(
+    "TRICOOPDIFF_CACHE_DIR",
+    Path(__file__).resolve().parents[3] / "results/runtime_cache/diffdock",
+))
+_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+_P_FILE = _CACHE_DIR / '.p.npy'
+_SCORE_FILE = _CACHE_DIR / '.score.npy'
+
+if _P_FILE.exists() and _SCORE_FILE.exists():
+    p_ = np.load(_P_FILE)
+    score_ = np.load(_SCORE_FILE)
 else:
     p_ = p(x, sigma[:, None], N=100)
-    np.save('.p.npy', p_)
+    np.save(_P_FILE, p_)
 
     eps = np.finfo(p_.dtype).eps
     score_ = grad(x, sigma[:, None], N=100) / (p_ + eps)
-    np.save('.score.npy', score_)
+    np.save(_SCORE_FILE, score_)
 
 
 def score(x, sigma):

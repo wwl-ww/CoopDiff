@@ -19,6 +19,7 @@ mkdir -p logs results/deepternary_test/cases
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export NAN_CLAMP=100
+export TRICOOPDIFF_CACHE_DIR="$PROJECT_ROOT/results/runtime_cache/diffdock"
 
 CHECKPOINT="${CHECKPOINT:-results/deepternary_phase1/best_model.pt}"
 if [ ! -f "$CHECKPOINT" ]; then

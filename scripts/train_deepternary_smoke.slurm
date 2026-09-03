@@ -23,7 +23,10 @@ export TRANSFORMERS_OFFLINE=1
 export TRITON_CACHE_DIR="$RUNTIME_ROOT/triton"
 export TORCHINDUCTOR_CACHE_DIR="$RUNTIME_ROOT/torchinductor"
 export TMPDIR="$RUNTIME_ROOT/tmp"
+export TRICOOPDIFF_CACHE_DIR="$RUNTIME_ROOT/diffdock"
 export NAN_CLAMP=100
+
+python -c "import runpy; tests=runpy.run_path('tests/test_torsion_utils.py'); tests['test_modify_conformer_torsion_angles_copies_and_rotates']()"
 
 python scripts/check_phase1_readiness.py \
     --training-only \

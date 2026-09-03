@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -11,6 +13,16 @@ X_N = 2000
 """
 
 omegas = np.linspace(0, np.pi, X_N + 1)[1:]
+
+_CACHE_DIR = Path(os.environ.get(
+    "TRICOOPDIFF_CACHE_DIR",
+    Path(__file__).resolve().parents[3] / "results/runtime_cache/diffdock",
+))
+_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _cache_file(name):
+    return _CACHE_DIR / name
 
 
 def _expansion(omega, eps, L=2000):  # the summation term only
@@ -37,11 +49,11 @@ def _score(exp, omega, eps, L=2000):  # score of density over SO(3)
     return dSigma / exp
 
 
-if os.path.exists('.so3_omegas_array4.npy'):
-    _omegas_array = np.load('.so3_omegas_array4.npy')
-    _cdf_vals = np.load('.so3_cdf_vals4.npy')
-    _score_norms = np.load('.so3_score_norms4.npy')
-    _exp_score_norms = np.load('.so3_exp_score_norms4.npy')
+if _cache_file('.so3_omegas_array4.npy').exists():
+    _omegas_array = np.load(_cache_file('.so3_omegas_array4.npy'))
+    _cdf_vals = np.load(_cache_file('.so3_cdf_vals4.npy'))
+    _score_norms = np.load(_cache_file('.so3_score_norms4.npy'))
+    _exp_score_norms = np.load(_cache_file('.so3_exp_score_norms4.npy'))
 else:
     _eps_array = 10 ** np.linspace(np.log10(MIN_EPS), np.log10(MAX_EPS), N_EPS)
     _omegas_array = np.linspace(0, np.pi, X_N + 1)[1:]
@@ -53,10 +65,10 @@ else:
 
     _exp_score_norms = np.sqrt(np.sum(_score_norms**2 * _pdf_vals, axis=1) / np.sum(_pdf_vals, axis=1) / np.pi)
 
-    np.save('.so3_omegas_array4.npy', _omegas_array)
-    np.save('.so3_cdf_vals4.npy', _cdf_vals)
-    np.save('.so3_score_norms4.npy', _score_norms)
-    np.save('.so3_exp_score_norms4.npy', _exp_score_norms)
+    np.save(_cache_file('.so3_omegas_array4.npy'), _omegas_array)
+    np.save(_cache_file('.so3_cdf_vals4.npy'), _cdf_vals)
+    np.save(_cache_file('.so3_score_norms4.npy'), _score_norms)
+    np.save(_cache_file('.so3_exp_score_norms4.npy'), _exp_score_norms)
 
 
 def sample(eps):

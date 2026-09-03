@@ -950,7 +950,13 @@ def _init_so3_cache(cache_dir=None):
         return
 
     import os as _os
-    cache_dir = cache_dir or '.'
+    from pathlib import Path as _Path
+    cache_dir = cache_dir or _os.environ.get(
+        "TRICOOPDIFF_CACHE_DIR",
+        str(_Path(__file__).resolve().parents[1]
+            / "results/runtime_cache/diffdock"),
+    )
+    _os.makedirs(cache_dir, exist_ok=True)
     omega_file = _os.path.join(cache_dir, '.so3_omegas_array4.npy')
     score_file = _os.path.join(cache_dir, '.so3_exp_score_norms4.npy')
     score_norm_file = _os.path.join(cache_dir, '.so3_score_norms4.npy')
