@@ -1,5 +1,6 @@
 """Pure-Python helpers shared by evaluation entry points and tests."""
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -49,7 +50,7 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=336):
         raise ValueError("checkpoint has no LoRA architecture config")
 
 
-def completed_report(path, case, checkpoint):
+def completed_report(path, case, checkpoint, expected_config=None):
     """Return true only for a valid, completed report with matching inputs."""
     destination = Path(path)
     if not destination.is_file():
@@ -59,9 +60,21 @@ def completed_report(path, case, checkpoint):
     except (OSError, json.JSONDecodeError):
         return False
     config = report.get("run_config", {})
-    structure = report.get("structure", {})
-    return bool(
+    ensemble = report.get("ensemble", {})
+    core_matches = bool(
         report.get("case") == case
         and config.get("tribrain_checkpoint") == checkpoint
-        and structure.get("n_valid_walkers", 0) > 0
+        and ensemble.get("n_valid_walkers", 0) > 0
     )
+    return core_matches and all(
+        config.get(key) == value for key, value in (expected_config or {}).items()
+    )
+
+
+def sha256_file(path, chunk_size=1024 * 1024):
+    """Return a reproducibility hash without loading a large file into RAM."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

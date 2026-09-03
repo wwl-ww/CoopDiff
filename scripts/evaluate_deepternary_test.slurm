@@ -26,6 +26,14 @@ if [ ! -f "$CHECKPOINT" ]; then
     exit 2
 fi
 
+TRAIN_LOG="${TRAIN_LOG:-logs/train_deepternary_phase1-154208.out}"
+python scripts/select_best_checkpoint.py \
+    --log "$TRAIN_LOG" \
+    --checkpoint "$CHECKPOINT" \
+    --expected-epochs 100 \
+    --steps-per-epoch 1981 \
+    --out results/deepternary_test/checkpoint_selection.json
+
 set +e
 PYTHONUNBUFFERED=1 python scripts/evaluate_index.py \
     --index data/ternary_test.json \
@@ -42,6 +50,7 @@ set -e
 python scripts/summarize_evaluation_reports.py \
     --reports-dir results/deepternary_test/cases \
     --require-trained \
+    --require-exact-dockq \
     --out-json results/deepternary_test/summary.json \
     --out-csv results/deepternary_test/summary.csv
 

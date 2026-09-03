@@ -1,6 +1,7 @@
 """CPU-only tests for evaluation aggregation."""
 
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -27,3 +28,18 @@ def test_summary_tracks_failures_walkers_and_quantiles():
     assert summary["n_valid_walkers"] == 63
     assert summary["n_requested_walkers"] == 96
     assert summary["metrics"]["dockq_best"]["median"] == 0.7
+
+
+def test_report_reads_walker_counts_from_ensemble(tmp_path):
+    path = tmp_path / "case.json"
+    path.write_text(json.dumps({
+        "case": "demo",
+        "run_config": {"tribrain_checkpoint": "/abs/best.pt"},
+        "ensemble": {"n_valid_walkers": 31, "n_nan_walkers": 1,
+                     "selection_metric": "dockq"},
+        "structure": {"dockq_best": 0.75},
+    }))
+    row = evaluation_summary.load_row(path)
+    assert row["n_valid_walkers"] == 31
+    assert row["n_nan_walkers"] == 1
+    assert row["exact_dockq"] is True

@@ -5,7 +5,7 @@ import argparse
 import json
 from pathlib import Path
 
-from evaluation_common import completed_report, resolve_entry_paths
+from evaluation_common import completed_report, resolve_entry_paths, sha256_file
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -50,6 +50,20 @@ def main():
     entries = select_entries(index, args.start, args.limit)
     output = Path(args.out_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "index": str(index),
+        "index_sha256": sha256_file(index),
+        "checkpoint": checkpoint,
+        "checkpoint_sha256": sha256_file(checkpoint),
+        "cases": [entry["case"] for entry in entries],
+        "seed": args.seed,
+        "n_walkers": args.n_walkers,
+        "steps": args.steps,
+        "native_root": str((_PROJECT_ROOT / args.native_root).resolve()),
+    }
+    (output / "evaluation_manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8",
+    )
     runner = EvaluationRunner(
         _PROJECT_ROOT, checkpoint=checkpoint, device=args.device,
     )
@@ -57,7 +71,13 @@ def main():
     for position, entry in enumerate(entries, start=1):
         case = entry["case"]
         report_path = output / f"{case}.json"
-        if not args.no_resume and completed_report(report_path, case, checkpoint):
+        expected_config = {
+            "seed": args.seed,
+            "n_walkers": args.n_walkers,
+            "steps": args.steps,
+        }
+        if not args.no_resume and completed_report(
+                report_path, case, checkpoint, expected_config):
             print(f"[{position}/{len(entries)}] SKIP completed {case}", flush=True)
             continue
         print(f"[{position}/{len(entries)}] RUN {case}", flush=True)

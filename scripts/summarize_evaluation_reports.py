@@ -36,6 +36,8 @@ def build_parser():
                         help="Also read every JSON directly under this directory")
     parser.add_argument("--require-trained", action="store_true",
                         help="Reject reports without a trained checkpoint")
+    parser.add_argument("--require-exact-dockq", action="store_true",
+                        help="Reject reports lacking DeepTernary full-atom DockQ")
     parser.add_argument("--out-json", default="results/evaluation_summary.json")
     parser.add_argument("--out-csv", default="results/evaluation_summary.csv")
     return parser
@@ -45,6 +47,7 @@ def load_row(path):
     with path.open() as handle:
         report = json.load(handle)
     structure = report.get("structure", {})
+    ensemble = report.get("ensemble", {})
     config = report.get("run_config", {})
     checkpoint = config.get("tribrain_checkpoint")
     mode = "trained" if checkpoint else "zero_film"
@@ -58,8 +61,10 @@ def load_row(path):
         "seed": config.get("seed"),
         "n_walkers": config.get("n_walkers"),
         "steps": config.get("steps"),
-        "n_valid_walkers": structure.get("n_valid_walkers"),
-        "n_nan_walkers": structure.get("n_nan_walkers"),
+        "n_valid_walkers": ensemble.get("n_valid_walkers"),
+        "n_nan_walkers": ensemble.get("n_nan_walkers"),
+        "selection_metric": ensemble.get("selection_metric"),
+        "exact_dockq": structure.get("dockq_best") is not None,
     }
     row.update({metric: structure.get(metric) for metric in METRICS})
     return row
@@ -103,6 +108,7 @@ def summarize_rows(rows):
         "n_requested_walkers": requested,
         "n_valid_walkers": valid,
         "valid_walker_rate": valid / requested if requested else 0.0,
+        "n_exact_dockq_cases": sum(bool(row.get("exact_dockq")) for row in rows),
         "metrics": metrics,
     }
 
@@ -113,7 +119,7 @@ def main():
     if args.reports_dir:
         paths.extend(
             path for path in sorted(Path(args.reports_dir).resolve().glob("*.json"))
-            if path.name != "batch_status.json"
+            if path.name not in {"batch_status.json", "evaluation_manifest.json"}
         )
     paths = list(dict.fromkeys(paths))
     if not paths:
@@ -130,6 +136,10 @@ def main():
         sys.exit(2)
     if args.require_trained and any(not row["checkpoint"] for row in rows):
         print("FATAL: zero-init report found in trained evaluation", file=sys.stderr)
+        sys.exit(2)
+    if args.require_exact_dockq and any(not row["exact_dockq"] for row in rows):
+        print("FATAL: report without DeepTernary full-atom DockQ found",
+              file=sys.stderr)
         sys.exit(2)
 
     summary = summarize_rows(rows)

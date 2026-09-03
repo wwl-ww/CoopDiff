@@ -51,8 +51,14 @@ def test_completed_report_requires_matching_checkpoint(tmp_path):
     path = tmp_path / "report.json"
     path.write_text(json.dumps({
         "case": "demo",
-        "run_config": {"tribrain_checkpoint": "best.pt"},
-        "structure": {"n_valid_walkers": 31},
+        "run_config": {"tribrain_checkpoint": "best.pt", "seed": 0},
+        "ensemble": {"n_valid_walkers": 31},
     }), encoding="utf-8")
     assert evaluation_common.completed_report(path, "demo", "best.pt")
+    assert evaluation_common.completed_report(
+        path, "demo", "best.pt", {"seed": 0},
+    )
+    assert not evaluation_common.completed_report(
+        path, "demo", "best.pt", {"seed": 1},
+    )
     assert not evaluation_common.completed_report(path, "demo", "other.pt")

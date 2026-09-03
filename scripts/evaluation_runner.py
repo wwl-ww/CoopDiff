@@ -83,7 +83,8 @@ class EvaluationRunner:
 
     def evaluate_case(self, case, paths, cache_dir, native_complex_pdb=None,
                       n_walkers=32, steps=20, seed=0,
-                      init_mode="coupled5a", t_anchor=None, freeze_poi=False):
+                      init_mode="coupled5a", t_anchor=None, freeze_poi=False,
+                      debug_trace=False, debug_seed=0):
         """Featurize and evaluate one case with the resident model."""
         torch.manual_seed(seed)
         if self.device.type == "cuda":
@@ -101,6 +102,7 @@ class EvaluationRunner:
             native_complex_pdb=(str(native_complex_pdb)
                                 if native_complex_pdb else None),
             freeze_poi=freeze_poi, init_mode=init_mode, t_anchor=t_anchor,
+            debug_trace=debug_trace, debug_seed=debug_seed,
             deepternary_dockq_paths={
                 "protein1_pdb": str(paths["protein1"]),
                 "protein2_pdb": str(paths["protein2"]),
@@ -112,12 +114,18 @@ class EvaluationRunner:
         report["run_config"] = {
             "seed": seed,
             "n_walkers": n_walkers,
-            "steps": steps,
+            "steps": (steps if steps is not None
+                      else self.diffusion.inference_steps),
             "freeze_poi": freeze_poi,
             "init_mode": init_mode,
-            "t_anchor": t_anchor if t_anchor is not None else 1.0,
-            "tribrain_checkpoint": str(self.checkpoint_path),
+            "t_anchor": (t_anchor if t_anchor is not None else
+                         (0.7 if init_mode == "anchor_local" else 1.0)),
+            "tribrain_checkpoint": str(self.checkpoint_path.resolve()),
             "expert_model_dir": str(self.model_dir),
+            "dockq_implementation": (
+                "DeepTernary/DockQ/dockq_util.py::cal_dockq"
+                if native_complex_pdb else None
+            ),
         }
         return report
 

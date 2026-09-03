@@ -156,6 +156,11 @@ def main():
         _sdf = case_dir / "ligand.sdf"
         _pdb = case_dir / "ligand.pdb"
         ligand_path = str(_sdf if _sdf.exists() else _pdb)
+        paths = {
+            "protein1": Path(protein1),
+            "protein2": Path(protein2),
+            "ligand": Path(ligand_path),
+        }
 
     print("=" * 72, flush=True)
     print(f"TriCoopDiff MVP evaluation — case {args.case}", flush=True)
@@ -163,6 +168,40 @@ def main():
     print(f"  n_walkers={args.n_walkers}  steps={args.steps}", flush=True)
     print(f"  tribrain_ckpt={args.tribrain_ckpt or '(zero-init baseline)'}", flush=True)
     print("=" * 72, flush=True)
+
+    # Production single-case and indexed evaluation intentionally share one
+    # runtime. Keep the code below only for the explicit zero-init diagnostic.
+    if args.tribrain_ckpt is not None:
+        from evaluation_runner import EvaluationRunner, write_report_atomic
+
+        native_pdb = case_dir / "gt_complex.pdb"
+        if not native_pdb.exists():
+            native_pdb = case_dir / "complex.pdb"
+        try:
+            runner = EvaluationRunner(
+                _PROJECT_ROOT, checkpoint=args.tribrain_ckpt,
+                device=args.device, model_dir=args.model_dir,
+                expert_checkpoint=args.ckpt,
+            )
+            report = runner.evaluate_case(
+                args.case, paths, cache_dir=_PROJECT_ROOT / args.cache_dir,
+                native_complex_pdb=native_pdb if native_pdb.is_file() else None,
+                n_walkers=args.n_walkers, steps=args.steps, seed=args.seed,
+                freeze_poi=args.freeze_poi, init_mode=args.init_mode,
+                t_anchor=args.t_anchor, debug_trace=args.debug_trace,
+                debug_seed=args.debug_seed,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            print(f"FATAL: trained evaluation failed: {error}", flush=True)
+            sys.exit(2)
+        print(json.dumps(report, indent=2), flush=True)
+        if args.out is not None:
+            out_path = Path(args.out)
+            if not out_path.is_absolute():
+                out_path = _PROJECT_ROOT / out_path
+            write_report_atomic(report, out_path)
+            print(f"\n[saved] {out_path}", flush=True)
+        return
 
     # --- Load score-model args (featurization hyperparams) --------------------
     with open(_PROJECT_ROOT / args.model_dir / "model_parameters.yml") as f:
