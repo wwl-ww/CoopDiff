@@ -3,11 +3,9 @@
 
 import argparse
 import json
-import subprocess
-import sys
 from pathlib import Path
 
-from evaluation_common import completed_report
+from evaluation_common import completed_report, resolve_entry_paths
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -40,12 +38,21 @@ def build_parser():
 
 
 def main():
+    import torch
+    from evaluation_runner import EvaluationRunner, write_report_atomic
+
     args = build_parser().parse_args()
     index = Path(args.index).resolve()
-    checkpoint = str(Path(args.tribrain_ckpt))
+    checkpoint_path = Path(args.tribrain_ckpt)
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = _PROJECT_ROOT / checkpoint_path
+    checkpoint = str(checkpoint_path.resolve())
     entries = select_entries(index, args.start, args.limit)
     output = Path(args.out_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
+    runner = EvaluationRunner(
+        _PROJECT_ROOT, checkpoint=checkpoint, device=args.device,
+    )
     failures = []
     for position, entry in enumerate(entries, start=1):
         case = entry["case"]
@@ -53,22 +60,24 @@ def main():
         if not args.no_resume and completed_report(report_path, case, checkpoint):
             print(f"[{position}/{len(entries)}] SKIP completed {case}", flush=True)
             continue
-        command = [
-            sys.executable, str(_PROJECT_ROOT / "scripts/evaluate_entry.py"),
-            "--index", str(index), "--case", case,
-            "--native-root", args.native_root,
-            "--tribrain-ckpt", checkpoint,
-            "--cache-dir", args.cache_dir,
-            "--n-walkers", str(args.n_walkers),
-            "--steps", str(args.steps), "--seed", str(args.seed),
-            "--device", args.device, "--out", str(report_path),
-        ]
         print(f"[{position}/{len(entries)}] RUN {case}", flush=True)
-        result = subprocess.run(command, cwd=_PROJECT_ROOT)
-        if result.returncode:
-            failures.append({"case": case, "exit_code": result.returncode})
-            print(f"[{position}/{len(entries)}] FAIL {case}: {result.returncode}",
-                  flush=True)
+        try:
+            paths = resolve_entry_paths(entry, _PROJECT_ROOT)
+            native = _PROJECT_ROOT / args.native_root / case / "gt_complex.pdb"
+            report = runner.evaluate_case(
+                case, paths, cache_dir=_PROJECT_ROOT / args.cache_dir,
+                native_complex_pdb=native if native.is_file() else None,
+                n_walkers=args.n_walkers, steps=args.steps, seed=args.seed,
+            )
+            write_report_atomic(report, report_path)
+        except Exception as error:
+            failures.append({
+                "case": case,
+                "error": f"{type(error).__name__}: {error}",
+            })
+            print(f"[{position}/{len(entries)}] FAIL {case}: {error}", flush=True)
+            if args.device == "cuda":
+                torch.cuda.empty_cache()
 
     status = {
         "requested_cases": len(entries),
