@@ -48,6 +48,11 @@ import yaml
 from argparse import Namespace
 
 from featurize_common import featurize_complex
+from evaluation_common import (
+    load_index_entry,
+    resolve_entry_paths,
+    validate_checkpoint_payload,
+)
 
 from tricoopdiff.expert_factory import build_diffdock_expert
 from tricoopdiff.tribrain import TriBrain
@@ -63,13 +68,18 @@ os.chdir(_PROJECT_ROOT)
 def build_parser():
     p = argparse.ArgumentParser(description="TriCoopDiff MVP evaluation entry point")
     p.add_argument("--protac-dir", default="DeepTernary/output/protac22")
+    p.add_argument("--index", default=None,
+                   help="Official ternary JSON index containing --case")
+    p.add_argument("--native-root", default="data/TernaryDB_release/pdbs",
+                   help="Root containing <case>/gt_complex.pdb for indexed data")
     p.add_argument("--model-dir", default="checkpoints/score_model")
     p.add_argument("--ckpt", default="best_ema_inference_epoch_model.pt")
     p.add_argument("--case", default="5T35_D_A_759",
                    help="Ternary complex case name (directory under --protac-dir)")
     p.add_argument("--tribrain-ckpt", default=None,
-                   help="Optional trained TriBrain checkpoint (default: zero-init "
-                        "baseline = no loading)")
+                   help="Version-3 trained TriBrain + LoRA checkpoint")
+    p.add_argument("--allow-zero-init", action="store_true",
+                   help="Explicitly allow evaluation without trained weights")
     p.add_argument("--lora-rank", type=int, default=4)
     p.add_argument("--lora-alpha", type=float, default=8.0)
     p.add_argument("--lora-start-layer", type=int, default=0)
@@ -106,6 +116,11 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
 
+    if args.tribrain_ckpt is None and not args.allow_zero_init:
+        print("FATAL: --tribrain-ckpt is required; use --allow-zero-init only "
+              "for an explicit baseline", flush=True)
+        sys.exit(2)
+
     if args.device == "cuda" and not torch.cuda.is_available():
         print("FATAL: --device cuda requested but CUDA is unavailable", flush=True)
         sys.exit(1)
@@ -116,18 +131,31 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
 
-    # Resolve the case directory + input files.
-    protac_dir = _PROJECT_ROOT / args.protac_dir
-    case_dir = protac_dir / args.case
-    if not case_dir.exists():
-        print(f"FATAL: case directory not found: {case_dir}", flush=True)
-        sys.exit(1)
-
-    protein1 = str(case_dir / "protein1.pdb")   # E3
-    protein2 = str(case_dir / "protein2.pdb")   # POI
-    _sdf = case_dir / "ligand.sdf"
-    _pdb = case_dir / "ligand.pdb"
-    ligand_path = str(_sdf if _sdf.exists() else _pdb)
+    # Resolve either an official index entry or a legacy case directory.
+    if args.index:
+        index_path = Path(args.index)
+        if not index_path.is_absolute():
+            index_path = _PROJECT_ROOT / index_path
+        try:
+            entry = load_index_entry(index_path, args.case)
+            paths = resolve_entry_paths(entry, _PROJECT_ROOT)
+        except (OSError, KeyError, ValueError) as error:
+            print(f"FATAL: invalid indexed case: {error}", flush=True)
+            sys.exit(2)
+        protein1 = str(paths["protein1"])
+        protein2 = str(paths["protein2"])
+        ligand_path = str(paths["ligand"])
+        case_dir = (_PROJECT_ROOT / args.native_root / args.case).resolve()
+    else:
+        case_dir = _PROJECT_ROOT / args.protac_dir / args.case
+        if not case_dir.exists():
+            print(f"FATAL: case directory not found: {case_dir}", flush=True)
+            sys.exit(1)
+        protein1 = str(case_dir / "protein1.pdb")
+        protein2 = str(case_dir / "protein2.pdb")
+        _sdf = case_dir / "ligand.sdf"
+        _pdb = case_dir / "ligand.pdb"
+        ligand_path = str(_sdf if _sdf.exists() else _pdb)
 
     print("=" * 72, flush=True)
     print(f"TriCoopDiff MVP evaluation — case {args.case}", flush=True)
@@ -149,6 +177,11 @@ def main():
             print(f"FATAL: --tribrain-ckpt not found: {ckpt_path}", flush=True)
             sys.exit(1)
         trained_ckpt = torch.load(ckpt_path, map_location=device)
+        try:
+            validate_checkpoint_payload(trained_ckpt)
+        except ValueError as error:
+            print(f"FATAL: invalid trained checkpoint: {error}", flush=True)
+            sys.exit(2)
 
     # --- Build the frozen expert ---------------------------------------------
     print("[expert] building frozen DiffDock-L expert...", flush=True)
@@ -243,7 +276,7 @@ def main():
         deepternary_dockq_paths={
             "protein1_pdb": protein1,
             "protein2_pdb": protein2,
-            "ligand_pdb": str(case_dir / "ligand.pdb"),
+            "ligand_pdb": ligand_path,
             "deepternary_root": str(_PROJECT_ROOT / "DeepTernary"),
         },
     )

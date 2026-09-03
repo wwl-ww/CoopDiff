@@ -4,6 +4,8 @@
 import argparse
 import csv
 import json
+import math
+import statistics
 import sys
 from pathlib import Path
 
@@ -29,7 +31,11 @@ METRICS = (
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("reports", nargs="+", help="Evaluation JSON files")
+    parser.add_argument("reports", nargs="*", help="Evaluation JSON files")
+    parser.add_argument("--reports-dir", default=None,
+                        help="Also read every JSON directly under this directory")
+    parser.add_argument("--require-trained", action="store_true",
+                        help="Reject reports without a trained checkpoint")
     parser.add_argument("--out-json", default="results/evaluation_summary.json")
     parser.add_argument("--out-csv", default="results/evaluation_summary.csv")
     return parser
@@ -52,14 +58,67 @@ def load_row(path):
         "seed": config.get("seed"),
         "n_walkers": config.get("n_walkers"),
         "steps": config.get("steps"),
+        "n_valid_walkers": structure.get("n_valid_walkers"),
+        "n_nan_walkers": structure.get("n_nan_walkers"),
     }
     row.update({metric: structure.get(metric) for metric in METRICS})
     return row
 
 
+def _percentile(values, fraction):
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] * (upper - position) + ordered[upper] * (position - lower)
+
+
+def summarize_rows(rows):
+    """Aggregate valid numeric metrics and list failed cases."""
+    failed = [row["case"] for row in rows if not row.get("n_valid_walkers")]
+    requested = sum(
+        (row.get("n_valid_walkers") or 0) + (row.get("n_nan_walkers") or 0)
+        for row in rows
+    )
+    valid = sum(row.get("n_valid_walkers") or 0 for row in rows)
+    metrics = {}
+    for metric in METRICS:
+        values = [float(row[metric]) for row in rows
+                  if isinstance(row.get(metric), (int, float))
+                  and math.isfinite(row[metric])]
+        if values:
+            metrics[metric] = {
+                "count": len(values),
+                "mean": statistics.fmean(values),
+                "median": statistics.median(values),
+                "p25": _percentile(values, 0.25),
+                "p75": _percentile(values, 0.75),
+            }
+    return {
+        "n_cases": len(rows),
+        "n_failed_cases": len(failed),
+        "failed_cases": failed,
+        "n_requested_walkers": requested,
+        "n_valid_walkers": valid,
+        "valid_walker_rate": valid / requested if requested else 0.0,
+        "metrics": metrics,
+    }
+
+
 def main():
     args = build_parser().parse_args()
     paths = [Path(value).resolve() for value in args.reports]
+    if args.reports_dir:
+        paths.extend(
+            path for path in sorted(Path(args.reports_dir).resolve().glob("*.json"))
+            if path.name != "batch_status.json"
+        )
+    paths = list(dict.fromkeys(paths))
+    if not paths:
+        print("FATAL: provide reports or --reports-dir", file=sys.stderr)
+        sys.exit(2)
     missing = [str(path) for path in paths if not path.is_file()]
     if missing:
         print(f"FATAL: missing reports: {missing}", file=sys.stderr)
@@ -69,19 +128,24 @@ def main():
     except (OSError, json.JSONDecodeError) as error:
         print(f"FATAL: invalid evaluation report: {error}", file=sys.stderr)
         sys.exit(2)
+    if args.require_trained and any(not row["checkpoint"] for row in rows):
+        print("FATAL: zero-init report found in trained evaluation", file=sys.stderr)
+        sys.exit(2)
+
+    summary = summarize_rows(rows)
 
     output_json = Path(args.out_json)
     output_csv = Path(args.out_csv)
     output_json.parent.mkdir(parents=True, exist_ok=True)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_json.open("w") as handle:
-        json.dump({"runs": rows}, handle, indent=2)
+        json.dump({"summary": summary, "runs": rows}, handle, indent=2)
     fieldnames = list(rows[0])
     with output_csv.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    print(json.dumps({"runs": rows}, indent=2))
+    print(json.dumps({"summary": summary, "runs": rows}, indent=2))
 
 
 if __name__ == "__main__":

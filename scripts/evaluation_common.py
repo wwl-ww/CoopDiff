@@ -1,0 +1,67 @@
+"""Pure-Python helpers shared by evaluation entry points and tests."""
+
+import json
+from pathlib import Path
+
+
+def load_index_entry(index_path, case):
+    """Return one uniquely named entry from a ternary JSON index."""
+    payload = json.loads(Path(index_path).read_text(encoding="utf-8"))
+    entries = payload.get("entries", payload)
+    matches = [entry for entry in entries if entry.get("case") == case]
+    if not matches:
+        raise KeyError(f"case {case!r} is absent from {index_path}")
+    if len(matches) != 1:
+        raise ValueError(f"case {case!r} occurs {len(matches)} times in {index_path}")
+    return matches[0]
+
+
+def resolve_entry_paths(entry, project_root):
+    """Resolve and validate the three structure paths in an index entry."""
+    root = Path(project_root)
+    resolved = {}
+    for key in ("protein1", "protein2", "ligand"):
+        value = Path(entry[key])
+        path = value if value.is_absolute() else root / value
+        if not path.is_file():
+            raise FileNotFoundError(f"{key} file is missing: {path}")
+        resolved[key] = path.resolve()
+    return resolved
+
+
+def validate_checkpoint_payload(payload, expected_lora_tensors=336):
+    """Reject incomplete or legacy checkpoints before expensive inference."""
+    if not isinstance(payload, dict):
+        raise ValueError("checkpoint must contain a mapping")
+    if payload.get("checkpoint_version", 0) < 3:
+        raise ValueError("checkpoint_version must be at least 3")
+    if not payload.get("tribrain_state_dict"):
+        raise ValueError("checkpoint has no TriBrain weights")
+    lora = payload.get("expert_lora_state_dict")
+    if not lora:
+        raise ValueError("checkpoint has no expert LoRA weights")
+    if expected_lora_tensors is not None and len(lora) != expected_lora_tensors:
+        raise ValueError(
+            f"checkpoint has {len(lora)} LoRA tensors; "
+            f"expected {expected_lora_tensors}"
+        )
+    if not payload.get("expert_lora_config"):
+        raise ValueError("checkpoint has no LoRA architecture config")
+
+
+def completed_report(path, case, checkpoint):
+    """Return true only for a valid, completed report with matching inputs."""
+    destination = Path(path)
+    if not destination.is_file():
+        return False
+    try:
+        report = json.loads(destination.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    config = report.get("run_config", {})
+    structure = report.get("structure", {})
+    return bool(
+        report.get("case") == case
+        and config.get("tribrain_checkpoint") == checkpoint
+        and structure.get("n_valid_walkers", 0) > 0
+    )
