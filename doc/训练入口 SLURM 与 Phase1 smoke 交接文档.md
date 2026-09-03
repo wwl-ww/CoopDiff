@@ -26,7 +26,8 @@ sacct -j <job_id> --format=JobID,State,ExitCode,Elapsed,NodeList
 
 1. `results/sampling_parity_regression.json`：sub1/sub2 全部 finite/pass；
 2. `results/initialization_frame_check.json`：全部 frame checks 通过；
-3. 有效 `data/protac_index.json`，所有路径在当前 clone 可解析；
+3. 有效且互不重叠的 `data/ternary_train.json`、`data/ternary_val.json` 和
+   `data/ternary_test.json`，所有路径在当前 clone 可解析；
 4. `checkpoints/score_model/model_parameters.yml` 与 expert 权重。
 
 使用 `scripts/check_phase1_readiness.py` 汇总，只有 `ready=true` 才能进入正式训练。清理 `results/` 后必须重新生成门禁报告。
@@ -34,11 +35,11 @@ sacct -j <job_id> --format=JobID,State,ExitCode,Elapsed,NodeList
 ## Smoke 与正式训练
 
 ```bash
-# 3 epochs、batch size 1
-sbatch scripts/train_entry_smoke.slurm
+# DeepTernary 独立 train/val 小样本 smoke
+sbatch scripts/train_deepternary_smoke.slurm
 
 # smoke 验收后才运行正式 Phase 1
-sbatch scripts/train_phase1_v4.slurm
+sbatch scripts/train_deepternary_phase1.slurm
 ```
 
 Smoke 验收至少检查：退出码 0；所有 loss/梯度有限；训练和验证均有有效 batch；协调器参数发生更新；每 epoch checkpoint 可读；验证阶段保持 eval mode。日志应打印 total、score、physical、SE3 translation 和 SE3 rotation loss，避免某个目标长期无梯度而不自知。
