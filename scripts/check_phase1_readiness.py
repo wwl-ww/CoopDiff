@@ -17,6 +17,10 @@ def build_parser():
     parser.add_argument("--data-index", default="data/protac_index.json")
     parser.add_argument("--model-dir", default="checkpoints/score_model")
     parser.add_argument("--out", default="results/phase1_readiness.json")
+    parser.add_argument(
+        "--training-only", action="store_true",
+        help="Check data and expert weights only; defer sampling gates to inference",
+    )
     return parser
 
 
@@ -119,25 +123,31 @@ def main():
     }
     checkpoint_ok = all(path.is_file() for path in checkpoint_files.values())
 
-    checks = {
-        "sampling_parity": parity_ok,
-        "initialization_frames": frame_ok,
-        "data_index": index_ok,
-        "expert_checkpoint": checkpoint_ok,
+    checks = {"data_index": index_ok, "expert_checkpoint": checkpoint_ok}
+    if not args.training_only:
+        checks = {
+            "sampling_parity": parity_ok,
+            "initialization_frames": frame_ok,
+            **checks,
+        }
+    details = {
+        "data_index": index_detail,
+        "data_entries": entry_count,
+        "checkpoint_files": {
+            name: {"path": str(path), "exists": path.is_file()}
+            for name, path in checkpoint_files.items()
+        },
+        "scope": "training" if args.training_only else "training_and_sampling",
     }
+    if not args.training_only:
+        details.update({
+            "sampling_parity": parity_detail,
+            "initialization_frames": frame_detail,
+        })
     report = {
         "ready": all(checks.values()),
         "checks": checks,
-        "details": {
-            "sampling_parity": parity_detail,
-            "initialization_frames": frame_detail,
-            "data_index": index_detail,
-            "data_entries": entry_count,
-            "checkpoint_files": {
-                name: {"path": str(path), "exists": path.is_file()}
-                for name, path in checkpoint_files.items()
-            },
-        },
+        "details": details,
     }
     output_path = resolve(args.out)
     output_path.parent.mkdir(parents=True, exist_ok=True)

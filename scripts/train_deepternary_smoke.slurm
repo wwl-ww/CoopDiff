@@ -1,0 +1,53 @@
+#!/bin/bash
+#SBATCH --partition=gpu_a800
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=4
+#SBATCH --time=3:00:00
+#SBATCH --job-name=tcd-dt-smoke
+#SBATCH --output=logs/train_deepternary_smoke-%j.out
+#SBATCH --error=logs/train_deepternary_smoke-%j.err
+
+set -euo pipefail
+
+eval "$(/data/home/scwb792/run/miniconda3/bin/conda shell.bash hook)"
+conda activate tricoopdiff
+
+PROJECT_ROOT="/data/run01/scwb792/mwj/CoopDiff"
+cd "$PROJECT_ROOT"
+RUNTIME_ROOT="$PROJECT_ROOT/results/runtime_cache"
+mkdir -p logs results "$RUNTIME_ROOT/triton" \
+    "$RUNTIME_ROOT/torchinductor" "$RUNTIME_ROOT/tmp"
+
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export TRITON_CACHE_DIR="$RUNTIME_ROOT/triton"
+export TORCHINDUCTOR_CACHE_DIR="$RUNTIME_ROOT/torchinductor"
+export TMPDIR="$RUNTIME_ROOT/tmp"
+export NAN_CLAMP=100
+
+python scripts/check_phase1_readiness.py \
+    --training-only \
+    --data-index results/deepternary_smoke/train.json \
+    --out results/deepternary_smoke/readiness.json
+
+PYTHONUNBUFFERED=1 python scripts/train_entry.py \
+    --train_data results/deepternary_smoke/train.json \
+    --val_data results/deepternary_smoke/val.json \
+    --output_dir results/deepternary_smoke/checkpoints \
+    --epochs 1 \
+    --batch_size 1 \
+    --lr 1e-4 \
+    --phase 1 \
+    --expert_model_dir checkpoints/score_model \
+    --cache_dir results/featurize_cache_deepternary_smoke \
+    --lora_rank 4 \
+    --lora_alpha 8 \
+    --lora_start_layer 0 \
+    --lora_early_layers 4 \
+    --lora_early_rank 2 \
+    --lora_early_alpha 4 \
+    --lora_lr 1e-5 \
+    --lora_early_lr 5e-6 \
+    --log_interval 1 \
+    --save_interval 1 \
+    --device cuda

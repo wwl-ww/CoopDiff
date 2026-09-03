@@ -96,6 +96,8 @@ def parse_args():
     )
     p.add_argument("--log_interval", type=int, default=10)
     p.add_argument("--save_interval", type=int, default=10)
+    p.add_argument("--seed", type=int, default=0,
+                   help="Random seed for model initialization, shuffling, and diffusion noise")
 
     return p.parse_args()
 
@@ -136,6 +138,11 @@ def main():
     args = parse_args()
     device = torch.device(args.device)
 
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
+
     # SO(3)/torus cache lookup resolves relative to CWD; chdir to project root.
     os.chdir(_PROJECT_ROOT)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -149,6 +156,7 @@ def main():
     print(f"  Val data: {args.val_data}")
     print(f"  Device: {device}")
     print(f"  Epochs: {args.epochs}, Batch: {args.batch_size}, LR: {args.lr}")
+    print(f"  Seed: {args.seed}")
 
     # ----------------------------------------------------------------
     # 0. Featurize the first sample to derive the receptor feature dim
