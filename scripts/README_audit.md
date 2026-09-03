@@ -106,7 +106,7 @@ audit_results/
 
 ### 最终审计 JSON（项目根目录）
 
-`deepternary_audit.json` — 结构见 `doc/DeepTernary 审计交接文档.md` Section 五。
+`deepternary_audit.json` — 指标口径与权威基线见 `doc/DeepTernary 审计完成交接文档.md`。
 
 ## 断点续跑
 

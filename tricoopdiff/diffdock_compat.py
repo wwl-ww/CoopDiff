@@ -118,7 +118,12 @@ def _scatter_pytorch(src, index, dim_size=None, dim=0, reduce='sum'):
         out.index_add_(0, index, src)
         count = torch.zeros(dim_size, dtype=src.dtype, device=src.device)
         count.index_add_(0, index, torch.ones(src.shape[0], dtype=src.dtype, device=src.device))
-        return out / count.clamp(min=1).unsqueeze(-1)
+        # Reshape count to [dim_size, 1, 1, ...] matching out's trailing dims so
+        # the division broadcasts elementwise along dim 0. A bare
+        # count.unsqueeze(-1) is [dim_size, 1]; for a 1-D src (out == [dim_size])
+        # that broadcasts to [dim_size, dim_size] instead of [dim_size].
+        count = count.clamp(min=1).view(dim_size, *([1] * (src.dim() - 1)))
+        return out / count
     elif reduce == 'max':
         out = torch.full((dim_size, *src.shape[1:]), float('-inf'),
                          dtype=src.dtype, device=src.device)

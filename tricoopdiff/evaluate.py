@@ -17,45 +17,11 @@ from typing import Dict, List, Optional, Tuple
 # Structure Quality Metrics
 # ---------------------------------------------------------------------------
 
-def compute_dockq(
-    pred_coords: np.ndarray,
-    ref_coords: np.ndarray,
-    interface_cutoff: float = 5.0,
-) -> float:
-    """
-    Compute DockQ score for ternary complex.
-
-    DockQ = fraction of native interface contacts recovered in the prediction.
-    An interface contact is defined as a pair of residues (one from each protein)
-    with Cβ-Cβ distance < cutoff in the reference structure.
-
-    Args:
-        pred_coords: [N_pred, 3] predicted Cβ coordinates
-        ref_coords: [N_ref, 3] reference Cβ coordinates
-        interface_cutoff: distance cutoff for interface contacts (Å)
-
-    Returns:
-        DockQ score in [0, 1], higher is better
-    """
-    from scipy.spatial.distance import cdist
-
-    # Compute pairwise distances
-    pred_dist = cdist(pred_coords, pred_coords)
-    ref_dist = cdist(ref_coords, ref_coords)
-
-    # Interface contacts in reference
-    ref_contacts = ref_dist < interface_cutoff
-
-    if ref_contacts.sum() == 0:
-        return 0.0
-
-    # Fraction of reference contacts recovered
-    pred_contacts = pred_dist < interface_cutoff
-    recovered = (ref_contacts & pred_contacts).sum()
-    dockq = recovered / ref_contacts.sum()
-
-    return float(dockq)
-
+# NOTE (BUG-1): `compute_dockq` was removed here. It computed *intra*-molecule
+# contact-map similarity (`cdist(coords, coords)` on a single coordinate set),
+# which is NOT DockQ (DockQ = Fnat across two proteins + iRMS/Lrms). It was
+# also dead code — `evaluate_model` uses `compute_e3_interface_dockq` /
+# `compute_poi_dockq` instead, and no other module imported or called it.
 
 def compute_rmsd(
     pred_coords: np.ndarray,
@@ -187,6 +153,84 @@ def compute_linker_strain_energy(
 # ---------------------------------------------------------------------------
 # POI / ternary interface metrics (frame-invariant)
 # ---------------------------------------------------------------------------
+
+def compute_deepternary_dockq(
+    native_ligand: np.ndarray,
+    native_e3: np.ndarray,
+    native_poi: np.ndarray,
+    pred_ligand: np.ndarray,
+    pred_e3: np.ndarray,
+    pred_poi: np.ndarray,
+    cutoff: float = 5.0,
+) -> Optional[Dict[str, float]]:
+    """Match DeepTernary's ``simple_dockq.cal_approx_dockq`` convention.
+
+    E3 is the receptor; PROTAC and POI are concatenated as the mobile partner.
+    Fnat is recovery of native interface-node identities (not contact pairs),
+    Lrms is measured in the fixed-E3 frame, and iRMS uses a Kabsch fit of the
+    native-interface nodes. This intentionally mirrors DeepTernary's benchmark
+    helper so the reported primary DockQ has the same meaning.
+    """
+    from scipy.spatial.distance import cdist
+
+    arrays = (native_ligand, native_e3, native_poi, pred_ligand, pred_e3, pred_poi)
+    if any(array.ndim != 2 or array.shape[1] != 3 for array in arrays):
+        return None
+    if (
+        native_ligand.shape != pred_ligand.shape
+        or native_e3.shape != pred_e3.shape
+        or native_poi.shape != pred_poi.shape
+    ):
+        return None
+
+    native_mobile = np.concatenate([native_ligand, native_poi], axis=0)
+    pred_mobile = np.concatenate([pred_ligand, pred_poi], axis=0)
+
+    def pocket_indices(mobile, receptor):
+        distances = cdist(mobile, receptor)
+        mobile_ids = np.flatnonzero(distances.min(axis=1) <= cutoff)
+        receptor_ids = np.flatnonzero(distances.min(axis=0) <= cutoff)
+        return mobile_ids, receptor_ids
+
+    native_mobile_ids, native_receptor_ids = pocket_indices(native_mobile, native_e3)
+    pred_mobile_ids, pred_receptor_ids = pocket_indices(pred_mobile, pred_e3)
+    native_nodes = {
+        *(f"{index}_lig" for index in native_mobile_ids.tolist()),
+        *(f"{index}_rec" for index in native_receptor_ids.tolist()),
+    }
+    if not native_nodes:
+        return None
+    pred_nodes = {
+        *(f"{index}_lig" for index in pred_mobile_ids.tolist()),
+        *(f"{index}_rec" for index in pred_receptor_ids.tolist()),
+    }
+    fnat = len(native_nodes & pred_nodes) / len(native_nodes)
+
+    lrms = float(np.sqrt(np.mean(np.sum((native_mobile - pred_mobile) ** 2, axis=1))))
+    native_interface = np.concatenate(
+        [native_mobile[native_mobile_ids], native_e3[native_receptor_ids]], axis=0
+    )
+    pred_interface = np.concatenate(
+        [pred_mobile[native_mobile_ids], pred_e3[native_receptor_ids]], axis=0
+    )
+    aligned_interface = kabsch_align(pred_interface, native_interface)
+    irms = float(
+        np.sqrt(np.mean(np.sum((native_interface - aligned_interface) ** 2, axis=1)))
+    )
+    dockq = (
+        fnat
+        + 1.0 / (1.0 + (irms / 1.5) ** 2)
+        + 1.0 / (1.0 + (lrms / 8.5) ** 2)
+    ) / 3.0
+    return {
+        "dockq": float(dockq),
+        "fnat": float(fnat),
+        "lrms": lrms,
+        "irms": irms,
+        "n_native_interface_nodes": len(native_nodes),
+        "n_recovered_interface_nodes": len(native_nodes & pred_nodes),
+        "cutoff": float(cutoff),
+    }
 
 def _parse_native_complex(pdb_path: str) -> Optional[Dict[str, np.ndarray]]:
     """
@@ -688,6 +732,12 @@ def evaluate_model(
     n_walkers: int = 32,
     steps: int = None,
     native_complex_pdb: Optional[str] = None,
+    debug_trace: bool = False,
+    debug_seed: int = 0,
+    freeze_poi: bool = False,
+    init_mode: str = "coupled5a",
+    t_anchor: float = None,
+    deepternary_dockq_paths: Optional[Dict[str, str]] = None,
 ) -> dict:
     """
     Sample a conformational ensemble and score structure quality vs the native
@@ -714,12 +764,15 @@ def evaluate_model(
         native_complex_pdb: optional path to the native ternary complex PDB
             (e.g. ``DeepTernary/output/protac22/<case>/gt_complex.pdb``). When
             None, POI metrics are skipped.
+        debug_trace: when True, also run a single-walker trajectory-level trace
+            for parity debugging (seeded by ``debug_seed``).
+        debug_seed: RNG seed for the single debug trace.
 
     Returns:
-        {'structure': {...}, 'ensemble': {...}, 'functional': {}}
+        {'structure': {...}, 'ensemble': {...}, 'functional': {}, 'debug_trace': ...}
     """
     from .diffusion import TernaryInitializer
-    from .sampler import sample_ensemble
+    from .sampler import sample_ensemble, sample_single
 
     if initializer is None:
         initializer = TernaryInitializer()
@@ -727,10 +780,14 @@ def evaluate_model(
     ensemble = sample_ensemble(
         model, diffusion, initializer, e3_data, poi_data, ligand_data,
         steps=steps, device=device, n_walkers=n_walkers,
+        freeze_poi=freeze_poi,
+        init_mode=init_mode,
+        t_anchor=t_anchor,
     )
 
     ref_lig = ligand_data['coords'][0].detach().cpu().numpy()  # [N_lig, 3] native
     e3_ca = e3_data['coords'][0].detach().cpu().numpy()        # [N_e3, 3] fixed E3 Cα
+    ref_poi = poi_data['coords'][0].detach().cpu().numpy()     # [N_poi, 3] native POI Cα
     lig_bonds = ligand_data['edge_index'].detach().cpu().numpy()  # [2, E] covalent graph
 
     # Per-walker records (one per finite trajectory, aligned indices) so the
@@ -743,7 +800,12 @@ def evaluate_model(
     n_nan = 0
     for r in ensemble:
         pred = r['ligand_coords']  # [N_lig, 3] numpy
-        if not np.isfinite(pred).all():
+        pred_poi = r['poi_coords']
+        if (
+            not r.get('valid', True)
+            or not np.isfinite(pred).all()
+            or not np.isfinite(pred_poi).all()
+        ):
             n_nan += 1
             continue
         rec = {
@@ -751,6 +813,28 @@ def evaluate_model(
             'protac_rmsd': compute_rmsd(pred, ref_lig, align_first=True),
             'pocket_dist': float(np.linalg.norm(pred.mean(axis=0) - ref_lig.mean(axis=0))),
         }
+        deepternary_m = compute_deepternary_dockq(
+            ref_lig, e3_ca, ref_poi,
+            pred, e3_ca, pred_poi,
+        )
+        if deepternary_m is not None:
+            rec['approx_dockq'] = deepternary_m['dockq']
+        if deepternary_dockq_paths is not None and native_complex_pdb is not None:
+            try:
+                from .deepternary_metrics import compute_fullatom_dockq
+                exact_m = compute_fullatom_dockq(
+                    pred_ligand=pred,
+                    pred_poi_ca=pred_poi,
+                    featurized_e3_ca=e3_ca,
+                    native_complex_pdb=native_complex_pdb,
+                    **deepternary_dockq_paths,
+                )
+                rec['dockq'] = exact_m['dockq']
+                rec['dockq_fnat'] = exact_m['fnat']
+                rec['dockq_lrms'] = exact_m['lrms']
+                rec['dockq_irms'] = exact_m['irms']
+            except Exception as error:
+                print(f"[evaluate] DeepTernary full-atom DockQ failed: {error}")
         e3_m = compute_e3_interface_dockq(e3_ca, pred, ref_lig)
         if e3_m is not None:
             rec['e3_dockq'] = e3_m['dockq']
@@ -759,31 +843,47 @@ def evaluate_model(
             if e3_native_contacts is None:
                 e3_native_contacts = e3_m['n_native_contacts']
         if native_complex_pdb is not None:
-            poi_m = compute_poi_dockq(r['poi_coords'], pred, native_complex_pdb)
+            poi_m = compute_poi_dockq(pred_poi, pred, native_complex_pdb)
             if poi_m is not None:
                 rec['poi_dockq'] = poi_m['dockq']
                 if poi_native_contacts is None:
                     poi_native_contacts = poi_m['n_native_contacts']
-            poi_c = compute_poi_com_dist(r['poi_coords'], native_complex_pdb)
+            poi_c = compute_poi_com_dist(pred_poi, native_complex_pdb)
             if poi_c is not None:
                 rec['poi_com_dist'] = poi_c['poi_com_dist']
                 poi_native_com_dist = poi_c['native_e3_poi_com_dist']
         walkers.append(rec)
     if n_nan:
-        print(f"[evaluate] skipped {n_nan}/{len(ensemble)} walkers with non-finite coords")
+        print(
+            f"[evaluate] skipped {n_nan}/{len(ensemble)} walkers with non-finite "
+            "scores or coordinates"
+        )
 
     pred_ligs = [w['pred'] for w in walkers]
     protac_rmsds = np.asarray([w['protac_rmsd'] for w in walkers])
     pocket_dists = np.asarray([w['pocket_dist'] for w in walkers])
-    # Best sample = the walker with the highest E3-PROTAC interface DockQ (the
-    # primary quality metric); every "_best" key below reports that same walker.
-    best_idx = int(np.argmax([w.get('e3_dockq', -1.0) for w in walkers])) if walkers else 0
+    # Best sample follows DeepTernary's ternary DockQ convention. Every "_best"
+    # field below refers to this same coherent walker.
+    exact_indices = [index for index, walker in enumerate(walkers) if 'dockq' in walker]
+    if exact_indices:
+        best_idx = max(exact_indices, key=lambda index: walkers[index]['dockq'])
+        selection_metric = 'dockq'
+    elif walkers:
+        best_idx = int(np.argmax([w.get('approx_dockq', -1.0) for w in walkers]))
+        selection_metric = 'approx_dockq'
+    else:
+        best_idx = 0
+        selection_metric = None
 
     # Initialize every metric to None; the finite-walker branch below fills in
     # what it can. "best" always means "the single dockq-best walker's value"
     # (see best_idx above) so the best column is one coherent pose, while
     # mean/median are ensemble statistics over all finite walkers.
     structure = {
+        'dockq_best': None, 'dockq_mean': None, 'dockq_median': None,
+        'dockq_fnat_best': None, 'dockq_fnat_mean': None,
+        'dockq_lrms_best': None, 'dockq_lrms_mean': None,
+        'dockq_irms_best': None, 'dockq_irms_mean': None,
         'protac_rmsd_best': None, 'protac_rmsd_mean': None, 'protac_rmsd_median': None,
         'protac_pocket_dist_mean': None, 'protac_pocket_dist_best': None,
         'clash_rate': None,
@@ -800,6 +900,19 @@ def evaluate_model(
 
     if walkers:
         best = walkers[best_idx]
+        dockqs = np.asarray([w['dockq'] for w in walkers if 'dockq' in w])
+        dockq_fnats = np.asarray([w['dockq_fnat'] for w in walkers if 'dockq_fnat' in w])
+        dockq_lrms = np.asarray([w['dockq_lrms'] for w in walkers if 'dockq_lrms' in w])
+        dockq_irms = np.asarray([w['dockq_irms'] for w in walkers if 'dockq_irms' in w])
+        structure['dockq_best'] = float(best['dockq']) if 'dockq' in best else None
+        structure['dockq_mean'] = float(dockqs.mean()) if len(dockqs) else None
+        structure['dockq_median'] = float(np.median(dockqs)) if len(dockqs) else None
+        structure['dockq_fnat_best'] = float(best['dockq_fnat']) if 'dockq_fnat' in best else None
+        structure['dockq_fnat_mean'] = float(dockq_fnats.mean()) if len(dockq_fnats) else None
+        structure['dockq_lrms_best'] = float(best['dockq_lrms']) if 'dockq_lrms' in best else None
+        structure['dockq_lrms_mean'] = float(dockq_lrms.mean()) if len(dockq_lrms) else None
+        structure['dockq_irms_best'] = float(best['dockq_irms']) if 'dockq_irms' in best else None
+        structure['dockq_irms_mean'] = float(dockq_irms.mean()) if len(dockq_irms) else None
         structure['protac_rmsd_best'] = float(best['protac_rmsd'])
         structure['protac_rmsd_mean'] = float(protac_rmsds.mean())
         structure['protac_rmsd_median'] = float(np.median(protac_rmsds))
@@ -850,19 +963,39 @@ def evaluate_model(
 
     ensemble_metrics = {
         'n_walkers': len(ensemble),
+        'n_valid_walkers': len(walkers),
         'n_nan_walkers': n_nan,
+        'selection_metric': selection_metric,
         'protac_rmsd_std': float(protac_rmsds.std()) if len(protac_rmsds) > 1 else 0.0,
     }
     if len(pred_ligs) > 1:
         ensemble_metrics['diversity'] = compute_ensemble_diversity(pred_ligs)
 
-    return {
+    debug_trace_report = None
+    if debug_trace:
+        debug_trace_report = sample_single(
+            model, diffusion, initializer, e3_data, poi_data, ligand_data,
+            steps=steps, device=device, seed=debug_seed, return_trace=True,
+            freeze_poi=freeze_poi,
+            init_mode=init_mode,
+            t_anchor=t_anchor,
+        )
+
+    report = {
         'structure': structure,
         'ensemble': ensemble_metrics,
         # Functional ranking (α, Top-20% hit rate, AUROC) requires predicted
         # productivity per complex — wired in a later phase.
         'functional': {},
     }
+    if debug_trace_report is not None:
+        report['debug_trace'] = {
+            'seed': debug_seed,
+            'trace': debug_trace_report.get('trace', []),
+            'final_ligand_coords': debug_trace_report['ligand_coords'].tolist(),
+            'final_poi_coords': debug_trace_report['poi_coords'].tolist(),
+        }
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -913,13 +1046,23 @@ def _estimate_torsional_strain(
     coords: np.ndarray,
     dihedral_indices: List[Tuple[int, int, int, int]],
 ) -> float:
-    """Estimate torsional strain from dihedral angles."""
+    """
+    Estimate torsional strain from dihedral angles.
+
+    Uses a cos(3φ) torsional-potential proxy: staggered conformations (gauche
+    ±60°, anti 180°) are the low-energy minima (strain → 0), while eclipsed
+    conformations (0°, ±120°) are the torsional barriers (strain → 1).
+
+    This is a *geometric approximation*, not a real force-field torsional term:
+    it ignores substituent size, asymmetric barriers, and the differing well
+    depths of anti vs gauche, so treat it as a rough ranking of linker strain
+    rather than a physically exact energy (BUG-12).
+    """
     strains = []
     for i, j, k, l in dihedral_indices:
         angle = _compute_dihedral(coords[i], coords[j], coords[k], coords[l])
-        # Penalize near 0° or 180° (eclipsed conformations)
-        sin_sq = np.sin(angle) ** 2
-        strains.append(1.0 - sin_sq)  # 0 = staggered (good), 1 = eclipsed (bad)
+        # cos(3φ) = +1 at eclipsed (0°/120°/240°), -1 at staggered (60°/180°/300°)
+        strains.append(0.5 * (1.0 + np.cos(3.0 * angle)))
     return np.mean(strains) if strains else 0.0
 
 

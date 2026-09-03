@@ -186,3 +186,9 @@ L_{tor} = \langle (s_\theta^{tor} - s^{tor})^2 / \text{score\_norm}^2(\sigma_{to
 | 10 | **SO(3) 采样精确性** | ✅ | 预计算查表，缓存 .so3_*.npy |
 | 11 | **ESM-2 嵌入** | 🔧 | 服务器同学负责 |
 | 12 | **温度采样** | ✅ | 匹配 v1.1 yaml (temp=1.17/2.06/7.04) |
+
+## 七、数值稳定性约束
+
+历史失败案例表明，严重 OOD 图会令 e3nn 卷积形成激活反馈并最终产生 NaN。`NAN_TRACE` 可用于定位首次非有限层；`NAN_CLAMP` 是兼容 native expert 的防护开关，但不能替代正确的初始化、参考系和 receptor crop。若 clamp 后 native/inline 仍不一致，应修复输入分布或调用顺序，而不是继续降低阈值。
+
+TriCoopDiff 的每层 inline 路径必须保持 `conv → native clamp（若启用）→ FiLM`，零 FiLM 时与 native forward 做逐层和最终 tr/rot/tor parity。论文原文见 [arXiv:2210.01776](https://arxiv.org/abs/2210.01776)。

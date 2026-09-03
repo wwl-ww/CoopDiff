@@ -19,7 +19,7 @@ mkdir -p logs results
 export HF_ENDPOINT=https://hf-mirror.com
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export NAN_CLAMP=10000
+unset NAN_CLAMP
 
 echo "=== TriCoopDiff MVP integration smoke test ==="
 echo "Date: $(date)"

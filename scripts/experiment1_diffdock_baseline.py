@@ -182,20 +182,16 @@ _COOPDIFF = str(Path(__file__).parent.parent)
 if _COOPDIFF not in sys.path:
     sys.path.insert(0, _COOPDIFF)
 
-_DIFFDOCK = str(Path(__file__).parent.parent.parent / "DiffDock")
-if _DIFFDOCK not in sys.path:
-    sys.path.insert(0, _DIFFDOCK)
-
 _DEEPT = str(Path(__file__).parent.parent / "DeepTernary")
 if _DEEPT not in sys.path:
     sys.path.insert(0, _DEEPT)
 
-from utils.inference_utils import InferenceDataset, get_sequences
+from tricoopdiff.diffdock.utils.inference_utils import InferenceDataset, get_sequences
 from tricoopdiff.diffdock.utils.diffusion_utils import t_to_sigma as t_to_sigma_compl, get_t_schedule
 from tricoopdiff.diffdock.sampling import randomize_position, sampling
 from tricoopdiff.diffdock.factory import build_cg_model
 from rdkit.Chem import RemoveAllHs
-from datasets.process_mols import write_mol_with_coords
+from tricoopdiff.diffdock.datasets.process_mols import write_mol_with_coords
 
 
 def build_parser():

@@ -52,9 +52,21 @@ def parse_args():
     # Training
     p.add_argument("--output_dir", required=True, help="Checkpoint output directory")
     p.add_argument("--epochs", type=int, default=850)       # paper: 850 epochs
-    p.add_argument("--batch_size", type=int, default=16)     # paper: batch_size=16
+    p.add_argument(
+        "--batch_size", type=int, default=1, choices=[1],
+        help="Only B=1 sequential training is currently implemented",
+    )
     p.add_argument("--lr", type=float, default=1e-3)         # paper: lr=1e-3, Plateau scheduler
     p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--lora_rank", type=int, default=0,
+                   help="Rank of independent sub1/sub2 expert adapters; 0 disables LoRA")
+    p.add_argument("--lora_alpha", type=float, default=8.0)
+    p.add_argument("--lora_start_layer", type=int, default=0)
+    p.add_argument("--lora_early_layers", type=int, default=4)
+    p.add_argument("--lora_early_rank", type=int, default=2)
+    p.add_argument("--lora_early_alpha", type=float, default=4.0)
+    p.add_argument("--lora_lr", type=float, default=1e-5)
+    p.add_argument("--lora_early_lr", type=float, default=5e-6)
 
     # Phase
     p.add_argument("--phase", type=int, default=1, choices=[1, 2],
@@ -73,17 +85,19 @@ def parse_args():
                    help="Dir with model_parameters.yml + best_ema_inference_epoch_model.pt")
 
     # Featurization
-    p.add_argument("--receptor_feat_dim", type=int, default=1281,
-                   help="Fallback receptor feature dim (1281 for DiffDock-L) if "
-                        "the first-sample featurization cannot determine it")
     p.add_argument("--cache_dir", default="results/featurize_cache",
                    help="Dir for on-disk featurization cache (per-case .pt)")
 
     # Hardware
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument(
+        "--num_workers", type=int, default=0, choices=[0],
+        help="Reserved for a future batched loader; currently must be 0",
+    )
     p.add_argument("--log_interval", type=int, default=10)
     p.add_argument("--save_interval", type=int, default=10)
+    p.add_argument("--seed", type=int, default=0,
+                   help="Random seed for model initialization, shuffling, and diffusion noise")
 
     return p.parse_args()
 
@@ -97,21 +111,41 @@ def _load_score_model_args(expert_model_dir):
 
 
 def _load_entries(data_json):
-    """Read a data index; accept either a flat list or {"entries": [...]}."""
+    """Read an index and resolve portable or stale-checkout input paths."""
     with open(data_json) as f:
         index = json.load(f)
-    if isinstance(index, dict):
-        return index.get("entries", [])
-    return index
+    entries = index.get("entries", []) if isinstance(index, dict) else index
+    resolved = []
+    for raw_entry in entries:
+        entry = dict(raw_entry)
+        for key in ("protein1", "protein2", "ligand"):
+            path = Path(entry[key])
+            if not path.is_absolute():
+                path = _PROJECT_ROOT / path
+            if not path.is_file():
+                # Backward compatibility for indices created in another clone:
+                # reconstruct the canonical in-repo case path from stable fields.
+                path = (
+                    _PROJECT_ROOT / "DeepTernary" / "output" / "protac22"
+                    / entry["case"] / Path(entry[key]).name
+                )
+            entry[key] = str(path.resolve())
+        resolved.append(entry)
+    return resolved
 
 
 def main():
     args = parse_args()
     device = torch.device(args.device)
-    os.makedirs(args.output_dir, exist_ok=True)
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
 
     # SO(3)/torus cache lookup resolves relative to CWD; chdir to project root.
     os.chdir(_PROJECT_ROOT)
+    os.makedirs(args.output_dir, exist_ok=True)
 
     # Save run config
     with open(os.path.join(args.output_dir, "config.json"), "w") as f:
@@ -122,6 +156,7 @@ def main():
     print(f"  Val data: {args.val_data}")
     print(f"  Device: {device}")
     print(f"  Epochs: {args.epochs}, Batch: {args.batch_size}, LR: {args.lr}")
+    print(f"  Seed: {args.seed}")
 
     # ----------------------------------------------------------------
     # 0. Featurize the first sample to derive the receptor feature dim
@@ -133,19 +168,12 @@ def main():
 
     print("[0/6] Determining receptor feature dim from first sample...")
     score_model_args = _load_score_model_args(args.expert_model_dir)
-    input_dim = None
     first = entries[0]
-    try:
-        _, _, _, input_dim = featurize_complex(
-            first["case"], first["protein1"], first["protein2"], first["ligand"],
-            score_model_args, str(device), cache_dir=args.cache_dir,
-        )
-        print(f"  receptor_feat_dim={input_dim} (from {first['case']})")
-    except Exception as e:
-        print(f"[warn] first-sample featurize failed ({e}); "
-              f"falling back to --receptor_feat_dim={args.receptor_feat_dim}")
-    if input_dim is None:
-        input_dim = args.receptor_feat_dim
+    _, _, _, input_dim = featurize_complex(
+        first["case"], first["protein1"], first["protein2"], first["ligand"],
+        score_model_args, str(device), cache_dir=args.cache_dir,
+    )
+    print(f"  receptor_feat_dim={input_dim} (from {first['case']})")
 
     # ----------------------------------------------------------------
     # 1. Build model
@@ -160,10 +188,12 @@ def main():
     train_loader = TernaryDataLoader(
         args.train_data, score_model_args,
         shuffle=True, device=str(device), cache_dir=args.cache_dir,
+        skip_on_error=False,
     )
     val_loader = TernaryDataLoader(
         args.val_data, score_model_args,
         shuffle=False, device=str(device), cache_dir=args.cache_dir,
+        skip_on_error=False,
     )
 
     # ----------------------------------------------------------------
@@ -209,9 +239,22 @@ def main():
                       f"rot={loss_dict['loss_se3_rot']:.4f}) | "
                       f"phys={loss_dict['loss_phys']:.4f}")
 
+        if n_skipped:
+            raise RuntimeError(
+                f"epoch {epoch}: {n_skipped} training batches were non-finite; "
+                "refusing to validate or save a partial-data checkpoint"
+            )
+        if not train_losses:
+            raise RuntimeError(f"epoch {epoch}: training loader produced no batches")
+
         # Validate
         val_loss = validate(trainer, val_loader, device)
-        trainer.scheduler_step()
+        if not np.isfinite(val_loss):
+            raise RuntimeError(
+                f"epoch {epoch}: validation produced no finite batches; "
+                "refusing to save a checkpoint"
+            )
+        trainer.scheduler_step(val_loss)
 
         # Log
         train_loss_avg = np.mean([d['loss_total'] for d in train_losses]) if train_losses else float('nan')
@@ -268,6 +311,18 @@ def build_trainer(args, device, input_dim=None):
         model_dir=args.expert_model_dir,
         device=str(device),
     )
+    if getattr(args, 'lora_rank', 0) > 0:
+        from tricoopdiff.lora import inject_expert_lora
+        count = inject_expert_lora(
+            frozen_expert, rank=args.lora_rank, alpha=args.lora_alpha,
+            start_layer=args.lora_start_layer,
+            early_layers=args.lora_early_layers,
+            early_rank=args.lora_early_rank,
+            early_alpha=args.lora_early_alpha,
+        )
+        print(f"  expert LoRA: {count} linear layers, early rank="
+              f"{args.lora_early_rank}, late rank={args.lora_rank}, "
+              f"start_layer={args.lora_start_layer}")
     num_conv_layers = frozen_expert.num_conv_layers
 
     # input_dim must match the ternary node feature dim, which is the receptor
@@ -301,6 +356,9 @@ def build_trainer(args, device, input_dim=None):
         diffusion=diffusion,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        lora_lr=getattr(args, 'lora_lr', 1e-5),
+        lora_early_lr=getattr(args, 'lora_early_lr', 5e-6),
+        lora_early_layers=getattr(args, 'lora_early_layers', 4),
         device=device,
     )
 
@@ -308,18 +366,31 @@ def build_trainer(args, device, input_dim=None):
 
 
 def _guarded_train_step(trainer, batch):
-    """``trainer.train_step`` with a non-finite loss guard.
+    """Return ``None`` without stepping when a batch is numerically invalid."""
+    from tricoopdiff.train import NonFiniteTrainingError
 
-    Skips (returns None) instead of stepping on NaN/Inf losses, so a handful of
-    known-NaN complexes can't poison the optimizer.
-    """
-    loss_dict = trainer.compute_loss(**batch)
+    trainer.model.train()
+    trainer.optimizer.zero_grad(set_to_none=True)
+    try:
+        loss_dict = trainer.compute_loss(**batch)
+    except NonFiniteTrainingError as error:
+        print(f"[train] SKIP {error}", flush=True)
+        return None
     total = loss_dict['loss_total']
     if not torch.isfinite(total):
+        print(f"[train] SKIP case={batch.get('case', 'unknown')}: non-finite total loss", flush=True)
         return None
-    trainer.optimizer.zero_grad()
     total.backward()
-    torch.nn.utils.clip_grad_norm_(trainer.model.tribrain.parameters(), max_norm=1.0)
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        trainer.model.tribrain.parameters(), max_norm=1.0,
+    )
+    if not torch.isfinite(grad_norm):
+        trainer.optimizer.zero_grad(set_to_none=True)
+        print(
+            f"[train] SKIP case={batch.get('case', 'unknown')}: non-finite gradients",
+            flush=True,
+        )
+        return None
     trainer.optimizer.step()
     trainer.global_step += 1
     result = {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
@@ -328,20 +399,37 @@ def _guarded_train_step(trainer, batch):
 
 
 def validate(trainer, val_loader, device):
-    """Run validation pass — no backward, no optimizer."""
-    trainer.model.eval()
-    total_loss = 0.0
-    n_batches = 0
+    """Run a deterministic validation pass without perturbing training RNG."""
+    cuda_devices = []
+    if device.type == 'cuda':
+        cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()]
+    numpy_state = np.random.get_state()
+    try:
+        with torch.random.fork_rng(devices=cuda_devices):
+            torch.manual_seed(0)
+            if cuda_devices:
+                torch.cuda.manual_seed_all(0)
+            np.random.seed(0)
+            trainer.model.eval()
+            total_loss = 0.0
+            n_batches = 0
 
-    for batch in val_loader:
-        loss_dict = trainer.validate_step(**batch)
-        if not np.isfinite(loss_dict['loss_total']):
-            continue
-        total_loss += loss_dict['loss_total']
-        n_batches += 1
-
-    trainer.model.train()
-    return total_loss / max(n_batches, 1)
+            for batch in val_loader:
+                try:
+                    loss_dict = trainer.validate_step(**batch)
+                except FloatingPointError as error:
+                    raise RuntimeError(f"validation failed: {error}") from error
+                if not np.isfinite(loss_dict['loss_total']):
+                    raise RuntimeError(
+                        f"validation failed: case={batch.get('case', 'unknown')} "
+                        "produced a non-finite loss"
+                    )
+                total_loss += loss_dict['loss_total']
+                n_batches += 1
+    finally:
+        np.random.set_state(numpy_state)
+        trainer.model.train()
+    return total_loss / n_batches if n_batches else float('nan')
 
 
 class TernaryDataLoader:
@@ -358,12 +446,12 @@ class TernaryDataLoader:
     batch dict whose keys match ``TriCoopDiffTrainer.compute_loss``::
         {'e3_data': ..., 'poi_data': ..., 'ligand_data': ..., 't_se3_data': None}
 
-    Featurization failures (e.g. the known NaN cases) are skipped with a log
-    rather than aborting training.
+    By default featurization failures abort training. Silently changing the
+    effective dataset would make validation/checkpoint selection misleading.
     """
 
     def __init__(self, data_json, score_model_args, shuffle=True, device="cuda",
-                 cache_dir=None, skip_on_error=True):
+                 cache_dir=None, skip_on_error=False):
         self.entries = _load_entries(data_json)
         self.score_model_args = score_model_args
         self.shuffle = shuffle
@@ -395,6 +483,7 @@ class TernaryDataLoader:
             self.score_model_args, self.device, cache_dir=self.cache_dir,
         )
         return {
+            'case': entry['case'],
             'e3_data': e3_data,
             'poi_data': poi_data,
             'ligand_data': ligand_data,

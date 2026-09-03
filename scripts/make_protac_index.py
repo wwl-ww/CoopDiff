@@ -9,13 +9,15 @@ with ``protein1.pdb`` [E3], ``protein2.pdb`` [POI] and ``ligand.sdf``/``ligand.p
 Output format::
     {"entries": [
         {"case": "5T35_D_A_759",
-         "protein1": "/abs/path/protein1.pdb",
-         "protein2": "/abs/path/protein2.pdb",
-         "ligand": "/abs/path/ligand.sdf"},
+         "protein1": "DeepTernary/output/protac22/.../protein1.pdb",
+         "protein2": "DeepTernary/output/protac22/.../protein2.pdb",
+         "ligand": "DeepTernary/output/protac22/.../ligand.sdf"},
         ...
     ]}
 
-Paths are written ABSOLUTE so the loader is independent of the process CWD.
+Paths below the repository are written relative to the project root so an index
+can move between the cluster and WSL checkouts. The loader resolves them before
+featurization.
 The receptor feature dim (1281 for DiffDock-L) is NOT baked in here — it is
 derived at runtime from the first featurized sample (see train_entry.py).
 """
@@ -50,11 +52,18 @@ def build_index(protac_dir: Path):
         if not (protein1.exists() and protein2.exists() and ligand):
             skipped.append(case_dir.name)
             continue
+        def portable(path):
+            path = Path(path).resolve()
+            try:
+                return str(path.relative_to(_PROJECT_ROOT.resolve()))
+            except ValueError:
+                return str(path)
+
         entries.append({
             "case": case_dir.name,
-            "protein1": str(protein1),
-            "protein2": str(protein2),
-            "ligand": ligand,
+            "protein1": portable(protein1),
+            "protein2": portable(protein2),
+            "ligand": portable(ligand),
         })
     return entries, skipped
 

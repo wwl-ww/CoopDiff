@@ -21,11 +21,7 @@ _COOPDIFF = str(Path(__file__).parent.parent)
 if _COOPDIFF not in sys.path:
     sys.path.insert(0, _COOPDIFF)
 
-_DIFFDOCK = str(Path(__file__).parent.parent.parent / "DiffDock")
-if _DIFFDOCK not in sys.path:
-    sys.path.insert(0, _DIFFDOCK)
-
-from utils.inference_utils import get_sequences
+from tricoopdiff.diffdock.utils.inference_utils import get_sequences
 
 
 def main():

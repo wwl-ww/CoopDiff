@@ -8,6 +8,7 @@ A third full ternary graph connects all three molecules for TriBrain coordinatio
 
 import torch
 from torch_geometric.data import HeteroData
+from torch_geometric.utils import subgraph
 
 
 def build_subgraph_e3l(
@@ -201,6 +202,121 @@ def build_tribrain_graph(
         'n_e3': n_e3,
         'n_poi': n_poi,
         'n_lig': n_lig,
+    }
+
+
+def crop_receptor_to_ligand(
+    receptor_coords: torch.Tensor,
+    receptor_features: torch.Tensor,
+    ligand_coords: torch.Tensor,
+    rec_edge_index: torch.Tensor = None,
+    cutoff: float | torch.Tensor = None,
+    min_residues: int = 1,
+    min_residues_with_edges: int = 8,
+    require_internal_edges: bool = True,
+) -> dict:
+    """
+    Lightweight TriCoopDiff-specific receptor crop.
+
+    Mirrors the native DiffDock sampling driver semantics at the minimal schema
+    our subgraph builders actually consume: keep receptor residues within
+    ``cutoff`` of any ligand atom, then relabel ``('receptor','receptor')``
+    edges. This intentionally omits native-only fields such as
+    ``side_chain_vecs`` / ``rec_contact``.
+
+    Args:
+        receptor_coords: [N_rec, 3] receptor residue coordinates
+        receptor_features: [N_rec, D_rec] receptor residue features
+        ligand_coords: [N_lig, 3] ligand coordinates in the SAME frame
+        rec_edge_index: [2, E_rec] receptor internal edges (optional)
+        cutoff: scalar crop radius. ``None`` disables cropping.
+        min_residues: fallback minimum number of kept residues. If the distance
+            crop would keep fewer than this many residues (e.g. ligand starts far
+            away from the protein), fall back to the ``min_residues`` closest
+            residues so the expert never sees an empty receptor graph.
+        min_residues_with_edges: stronger fallback used when receptor internal
+            edges are available. Keeping a single isolated residue leaves the
+            receptor-only edge groups empty, which drives DiffDock's grouped
+            tensor-product conv into a divide-by-zero path. Promote the crop to
+            the ``min_residues_with_edges`` nearest residues so the receptor
+            subgraph retains a small but connected local neighborhood.
+        require_internal_edges: when True and ``rec_edge_index`` is available,
+            keep enlarging the nearest-residue fallback until the cropped
+            receptor subgraph has at least one internal edge (or all residues are
+            exhausted). This prevents the ``n_rec=1, n_rec_e=0, n_cross_e=0``
+            degenerate graphs that the parity trace showed exploding inside the
+            grouped tensor-product convolutions.
+
+    Returns:
+        dict with cropped ``coords``, ``features``, ``edge_index`` and the
+        boolean ``mask`` over the original receptor residues.
+    """
+    if cutoff is None:
+        return {
+            'coords': receptor_coords,
+            'features': receptor_features,
+            'edge_index': rec_edge_index,
+            'mask': torch.ones(receptor_coords.shape[0], dtype=torch.bool, device=receptor_coords.device),
+        }
+
+    if torch.is_tensor(cutoff):
+        cutoff = float(cutoff.detach().cpu().item())
+
+    if receptor_coords.shape[0] == 0:
+        return {
+            'coords': receptor_coords,
+            'features': receptor_features,
+            'edge_index': rec_edge_index,
+            'mask': torch.zeros(0, dtype=torch.bool, device=receptor_coords.device),
+        }
+
+    dist2 = torch.sum(
+        (receptor_coords.unsqueeze(1) - ligand_coords.unsqueeze(0)) ** 2,
+        dim=-1,
+    )
+    min_dist2 = dist2.min(dim=1).values
+    distance_order = torch.argsort(min_dist2)
+    keep_mask = torch.any(dist2 < cutoff ** 2, dim=1)
+
+    keep_count = int(keep_mask.sum().item())
+    target_min = min_residues
+    has_rec_graph = rec_edge_index is not None and receptor_coords.shape[0] > 1
+    if has_rec_graph:
+        target_min = max(target_min, min_residues_with_edges)
+
+    if keep_count < target_min:
+        k = min(max(target_min, 1), receptor_coords.shape[0])
+        keep_mask = torch.zeros_like(keep_mask)
+        keep_mask[distance_order[:k]] = True
+
+    cropped_edge_index = rec_edge_index
+    if rec_edge_index is not None:
+        cropped_edge_index = subgraph(keep_mask, rec_edge_index, relabel_nodes=True)[0]
+
+        if has_rec_graph and require_internal_edges:
+            max_k = receptor_coords.shape[0]
+            k = int(keep_mask.sum().item())
+            while k < max_k and cropped_edge_index.shape[1] == 0:
+                k = min(max_k, max(k + 1, target_min))
+                keep_mask = torch.zeros_like(keep_mask)
+                keep_mask[distance_order[:k]] = True
+                cropped_edge_index = subgraph(keep_mask, rec_edge_index, relabel_nodes=True)[0]
+
+    # Align with native crop_beyond semantics: once the crop is stable, do not
+    # over-prune to a single residue if the geometric cutoff happened to miss all
+    # residues at this step. The residual-gated expert already has a native-style
+    # fallback for fully empty cross graphs, so the crop should remain a genuine
+    # receptor neighborhood whenever internal edges exist.
+    if has_rec_graph and cropped_edge_index is not None and cropped_edge_index.shape[1] == 0 and keep_mask.sum() > 1:
+        keep_mask = torch.zeros_like(keep_mask)
+        keep_mask[distance_order[:min(receptor_coords.shape[0], max(target_min, 2))]] = True
+        cropped_edge_index = subgraph(keep_mask, rec_edge_index, relabel_nodes=True)[0]
+
+    return {
+        'coords': receptor_coords[keep_mask],
+        'features': receptor_features[keep_mask],
+        'edge_index': cropped_edge_index,
+        'mask': keep_mask,
     }
 
 

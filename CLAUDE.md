@@ -6,17 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **TriCoopDiff** is a deep learning research project: a physically-constrained diffusion generative model for PROTAC ternary complex structure prediction and functional ranking. The core idea is freezing a pretrained two-body expert (DiffDock-L, ~20M params) and training a lightweight coordination network (TriBrain, ~2.2M params) that modulates the expert via per-layer FiLM, enabling explicit three-body cooperative effects while preserving the expert's pretrained capabilities with zero input-distribution OOD.
 
-**Current status**: The MVP integration loop is wired end-to-end on real PROTAC data: featurize → train → sample → evaluate. `scripts/mvp_smoke_test.py` passes its two gates (zero-FiLM transparency + gradient flow to TriBrain). Training runs B=1 (sequential per-complex). The "Agent B" task (E3→POI rotation + POI/DockQ metrics) is **done** — `model.forward` now takes an `r_e3_to_poi` rotation (defaults to identity) and `evaluate.py` reports POI/E3-interface DockQ. The active open problem is now **score-merge double-counting**, and the SE3 loss is being debugged on branch `debug-se3-loss`. `doc/README.md` is the authoritative doc index — consult it first.
+**Current status**: The MVP loop is wired end-to-end on real PROTAC data. Frame handling, residual-gated score merge, vendored DiffDock featurization, and both native/inline expert branches are implemented. On case `5T35_D_A_759`, `coupled5a` initialization with no activation clamp passes sub1/sub2 tr/rot/tor parity and the four Phase 1 readiness checks. Training remains B=1. The active work is Phase 1 smoke training and exact full-atom DockQ alignment with DeepTernary.
 
-Key design documents in `doc/` (Chinese). **`doc/README.md` is the authoritative index**, tiering each doc as current / partially-stale / superseded; consult it before trusting a doc:
-- `TriCoopDiff 模型交接文档.md` (v2.4) — the sole authoritative architecture doc (per-layer FiLM, multi-rate diffusion, SE3 rigid body, TriReflect)
-- `TriCoopDiff 执行计划.md` — 9-week execution plan with phase gates
-- `三分子初始化策略方案.md` — Three-molecule initialization strategy
-- `DeepTernary 审计完成交接文档.md` — baseline audit (mean best DockQ **0.6588**, 22 cases × 40 seeds)
-- `Score合并 双重计数与零-FiLM基线 交接文档.md` — open problem #1: `s_q1+s_q2` merge double-counting (zero-FiLM baseline DockQ 0.153 vs pure DiffDock E3-L 0.844)
-- `DiffDock 审计文档.md` / `DiffDock 实验交接文档.md` — two-body expert reference
-- `公式推导参考.md` — formula derivations
-- `训练入口 SLURM 与 Phase1 smoke 交接文档.md` — SLURM gotchas + Phase1 smoke observations
+`doc/README.md` is the authoritative documentation index. The maintained documents cover architecture, current status, initialization/frame conventions, final sampling-parity findings, training/SLURM operation, DeepTernary baseline and DockQ semantics, DiffDock internals, formulas, and the execution roadmap. Do not rely on deleted historical agent briefs or patch handoffs; recover them from Git history only when auditing an old decision.
 
 ## Build / Test / Lint
 
@@ -30,7 +22,7 @@ pip install torch torch_geometric e3nn torchdiffeq torch_scatter rdkit biopython
 # Download DiffDock-L weights to checkpoints/score_model/ (model_parameters.yml + best_ema_inference_epoch_model.pt)
 ```
 
-- **DiffDock is vendored** at `tricoopdiff/diffdock/` (factory + models + utils). The frozen expert is built from this vendored core via `expert_factory.build_diffdock_expert`, which does `load_state_dict(strict=True)`. The sibling `../DiffDock` checkout is used **only for data featurization** (`InferenceDataset`, `get_sequences`, `process_mols`) and must still be cloned alongside this repo.
+- **DiffDock is fully vendored** at `tricoopdiff/diffdock/` — both the model core (`factory`, `models/`, `utils/{so3,torus,torsion,crop,diffusion_utils}`, `sampling.py`) **and** the data-featurization modules (`datasets/` + `utils/inference_utils.py`: `InferenceDataset`, `get_sequences`, `process_mols`, etc.). The frozen expert is built from the vendored core via `expert_factory.build_diffdock_expert` (`load_state_dict(strict=True)`); featurization imports `tricoopdiff.diffdock.datasets.*` / `tricoopdiff.diffdock.utils.inference_utils`. **No external `../DiffDock` checkout is needed anywhere** (BUG-20 fully resolved). Only `scripts/experiment3_ood_verify.py` still references `../DiffDock` by design (it compares vendored vs *native* DiffDock via `get_model`). The former legacy entry points were removed; use `scripts/evaluate_entry.py`.
 - **`DeepTernary/`** (git-ignored) holds the baseline; data lives at `DeepTernary/output/protac22/<case>/` with `protein1.pdb` (E3), `protein2.pdb` (POI), `ligand.sdf`/`ligand.pdb` (PROTAC).
 - **conda env name is `tricoopdiff`** (SLURM scripts hardcode `/data/home/scwb792/run/miniconda3/bin/conda`).
 - **HuggingFace is offline + mirrored**: SLURM scripts `export HF_ENDPOINT=https://hf-mirror.com HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`. ESM2-650M must already be cached locally (`local_files_only=True` in `esm_embedder.py`).
@@ -48,11 +40,11 @@ ternary graph (E3+POI+PROTAC)
     │
     ├─→ subgraph POI-L (HeteroData) ─→ FrozenDiffDock + FiLM ─→ s_q2
     │                                        ↑
-    └─→ TriBrain ─→ FiLM params (γ,β) ──────┘
+    └─→ TriBrain ─→ FiLM params (γ,β) + merge gate g ─┘
             │
             └─→ s_SE3, confidence, state (ΔΔG, p_productive)
 
-s_q = s_q1 + s_q2  (direct addition, see merging.py)
+s_q = s_q1 + g·(s_q2 - s_q1)   (residual-gated merge, g zero-init → s_q = s_q1 at init; see merging.py)
 ```
 
 - **Frozen expert**: DiffDock-L v1.1, `ns=48`, `nv=10`, `num_conv_layers=11` (read from `model_parameters.yml`, not hardcoded in new code). ~20M params, all frozen.
@@ -66,19 +58,19 @@ s_q = s_q1 + s_q2  (direct addition, see merging.py)
 | `expert.py` | `FrozenDiffDock` — wraps the vendored `CGModel`, freezes all params, exposes `embedding()`, `compute_scores()`, `forward()`. Owns `torus_score_norm`. |
 | `expert_factory.py` | `build_diffdock_expert(model_dir, device, ...)` — single source of truth for constructing the frozen expert from the vendored core + pretrained weights. Disables dynamic receptor cropping (critical for POI subgraphs). |
 | `diffdock_compat.py` | Pure-PyTorch fallbacks for `torch_cluster` / `torch_scatter`; patches on import. |
-| `diffdock/` | **Vendored** DiffDock core (`factory`, `models/cg_model`, `utils/so3`, `utils/torus`, `utils/torsion`, `utils/crop`, `utils/diffusion_utils`). The model runs entirely on this. |
+| `diffdock/` | **Vendored** DiffDock — model core (`factory`, `models/cg_model`, `utils/so3`, `utils/torus`, `utils/torsion`, `utils/crop`, `utils/diffusion_utils`, `sampling.py`) **and** data featurization (`datasets/` + `utils/inference_utils.py`). The model + featurization run entirely on this; no external DiffDock checkout. |
 | `esm_embedder.py` | `ESMEmbedder` — ESM2-650M per-residue embeddings (1280-dim) via HF transformers. Not directly imported by the pipeline (featurization uses `scripts/featurize_common.py`). |
 | `graphs.py` | `build_subgraph_e3l`, `build_subgraph_pol`, `build_tribrain_graph`, `transform_ligand_to_poi_frame`. Constructs the two disconnected protein+ligand HeteroData subgraphs + one flat ternary dict. |
-| `tribrain.py` | `TriBrain`, `MultiScalePooling`, `EquivariantTransformer`, `EquivariantTransformerLayer`, `SE3ScoreHead`, `JudgeHead`, `StateHead`, `FiLMHead`. The only trainable module. |
+| `tribrain.py` | `TriBrain`, `MultiScalePooling`, `EquivariantTransformer`, `EquivariantTransformerLayer`, `SE3ScoreHead`, `JudgeHead`, `StateHead`, `FiLMHead`, `MergeGateHead`. The only trainable module. `MergeGateHead` predicts the zero-init residual merge gate `g`. |
 | `model.py` | `TriCoopDiff`, `_expert_forward_with_film`, `zero_film_verification`. Orchestrates subgraphs → TriBrain → two expert FiLM passes → merge. `_expert_forward_with_film` replicates `CGModel.forward()` inline, accessing `model.conv_layers[l]` directly. |
-| `film.py` | `FiLMSharedMLP`, `FiLMLayerHead`, `apply_film`. Only `apply_film` is actually used (by `model.py:_expert_forward_with_film`); the MLP classes are unused. |
-| `diffusion.py` | `MultiRateDiffusion`, `TernaryInitializer`, `so3_exp`, `sample_so3_noise`, `so3_score_norm`, `so3_score_vec`. Multi-rate schedules (PROTAC fast λ_q, SE3 slow λ_SE3); forward noise (`add_noise_protac`/`add_noise_se3`/`add_torsion_noise`) and reverse SDE steps (`reverse_step_protac`/`reverse_step_torsion`/`reverse_step_se3`). |
+| `film.py` | `apply_film` only (used by `model.py:_expert_forward_with_film`). The old `FiLMSharedMLP`/`FiLMLayerHead` classes were removed (`959867a`). |
+| `diffusion.py` | `MultiRateDiffusion`, `TernaryInitializer`, `so3_exp`, `sample_so3_noise`, `so3_score_norm`, `so3_score_vec`. Exponential σ(t) schedules for PROTAC (fast) and SE3 rigid body (slow); forward noise (`add_noise_protac`/`add_noise_se3`/`add_torsion_noise`) and reverse SDE steps (`reverse_step_protac`/`reverse_step_torsion`/`reverse_step_se3`). The old λ_q/λ_SE3 threshold masking is **removed** (full-range σ for all t); `get_lambda_q`/`get_lambda_se3` + the threshold params are dead code kept only for legacy diagnostic scripts. |
 | `sampler.py` | `sample_single` / `sample_ensemble` — composes the reverse steps into a t=1→0 denoising loop, rebuilding subgraphs inside `model.forward` at each step. Self-contained (does not import `../DiffDock`). |
-| `merging.py` | `merge_direct_addition` (MVP default), `LearnedCoordinationLayer` (Ablation B). |
+| `merging.py` | `merge_residual_gated` (**default**, `s_q = s_q1 + g·(s_q2 - s_q1)`), `merge_direct_addition` (L0 ablation only — double-counts the shared PROTAC DOFs). `LearnedCoordinationLayer` is the old Ablation B, now superseded. |
 | `reflect.py` | `tricoop_reflect`, `detect_clashes`, `detect_bond_anomalies`, `detect_linker_strain`, `local_minimization`. Post-processing clash/geometry checks + simple repulsive minimization. |
 | `train.py` | `TriCoopDiffTrainer` — multi-task loss (score + phys + se3), two-phase training, AdamW + CosineAnnealingLR. `compute_loss`/`train_step`/`validate_step`, `set_phase`, `save/load_checkpoint`. |
 | `evaluate.py` | Metric functions (`compute_dockq`, `compute_rmsd`, `compute_clash_rate`, `compute_ensemble_diversity`, `compute_cooperativity_ranking`, `kabsch_align`, `compute_poi_dockq`, `compute_e3_interface_dockq`, `compute_poi_com_dist`, …) + `evaluate_model` + `EnsembleAnalyzer`. POI/E3-interface metrics need the native ternary PDB (`native_complex_pdb`); otherwise they report `None`, never NaN. |
-| `scripts/featurize_common.py` | Shared featurization: `featurize_complex`, `generate_esm_embeddings`, `featurize_subgraph`, `extract_receptor`, `extract_ligand`. Produces B=1 dicts with `coords`/`features`/`edge_index`/`edge_attr`/`edge_mask`/`mask_rotate`. |
+| `scripts/featurize_common.py` | Shared featurization: `featurize_complex`, `generate_esm_embeddings`, `featurize_subgraph`, `extract_receptor`, `extract_ligand`. Produces B=1 dicts with `coords`/`features`/`edge_index`/`edge_attr`/`edge_mask`/`mask_rotate`. Re-express POI + PROTAC in the shared E3 frame (BUG-18 fix: recovers true crystal-frame inter-molecule translations, since `InferenceDataset` centers each molecule independently); caches carry a `cache_version` to invalidate pre-fix geometry. |
 | `scripts/make_protac_index.py` | Scans `DeepTernary/output/protac22/` → `data/protac_index.json` (absolute paths, consumed by `train_entry.py`). |
 
 ### Diffusion Variables
@@ -90,7 +82,7 @@ s_q = s_q1 + s_q2  (direct addition, see merging.py)
 | PROTAC torsion | K | `add_torsion_noise` | merged from both subgraphs |
 | E3-POI rigid body | 6 (3T+3R) | `add_noise_se3` | `s_se3` from TriBrain SE3 head |
 
-Reference frame: E3 fixed at its featurized coordinates. PROTAC coords sampled once in the E3 frame; subgraph 2 uses `transform_ligand_to_poi_frame`.
+Reference frame: E3 fixed at its featurized coordinates (Cα centroid at origin). After the BUG-18 fix, POI and PROTAC are re-expressed in this shared E3 frame (true crystal-frame translations), so `t_e3_to_poi = poi_center - e3_center` recovers the real E3→POI offset rather than 0. PROTAC coords are sampled once in the E3 frame; subgraph 2 uses `transform_ligand_to_poi_frame`.
 
 ## Running Commands
 
@@ -133,7 +125,7 @@ sbatch scripts/evaluate_entry.slurm
 python scripts/evaluate_entry.py --case 5T35_D_A_759 --n-walkers 32 \
     --out results/eval_5T35.json
 ```
-Reports PROTAC RMSD / pocket distance / clash rate / ensemble diversity / E3-interface & POI DockQ (when the native PDB is available) as JSON. The zero-FiLM baseline (no `--tribrain-ckpt`) is the Go/No-Go reference: it should reproduce native DiffDock-L two-body PROTAC distribution. For full-benchmark comparison against the DeepTernary audit, use `scripts/eval_entry.py` (`--data data/protac_benchmark_test.json --checkpoint <ckpt> --outdir <dir> --deepternary_audit deepternary_audit.json`).
+Reports PROTAC RMSD / pocket distance / clash rate / ensemble diversity / E3-interface & POI DockQ (when the native PDB is available) as JSON. The zero-FiLM baseline (no `--tribrain-ckpt`) is the Go/No-Go reference: it should reproduce native DiffDock-L two-body PROTAC distribution. `evaluate_entry.py` is the single-complex evaluation entry point.
 
 ### DeepTernary baseline audit
 
@@ -154,9 +146,9 @@ Output: `deepternary_audit.json`, `audit_results/`, `logs/`. Full instructions i
 - **Two subgraphs must be physically disconnected**: no protein-protein edges, no ligand-mediated bridging. Each subgraph = exactly one protein + PROTAC. Cross-edges are built dynamically by `CGModel` per forward pass.
 - **PROTAC coordinate sync**: PROTAC sampled once globally (E3 frame). Subgraph 1 uses it directly; subgraph 2 transforms via `t_e3_to_poi = poi_center - e3_center` and the `r_e3_to_poi` rotation (defaults to identity; the sampler/trainer passes the cumulative SE3 rotation so subgraph 2 sees the correct PROTAC-POI relative geometry). Subgraph 2's tr/rot scores are rotated back into the E3 frame before merging (torsion is frame-invariant).
 - **FiLM zero-init is mandatory**: `FiLMHead` uses `nn.init.zeros_`. At training start `h' = h`. Verified by `zero_film_verification()` (GATE 1 of the smoke test).
-- **Gradient flow**: `loss_phys` backprops through `_estimate_denoised()` (Tweedie) → predicted scores → `model.forward()` → TriBrain — a direct path, not through FiLM. The two-body expert has `requires_grad=False` everywhere.
-- **Score merging**: direct addition `s_q = s_q1 + s_q2` is the MVP. `LearnedCoordinationLayer` is Ablation B.
-- **Multi-rate λ**: stepwise threshold functions (non-differentiable at t=0.7, t=0.5); accepted engineering approximation.
+- **Gradient flow**: the two-body expert has `requires_grad=False` everywhere. `loss_phys` backprops through `_estimate_denoised()` (Tweedie) → predicted scores → `model.forward()` → TriBrain along two paths: (1) the PROTAC path passes *through* FiLM (`x̂_ligand` depends on `s_q`, which is FiLM-modulated); (2) the POI/SE3 path goes directly through the SE3 head. The old "not through FiLM" note in `train.py`'s docstring is stale.
+- **Score merging**: residual-gated `s_q = s_q1 + g·(s_q2 - s_q1)` is the default (`use_learned_merge=True`). The gate `g` is zero-initialized so at init `s_q = s_q1` (pure E3-L, zero-FiLM transparent); `g=1` → pure POI-L. `merge_direct_addition` is the L0 ablation (`use_learned_merge=False`) and re-introduces double-counting.
+- **No multi-rate λ masking anymore**: the stepwise λ_q (t=0.7) / λ_SE3 (t=0.5) cutoffs were removed in the debug-se3-loss work. Forward noise, reverse denoising, and the DSM target now all use the same full-range σ(t) schedule; the λ threshold params/functions are dead code.
 - **`t` is a noise-schedule variable in [0,1]**, not physical time.
 - **`_expert_forward_with_film` bypasses `FrozenDiffDock.step_conv_layer()`**: it replicates `CGModel.forward()` inline and directly accesses `model.conv_layers[l]`. Intentional — avoids refactoring the edge-group splitting that differs between intermediate and final conv layers.
 - **Import order**: `tricoopdiff.diffdock_compat` must be imported before anything that binds `torch_cluster`/`torch_scatter`. Importing any `tricoopdiff.*` submodule runs `__init__.py`, which does this first.
@@ -164,18 +156,19 @@ Output: `deepternary_audit.json`, `audit_results/`, `logs/`. Full instructions i
 
 ## Known Incomplete / Open Items
 
-- **Score-merge double-counting** (open problem #1): `s_q = s_q1 + s_q2` direct addition over-counts the shared PROTAC DOFs. Zero-FiLM baseline gives DockQ **0.153** vs pure DiffDock E3-L **0.844**; root cause = frame mismatch (tr/rot) + double-counting (transparency). Candidate fixes A/B/C, recommended B (α-init=1). See `doc/Score合并 双重计数与零-FiLM基线 交接文档.md`.
-- **`loss_se3` (was ≈0 / π-floored)** — root causes fixed on `debug-se3-loss`: (a) wrapped SO(3) sampler/score mismatch → Euclidean (R³) DSM for SE3 rotation, symmetric with translation; (b) λ_SE3 cutoff dropped so the head trains on the full t∈[0,1] schedule; (c) SE3 geometry encoder gained rotation-sensitive second-moment (covariance) features. Verif run 138510: `loss_se3_tr` 54→~3 (learns), `loss_se3_rot` active (0.02–5.4, ~1.3 avg, below the π≈3.14 wrapped floor). A **pre-existing score-loss blow-up** on large PROTACs (frozen-expert forward hitting `NAN_CLAMP=1e4` → loss ~1e6-1e8) was masking SE3 convergence at B=1; fixed with a per-component `score_loss_cap=100.0`. See commits `b20c238`/`4511ab0`/`cbbd5f0`/`f3b2736`/`c1f1dd0` and `scripts/diagnose_loss_se3.py`/`scripts/verify_se3_sigma_consistency.py`/`scripts/probe_se3_orientation.py`.
-- **`train.py:_physical_loss`**: fixed 3.4 Å contact distance (per-atom via `torch.cdist`), not true VDW radii. In Phase-1 smoke this makes `loss_phys ≈ 0` (well-separated complexes have no clash at noise level) — the physical term produces no gradient until real VDW radii are used.
-- **B=1 only**: `model.forward` is single-complex per step; padded B>1 batching is a follow-up.
-- **Checkpoint bloat**: `save_checkpoint` writes full `model_state_dict` (~131 MB, includes frozen expert) but `load_checkpoint` only reads `tribrain_state_dict` (~9 MB). `load_checkpoint` also does not restore optimizer/scheduler.
-- **`scripts/prepare_data.py:cluster_by_sequence_identity`**: greedy fallback; production should use MMseqs2.
-- **`reflect.py:local_minimization`**: simple repulsive gradient descent; production should use RDKit MMFF94.
+- **Exact DockQ alignment**: the primary metric must rebuild a full-atom ternary PDB and call DeepTernary's `DockQ/dockq_util.py::cal_dockq`. Cα-only and interface-specific metrics remain diagnostics.
+- **Phase 1 smoke**: regenerate parity/frame reports after result cleanup, rerun readiness, then validate all loss components, finite gradients, and checkpoint loading.
+- **Initialization semantics**: `coupled5a` passes ternary native/inline parity without clamp; `native` remains the DiffDock-compatible two-body prior and can create OOD POI-L graphs in ternary use.
+- **B=1 only**: `model.forward` remains single-complex per step; padded B>1 batching needs a separate validation cycle.
+- **Pooling geometry**: `MultiScalePooling` still applies its branches to the same node set; true distance-scale partitioning is not implemented.
+- **Physical proxies**: torsional strain and local minimization remain lightweight geometric approximations rather than a force field.
 
 ## Code Duplication to Be Aware Of
 
-- **Two FiLM head implementations**: `tribrain.py:FiLMHead` (production — Linear, zero-init) and `film.py:FiLMLayerHead`/`FiLMSharedMLP` (standalone, unused). Only `apply_film` from `film.py` is called.
+- **Single FiLM head**: `tribrain.py:FiLMHead` (production — Linear, zero-init). `film.py` holds only `apply_film`; the standalone `FiLMSharedMLP`/`FiLMLayerHead` classes were removed (`959867a`).
 - **Score norm split**: `so3_score_norm` lives in `diffusion.py` (imported by `train.py` via `from .diffusion import so3_score_norm`); `expert.py` has a separate `torus_score_norm` (torsion). If the DiffDock normalization formula changes, update `diffusion.py`.
+- **Stale/divergent entry points** (BUG-19): the former legacy scripts were removed because they had forked `../DiffDock` imports, placeholder protein features, and a separate reverse-diffusion loop. The real inference/eval path is `scripts/evaluate_entry.py` → `featurize_common.featurize_complex` → `expert_factory.build_diffdock_expert` → `sampler.sample_ensemble`.
+- **Dead λ code**: `diffusion.py`'s `get_lambda_q`/`get_lambda_se3` + `lambda_q_threshold`/`lambda_se3_threshold` are deprecated (production never consults them); only `scripts/diagnose_loss_se3.py`, `scripts/verify_se3_sigma_consistency.py`, and `tests/test_model_build.py` still reference them.
 
 ## Training Strategy
 
@@ -183,3 +176,4 @@ Output: `deepternary_audit.json`, `audit_results/`, `logs/`. Full instructions i
 - **Phase 2**: unfreeze all TriBrain heads (`trainer.set_phase(2)`), same hyperparams.
 - **PROTAC fine-tuning**: 30-50 epochs, batch=8, lr=2e-5, LoRA rank=4 or strong weight decay.
 - Loss weights: `score=1.0, phys=0.5, se3=0.3` (configurable in `TriCoopDiffTrainer.__init__`).
+- Batch sizes above are the execution-plan targets; the current code only supports **B=1** (see "B=1 only" in Open Items).

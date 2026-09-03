@@ -29,17 +29,11 @@ import sys
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_DIFFDOCK_DIR = _PROJECT_ROOT.parent / "DiffDock"
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import tricoopdiff.diffdock_compat  # noqa: F401  (patches torch_cluster/scatter first)
-
-if not _DIFFDOCK_DIR.exists():
-    print(f"FATAL: DiffDock checkout not found at {_DIFFDOCK_DIR}", flush=True)
-    sys.exit(1)
-sys.path.insert(0, str(_DIFFDOCK_DIR))
 
 import torch
 import yaml
