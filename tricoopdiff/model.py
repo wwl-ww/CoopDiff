@@ -12,7 +12,6 @@ The forward pass at each diffusion step:
 
 import torch
 import torch.nn as nn
-import numpy as np
 
 from .graphs import (
     build_subgraph_e3l,

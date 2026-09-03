@@ -1,7 +1,6 @@
 import os
 import numpy as np
 import torch
-from scipy.spatial.transform import Rotation
 
 MIN_EPS, MAX_EPS, N_EPS = 0.0005, 4, 2000
 X_N = 2000
@@ -12,10 +11,6 @@ X_N = 2000
 """
 
 omegas = np.linspace(0, np.pi, X_N + 1)[1:]
-
-
-def _compose(r1, r2):  # R1 @ R2 but for Euler vecs
-    return Rotation.from_matrix(Rotation.from_rotvec(r1).as_matrix() @ Rotation.from_rotvec(r2).as_matrix()).as_rotvec()
 
 
 def _expansion(omega, eps, L=2000):  # the summation term only

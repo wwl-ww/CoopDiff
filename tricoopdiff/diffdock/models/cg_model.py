@@ -1,4 +1,3 @@
-import math
 import os
 import sys
 
@@ -6,9 +5,8 @@ from e3nn import o3
 import torch
 from e3nn.o3 import Linear
 from torch import nn
-from torch.nn import functional as F
 from torch_cluster import radius, radius_graph
-from torch_scatter import scatter, scatter_mean
+from torch_scatter import scatter_mean
 import numpy as np
 
 from .layers import GaussianSmearing, AtomEncoder

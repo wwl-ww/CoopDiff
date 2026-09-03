@@ -29,10 +29,6 @@ def vector_batch(a, b):
     return a - b
 
 
-def unit_vector_batch(v):
-    return v / np.linalg.norm(v, axis=1, keepdims=True)
-
-
 def dihedral_angle_batch(p):
     b0 = vector_batch(p[:, 0], p[:, 1])
     b1 = vector_batch(p[:, 1], p[:, 2])
@@ -142,5 +138,4 @@ def test_get_chi_angles(print_chi_angles=False):
 
 if __name__ == '__main__':
     test_get_chi_angles(print_chi_angles=True)
-
 

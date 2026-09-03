@@ -9,7 +9,6 @@ Key constraint: each subgraph contains exactly one protein + PROTAC, matching
 DiffDock's pretraining input distribution exactly (zero OOD).
 """
 
-import copy
 import torch
 import torch.nn as nn
 import numpy as np

@@ -12,7 +12,6 @@ back physically impossible structures for correction.
 """
 
 import numpy as np
-import torch
 from scipy.spatial import KDTree
 from typing import Optional, Tuple, List
 

@@ -9,8 +9,7 @@ Metrics categories:
 """
 
 import numpy as np
-from scipy.stats import spearmanr
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -45,54 +44,6 @@ def compute_rmsd(
     return float(np.sqrt(np.mean(np.sum(diff ** 2, axis=1))))
 
 
-def compute_rmsd_by_region(
-    pred_coords: np.ndarray,
-    ref_coords: np.ndarray,
-    region_masks: Dict[str, np.ndarray],
-    align_first: bool = True,
-) -> Dict[str, float]:
-    """
-    Compute RMSD separately for different molecular regions.
-
-    Args:
-        pred_coords: [N, 3]
-        ref_coords: [N, 3]
-        region_masks: dict mapping region name → [N] bool mask
-        align_first: Kabsch align on all atoms before computing per-region RMSD
-
-    Returns:
-        dict of region → RMSD
-    """
-    if align_first:
-        pred_coords = kabsch_align(pred_coords, ref_coords)
-
-    results = {}
-    for region, mask in region_masks.items():
-        if mask.sum() > 0:
-            results[region] = compute_rmsd(
-                pred_coords[mask], ref_coords[mask], align_first=False
-            )
-        else:
-            results[region] = float('nan')
-
-    results['global'] = compute_rmsd(pred_coords, ref_coords, align_first=False)
-    return results
-
-
-def compute_linker_rmsd(
-    pred_coords: np.ndarray,
-    ref_coords: np.ndarray,
-    linker_mask: np.ndarray,
-) -> float:
-    """
-    RMSD specifically for PROTAC linker atoms.
-    Linker atoms are identified by excluding warhead atoms (binders).
-    """
-    if linker_mask.sum() == 0:
-        return 0.0
-    return compute_rmsd(pred_coords[linker_mask], ref_coords[linker_mask])
-
-
 def compute_clash_rate(
     ensemble_coords: List[np.ndarray],
     atomic_numbers: np.ndarray,
@@ -125,28 +76,6 @@ def compute_clash_rate(
         'mean_clash_rate': float(np.mean(clash_rates)),
         'max_clash_rate': float(np.max(clash_rates)),
         'std_clash_rate': float(np.std(clash_rates)),
-    }
-
-
-def compute_linker_strain_energy(
-    ensemble_coords: List[np.ndarray],
-    dihedral_indices: List[Tuple[int, int, int, int]],
-) -> Dict[str, float]:
-    """
-    Estimate linker strain energy via MMFF94 (requires RDKit).
-
-    For now, returns torsional deviation as a proxy.
-    Full MMFF94 integration requires RDKit molecule construction.
-    """
-    strains = []
-    for coords in ensemble_coords:
-        strain = _estimate_torsional_strain(coords, dihedral_indices)
-        strains.append(strain)
-
-    return {
-        'mean_strain': float(np.mean(strains)),
-        'max_strain': float(np.max(strains)),
-        'min_strain': float(np.min(strains)),
     }
 
 
@@ -518,38 +447,6 @@ def compute_e3_interface_dockq(
 # Ensemble Quality Metrics
 # ---------------------------------------------------------------------------
 
-def compute_ensemble_energy_probability_correlation(
-    ensemble_coords: List[np.ndarray],
-    ensemble_weights: List[float],
-    energy_func=None,
-) -> float:
-    """
-    Spearman ρ between MMFF94 energies and sampling frequencies.
-
-    A positive ρ indicates that lower-energy conformations are sampled more often,
-    suggesting the ensemble has physical meaning.
-
-    Args:
-        ensemble_coords: list of conformations
-        ensemble_weights: sampling frequency of each conformation
-        energy_func: callable that returns energy for a conformation
-
-    Returns:
-        Spearman ρ correlation coefficient
-    """
-    if energy_func is None:
-        # Fallback: use a simple repulsive energy proxy
-        energy_func = _simple_repulsive_energy
-
-    energies = [energy_func(coords) for coords in ensemble_coords]
-
-    if len(set(energies)) < 2 or len(set(ensemble_weights)) < 2:
-        return 0.0
-
-    rho, _ = spearmanr(energies, ensemble_weights)
-    return float(rho)
-
-
 def compute_ensemble_diversity(
     ensemble_coords: List[np.ndarray],
 ) -> Dict[str, float]:
@@ -589,57 +486,6 @@ def compute_ensemble_diversity(
         'std_pairwise_rmsd': float(np.std(pairwise_rmsd)),
         'n_clusters': n_clusters,
     }
-
-
-# ---------------------------------------------------------------------------
-# Functional Ranking Metrics
-# ---------------------------------------------------------------------------
-
-def compute_cooperativity_ranking(
-    predicted_ranks: np.ndarray,
-    experimental_alpha: np.ndarray,
-) -> Dict[str, float]:
-    """
-    Evaluate PROTAC cooperativity α ranking performance.
-
-    Args:
-        predicted_ranks: [N] predicted ranking (lower = more cooperative)
-        experimental_alpha: [N] experimental cooperativity values
-
-    Returns:
-        dict with 'spearman_rho', 'p_value', 'top20_hit_rate'
-    """
-    rho, p_value = spearmanr(predicted_ranks, experimental_alpha)
-
-    # Top-20% hit rate: fraction of top 20% predictions that are in top 20% experiments
-    n = len(predicted_ranks)
-    top_k = max(1, int(n * 0.2))
-    top_pred = np.argsort(predicted_ranks)[:top_k]
-    top_exp = np.argsort(experimental_alpha)[:top_k]
-    hit_rate = len(set(top_pred) & set(top_exp)) / top_k
-
-    return {
-        'spearman_rho': float(rho),
-        'p_value': float(p_value),
-        'top20_hit_rate': float(hit_rate),
-    }
-
-
-def compute_productive_auc(
-    productive_scores: np.ndarray,
-    productive_labels: np.ndarray,
-) -> float:
-    """
-    AUROC for discriminating productive vs non-productive ternary complexes.
-
-    Args:
-        productive_scores: [N] predicted productive probability
-        productive_labels: [N] binary ground truth
-    Returns:
-        AUROC score
-    """
-    from sklearn.metrics import roc_auc_score
-    return float(roc_auc_score(productive_labels, productive_scores))
 
 
 # ---------------------------------------------------------------------------
@@ -1040,55 +886,3 @@ def kabsch_align(mobile: np.ndarray, target: np.ndarray) -> np.ndarray:
     # Apply rotation
     aligned = mobile_c @ R + target_center
     return aligned
-
-
-def _estimate_torsional_strain(
-    coords: np.ndarray,
-    dihedral_indices: List[Tuple[int, int, int, int]],
-) -> float:
-    """
-    Estimate torsional strain from dihedral angles.
-
-    Uses a cos(3φ) torsional-potential proxy: staggered conformations (gauche
-    ±60°, anti 180°) are the low-energy minima (strain → 0), while eclipsed
-    conformations (0°, ±120°) are the torsional barriers (strain → 1).
-
-    This is a *geometric approximation*, not a real force-field torsional term:
-    it ignores substituent size, asymmetric barriers, and the differing well
-    depths of anti vs gauche, so treat it as a rough ranking of linker strain
-    rather than a physically exact energy (BUG-12).
-    """
-    strains = []
-    for i, j, k, l in dihedral_indices:
-        angle = _compute_dihedral(coords[i], coords[j], coords[k], coords[l])
-        # cos(3φ) = +1 at eclipsed (0°/120°/240°), -1 at staggered (60°/180°/300°)
-        strains.append(0.5 * (1.0 + np.cos(3.0 * angle)))
-    return np.mean(strains) if strains else 0.0
-
-
-def _compute_dihedral(p1, p2, p3, p4):
-    """Compute dihedral angle between four points."""
-    b1 = p2 - p1
-    b2 = p3 - p2
-    b3 = p4 - p3
-
-    n1 = np.cross(b1, b2)
-    n2 = np.cross(b2, b3)
-
-    n1 /= np.linalg.norm(n1)
-    n2 /= np.linalg.norm(n2)
-
-    m1 = np.cross(n1, b2 / np.linalg.norm(b2))
-    x = np.dot(n1, n2)
-    y = np.dot(m1, n2)
-
-    return float(np.arctan2(y, x))
-
-
-def _simple_repulsive_energy(coords: np.ndarray) -> float:
-    """Simple repulsive energy proxy for ensemble evaluation."""
-    from scipy.spatial.distance import pdist
-    dists = pdist(coords)
-    # Penalize close contacts (< 2Å)
-    close = dists[dists < 2.0]
-    return float(np.sum((2.0 - close) ** 2))

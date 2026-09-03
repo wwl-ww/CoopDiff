@@ -1,7 +1,5 @@
 import logging
-import multiprocessing
 import os
-import subprocess
 
 
 LOGGER_NAME = "DiffDock"
@@ -66,34 +64,4 @@ def get_logger(base_name=LOGGER_NAME):
     if not logger.hasHandlers():
         configure_logger(logger_name=logger_name)
     return logger
-
-
-def get_git_revision_hash() -> str:
-    """
-    Get the full git revision of the latest HEAD.
-    Note: This only works if run from git directory.
-    """
-    return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("ascii").strip()
-
-
-def get_git_revision_short_hash() -> str:
-    """
-    Get the short git revision of the latest HEAD.
-    Note: This only works if run from git directory.
-    Returns:
-
-    """
-    return (
-        subprocess.check_output(["git", "rev-parse", "--short", "HEAD"])
-        .decode("ascii")
-        .strip()
-    )
-
-
-def check_git_uncommitted() -> bool:
-    changed_files = (
-        subprocess.check_output(["git", "status", "-suno"]).decode("ascii").strip()
-    )
-    lines = list(filter(lambda x: x, changed_files.split("\n")))
-    return len(lines) > 0
 

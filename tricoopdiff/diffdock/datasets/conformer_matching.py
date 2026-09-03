@@ -1,9 +1,7 @@
-import copy, time
+import copy
 import numpy as np
-from collections import defaultdict
-from rdkit import Chem, RDLogger
+from rdkit import RDLogger
 from rdkit.Chem import AllChem, rdMolTransforms
-from rdkit import Geometry
 import networkx as nx
 from scipy.optimize import differential_evolution
 
@@ -12,10 +10,6 @@ RDLogger.DisableLog('rdApp.*')
 """
     Conformer matching routines from Torsional Diffusion
 """
-
-def GetDihedral(conf, atom_idx):
-    return rdMolTransforms.GetDihedralRad(conf, atom_idx[0], atom_idx[1], atom_idx[2], atom_idx[3])
-
 
 def SetDihedral(conf, atom_idx, new_vale):
     rdMolTransforms.SetDihedralRad(conf, atom_idx[0], atom_idx[1], atom_idx[2], atom_idx[3], new_vale)
@@ -82,4 +76,3 @@ def get_torsion_angles(mol):
             (n0[0], e[0], e[1], n1[0])
         )
     return torsions_list
-

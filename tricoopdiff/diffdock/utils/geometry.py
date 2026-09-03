@@ -1,6 +1,5 @@
 import math
 import torch.nn.functional as F
-import numpy as np
 import torch
 
 
@@ -312,7 +311,6 @@ def rigid_transform_Kabsch_independent_torch(A, B):
     t = - centroid_A + centroid_B # note does not change rotation
     R_vec = matrix_to_axis_angle(R)
     return t, R_vec
-
 
 
 

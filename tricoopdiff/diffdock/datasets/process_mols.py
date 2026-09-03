@@ -2,11 +2,9 @@ import copy
 import warnings
 import numpy as np
 import torch
-from Bio.PDB import PDBParser
 from rdkit import Chem
 from rdkit.Chem.rdchem import BondType as BT
 from rdkit.Chem import AllChem, GetPeriodicTable, RemoveHs
-from rdkit.Geometry import Point3D
 from torch import cdist
 from torch_cluster import knn_graph
 import prody as pr
@@ -14,7 +12,7 @@ import prody as pr
 import torch.nn.functional as F
 
 from tricoopdiff.diffdock.datasets.conformer_matching import get_torsion_angles, optimize_rotatable_bonds
-from tricoopdiff.diffdock.datasets.constants import aa_short2long, atom_order, three_to_one
+from tricoopdiff.diffdock.datasets.constants import aa_short2long, atom_order
 from tricoopdiff.diffdock.datasets.parse_chi import get_chi_angles, get_coords, aa_idx2aa_short, get_onehot_sequence
 from tricoopdiff.diffdock.utils.torsion import get_transformation_mask
 from tricoopdiff.diffdock.utils.logging_utils import get_logger
@@ -382,45 +380,6 @@ def get_lig_graph_with_matching(mol_, complex_graph, popsize, maxiter, matching,
     complex_graph['ligand'].mask_rotate = mask_rotate
 
     return
-
-
-def get_rec_misc_atom_feat(bio_atom=None, atom_name=None, element=None, get_misc_features=False):
-    if get_misc_features:
-        return [safe_index(allowable_features['possible_amino_acids'], 'misc'),
-                 safe_index(allowable_features['possible_atomic_num_list'], 'misc'),
-                 safe_index(allowable_features['possible_atom_type_2'], 'misc'),
-                 safe_index(allowable_features['possible_atom_type_3'], 'misc')]
-    if atom_name is not None:
-        atom_name = atom_name
-    else:
-        atom_name = bio_atom.name
-    if element is not None:
-        element = element
-    else:
-        element = bio_atom.element
-    if element == 'CD':
-        element = 'C'
-    assert not element == ''
-    try:
-        atomic_num = periodic_table.GetAtomicNumber(element.lower().capitalize())
-    except:
-        atomic_num = -1
-
-    atom_feat = [safe_index(allowable_features['possible_amino_acids'], bio_atom.get_parent().get_resname()),
-                 safe_index(allowable_features['possible_atomic_num_list'], atomic_num),
-                 safe_index(allowable_features['possible_atom_type_2'], (atom_name + '*')[:2]),
-                 safe_index(allowable_features['possible_atom_type_3'], atom_name)]
-    return atom_feat
-
-
-def write_mol_with_coords(mol, new_coords, path):
-    w = Chem.SDWriter(path)
-    conf = mol.GetConformer()
-    for i in range(mol.GetNumAtoms()):
-        x,y,z = new_coords.astype(np.double)[i]
-        conf.SetAtomPosition(i,Point3D(x,y,z))
-    w.write(mol)
-    w.close()
 
 
 def read_molecule(molecule_file, sanitize=False, calc_charges=False, remove_hs=False):

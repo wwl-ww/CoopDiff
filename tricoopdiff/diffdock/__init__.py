@@ -1,8 +1,8 @@
-"""Vendored DiffDock (model core + reverse sampling + data featurization).
+"""Vendored DiffDock model core and data featurization.
 
 This subpackage vendors everything TriCoopDiff needs from DiffDock: the model
-core to build/run the frozen DiffDock-L expert, the reverse-sampling loop, and
-the data-featurization modules — so the project no longer depends on the
+core to build/run the frozen DiffDock-L expert and the data-featurization
+modules — so the project no longer depends on the
 sibling ``../DiffDock`` checkout at all.
 
 Upstream source: github.com/gcorso/DiffDock commit 47eb91a (+ uncommitted
@@ -15,8 +15,7 @@ from upstream are:
      when featurization is imported);
   2. the NaN root-cause fix (``NAN_CLAMP`` clamp + ``NAN_TRACE`` diagnostics +
      ``tor_bonds[0]`` sigma indexing) in ``models/cg_model.py``, the
-     ``NAN_TRACE`` tensor-product diagnostics in ``models/tensor_layers.py``,
-     and the NaN fallback gate (Bug B) in ``sampling.py``.
+     ``NAN_TRACE`` tensor-product diagnostics in ``models/tensor_layers.py``.
 
 Data featurization (``InferenceDataset`` / ``get_sequences`` /
 ``datasets/process_mols.py`` / ``utils/inference_utils.py``) is vendored under

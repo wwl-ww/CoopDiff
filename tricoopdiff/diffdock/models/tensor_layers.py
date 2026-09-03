@@ -1,7 +1,6 @@
-import logging
 import os
 import sys
-from typing import Tuple, Union, List
+from typing import Union, List
 
 import numpy as np
 import torch
@@ -10,7 +9,7 @@ import torch.nn.functional as F
 from e3nn import o3
 from e3nn.nn import BatchNorm
 from e3nn.o3 import TensorProduct, Linear
-from torch_scatter import scatter, scatter_mean
+from torch_scatter import scatter
 
 from .layers import FCBlock
 

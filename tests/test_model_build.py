@@ -14,7 +14,7 @@ import numpy as np
 
 def test_tribrain_build():
     """TriBrain builds with correct output shapes."""
-    from tricoopdiff.tribrain import TriBrain, MultiScalePooling, EquivariantTransformer
+    from tricoopdiff.tribrain import TriBrain
 
     tribrain = TriBrain(
         node_dim=128, ns=32, nv=4,

@@ -38,10 +38,6 @@ def get_sequences_from_pdbfile(file_path):
     return sequence
 
 
-def set_nones(l):
-    return [s if str(s) != 'nan' else None for s in l]
-
-
 def get_sequences(protein_files, protein_sequences):
     new_sequences = []
     for i in range(len(protein_files)):
