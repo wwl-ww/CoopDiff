@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import sys
+import gc
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -46,7 +47,7 @@ os.chdir(_PROJECT_ROOT)
 # Featurization cache schema version. Bump whenever the geometry/frame handling
 # of the produced data changes, so stale on-disk caches (written before the
 # shared-reference-frame fix) are invalidated instead of silently reused.
-_FEATURIZE_CACHE_VERSION = 3
+_FEATURIZE_CACHE_VERSION = 4
 
 
 def _featurize_signature(protein1, protein2, ligand_path, score_model_args):
@@ -153,10 +154,18 @@ def generate_esm_embeddings(protein_paths, device):
     unique_embeddings = embedder.embed_from_fasta(unique_seqs, batch_size=4)
     seq_to_emb = dict(zip(unique_seqs, unique_embeddings))
 
-    return {
+    result = {
         path: [seq_to_emb[s].cpu() for s in chain_seqs]
         for path, chain_seqs in per_protein_info
     }
+    # This helper is called lazily once per uncached training case. ESM2-650M is
+    # much larger than the score model, so retaining one allocator block per
+    # call eventually exhausts a single GPU even with B=1.
+    del embedder, unique_embeddings, seq_to_emb
+    gc.collect()
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return result
 
 
 def featurize_subgraph(case_label, protein_path, ligand_path, chain_embs,
@@ -183,6 +192,10 @@ def featurize_subgraph(case_label, protein_path, ligand_path, chain_embs,
             False if not hasattr(score_model_args, "not_knn_only_graph")
             else not score_model_args.not_knn_only_graph
         ),
+        # These are crystallographic training/evaluation SDFs. The generic
+        # DiffDock inference path regenerates file conformers by default, which
+        # destroys the ternary pose even when its centroid is restored later.
+        preserve_ligand_conformer=True,
     )
     loader = DataLoader(dataset=dataset, batch_size=1, shuffle=False)
     return next(iter(loader))

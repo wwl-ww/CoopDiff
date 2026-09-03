@@ -87,6 +87,9 @@ class TriCoopDiffTrainer:
         loss_weights: Optional[Dict[str, float]] = None,
         device: str = 'cuda',
         contact_distance: float = 3.4,
+        lora_lr: float = 1e-5,
+        lora_early_lr: float = 5e-6,
+        lora_early_layers: int = 4,
     ):
         self.model = model.to(device)
         self.diffusion = diffusion
@@ -106,11 +109,28 @@ class TriCoopDiffTrainer:
         }
 
         # Only TriBrain is trainable; experts are frozen
-        self.optimizer = AdamW(
-            model.tribrain.parameters(),
-            lr=lr,
-            weight_decay=weight_decay,
+        parameter_groups = [{
+            'params': list(model.tribrain.parameters()),
+            'lr': lr,
+            'name': 'tribrain',
+        }]
+        from .lora import expert_lora_parameter_groups
+        lora_groups = expert_lora_parameter_groups(
+            model.expert, early_layers=lora_early_layers,
         )
+        if lora_groups['early']:
+            parameter_groups.append({
+                'params': lora_groups['early'],
+                'lr': lora_early_lr,
+                'name': 'expert_lora_early',
+            })
+        if lora_groups['late']:
+            parameter_groups.append({
+                'params': lora_groups['late'],
+                'lr': lora_lr,
+                'name': 'expert_lora_late',
+            })
+        self.optimizer = AdamW(parameter_groups, weight_decay=weight_decay)
         self.scheduler = ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-7,
         )
@@ -124,6 +144,8 @@ class TriCoopDiffTrainer:
         ligand_data: dict,
         t_se3_data: dict,
         case: str = "unknown",
+        t_override: Optional[torch.Tensor] = None,
+        t_se3_override: Optional[torch.Tensor] = None,
     ) -> dict:
         """
         Compute forward pass + losses without backward.
@@ -140,8 +162,19 @@ class TriCoopDiffTrainer:
         device = self.device
 
         # Sample random diffusion times
-        t = torch.rand(B, device=device)
-        t_se3 = torch.rand(B, device=device)
+        t = (t_override.to(device=device, dtype=torch.float32)
+             if t_override is not None else torch.rand(B, device=device))
+        t_se3 = (t_se3_override.to(device=device, dtype=torch.float32)
+                 if t_se3_override is not None else t.clone())
+        if t.ndim == 0:
+            t = t.expand(B)
+        if t_se3.ndim == 0:
+            t_se3 = t_se3.expand(B)
+        if t.shape != (B,) or t_se3.shape != (B,):
+            raise ValueError(
+                f"t/t_se3 overrides must have shape [{B}], got "
+                f"{tuple(t.shape)} and {tuple(t_se3.shape)}"
+            )
 
         # Add noise to PROTAC (rigid-body tr/rot DOFs only)
         noisy_ligand, tr_noise, rot_noise, rot_omega = self.diffusion.add_noise_protac(
@@ -406,14 +439,18 @@ class TriCoopDiffTrainer:
     def save_checkpoint(self, path: str):
         """Save model checkpoint.
 
-        Stores only the trainable TriBrain state (the frozen expert is ~131 MB and
-        never changes, so its full ``model_state_dict`` was redundant bloat), plus
-        optimizer/scheduler state and the global step for resumable training.
+        Stores TriBrain and adapter-only expert state. The frozen expert base is
+        omitted to avoid duplicating the pretrained checkpoint.
         """
+        from .lora import expert_lora_state_dict
         torch.save({
-            'checkpoint_version': 2,
+            'checkpoint_version': 3,
             'global_step': self.global_step,
             'tribrain_state_dict': self.model.tribrain.state_dict(),
+            'expert_lora_state_dict': expert_lora_state_dict(self.model.expert),
+            'expert_lora_config': getattr(
+                self.model.expert, 'lora_config', None,
+            ),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'scheduler_type': type(self.scheduler).__name__,
@@ -428,6 +465,11 @@ class TriCoopDiffTrainer:
         """
         ckpt = torch.load(path, map_location=self.device)
         self.model.tribrain.load_state_dict(ckpt['tribrain_state_dict'])
+        if ckpt.get('expert_lora_state_dict'):
+            from .lora import load_expert_lora_state_dict
+            load_expert_lora_state_dict(
+                self.model.expert, ckpt['expert_lora_state_dict'],
+            )
         self.global_step = ckpt.get('global_step', 0)
         if 'optimizer_state_dict' in ckpt:
             self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])

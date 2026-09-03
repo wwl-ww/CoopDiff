@@ -261,6 +261,7 @@ def main():
     data = copy.deepcopy(bundle[args.branch])
     t = bundle["t"]
     meta = bundle["meta"]
+    t_anchor = args.t_anchor if args.t_anchor is not None else (0.7 if args.init_mode == "anchor_local" else 1.0)
 
     # Native forward on the exact same graph.
     native_data = copy.deepcopy(data)

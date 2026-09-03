@@ -70,6 +70,12 @@ def build_parser():
     p.add_argument("--tribrain-ckpt", default=None,
                    help="Optional trained TriBrain checkpoint (default: zero-init "
                         "baseline = no loading)")
+    p.add_argument("--lora-rank", type=int, default=4)
+    p.add_argument("--lora-alpha", type=float, default=8.0)
+    p.add_argument("--lora-start-layer", type=int, default=0)
+    p.add_argument("--lora-early-layers", type=int, default=4)
+    p.add_argument("--lora-early-rank", type=int, default=2)
+    p.add_argument("--lora-early-alpha", type=float, default=4.0)
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--n-walkers", type=int, default=32,
@@ -136,6 +142,14 @@ def main():
     print(f"[cfg] ns={score_model_args.ns} nv={score_model_args.nv} "
           f"num_conv_layers={score_model_args.num_conv_layers}", flush=True)
 
+    trained_ckpt = None
+    if args.tribrain_ckpt is not None:
+        ckpt_path = _PROJECT_ROOT / args.tribrain_ckpt
+        if not ckpt_path.exists():
+            print(f"FATAL: --tribrain-ckpt not found: {ckpt_path}", flush=True)
+            sys.exit(1)
+        trained_ckpt = torch.load(ckpt_path, map_location=device)
+
     # --- Build the frozen expert ---------------------------------------------
     print("[expert] building frozen DiffDock-L expert...", flush=True)
     expert = build_diffdock_expert(
@@ -144,6 +158,18 @@ def main():
         ckpt=args.ckpt,
         num_conv_layers=score_model_args.num_conv_layers,
     )
+    if isinstance(trained_ckpt, dict) and trained_ckpt.get("expert_lora_state_dict"):
+        from tricoopdiff.lora import inject_expert_lora
+        config = trained_ckpt.get("expert_lora_config") or {
+            "rank": args.lora_rank,
+            "alpha": args.lora_alpha,
+            "start_layer": args.lora_start_layer,
+            "early_layers": args.lora_early_layers,
+            "early_rank": args.lora_early_rank,
+            "early_alpha": args.lora_early_alpha,
+        }
+        count = inject_expert_lora(expert, **config)
+        print(f"[expert] injected {count} LoRA linear layers", flush=True)
     num_conv_layers = expert.num_conv_layers
     print(f"[expert] loaded (num_conv_layers={num_conv_layers}, ns={expert.ns})",
           flush=True)
@@ -183,15 +209,15 @@ def main():
 
     # --- Optional: load a trained TriBrain checkpoint ------------------------
     if args.tribrain_ckpt is not None:
-        ckpt_path = _PROJECT_ROOT / args.tribrain_ckpt
-        if not ckpt_path.exists():
-            print(f"FATAL: --tribrain-ckpt not found: {ckpt_path}", flush=True)
-            sys.exit(1)
-        ckpt = torch.load(ckpt_path, map_location=device)
-        if "tribrain_state_dict" in ckpt:
-            model.tribrain.load_state_dict(ckpt["tribrain_state_dict"])
+        if "tribrain_state_dict" in trained_ckpt:
+            model.tribrain.load_state_dict(trained_ckpt["tribrain_state_dict"])
+            if trained_ckpt.get("expert_lora_state_dict"):
+                from tricoopdiff.lora import load_expert_lora_state_dict
+                load_expert_lora_state_dict(
+                    model.expert, trained_ckpt["expert_lora_state_dict"],
+                )
         else:
-            model.tribrain.load_state_dict(ckpt)
+            model.tribrain.load_state_dict(trained_ckpt)
         print(f"[model] loaded TriBrain weights from {ckpt_path}", flush=True)
 
     # --- Evaluate ------------------------------------------------------------

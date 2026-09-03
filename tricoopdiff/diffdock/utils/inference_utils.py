@@ -118,7 +118,8 @@ def generate_ESM_structure(model, filename, sequence):
 class InferenceDataset(Dataset):
     def __init__(self, out_dir, complex_names, protein_files, ligand_descriptions, protein_sequences, lm_embeddings,
                  receptor_radius=30, c_alpha_max_neighbors=None, precomputed_lm_embeddings=None,
-                 remove_hs=False, all_atoms=False, atom_radius=5, atom_max_neighbors=None, knn_only_graph=False):
+                 remove_hs=False, all_atoms=False, atom_radius=5, atom_max_neighbors=None, knn_only_graph=False,
+                 preserve_ligand_conformer=False):
 
         super(InferenceDataset, self).__init__()
         self.receptor_radius = receptor_radius
@@ -127,6 +128,7 @@ class InferenceDataset(Dataset):
         self.all_atoms = all_atoms
         self.atom_radius, self.atom_max_neighbors = atom_radius, atom_max_neighbors
         self.knn_only_graph = knn_only_graph
+        self.preserve_ligand_conformer = preserve_ligand_conformer
 
         self.complex_names = complex_names
         self.protein_files = protein_files
@@ -198,9 +200,10 @@ class InferenceDataset(Dataset):
                 mol = read_molecule(ligand_description, remove_hs=False, sanitize=True)
                 if mol is None:
                     raise Exception('RDKit could not read the molecule ', ligand_description)
-                mol.RemoveAllConformers()
-                mol = AddHs(mol)
-                generate_conformer(mol)
+                if not self.preserve_ligand_conformer:
+                    mol.RemoveAllConformers()
+                    mol = AddHs(mol)
+                    generate_conformer(mol)
         except Exception as e:
             print('Failed to read molecule ', ligand_description, ' We are skipping it. The reason is the exception: ', e)
             complex_graph['success'] = False

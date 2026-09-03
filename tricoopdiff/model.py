@@ -244,16 +244,18 @@ class TriCoopDiff(nn.Module):
             debug_step0 = (
                 b == 0
                 and bool(getattr(self, '_debug_step0_probe', False))
-                and float(t[b].detach().item()) >= 0.999
             )
             sub1_probe = {} if debug_step0 else None
             sub2_probe = {} if debug_step0 else None
             if self.use_film:
+                from .lora import set_expert_lora_branch
+                set_expert_lora_branch(self.expert, "sub1")
                 scores_1 = _expert_forward_with_film(
                     self.expert, sub1, t[b:b+1], film_params_b[:self.num_conv_layers],
                     trace_prefix=f"sub1/b{b}",
                     debug_probe=sub1_probe,
                 )
+                set_expert_lora_branch(self.expert, "sub2")
                 scores_2 = _expert_forward_with_film(
                     self.expert, sub2, t[b:b+1], film_params_b[self.num_conv_layers:],
                     trace_prefix=f"sub2/b{b}",
@@ -267,6 +269,19 @@ class TriCoopDiff(nn.Module):
                 scores_2 = {'tr_score': raw_out2[0], 'rot_score': raw_out2[1], 'tor_score': raw_out2[2]}
 
             if debug_step0:
+                def _score_debug(scores):
+                    out = {}
+                    for name in ('tr_score', 'rot_score', 'tor_score'):
+                        value = scores.get(name)
+                        if value is None or value.numel() == 0:
+                            out[name] = {'finite': True, 'absmax': 0.0}
+                        else:
+                            out[name] = {
+                                'finite': bool(torch.isfinite(value).all().item()),
+                                'absmax': float(torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0).abs().max().item()),
+                            }
+                    return out
+
                 self._last_step0_probe = {
                     'batch_index': int(b),
                     'receptor_crop_cutoff': (
@@ -292,6 +307,8 @@ class TriCoopDiff(nn.Module):
                     },
                     'sub1': sub1_probe,
                     'sub2': sub2_probe,
+                    'scores_sub1': _score_debug(scores_1),
+                    'scores_sub2': _score_debug(scores_2),
                     'merge_gate': tri_out['merge_gate'].detach().cpu().view(-1).tolist(),
                 }
 
@@ -314,6 +331,9 @@ class TriCoopDiff(nn.Module):
             else:
                 from .merging import merge_direct_addition
                 merged = merge_direct_addition(scores_1, scores_2)
+
+            if debug_step0:
+                self._last_step0_probe['scores_merge'] = _score_debug(merged)
 
             all_s_q['tr'].append(merged['tr_score'])
             all_s_q['rot'].append(merged['rot_score'])
@@ -383,6 +403,30 @@ def _expert_forward_with_film(
     # themselves. Keep trace spam opt-in; a non-empty prefix is attached only when
     # NAN_TRACE is exported in the environment.
     nan_trace = bool(os.environ.get("NAN_TRACE"))
+    lora_branch = "sub2" if str(trace_prefix).startswith("sub2") else "sub1"
+
+    def run_conv(layer, current_node_attr, current_edge_index,
+                 current_edge_attr, current_edge_sh, current_edge_weight):
+        """Checkpoint LoRA-enabled convolutions to bound training memory."""
+        if bool(getattr(expert, "lora_enabled", False)) and torch.is_grad_enabled():
+            from torch.utils.checkpoint import checkpoint
+
+            def forward(node_attr_input):
+                # Checkpoint recomputation happens during backward, after the
+                # shared expert may have run the other branch. Re-select the
+                # adapter so recomputation uses the same parameters as forward.
+                from .lora import set_expert_lora_branch
+                set_expert_lora_branch(expert, lora_branch)
+                return layer(
+                    node_attr_input, current_edge_index, current_edge_attr,
+                    current_edge_sh, edge_weight=current_edge_weight,
+                )
+
+            return checkpoint(forward, current_node_attr, use_reentrant=False)
+        return layer(
+            current_node_attr, current_edge_index, current_edge_attr,
+            current_edge_sh, edge_weight=current_edge_weight,
+        )
 
     # Set time embeddings on data
     _set_time_embeddings(data, t, model)
@@ -542,9 +586,9 @@ def _expert_forward_with_film(
                     edge_attr_[:s1], edge_attr_[s1:s2],
                     edge_attr_[s2:s3], edge_attr_[s3:]
                 ]
-            node_attr = model.conv_layers[l](
-                node_attr, edge_index, edge_attr_, edge_sh,
-                edge_weight=edge_weight
+            node_attr = run_conv(
+                model.conv_layers[l], node_attr, edge_index, edge_attr_,
+                edge_sh, edge_weight,
             )
         else:
             edge_attr_ = torch.cat([
@@ -554,9 +598,9 @@ def _expert_forward_with_film(
             ], -1)
             if model.differentiate_convolutions:
                 edge_attr_ = [edge_attr_[:s1], edge_attr_[s1:s2]]
-            node_attr = model.conv_layers[l](
-                node_attr, edge_index[:, :s2], edge_attr_, edge_sh[:s2],
-                edge_weight=edge_weight[:s2]
+            node_attr = run_conv(
+                model.conv_layers[l], node_attr, edge_index[:, :s2],
+                edge_attr_, edge_sh[:s2], edge_weight[:s2],
             )
 
         # Keep the inline expert path numerically identical to the vendored

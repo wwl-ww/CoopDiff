@@ -58,6 +58,15 @@ def parse_args():
     )
     p.add_argument("--lr", type=float, default=1e-3)         # paper: lr=1e-3, Plateau scheduler
     p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--lora_rank", type=int, default=0,
+                   help="Rank of independent sub1/sub2 expert adapters; 0 disables LoRA")
+    p.add_argument("--lora_alpha", type=float, default=8.0)
+    p.add_argument("--lora_start_layer", type=int, default=0)
+    p.add_argument("--lora_early_layers", type=int, default=4)
+    p.add_argument("--lora_early_rank", type=int, default=2)
+    p.add_argument("--lora_early_alpha", type=float, default=4.0)
+    p.add_argument("--lora_lr", type=float, default=1e-5)
+    p.add_argument("--lora_early_lr", type=float, default=5e-6)
 
     # Phase
     p.add_argument("--phase", type=int, default=1, choices=[1, 2],
@@ -294,6 +303,18 @@ def build_trainer(args, device, input_dim=None):
         model_dir=args.expert_model_dir,
         device=str(device),
     )
+    if getattr(args, 'lora_rank', 0) > 0:
+        from tricoopdiff.lora import inject_expert_lora
+        count = inject_expert_lora(
+            frozen_expert, rank=args.lora_rank, alpha=args.lora_alpha,
+            start_layer=args.lora_start_layer,
+            early_layers=args.lora_early_layers,
+            early_rank=args.lora_early_rank,
+            early_alpha=args.lora_early_alpha,
+        )
+        print(f"  expert LoRA: {count} linear layers, early rank="
+              f"{args.lora_early_rank}, late rank={args.lora_rank}, "
+              f"start_layer={args.lora_start_layer}")
     num_conv_layers = frozen_expert.num_conv_layers
 
     # input_dim must match the ternary node feature dim, which is the receptor
@@ -327,6 +348,9 @@ def build_trainer(args, device, input_dim=None):
         diffusion=diffusion,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        lora_lr=getattr(args, 'lora_lr', 1e-5),
+        lora_early_lr=getattr(args, 'lora_early_lr', 5e-6),
+        lora_early_layers=getattr(args, 'lora_early_layers', 4),
         device=device,
     )
 
