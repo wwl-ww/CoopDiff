@@ -5,7 +5,7 @@
 小型诊断应写成可复现 Python 脚本，提交 Git 后交由同学运行。训练、完整 GPU parity 和大规模评估才使用 SLURM。有效 GPU 分区包括 `gpu_a800`、`gpu_h100`、`gpu_h200`；提交前用真实调度器检查，不依赖静态 `sinfo` 包装输出。
 
 ```bash
-sbatch scripts/train_entry_smoke.slurm
+sbatch scripts/train_deepternary_smoke.slurm
 squeue -j <job_id>
 sacct -j <job_id> --format=JobID,State,ExitCode,Elapsed,NodeList
 ```
@@ -17,7 +17,7 @@ sacct -j <job_id> --format=JobID,State,ExitCode,Elapsed,NodeList
 - 导入 `PIL`、PyTorch 和 `transformers.models.esm.modeling_esm` 做预检；
 - 从 conda site-packages 收集 NVIDIA library 目录加入 `LD_LIBRARY_PATH`；
 - 将 `TRITON_CACHE_DIR`、`TORCHINDUCTOR_CACHE_DIR` 和 `TMPDIR` 指向项目盘；
-- 检查 CUDA、`data/protac_index.json`、expert 参数/权重及缓存可写性；
+- 检查 CUDA、DeepTernary 数据索引、expert 参数/权重及缓存可写性；
 - Hugging Face 使用本地缓存并设置 offline 模式，作业不得静默下载模型。
 
 ## Phase 1 门禁

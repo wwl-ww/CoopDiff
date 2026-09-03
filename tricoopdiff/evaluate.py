@@ -448,7 +448,7 @@ def compute_e3_interface_dockq(
     (``ligand_data['coords']``) is featurized in the *same* E3-L subgraph — so no
     superposition is needed. This is the E3-side analogue of the pure-DiffDock
     baseline's ``dockq`` / ``fnat`` / ``Lrms``
-    (``scripts/experiment1_diffdock_baseline.py``, ``cal_dockq``).
+    (DeepTernary ``DockQ/dockq_util.py::cal_dockq``).
 
     Definitions (standard DockQ, d1=1.5 Å iRMS, d2=8.5 Å Lrms):
       - Fnat  = fraction of native E3-PROTAC contacts (E3 Cα ↔ PROTAC atom within

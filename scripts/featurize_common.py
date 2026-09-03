@@ -1,10 +1,9 @@
 #!/usr/bin/env python
 """
-Shared featurization utilities for TriCoopDiff training + smoke test.
+Shared production featurization for TriCoopDiff training and evaluation.
 
-Extracts the featurization path that ``scripts/mvp_smoke_test.py`` validated
-(receptor/ligand subgraph featurization via DiffDock's ``InferenceDataset`` +
-on-the-fly ESM2-650M embeddings) into a single reusable module.
+Builds receptor/ligand subgraphs through DiffDock's ``InferenceDataset`` and
+generates ESM2-650M embeddings on demand.
 
 The featurization modules (``InferenceDataset`` / ``get_sequences`` /
 ``datasets.process_mols``) are vendored under ``tricoopdiff.diffdock``
@@ -129,7 +128,7 @@ def _true_relative_offsets(protein1, protein2, ligand_path):
 
 
 def generate_esm_embeddings(protein_paths, device):
-    """Generate ESM2-650M embeddings for protein PDBs (mirrors experiment1).
+    """Generate ESM2-650M embeddings for protein PDBs.
 
     Returns: dict {protein_path: [per-chain torch.Tensor (n_res, 1280)]}.
     """

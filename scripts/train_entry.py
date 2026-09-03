@@ -5,14 +5,14 @@ Two-phase training:
   Phase 1: General ternary pretraining (FiLM + SE3 heads only)
   Phase 2: PROTAC fine-tuning (all TriBrain heads, low LR, LoRA)
 
-Current scope: **B=1 sequential training** on real PROTAC complexes. The
-featurized data is produced on the fly from a JSON index (``make_protac_index.py``)
+Current scope: **B=1 sequential training** on real ternary complexes. The
+featurized data is produced on the fly from a JSON index (``make_deepternary_index.py``)
 via ``featurize_common.featurize_complex`` and cached to disk so subsequent epochs
 skip the expensive ESM2 embedding step. Padded B>1 batching is a follow-up.
 
 Usage:
     # Build the index once
-    python scripts/make_protac_index.py
+    python scripts/make_deepternary_index.py
 
     # Phase 1 smoke: 3 epochs, B=1, single complex per step
     python scripts/train_entry.py \
@@ -436,7 +436,7 @@ class TernaryDataLoader:
     """
     Real data loader for PROTAC ternary complexes.
 
-    Reads the JSON index written by ``scripts/make_protac_index.py``::
+    Reads the JSON index written by ``scripts/make_deepternary_index.py``::
         {"entries": [
             {"case": ..., "protein1": ".../protein1.pdb",
              "protein2": ".../protein2.pdb", "ligand": ".../ligand.sdf"}]}

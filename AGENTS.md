@@ -10,13 +10,14 @@ There is no package build system or project-level dependency manifest. Run comma
 
 ```bash
 python tests/test_model_build.py
-python scripts/make_protac_index.py
-python scripts/mvp_smoke_test.py --device cuda --case 5T35_D_A_759 --seed 0
-sbatch scripts/train_entry_smoke.slurm
+python scripts/make_deepternary_index.py
+python scripts/audit_ternary_inputs.py --index data/ternary_train.json --out results/input_audit.json
+sbatch scripts/train_deepternary_smoke.slurm
+sbatch scripts/train_deepternary_phase1.slurm
 python scripts/evaluate_entry.py --case 5T35_D_A_759 --n-walkers 32 --out results/eval.json
 ```
 
-The first command runs the fast assertion-based model checks. The index command creates `data/protac_index.json`; smoke, training, and evaluation workflows require the configured model checkpoints and usually a GPU. Do not use legacy `scripts/inference.py` or `scripts/eval_entry.py`.
+The first command runs the fast assertion-based model checks. The index command creates the official DeepTernary train/validation/test indexes. Training and evaluation require configured model checkpoints and usually a GPU; use SLURM rather than running GPU work on a login node.
 
 ## Coding Style & Naming Conventions
 
@@ -24,7 +25,7 @@ Follow existing Python style: four-space indentation, PEP 8 naming, `snake_case`
 
 ## Testing Guidelines
 
-Tests use plain functions and `assert`, although `test_*.py` naming remains pytest-compatible. Name new checks `test_<behavior>` and make failures describe the violated invariant. Run `python tests/test_model_build.py` for model-level changes and the MVP smoke test for FiLM, gradient-flow, sampling, or expert-integration changes. Avoid tests that silently download models; cluster execution expects cached Hugging Face assets.
+Tests use plain functions and `assert`, although `test_*.py` naming remains pytest-compatible. Name new checks `test_<behavior>` and make failures describe the violated invariant. Run `python tests/test_model_build.py` for model changes and `python tests/test_prepare_data.py` for data-pipeline changes. Use the DeepTernary smoke for gradient-flow or expert-integration changes. Avoid tests that silently download models; cluster execution expects cached Hugging Face assets.
 
 ## Commit & Pull Request Guidelines
 
