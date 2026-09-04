@@ -48,6 +48,7 @@ def load_row(path):
         report = json.load(handle)
     structure = report.get("structure", {})
     ensemble = report.get("ensemble", {})
+    conformational = ensemble.get("conformational_analysis", {})
     config = report.get("run_config", {})
     checkpoint = config.get("tribrain_checkpoint")
     mode = "trained" if checkpoint else "zero_film"
@@ -65,6 +66,9 @@ def load_row(path):
         "n_nan_walkers": ensemble.get("n_nan_walkers"),
         "selection_metric": ensemble.get("selection_metric"),
         "exact_dockq": structure.get("dockq_best") is not None,
+        "ensemble_n_clusters": conformational.get("n_clusters"),
+        "ensemble_dominant_fraction": conformational.get("dominant_fraction"),
+        "ensemble_mean_pairwise_rmsd": conformational.get("mean_pairwise_rmsd"),
     }
     row.update({metric: structure.get(metric) for metric in METRICS})
     return row

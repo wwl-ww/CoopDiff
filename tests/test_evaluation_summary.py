@@ -36,10 +36,15 @@ def test_report_reads_walker_counts_from_ensemble(tmp_path):
         "case": "demo",
         "run_config": {"tribrain_checkpoint": "/abs/best.pt"},
         "ensemble": {"n_valid_walkers": 31, "n_nan_walkers": 1,
-                     "selection_metric": "dockq"},
+                     "selection_metric": "dockq",
+                     "conformational_analysis": {
+                         "n_clusters": 4, "dominant_fraction": 0.5,
+                         "mean_pairwise_rmsd": 3.0,
+                     }},
         "structure": {"dockq_best": 0.75},
     }))
     row = evaluation_summary.load_row(path)
     assert row["n_valid_walkers"] == 31
     assert row["n_nan_walkers"] == 1
     assert row["exact_dockq"] is True
+    assert row["ensemble_n_clusters"] == 4

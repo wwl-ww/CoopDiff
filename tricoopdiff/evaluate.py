@@ -656,6 +656,7 @@ def evaluate_model(
             continue
         rec = {
             'pred': pred,
+            'pred_poi': pred_poi,
             'protac_rmsd': compute_rmsd(pred, ref_lig, align_first=True),
             'pocket_dist': float(np.linalg.norm(pred.mean(axis=0) - ref_lig.mean(axis=0))),
         }
@@ -816,6 +817,15 @@ def evaluate_model(
     }
     if len(pred_ligs) > 1:
         ensemble_metrics['diversity'] = compute_ensemble_diversity(pred_ligs)
+    if walkers:
+        from .ensemble_analysis import analyze_ensemble
+        ternary_poses = [
+            np.concatenate([walker['pred'], walker['pred_poi']], axis=0)
+            for walker in walkers
+        ]
+        ensemble_metrics['conformational_analysis'] = analyze_ensemble(
+            ternary_poses, rmsd_cutoff=2.0,
+        )
 
     debug_trace_report = None
     if debug_trace:
