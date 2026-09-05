@@ -321,8 +321,8 @@ class TernaryGeometryEncoder(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim),
         )
         self.ligand_contact_fusion = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 3),
-            nn.Linear(hidden_dim * 3, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 3 + 2),
+            nn.Linear(hidden_dim * 3 + 2, hidden_dim * 2),
             nn.SiLU(),
             nn.Linear(hidden_dim * 2, hidden_dim),
         )
@@ -416,8 +416,39 @@ class TernaryGeometryEncoder(nn.Module):
             + contacts.max(dim=1).values
         ) / 3.0
 
+    def _ligand_direction_invariants(
+        self,
+        e3_coords: torch.Tensor,
+        poi_coords: torch.Tensor,
+        ligand_coords: torch.Tensor,
+        lig_edge_index: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """Return angle and SE(3)-invariant, reflection-sensitive handedness."""
+        e3_nearest = torch.cdist(ligand_coords, e3_coords).argmin(dim=1)
+        poi_nearest = torch.cdist(ligand_coords, poi_coords).argmin(dim=1)
+        e3_direction = F.normalize(
+            e3_coords[e3_nearest] - ligand_coords, dim=-1, eps=1e-8,
+        )
+        poi_direction = F.normalize(
+            poi_coords[poi_nearest] - ligand_coords, dim=-1, eps=1e-8,
+        )
+        cosine = (e3_direction * poi_direction).sum(dim=-1)
+
+        bond_direction = torch.zeros_like(ligand_coords)
+        if lig_edge_index is not None and lig_edge_index.numel():
+            source, target = lig_edge_index.long()
+            bond_direction.index_add_(
+                0, source, ligand_coords[target] - ligand_coords[source],
+            )
+        bond_direction = F.normalize(bond_direction, dim=-1, eps=1e-8)
+        handedness = (
+            torch.cross(e3_direction, poi_direction, dim=-1) * bond_direction
+        ).sum(dim=-1)
+        return torch.stack((cosine, handedness), dim=-1)
+
     def forward(self, node_features: torch.Tensor, node_coords: torch.Tensor,
-                node_types: torch.Tensor, batch: torch.Tensor = None) -> torch.Tensor:
+                node_types: torch.Tensor, batch: torch.Tensor = None,
+                lig_edge_index: torch.Tensor = None) -> dict:
         if batch is None:
             batch = torch.zeros(
                 node_features.shape[0], dtype=torch.long,
@@ -488,6 +519,10 @@ class TernaryGeometryEncoder(nn.Module):
             )
             ligand_tokens = self.ligand_contact_fusion(torch.cat((
                 component_features_by_type[2], e3_contacts, pol_contacts,
+                self._ligand_direction_invariants(
+                    component_coords[0], component_coords[1],
+                    component_coords[2], lig_edge_index,
+                ),
             ), dim=-1))
             local_pair_tokens = [
                 e3_contacts.mean(dim=0),
@@ -1013,7 +1048,10 @@ class TriFuse(nn.Module):
                              Next num_conv_layers are for subgraph 2 (POI-L)
         """
         # 1. Pool the ternary graph to compact tokens
-        pooled = self.pooling(node_features, node_coords, node_types, batch)
+        pooled = self.pooling(
+            node_features, node_coords, node_types, batch,
+            lig_edge_index=lig_edge_index,
+        )
 
         # 2. Negotiate between both interfaces, linker, and the physical noise
         # state. Fourier(t) alone does not carry sigma units or solver step size.

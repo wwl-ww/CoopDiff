@@ -77,7 +77,7 @@ def build_parser():
     p.add_argument("--case", default="5T35_D_A_759",
                    help="Ternary complex case name (directory under --protac-dir)")
     p.add_argument("--trifuse-ckpt", default=None,
-                   help="Version-14 TriFuse checkpoint")
+                   help="Version-15 TriFuse checkpoint")
     p.add_argument(
         "--nan-clamp", type=float, default=100.0,
         help="Activation clamp for an explicit zero-init baseline",

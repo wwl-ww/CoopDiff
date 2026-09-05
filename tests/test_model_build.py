@@ -172,6 +172,35 @@ def test_trifuse_reads_sigma_and_solver_state():
     print("  [OK] TriFuse reads sigma and solver state")
 
 
+def test_trifuse_distinguishes_mirrored_interface_handedness():
+    """Signed local geometry distinguishes mirror images with equal distances."""
+    from tricoopdiff.trifuse import TriFuse
+
+    torch.manual_seed(23)
+    trifuse = TriFuse(
+        node_dim=32, input_dim=16, num_transformer_layers=1,
+        num_conv_layers_per_expert=2, dropout=0.0,
+    ).eval()
+    features = torch.randn(9, 16)
+    node_types = torch.tensor([0] * 3 + [1] * 3 + [2] * 3)
+    coords = torch.tensor([
+        [-2.0, 0.0, 1.0], [-2.0, 1.0, 0.0], [-2.0, -1.0, 0.0],
+        [2.0, 0.0, 1.0], [2.0, 1.0, 0.0], [2.0, -1.0, 0.0],
+        [0.0, 0.0, 0.0], [0.0, 1.0, 1.0], [0.0, 2.0, 0.5],
+    ])
+    edges = torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]])
+    base = trifuse(
+        features, coords, node_types, lig_edge_index=edges,
+    )['h_cond']
+    mirrored = coords.clone()
+    mirrored[:, 2] *= -1
+    reflected = trifuse(
+        features, mirrored, node_types, lig_edge_index=edges,
+    )['h_cond']
+    assert not torch.allclose(base, reflected, atol=1e-5)
+    print("  [OK] TriFuse distinguishes mirrored interface handedness")
+
+
 def test_film_zero_init():
     """FiLM is transparent at initialization (adaLN-Zero)."""
     from tricoopdiff.trifuse import FiLMHead
@@ -506,6 +535,7 @@ if __name__ == "__main__":
     test_trifuse_reads_geometry_and_preserves_rigid_invariance()
     test_trifuse_links_chemical_features_to_local_contacts()
     test_trifuse_reads_sigma_and_solver_state()
+    test_trifuse_distinguishes_mirrored_interface_handedness()
     test_film_zero_init()
     test_trifuse_atom_film_can_select_ligand_regions()
     test_score_control_is_identity_bounded_and_trainable()
