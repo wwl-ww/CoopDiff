@@ -438,15 +438,15 @@ def test_frozen_expert_stays_eval():
 
 
 def test_score_sanitizer_handles_infinity():
-    """Inference fallback must replace NaN and both infinities with finite values."""
+    """Inference must detect non-finite scores without hiding their values."""
     from tricoopdiff.sampler import _sanitize_score
 
     score = torch.tensor([[1.0, float("nan"), float("inf"), -float("inf")]])
     sanitized, changed = _sanitize_score(score)
     assert changed
-    assert torch.isfinite(sanitized).all()
+    assert torch.equal(torch.isfinite(sanitized), torch.isfinite(score))
 
-    print("  [OK] Score sanitizer handles infinities")
+    print("  [OK] Score guard rejects rather than sanitizes infinities")
 
 
 def test_reflect_pipeline():

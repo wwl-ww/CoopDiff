@@ -34,29 +34,19 @@ def _tensor_summary(tensor: torch.Tensor) -> dict:
 
 
 def _sanitize_score(score):
-    """
-    Replace NaN/inf entries in a score tensor with a small fraction of its mean
-    |score|, mirroring the vendored DiffDock inference fallback (``sampling.py``
-    ~L139-150). DiffDock's own loop does this because when the PROTAC drifts far
-    from the receptor the cross edges vanish and the expert emits NaN scores;
-    without the sanitize those NaNs leak into the pose via the reverse update.
+    """Detect a non-finite score without inventing a replacement value.
+
+    The historical name is retained for local callers, but sanitization is no
+    longer performed. A non-finite expert prediction invalidates the walker
+    before coordinates are updated; ``nan_to_num`` would hide an OOD state and
+    create a pose that is not sampled from the learned reverse process.
 
     Returns:
-        (sanitized_score, had_nonfinite)
+        (original_score, had_nonfinite)
     """
     if score is None or score.numel() == 0:
         return score, False
     had_nonfinite = bool(torch.isnan(score).any() or torch.isinf(score).any())
-    if had_nonfinite:
-        finite_values = score[torch.isfinite(score)].abs()
-        eps = (
-            0.01 * finite_values.mean()
-            if finite_values.numel()
-            else torch.tensor(0.01, device=score.device, dtype=score.dtype)
-        )
-        score = torch.nan_to_num(
-            score, nan=eps.item(), posinf=eps.item(), neginf=-eps.item()
-        )
     return score, had_nonfinite
 
 
@@ -291,6 +281,14 @@ def sample_single(
                 "step": i,
                 "components": sanitized_components,
             })
+            if return_trace:
+                trace.append({
+                    "stage": "rejected",
+                    "step": i,
+                    "reason": "nonfinite_score",
+                    "components": sanitized_components,
+                })
+            break
 
         add_noise = i < steps - 1  # no stochastic noise on the final step
 
@@ -396,6 +394,9 @@ def sample_single(
         "poi_coords": poi_pos[0].detach().cpu().numpy(),
         "valid": not nonfinite_score_steps,
         "nonfinite_score_steps": nonfinite_score_steps,
+        "termination_reason": (
+            "nonfinite_score" if nonfinite_score_steps else "completed"
+        ),
     }
     if return_trajectory:
         result["trajectory"] = trajectory
