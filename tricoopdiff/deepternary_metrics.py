@@ -16,6 +16,41 @@ def _records(path, kind):
     return lines, indices, coords
 
 
+def _ligand_records(path):
+    """Return a PDB-template record set for either PDB or SDF input.
+
+    Official PROTAC indexes point to ``ligand.sdf`` because that preserves bond
+    and atom ordering for DiffDock. Exact DockQ nevertheless needs a combined
+    PDB. Converting the same RDKit molecule to a PDB block preserves conformer
+    atom order, so predicted coordinates can be inserted without a second atom
+    mapping step.
+    """
+    ligand_path = Path(path)
+    if ligand_path.suffix.lower() in {".sdf", ".mol"}:
+        from rdkit import Chem
+
+        molecule = Chem.MolFromMolFile(
+            str(ligand_path), removeHs=False, sanitize=False,
+        )
+        if molecule is None:
+            raise ValueError(f"cannot parse ligand structure: {ligand_path}")
+        lines = Chem.MolToPDBBlock(molecule).splitlines()
+        indices = [
+            index for index, line in enumerate(lines)
+            if line.startswith(("ATOM", "HETATM"))
+        ]
+        coords = np.asarray([
+            [
+                float(lines[index][30:38]),
+                float(lines[index][38:46]),
+                float(lines[index][46:54]),
+            ]
+            for index in indices
+        ])
+        return lines, indices, coords
+    return _records(ligand_path, "HETATM")
+
+
 def _ca_coords(lines):
     return np.asarray([
         [float(line[30:38]), float(line[38:46]), float(line[46:54])]
@@ -65,7 +100,7 @@ def compute_fullatom_dockq(
     """Rebuild a predicted ternary PDB and call DeepTernary's ``cal_dockq``."""
     p1_lines, _, _ = _records(protein1_pdb, "ATOM")
     p2_lines, p2_indices, p2_atoms = _records(protein2_pdb, "ATOM")
-    lig_lines, lig_indices, _ = _records(ligand_pdb, "HETATM")
+    lig_lines, lig_indices, _ = _ligand_records(ligand_pdb)
     p1_ca = _ca_coords(p1_lines)
     p2_ca = _ca_coords(p2_lines)
 
