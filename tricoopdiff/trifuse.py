@@ -221,6 +221,14 @@ class TernaryGeometryEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        # The same interface projector is reused for E3-L and POI-L so their
+        # representations stay comparable while their inputs remain distinct.
+        self.interface_fusion = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 4),
+            nn.Linear(hidden_dim * 4, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
         self.fusion = nn.Sequential(
             nn.LayerNorm(hidden_dim * 7),
             nn.Linear(hidden_dim * 7, hidden_dim * 2),
@@ -289,7 +297,9 @@ class TernaryGeometryEncoder(nn.Module):
         node_coords = node_coords.to(device=node_features.device)
         features = self.feature_proj(node_features) + self.type_embedding(node_types)
 
-        outputs = []
+        global_outputs = []
+        e3l_outputs = []
+        pol_outputs = []
         n_batch = int(batch.max().item()) + 1
         for batch_index in range(n_batch):
             batch_mask = batch == batch_index
@@ -340,10 +350,22 @@ class TernaryGeometryEncoder(nn.Module):
                 *pair_descriptors, torch.stack(component_descriptors),
             ))
             geometry_token = self.geometry_net(geometry)
-            outputs.append(self.fusion(torch.cat((
+            global_outputs.append(self.fusion(torch.cat((
                 *component_tokens, *local_pair_tokens, geometry_token,
             ))))
-        return torch.stack(outputs, dim=0)
+            e3l_outputs.append(self.interface_fusion(torch.cat((
+                component_tokens[0], component_tokens[2],
+                local_pair_tokens[0], geometry_token,
+            ))))
+            pol_outputs.append(self.interface_fusion(torch.cat((
+                component_tokens[1], component_tokens[2],
+                local_pair_tokens[1], geometry_token,
+            ))))
+        return {
+            "global": torch.stack(global_outputs, dim=0),
+            "e3l": torch.stack(e3l_outputs, dim=0),
+            "pol": torch.stack(pol_outputs, dim=0),
+        }
 
 
 class ContextProcessor(nn.Module):
@@ -755,9 +777,12 @@ class TriFuse(nn.Module):
         # 1. Pool the ternary graph to compact tokens
         pooled = self.pooling(node_features, node_coords, node_types, batch)
 
-        # 2. Scalar/vector token processor for global conditioning.
-        transformer_out = self.transformer(pooled)
-        h_cond = transformer_out['combined']  # [B, node_dim]
+        # 2. Process global and interface-local tokens with shared weights. The
+        # two expert branches no longer receive an identical geometry context.
+        h_global = self.transformer(pooled['global'])['combined']
+        h_e3l = self.transformer(pooled['e3l'])['combined']
+        h_pol = self.transformer(pooled['pol'])['combined']
+        h_cond = h_global + 0.5 * (h_e3l + h_pol)
 
         # 3. Auxiliary scalar heads.
         confidence = self.judge_head(h_cond)      # [B, 1]
@@ -768,8 +793,8 @@ class TriFuse(nn.Module):
         # interface-coordinate formulation is intended to remove.
         if t_pol is None:
             t_pol = t_e3l
-        h_film_e3l = h_cond
-        h_film_pol = h_cond
+        h_film_e3l = h_global + h_e3l
+        h_film_pol = h_global + h_pol
         if t_e3l is not None:
             h_film_e3l = h_film_e3l + fourier_time_embedding(
                 t_e3l, self.node_dim // 2,
@@ -791,6 +816,8 @@ class TriFuse(nn.Module):
             'state': state,
             'film_params': film_params,  # list of (gamma, beta), len=num_conv_layers*2
             'h_cond': h_cond,
+            'h_e3l': h_e3l,
+            'h_pol': h_pol,
         }
 
 

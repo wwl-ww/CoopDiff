@@ -39,6 +39,9 @@ def test_trifuse_build():
 
     assert out['confidence'].shape == (1, 1)
     assert out['state'].shape == (1, 2)
+    assert out['h_e3l'].shape == (1, trifuse.node_dim)
+    assert out['h_pol'].shape == (1, trifuse.node_dim)
+    assert not torch.allclose(out['h_e3l'], out['h_pol'])
     assert len(out['film_params']) == 12  # 6 layers × 2 subgraphs
     for gamma, beta in out['film_params']:
         # FiLMHead outputs [B, film_dim] per (gamma, beta); film_dim defaults to

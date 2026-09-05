@@ -63,7 +63,7 @@ TriFuse 不输出 rigid score、merge gate 或 SE(3) residual。刚体动力学�
 
 ## Checkpoint 与恢复
 
-当前架构标识为 `trifuse_v5`，checkpoint version 为 8。TriFuse 额外编码至多 24 个最近邻、带端点化学特征的局部 pair tokens，因此 v7 权重不兼容。加载时必须同时验证 version、architecture、LoRA、activation clamp 和 torsion auxiliary weight；旧版本必须硬拒绝。
+当前架构标识为 `trifuse_v6`，checkpoint version 为 9。TriFuse 编码至多 24 个最近邻、带端点化学特征的局部 pair tokens，并为 E3–L 与 POI–L 产生不同的界面条件；因此旧权重不兼容。加载时必须同时验证 version、architecture、LoRA、activation clamp 和 torsion auxiliary weight；旧版本必须硬拒绝。
 
 ## 最小验收
 
