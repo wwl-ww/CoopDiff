@@ -6,7 +6,8 @@
 
 | 文档 | 用途 | 何时阅读 |
 |---|---|---|
-| [TriCoopDiff 模型交接文档.md](TriCoopDiff%20模型交接文档.md) | 模型架构、FiLM、扩散变量和训练目标 | 修改核心模型前 |
+| [TriCoopDiff 模型交接文档.md](TriCoopDiff%20模型交接文档.md) | `interface_coordinate_v1` 架构、FiLM、训练和采样 | 修改核心模型前 |
+| [双DiffDock界面协同修正方案.md](双DiffDock界面协同修正方案.md) | 双 expert 的界面职责与刚体更新顺序 | 修改坐标动力学时 |
 | [三分子初始化策略方案.md](三分子初始化策略方案.md) | `native` 与 `coupled5a` 初始化、参考系和验收 | 修改采样或初始化时 |
 | [训练入口 SLURM 与 Phase1 smoke 交接文档.md](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md) | 环境预检、SLURM、缓存和训练入口 | 提交训练前 |
 | [DiffDock 审计文档.md](DiffDock%20审计文档.md) | 冻结二体专家的结构和扩散实现 | 修改 expert 集成时 |
@@ -16,8 +17,11 @@
 
 - DeepTernary 可复现实验基线为 **mean best DockQ 0.6588**（22 cases × 40 seeds）。
 - 与 DeepTernary 横向比较时，主指标必须调用其完整原子 `DockQ/dockq_util.py::cal_dockq`；Cα 或接触恢复近似值只能作为诊断指标。
-- 零 FiLM 时，合并采用 `s_q = s_q1 + g(s_q2-s_q1)` 且 `g=0`，应退化为 E3-L expert。
-- `coupled5a` 将 POI 与 PROTAC 放在共同口袋附近；该模式在无 `NAN_CLAMP` 时通过 sub1/sub2 native-inline parity。`native` 保留用于复现 DiffDock 二体先验。
+- E3 固定；动态状态是 E3–Ligand 与 POI–Ligand 两个相对刚体界面以及共享 Ligand torsion。
+- `sub1` 直接更新 Ligand；`sub2` 保持 Ligand fixed，通过精确逆刚体组合更新 POI；torsion 取两 expert proposal 的均值。
+- TriBrain 只负责 branch-specific FiLM 和 scalar auxiliary heads，不输出 merge gate、坐标 residual 或独立 SE(3) score。
+- 训练分别对两个界面应用 native DiffDock forward noise，再重建唯一一致的全局坐标。
+- 新 checkpoint 必须是 version 4 且 `architecture=interface_coordinate_v1`；version 3 必须拒绝。
 - Phase 1 使用官方 DeepTernary MGD cluster representatives 训练，并保持 train/validation/test 三个索引互不重叠。
 
 ## 维护规则
