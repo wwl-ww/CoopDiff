@@ -270,9 +270,15 @@ def main():
     # 4. Training loop
     # ----------------------------------------------------------------
     print(f"[4/6] Training {args.epochs} epochs...")
-    best_val_loss = float('inf')
+    start_epoch = trainer.resume_epoch + 1
+    best_val_loss = trainer.resume_best_val_loss
+    if start_epoch > args.epochs:
+        raise RuntimeError(
+            f"resume checkpoint already completed epoch {trainer.resume_epoch}, "
+            f"which meets/exceeds target --epochs={args.epochs}"
+        )
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         train_losses = []
         n_skipped = 0
         t0 = time.time()
@@ -329,12 +335,16 @@ def main():
         # Save best & periodic
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            trainer.save_checkpoint(os.path.join(args.output_dir, "best_model.pt"))
+            trainer.save_checkpoint(
+                os.path.join(args.output_dir, "best_model.pt"),
+                epoch=epoch, best_val_loss=best_val_loss,
+            )
             print(f"  -> Saved best (val_loss={val_loss:.4f})")
 
         if epoch % args.save_interval == 0:
             trainer.save_checkpoint(
-                os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt")
+                os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt"),
+                epoch=epoch, best_val_loss=best_val_loss,
             )
 
     # ----------------------------------------------------------------
@@ -342,7 +352,9 @@ def main():
     # ----------------------------------------------------------------
     print("[5/6] Saving final model...")
     final_path = os.path.join(args.output_dir, "tricoopdiff_zero.pt")
-    trainer.save_checkpoint(final_path)
+    trainer.save_checkpoint(
+        final_path, epoch=args.epochs, best_val_loss=best_val_loss,
+    )
     print(f"Done. Model saved to {final_path}")
 
 

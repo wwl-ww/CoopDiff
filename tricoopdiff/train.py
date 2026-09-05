@@ -103,6 +103,8 @@ class TriCoopDiffTrainer:
         )
 
         self.global_step = 0
+        self.resume_epoch = 0
+        self.resume_best_val_loss = float('inf')
 
     def _set_lora_trainable(self, trainable: bool):
         for parameter in self._lora_params:
@@ -376,7 +378,8 @@ class TriCoopDiffTrainer:
                 "confidence/state labels and losses"
             )
 
-    def save_checkpoint(self, path: str):
+    def save_checkpoint(self, path: str, epoch: int = 0,
+                        best_val_loss: float = float('inf')):
         """Save model checkpoint.
 
         Stores TriFuse and adapter-only expert state. The frozen expert base is
@@ -398,6 +401,10 @@ class TriCoopDiffTrainer:
                 'optimizer_groups': self.optimizer_config,
             },
             'global_step': self.global_step,
+            'training_state': {
+                'epoch': int(epoch),
+                'best_val_loss': float(best_val_loss),
+            },
             'trifuse_state_dict': self.model.trifuse.state_dict(),
             'expert_lora_state_dict': lora_state,
             'expert_lora_config': getattr(
@@ -471,6 +478,11 @@ class TriCoopDiffTrainer:
                 self.model.expert, ckpt['expert_lora_state_dict'],
             )
         self.global_step = ckpt.get('global_step', 0)
+        training_state = ckpt.get('training_state', {})
+        self.resume_epoch = int(training_state.get('epoch', 0))
+        self.resume_best_val_loss = float(
+            training_state.get('best_val_loss', float('inf'))
+        )
         self._set_lora_trainable(self.global_step >= self.lora_warmup_steps)
         if 'optimizer_state_dict' in ckpt:
             self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
