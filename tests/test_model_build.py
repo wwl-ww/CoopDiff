@@ -91,6 +91,19 @@ def test_torsion_coordinator_zero_init_and_per_bond_control():
     print("  [OK] Torsion coordinator neutral initialization")
 
 
+def test_torsion_coordinator_rejects_flat_native_shape():
+    """The coordinator boundary requires an explicit batch dimension."""
+    from tricoopdiff.tribrain import TorsionCoordinator
+
+    coordinator = TorsionCoordinator(context_dim=8, hidden_dim=4)
+    try:
+        coordinator(torch.randn(1, 8), torch.randn(3), torch.randn(3))
+    except ValueError as error:
+        assert "[B,K]" in str(error)
+    else:
+        raise AssertionError("flat native torsion score must be normalized first")
+
+
 def test_diffusion_schedules():
     """Diffusion schedules produce valid noise levels."""
     from tricoopdiff.diffusion import InterfaceDiffusion, so3_score_norm
@@ -284,6 +297,7 @@ if __name__ == "__main__":
     test_tribrain_build()
     test_film_zero_init()
     test_torsion_coordinator_zero_init_and_per_bond_control()
+    test_torsion_coordinator_rejects_flat_native_shape()
     test_diffusion_schedules()
     test_graph_construction()
     test_initializer_body_frame()

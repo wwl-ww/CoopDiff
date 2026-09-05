@@ -316,6 +316,15 @@ class TriCoopDiff(nn.Module):
             scores_2['tr_score'] = scores_2['tr_score'] @ r_poi_to_e3
             scores_2['rot_score'] = scores_2['rot_score'] @ r_poi_to_e3
 
+            # Native DiffDock drops the batch dimension from torsion scores for
+            # a single graph. Restore the model-level [B,K] contract before
+            # coordination and aggregation. Besides serving the coordinator,
+            # this prevents a future B>1 loop from concatenating torsions into
+            # one flat [B*K] vector.
+            for scores in (scores_1, scores_2):
+                if scores['tor_score'].ndim == 1:
+                    scores['tor_score'] = scores['tor_score'].unsqueeze(0)
+
             # Preserve both expert fields after mapping them into the common E3
             # frame.  Downstream joint coordination must be able to distinguish
             # the two interface constraints. Both remain available to the
