@@ -63,7 +63,7 @@ TriFuse 不输出 rigid score、merge gate 或 SE(3) residual。刚体动力学�
 
 ## Checkpoint 与恢复
 
-当前架构标识为 `trifuse_v8`，checkpoint version 为 11。TriFuse 使用独立蛋白/配体编码器、ligand-centric contacts 与逐键 context；global/E3-L/POI-L/linker/noise-state tokens 通过小型 Transformer 协商，FiLM 显式区分层和分支。旧权重不兼容。
+当前架构标识为 `trifuse_v9`，checkpoint version 为 12。除 v8 的 token 协商外，每次 expert forward 会产生固定宽度的逐层 invariant telemetry；两侧 telemetry 进入逐键 torsion context，但不会形成同一步 FiLM 循环或重复 expert forward。旧权重不兼容。
 
 ## 最小验收
 

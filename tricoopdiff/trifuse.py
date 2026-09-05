@@ -12,6 +12,10 @@ import torch.nn.functional as F
 
 from .diffdock.constants import lig_feature_dims
 
+
+TELEMETRY_PER_LAYER = 8
+TELEMETRY_TAIL = 8
+
 # torch_scatter is a common dependency but may need separate install.
 # Fall back to manual scatter if unavailable.
 try:
@@ -928,6 +932,15 @@ class TriFuse(nn.Module):
             context_dim=node_dim,
         )
         self.bond_context_encoder = BondContextEncoder(node_dim)
+        telemetry_dim = (
+            num_conv_layers_per_expert * TELEMETRY_PER_LAYER + TELEMETRY_TAIL
+        )
+        self.telemetry_encoder = nn.Sequential(
+            nn.LayerNorm(telemetry_dim * 2),
+            nn.Linear(telemetry_dim * 2, node_dim * 2),
+            nn.SiLU(),
+            nn.Linear(node_dim * 2, node_dim),
+        )
 
         # FiLM: shared MLP → per-layer heads (12 heads = 6 layers × 2 subgraphs)
         self.film_shared = nn.Sequential(
@@ -1055,6 +1068,28 @@ class TriFuse(nn.Module):
             'h_state': h_state,
             'bond_context': bond_context,
         }
+
+    def condition_bonds_on_telemetry(
+        self,
+        bond_context: torch.Tensor,
+        telemetry_e3l: torch.Tensor,
+        telemetry_pol: torch.Tensor,
+    ) -> torch.Tensor:
+        """Inject compact current-step expert evidence into every bond token."""
+        if bond_context.ndim != 3:
+            raise ValueError("bond_context must have shape [B,K,D]")
+        expected = self.telemetry_encoder[0].normalized_shape[0] // 2
+        if telemetry_e3l.shape != telemetry_pol.shape:
+            raise ValueError("expert telemetry shapes differ")
+        if telemetry_e3l.shape != (bond_context.shape[0], expected):
+            raise ValueError(
+                f"telemetry must have shape [B,{expected}], got "
+                f"{tuple(telemetry_e3l.shape)}"
+            )
+        evidence = self.telemetry_encoder(torch.cat((
+            telemetry_e3l, telemetry_pol,
+        ), dim=-1))
+        return bond_context + evidence.unsqueeze(1)
 
 
 class FiLMHead(nn.Module):

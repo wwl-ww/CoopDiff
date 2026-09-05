@@ -113,6 +113,7 @@ class TriCoopDiff(nn.Module):
             'sub1': {'tr': [], 'rot': [], 'tor': []},
             'sub2': {'tr': [], 'rot': [], 'tor': []},
         }
+        all_expert_telemetry = {'sub1': [], 'sub2': []}
         all_torsion_scores = []
         all_torsion_weights = []
         all_torsion_residuals = []
@@ -273,6 +274,9 @@ class TriCoopDiff(nn.Module):
                 raw_out2 = self.expert(sub2)
                 scores_1 = {'tr_score': raw_out1[0], 'rot_score': raw_out1[1], 'tor_score': raw_out1[2]}
                 scores_2 = {'tr_score': raw_out2[0], 'rot_score': raw_out2[1], 'tor_score': raw_out2[2]}
+                telemetry_dim = self.num_conv_layers * 8 + 8
+                scores_1['telemetry'] = t_e3l.new_zeros(1, telemetry_dim)
+                scores_2['telemetry'] = t_pol.new_zeros(1, telemetry_dim)
 
             if debug_step0:
                 def _score_debug(scores):
@@ -351,6 +355,8 @@ class TriCoopDiff(nn.Module):
                 all_expert_scores['sub2'][output_name].append(
                     scores_2[score_name]
                 )
+            all_expert_telemetry['sub1'].append(scores_1['telemetry'])
+            all_expert_telemetry['sub2'].append(scores_2['telemetry'])
 
             if debug_step0:
                 self._last_step0_probe['scores_sub2_mapped'] = _score_debug(scores_2)
@@ -359,9 +365,13 @@ class TriCoopDiff(nn.Module):
             # The experts provide two interface-local opinions; TriFuse makes
             # the single executable decision for every rotatable bond.
             if scores_1['tor_score'].numel() and scores_2['tor_score'].numel():
+                bond_context = self.trifuse.condition_bonds_on_telemetry(
+                    tri_out['bond_context'], scores_1['telemetry'],
+                    scores_2['telemetry'],
+                )
                 torsion_score, torsion_weight, torsion_residual = (
                     self.trifuse.torsion_coordinator(
-                        tri_out['bond_context'],
+                        bond_context,
                         scores_1['tor_score'],
                         scores_2['tor_score'],
                     )
@@ -404,6 +414,10 @@ class TriCoopDiff(nn.Module):
             },
             'confidence': torch.cat(all_confidence, dim=0),
             'state': torch.cat(all_state, dim=0),
+            'expert_telemetry': {
+                'e3_ligand': torch.cat(all_expert_telemetry['sub1'], dim=0),
+                'poi_ligand': torch.cat(all_expert_telemetry['sub2'], dim=0),
+            },
         }
 
     def _expert_forward_with_film(
@@ -498,6 +512,7 @@ def _expert_forward_with_film(
     fallback_triggered = False
     fallback_cross_edges = 0
     fallback_cutoff_value = None
+    layer_telemetry = []
     if lr_edge_index.shape[1] == 0 and rec_node_attr.shape[0] > 1 and rec_edge_index.shape[1] > 0:
         # Zero-FiLM parity must be measured against the true vendored DiffDock
         # path. Do NOT silently expand the cross cutoff here: native sampling.py
@@ -652,9 +667,14 @@ def _expert_forward_with_film(
         # after every convolution; omitting it here meant zero-FiLM native and
         # inline forwards diverged only on the high-magnitude POI branch.
         nan_clamp = os.environ.get("NAN_CLAMP")
+        pre_clamp_fraction = node_attr.new_zeros(())
         if nan_clamp:
+            threshold = float(nan_clamp)
+            pre_clamp_fraction = (
+                node_attr.detach().abs() > threshold
+            ).to(node_attr.dtype).mean()
             node_attr = torch.clamp(
-                node_attr, min=-float(nan_clamp), max=float(nan_clamp)
+                node_attr, min=-threshold, max=threshold
             )
 
         # --- FiLM modulation (scalar block only, ligand nodes only) ---
@@ -667,6 +687,29 @@ def _expert_forward_with_film(
         node_attr = apply_film(
             node_attr, gamma, beta, node_mask=lig_mask, scalar_dim=expert.ns
         )
+
+        lig_current = node_attr[:n_lig]
+        rec_current = node_attr[n_lig:]
+        lig_scalar = lig_current[:, :model.ns]
+        lig_vector = lig_current[:, model.ns:]
+        rec_scalar = rec_current[:, :model.ns]
+
+        def _log_rms(value):
+            if value.numel() == 0:
+                return node_attr.new_zeros(())
+            return torch.log1p(torch.sqrt(value.square().mean()))
+
+        layer_telemetry.append(torch.stack((
+            torch.tanh(lig_scalar.mean() / 10.0),
+            _log_rms(lig_scalar),
+            torch.log1p(lig_scalar.abs().max()),
+            _log_rms(lig_vector),
+            (torch.log1p(lig_vector.abs().max())
+             if lig_vector.numel() else node_attr.new_zeros(())),
+            _log_rms(rec_scalar),
+            pre_clamp_fraction,
+            torch.isfinite(node_attr).to(node_attr.dtype).mean(),
+        )))
 
         if nan_trace:
             prefix = trace_prefix or "expert"
@@ -688,6 +731,20 @@ def _expert_forward_with_film(
         data, lig_node_attr, graph_sigma_emb,
         tr_sigma, rot_sigma, tor_sigma
     )
+    count_values = node_attr.new_tensor([
+        float(n_lig), float(rec_node_attr.shape[0]),
+        float(lig_edge_index.shape[1]), float(lr_edge_index.shape[1]),
+        float(rec_edge_index.shape[1]),
+    ])
+    score_norms = torch.stack([
+        torch.log1p(torch.linalg.vector_norm(scores[name]))
+        if scores[name].numel() else node_attr.new_zeros(())
+        for name in ('tr_score', 'rot_score', 'tor_score')
+    ])
+    telemetry_tail = torch.cat((torch.log1p(count_values) / 10.0, score_norms))
+    scores['telemetry'] = torch.cat((
+        torch.cat(layer_telemetry, dim=0), telemetry_tail,
+    )).unsqueeze(0)
 
     if nan_trace:
         prefix = trace_prefix or "expert"

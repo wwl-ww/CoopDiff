@@ -257,6 +257,28 @@ def test_bond_context_is_local_to_each_rotatable_bond():
     print("  [OK] Rotatable bonds receive local contexts")
 
 
+def test_expert_telemetry_conditions_bond_context():
+    """Branch activation evidence must reach the shared torsion decision."""
+    from tricoopdiff.trifuse import (
+        TELEMETRY_PER_LAYER, TELEMETRY_TAIL, TriFuse,
+    )
+
+    torch.manual_seed(17)
+    trifuse = TriFuse(
+        node_dim=32, input_dim=16, num_transformer_layers=1,
+        num_conv_layers_per_expert=2, dropout=0.0,
+    ).eval()
+    width = 2 * TELEMETRY_PER_LAYER + TELEMETRY_TAIL
+    bonds = torch.randn(1, 3, 32)
+    quiet = torch.zeros(1, width)
+    stressed = torch.ones(1, width)
+    base = trifuse.condition_bonds_on_telemetry(bonds, quiet, quiet)
+    changed = trifuse.condition_bonds_on_telemetry(bonds, stressed, quiet)
+    assert base.shape == bonds.shape
+    assert not torch.allclose(base, changed)
+    print("  [OK] Expert telemetry conditions bond contexts")
+
+
 def test_diffusion_schedules():
     """Diffusion schedules produce valid noise levels."""
     from tricoopdiff.diffusion import InterfaceDiffusion, so3_score_norm
@@ -456,6 +478,7 @@ if __name__ == "__main__":
     test_torsion_coordinator_rejects_flat_native_shape()
     test_torsion_coordinator_does_not_overflow_finite_evidence()
     test_bond_context_is_local_to_each_rotatable_bond()
+    test_expert_telemetry_conditions_bond_context()
     test_diffusion_schedules()
     test_graph_construction()
     test_initializer_body_frame()
