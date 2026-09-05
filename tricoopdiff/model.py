@@ -115,6 +115,10 @@ class TriCoopDiff(nn.Module):
         # 1-5: Iterate over batch (HeteroData subgraphs are per-complex)
         # ------------------------------------------------------------------
         all_s_q = {'tr': [], 'rot': [], 'tor': []}
+        all_expert_scores = {
+            'sub1': {'tr': [], 'rot': [], 'tor': []},
+            'sub2': {'tr': [], 'rot': [], 'tor': []},
+        }
         all_s_se3 = []
         all_s_se3_components = {'tr': [], 'rot': []}
         all_confidence = []
@@ -321,6 +325,22 @@ class TriCoopDiff(nn.Module):
             scores_2['tr_score'] = scores_2['tr_score'] @ r_poi_to_e3
             scores_2['rot_score'] = scores_2['rot_score'] @ r_poi_to_e3
 
+            # Preserve both expert fields after mapping them into the common E3
+            # frame.  Downstream joint coordination must be able to distinguish
+            # the two interface constraints; exposing only their legacy merge
+            # made the POI--Ligand evidence unavailable to the sampler and loss.
+            for score_name, output_name in (
+                ('tr_score', 'tr'),
+                ('rot_score', 'rot'),
+                ('tor_score', 'tor'),
+            ):
+                all_expert_scores['sub1'][output_name].append(
+                    scores_1[score_name]
+                )
+                all_expert_scores['sub2'][output_name].append(
+                    scores_2[score_name]
+                )
+
             # Merge scores. Default = residual-gated (transparent): s_q = s_q1 +
             # g*(s_q2 - s_q1), g from TriBrain's zero-init MergeGateHead → at init
             # s_q = s_q1 (pure E3-L). merge_direct_addition is the L0 ablation.
@@ -349,9 +369,17 @@ class TriCoopDiff(nn.Module):
         # yields [B,3]/[B,K] for both B=1 and B>1. (The previous
         # torch.stack(...).squeeze(0) left a stray [B,1,3] for B>1.)
         s_q = {k: torch.cat(v, dim=0) for k, v in all_s_q.items()}
+        expert_scores = {
+            branch: {
+                name: torch.cat(values, dim=0)
+                for name, values in branch_scores.items()
+            }
+            for branch, branch_scores in all_expert_scores.items()
+        }
 
         return {
             's_q': s_q,
+            'expert_scores': expert_scores,
             's_se3': torch.cat(all_s_se3, dim=0),
             's_se3_components': {
                 'tr': torch.cat(all_s_se3_components['tr'], dim=0),
