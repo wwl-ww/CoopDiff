@@ -3,11 +3,11 @@ TriCoopDiff: Top-level model orchestrating two-body experts and TriBrain.
 
 The forward pass at each diffusion step:
 1. Build two disconnected subgraphs (E3-L, POI-L) + full ternary graph
-2. TriBrain processes the ternary graph → FiLM params + s_SE3
+2. TriBrain processes the ternary graph → branch-specific FiLM params
 3. Two-body experts run forward with per-layer FiLM modulation
-4. Scores from two subgraphs are merged (residual-gated by default; direct-add
-   only for the L0 ablation)
-5. Output: combined PROTAC scores + E3-POI rigid body score
+4. Return both interface score fields without merging their rigid coordinates
+5. The sampler updates E3--Ligand directly and applies the inverse POI--Ligand
+   rigid update to POI
 """
 
 import torch
@@ -33,7 +33,7 @@ class TriCoopDiff(nn.Module):
     - Two frozen DiffDock experts (shared weights, two subgraphs)
     - One trainable TriBrain (~2.2M params)
     - Multi-rate diffusion process
-    - Score merging by a zero-initialized residual gate
+    - Explicit E3--Ligand and POI--Ligand interface score fields
     """
 
     def __init__(
@@ -42,7 +42,6 @@ class TriCoopDiff(nn.Module):
         tribrain: TriBrain,
         num_conv_layers: int = 11,
         use_film: bool = True,
-        use_learned_merge: bool = True,
     ):
         """
         Args:
@@ -50,17 +49,12 @@ class TriCoopDiff(nn.Module):
             tribrain: TriBrain coordination network
             num_conv_layers: number of conv layers in the expert (11 for DiffDock-L)
             use_film: if False, skip FiLM modulation (L0 ablation)
-            use_learned_merge: if True (default), merge via TriBrain's residual
-                gate ``s_q = s_q1 + g*(s_q2 - s_q1)`` (zero-init → transparent).
-                If False, fall back to ``merge_direct_addition`` (L0 ablation
-                that double-counts both subgraphs).
         """
         super().__init__()
         self.expert = frozen_expert
         self.tribrain = tribrain
         self.num_conv_layers = num_conv_layers
         self.use_film = use_film
-        self.use_learned_merge = use_learned_merge
 
         self._layer_cache = {}
 
@@ -69,8 +63,8 @@ class TriCoopDiff(nn.Module):
         e3_data: dict,
         poi_data: dict,
         ligand_data: dict,
-        t: torch.Tensor,
-        t_se3: torch.Tensor = None,
+        t_e3l: torch.Tensor,
+        t_pol: torch.Tensor = None,
         r_e3_to_poi: torch.Tensor = None,
         pocket_guide: torch.Tensor = None,
         receptor_crop_cutoff: torch.Tensor = None,
@@ -84,8 +78,9 @@ class TriCoopDiff(nn.Module):
             poi_data: dict with 'coords' [B,N_poi,3], 'features' [B,N_poi,D_rec]
             ligand_data: dict with 'coords' [B,N_lig,3], 'features' [B,N_lig,D_lig],
                          'edge_index', 'edge_attr', 'edge_mask', 'mask_rotate' (optional)
-            t: [B] diffusion time for PROTAC DOFs
-            t_se3: [B] diffusion time for SE3 DOFs (defaults to t if None)
+            t_e3l: [B] diffusion time for the E3--Ligand interface.
+            t_pol: [B] diffusion time for the POI--Ligand interface. Defaults
+                to ``t_e3l``.
             r_e3_to_poi: [B,3,3] rotation from E3 frame to POI frame. Defaults to
                 identity (backward-compatible). The sampler tracks this inverse
                 body-frame map directly so subgraph2 sees the correct
@@ -99,28 +94,25 @@ class TriCoopDiff(nn.Module):
 
         Returns:
             dict with:
-              's_q': dict with 'tr', 'rot', 'tor' PROTAC scores
-              's_se3': [B,6] E3-POI rigid body score
-              'film_params': list of FiLM params (for analysis)
+              'interface_scores': raw E3--Ligand and mapped POI--Ligand scores
+              'torsion_score': mean score for the shared Ligand torsions
               'confidence': [B,1] clash confidence
               'state': [B,2] thermodynamic state predictions
         """
-        if t_se3 is None:
-            t_se3 = t
+        if t_pol is None:
+            t_pol = t_e3l
 
-        B = t.shape[0]
-        device = t.device
+        B = t_e3l.shape[0]
+        device = t_e3l.device
 
         # ------------------------------------------------------------------
         # 1-5: Iterate over batch (HeteroData subgraphs are per-complex)
         # ------------------------------------------------------------------
-        all_s_q = {'tr': [], 'rot': [], 'tor': []}
         all_expert_scores = {
             'sub1': {'tr': [], 'rot': [], 'tor': []},
             'sub2': {'tr': [], 'rot': [], 'tor': []},
         }
-        all_s_se3 = []
-        all_s_se3_components = {'tr': [], 'rot': []}
+        all_torsion_scores = []
         all_confidence = []
         all_state = []
 
@@ -237,8 +229,8 @@ class TriCoopDiff(nn.Module):
                 node_features=tri_graph['node_features'],
                 node_coords=tri_graph['node_coords'],
                 node_types=tri_graph['node_types'],
-                t=t[b:b + 1],
-                t_se3=t_se3[b:b + 1],
+                t_e3l=t_e3l[b:b + 1],
+                t_pol=t_pol[b:b + 1],
             )
 
             film_params_b = tri_out['film_params']
@@ -254,13 +246,13 @@ class TriCoopDiff(nn.Module):
                 from .lora import set_expert_lora_branch
                 set_expert_lora_branch(self.expert, "sub1")
                 scores_1 = _expert_forward_with_film(
-                    self.expert, sub1, t[b:b+1], film_params_b[:self.num_conv_layers],
+                    self.expert, sub1, t_e3l[b:b+1], film_params_b[:self.num_conv_layers],
                     trace_prefix=f"sub1/b{b}",
                     debug_probe=sub1_probe,
                 )
                 set_expert_lora_branch(self.expert, "sub2")
                 scores_2 = _expert_forward_with_film(
-                    self.expert, sub2, t[b:b+1], film_params_b[self.num_conv_layers:],
+                    self.expert, sub2, t_pol[b:b+1], film_params_b[self.num_conv_layers:],
                     trace_prefix=f"sub2/b{b}",
                     debug_probe=sub2_probe,
                 )
@@ -312,7 +304,6 @@ class TriCoopDiff(nn.Module):
                     'sub2': sub2_probe,
                     'scores_sub1': _score_debug(scores_1),
                     'scores_sub2': _score_debug(scores_2),
-                    'merge_gate': tri_out['merge_gate'].detach().cpu().view(-1).tolist(),
                 }
 
             # --- Frame fix: rotate sub2's tr/rot scores back to E3 frame ---
@@ -341,26 +332,21 @@ class TriCoopDiff(nn.Module):
                     scores_2[score_name]
                 )
 
-            # Merge scores. Default = residual-gated (transparent): s_q = s_q1 +
-            # g*(s_q2 - s_q1), g from TriBrain's zero-init MergeGateHead → at init
-            # s_q = s_q1 (pure E3-L). merge_direct_addition is the L0 ablation.
-            if self.use_learned_merge:
-                from .merging import merge_residual_gated
-                merged = merge_residual_gated(scores_1, scores_2, tri_out['merge_gate'])
-            else:
-                from .merging import merge_direct_addition
-                merged = merge_direct_addition(scores_1, scores_2)
-
             if debug_step0:
-                self._last_step0_probe['scores_merge'] = _score_debug(merged)
+                self._last_step0_probe['scores_sub2_mapped'] = _score_debug(scores_2)
 
-            all_s_q['tr'].append(merged['tr_score'])
-            all_s_q['rot'].append(merged['rot_score'])
-            all_s_q['tor'].append(merged['tor_score'])
-
-            all_s_se3.append(tri_out['s_se3'])
-            all_s_se3_components['tr'].append(tri_out['s_se3'][:, :3])
-            all_s_se3_components['rot'].append(tri_out['s_se3'][:, 3:])
+            # Torsion is the only coordinate shared by both interface states.
+            # Averaging keeps the pretrained single-interface score scale while
+            # allowing both binding sites to constrain the linker conformation.
+            if scores_1['tor_score'].numel() and scores_2['tor_score'].numel():
+                torsion_score = 0.5 * (
+                    scores_1['tor_score'] + scores_2['tor_score']
+                )
+            elif scores_1['tor_score'].numel():
+                torsion_score = scores_1['tor_score']
+            else:
+                torsion_score = scores_2['tor_score']
+            all_torsion_scores.append(torsion_score)
             all_confidence.append(tri_out['confidence'])
             all_state.append(tri_out['state'])
 
@@ -368,7 +354,6 @@ class TriCoopDiff(nn.Module):
         # (e.g. tr/rot are [1,3], tor is [1,K]), so torch.cat along dim 0
         # yields [B,3]/[B,K] for both B=1 and B>1. (The previous
         # torch.stack(...).squeeze(0) left a stray [B,1,3] for B>1.)
-        s_q = {k: torch.cat(v, dim=0) for k, v in all_s_q.items()}
         expert_scores = {
             branch: {
                 name: torch.cat(values, dim=0)
@@ -378,13 +363,11 @@ class TriCoopDiff(nn.Module):
         }
 
         return {
-            's_q': s_q,
-            'expert_scores': expert_scores,
-            's_se3': torch.cat(all_s_se3, dim=0),
-            's_se3_components': {
-                'tr': torch.cat(all_s_se3_components['tr'], dim=0),
-                'rot': torch.cat(all_s_se3_components['rot'], dim=0),
+            'interface_scores': {
+                'e3_ligand': expert_scores['sub1'],
+                'poi_ligand': expert_scores['sub2'],
             },
+            'torsion_score': torch.cat(all_torsion_scores, dim=0),
             'confidence': torch.cat(all_confidence, dim=0),
             'state': torch.cat(all_state, dim=0),
         }

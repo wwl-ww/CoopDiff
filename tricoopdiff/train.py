@@ -1,18 +1,15 @@
 """
-Training pipeline for TriCoopDiff.
-
-Multi-task loss: score matching (L_score) + physical consistency (L_phys) + SE3 (L_se3).
+Training pipeline for interface-coordinate TriCoopDiff.
 
 Gradient flow (the two-body experts are frozen, requires_grad=False everywhere,
 so every gradient reaches TriBrain only through TriBrain's own outputs — the
 FiLM params and the SE3 head):
-  L_score → merged expert scores s_q (tr/rot/tor) → FiLM params → TriBrain
-  L_phys  → Tweedie-denoiséd PROTAC (from s_q['tr']) → FiLM params → TriBrain
-          → Tweedie-denoiséd POI (from s_se3) → TriBrain SE3 head (direct)
-  L_se3   → TriBrain SE3 head (direct)
+  L_E3L → E3--Ligand expert → branch FiLM → TriBrain
+  L_POL → POI--Ligand expert → branch FiLM → TriBrain
+  L_tor → shared linker torsion score → both expert adapters
 
 Two training phases:
-  Phase 1: Train FiLM heads + SE3 head only (freeze judge/state heads)
+  Phase 1: Train FiLM heads and expert adapters (freeze judge/state heads)
   Phase 2: Unfreeze all TriBrain heads
 
 Current implementation uses B=1 sequential optimization; batched variable-size
@@ -160,24 +157,32 @@ class TriCoopDiffTrainer:
         B = e3_data['coords'].shape[0]
         device = self.device
 
-        # Sample random diffusion times
+        # Both relative interface variables share a clock but receive
+        # independent noise draws. This matches inference while ensuring each
+        # frozen expert sees the native DiffDock forward marginal it was trained
+        # on. ``t_se3_override`` is retained as the explicit POI--Ligand clock
+        # for diagnostics; production training uses the shared clock.
         t = (t_override.to(device=device, dtype=torch.float32)
              if t_override is not None else torch.rand(B, device=device))
-        t_se3 = (t_se3_override.to(device=device, dtype=torch.float32)
+        t_pol = (t_se3_override.to(device=device, dtype=torch.float32)
                  if t_se3_override is not None else t.clone())
         if t.ndim == 0:
             t = t.expand(B)
-        if t_se3.ndim == 0:
-            t_se3 = t_se3.expand(B)
-        if t.shape != (B,) or t_se3.shape != (B,):
+        if t_pol.ndim == 0:
+            t_pol = t_pol.expand(B)
+        if t.shape != (B,) or t_pol.shape != (B,):
             raise ValueError(
-                f"t/t_se3 overrides must have shape [{B}], got "
-                f"{tuple(t.shape)} and {tuple(t_se3.shape)}"
+                f"interface time overrides must have shape [{B}], got "
+                f"{tuple(t.shape)} and {tuple(t_pol.shape)}"
             )
 
-        # Add noise to PROTAC (rigid-body tr/rot DOFs only)
-        noisy_ligand, tr_noise, rot_noise, rot_omega = self.diffusion.add_noise_protac(
-            ligand_data['coords'].to(device), t, t, t,
+        noisy_ligand, noisy_poi, interface_noise, r_e3_to_poi = (
+            self.diffusion.add_noise_interface_pair(
+                ligand_data['coords'].to(device),
+                poi_data['coords'].to(device),
+                t,
+                t_pol,
+            )
         )
         # Add torsion noise (rotatable-bond angles) — the PROTAC-specific DOF
         tor_update = None
@@ -186,31 +191,27 @@ class TriCoopDiffTrainer:
                 noisy_ligand, t,
                 ligand_data['edge_index'], ligand_data['edge_mask'], ligand_data['mask_rotate'],
             )
-        # Add noise to POI (SE3)
-        noisy_poi, se3_tr_noise, se3_rot_noise, se3_rot_omega = self.diffusion.add_noise_se3(
-            poi_data['coords'].to(device), t_se3, t_se3,
-        )
-
         # Prepare noisy batch
         noisy_e3_data = {**e3_data, 'coords': e3_data['coords'].to(device)}
         noisy_poi_data = {**poi_data, 'coords': noisy_poi}
         noisy_ligand_data = {**ligand_data, 'coords': noisy_ligand}
 
-        # Model forward. Pass the SE3 rotation applied to the POI so subgraph2
-        # (POI-L) sees the correct PROTAC-POI relative geometry: r_e3_to_poi is
-        # the inverse (= transpose) of the clean->noisy POI rotation.
         output = self.model(
-            noisy_e3_data, noisy_poi_data, noisy_ligand_data, t=t, t_se3=t_se3,
-            r_e3_to_poi=se3_rot_noise.transpose(-1, -2),
+            noisy_e3_data,
+            noisy_poi_data,
+            noisy_ligand_data,
+            t_e3l=t,
+            t_pol=t_pol,
+            r_e3_to_poi=r_e3_to_poi,
         )
 
         nonfinite_components = []
-        for name in ('tr', 'rot', 'tor'):
-            score = output['s_q'][name]
-            if score is not None and score.numel() > 0 and not torch.isfinite(score).all():
-                nonfinite_components.append(name)
-        if not torch.isfinite(output['s_se3']).all():
-            nonfinite_components.append('se3')
+        for branch, scores in output['interface_scores'].items():
+            for name, score in scores.items():
+                if score is not None and score.numel() > 0 and not torch.isfinite(score).all():
+                    nonfinite_components.append(f"{branch}.{name}")
+        if not torch.isfinite(output['torsion_score']).all():
+            nonfinite_components.append('torsion_score')
         if nonfinite_components:
             raise NonFiniteTrainingError(
                 f"case={case}: non-finite model scores: {','.join(nonfinite_components)}"
@@ -223,68 +224,69 @@ class TriCoopDiffTrainer:
         from .diffusion import so3_score_norm
 
         tr_sigma, rot_sigma, tor_sigma = self.diffusion.t_to_sigma(t, t, t)
-        tr_score_target = -tr_noise / tr_sigma.unsqueeze(-1)**2
-        diff_tr = output['s_q']['tr'] - tr_score_target
-        loss_score_tr = (diff_tr**2 * tr_sigma.unsqueeze(-1)**2).mean()
+        pol_tr_sigma, pol_rot_sigma, _ = self.diffusion.t_to_sigma(
+            t_pol, t_pol, t_pol,
+        )
+        e3l = output['interface_scores']['e3_ligand']
+        pol = output['interface_scores']['poi_ligand']
 
-        rot_score_target = self._compute_rot_score_target(rot_omega, rot_sigma)
-        rot_norm = so3_score_norm(rot_sigma).unsqueeze(-1)
-        loss_score_rot = ((output['s_q']['rot'] - rot_score_target)**2 / rot_norm**2).mean()
+        target_e3l_tr = (
+            -interface_noise['e3_ligand']['tr'] / tr_sigma.unsqueeze(-1) ** 2
+        )
+        target_e3l_rot = self._compute_rot_score_target(
+            interface_noise['e3_ligand']['rot_omega'], rot_sigma,
+        )
+        loss_e3l_tr = (
+            (e3l['tr'] - target_e3l_tr) ** 2 * tr_sigma.unsqueeze(-1) ** 2
+        ).mean()
+        loss_e3l_rot = (
+            (e3l['rot'] - target_e3l_rot) ** 2
+            / so3_score_norm(rot_sigma).unsqueeze(-1) ** 2
+        ).mean()
 
-        if tor_update is not None and output['s_q']['tor'].numel() > 0:
+        target_pol_tr_local = (
+            -interface_noise['poi_ligand']['tr_local']
+            / pol_tr_sigma.unsqueeze(-1) ** 2
+        )
+        target_pol_rot_local = self._compute_rot_score_target(
+            interface_noise['poi_ligand']['rot_omega_local'], pol_rot_sigma,
+        )
+        local_to_e3 = r_e3_to_poi.transpose(-1, -2)
+        target_pol_tr = target_pol_tr_local @ local_to_e3
+        target_pol_rot = target_pol_rot_local @ local_to_e3
+        loss_pol_tr = (
+            (pol['tr'] - target_pol_tr) ** 2
+            * pol_tr_sigma.unsqueeze(-1) ** 2
+        ).mean()
+        loss_pol_rot = (
+            (pol['rot'] - target_pol_rot) ** 2
+            / so3_score_norm(pol_rot_sigma).unsqueeze(-1) ** 2
+        ).mean()
+
+        if tor_update is not None and output['torsion_score'].numel() > 0:
             tor_score_target = self._compute_tor_score_target(tor_update, tor_sigma)
             tor_norm = self._compute_tor_score_norm(tor_sigma)  # E[score²], like so3
-            loss_score_tor = ((output['s_q']['tor'] - tor_score_target)**2 / tor_norm).mean()
+            loss_score_tor = (
+                (output['torsion_score'] - tor_score_target) ** 2 / tor_norm
+            ).mean()
         else:
             loss_score_tor = torch.tensor(0.0, device=device)
 
-        loss_score = loss_score_tr + loss_score_rot + loss_score_tor
-
-        # SE3 score matching loss — full-range (no λ_SE3 cutoff). add_noise_se3
-        # samples noise at the raw σ(t) for all t, matching reverse_step_se3, so
-        # the head is trained on the whole t ∈ [0, 1] schedule instead of only
-        # t ∈ (0.5, 1]. (The earlier λ mask left the low-t regime untrained,
-        # which inference still queried.)
-        se3_tr_sigma, se3_rot_sigma = self.diffusion.se3_t_to_sigma(t_se3, t_se3)
-        se3_tr_target = -se3_tr_noise / se3_tr_sigma.unsqueeze(-1)**2
-        diff_se3_tr = output['s_se3_components']['tr'] - se3_tr_target
-        loss_se3_tr = (diff_se3_tr**2 * se3_tr_sigma.unsqueeze(-1)**2).mean()
-
-        # SE3 rotation uses Euclidean (R³) DSM, symmetric with translation.
-        # add_noise_se3 samples ω ~ N(0, σ²I) in the unwrapped so(3) Lie algebra
-        # via sample_so3_noise, whose exact score is -ω/σ². The previous wrapped
-        # so3_score_vec target both mismatched that sampler and, combined with the
-        # 1/norm² weighting, gave translation ~14-17× more gradient than rotation
-        # — starving the rotation head at the π≈3.14 zero-model floor.
-        se3_rot_target = -se3_rot_omega / se3_rot_sigma.unsqueeze(-1)**2
-        diff_se3_rot = output['s_se3_components']['rot'] - se3_rot_target
-        loss_se3_rot = (diff_se3_rot**2 * se3_rot_sigma.unsqueeze(-1)**2).mean()
-        loss_se3 = loss_se3_tr + loss_se3_rot
-
-        # Physical consistency loss
-        denoised_ligand = self._estimate_denoised(noisy_ligand, output['s_q']['tr'], tr_sigma)
-        denoised_poi = self._estimate_denoised_se3(noisy_poi, output['s_se3'], se3_tr_sigma, se3_rot_sigma)
-        loss_phys = self._physical_loss(
-            denoised_ligand, noisy_e3_data['coords'], denoised_poi,
-            ligand_features=ligand_data.get('features'),
+        loss_score = (
+            loss_e3l_tr + loss_e3l_rot
+            + loss_pol_tr + loss_pol_rot
+            + loss_score_tor
         )
-
-        loss_total = (
-            self.loss_weights['score'] * loss_score
-            + self.loss_weights['phys'] * loss_phys
-            + self.loss_weights['se3'] * loss_se3
-        )
+        loss_total = self.loss_weights['score'] * loss_score
 
         return {
             'loss_total': loss_total,
             'loss_score': loss_score.item(),
-            'loss_score_tr': loss_score_tr.item(),
-            'loss_score_rot': loss_score_rot.item(),
+            'loss_e3l_tr': loss_e3l_tr.item(),
+            'loss_e3l_rot': loss_e3l_rot.item(),
+            'loss_pol_tr': loss_pol_tr.item(),
+            'loss_pol_rot': loss_pol_rot.item(),
             'loss_score_tor': loss_score_tor.item(),
-            'loss_se3': loss_se3.item(),
-            'loss_se3_tr': loss_se3_tr.item(),
-            'loss_se3_rot': loss_se3_rot.item(),
-            'loss_phys': loss_phys.item(),
         }
 
     def train_step(self, **batch) -> dict:
@@ -421,7 +423,7 @@ class TriCoopDiffTrainer:
         """
         Switch training phase.
 
-        Phase 1: Train FiLM heads + SE3 head only (freeze judge/state)
+        Phase 1: Train FiLM heads and expert adapters (freeze judge/state)
         Phase 2: Unfreeze all TriBrain heads
         """
         if phase == 1:
@@ -443,7 +445,8 @@ class TriCoopDiffTrainer:
         """
         from .lora import expert_lora_state_dict
         torch.save({
-            'checkpoint_version': 3,
+            'checkpoint_version': 4,
+            'architecture': 'interface_coordinate_v1',
             'global_step': self.global_step,
             'tribrain_state_dict': self.model.tribrain.state_dict(),
             'expert_lora_state_dict': expert_lora_state_dict(self.model.expert),
@@ -463,6 +466,12 @@ class TriCoopDiffTrainer:
         (weights + global step only).
         """
         ckpt = torch.load(path, map_location=self.device)
+        if ckpt.get('checkpoint_version') != 4:
+            raise ValueError(
+                "interface-coordinate training requires checkpoint_version=4"
+            )
+        if ckpt.get('architecture') != 'interface_coordinate_v1':
+            raise ValueError("checkpoint architecture is not interface_coordinate_v1")
         self.model.tribrain.load_state_dict(ckpt['tribrain_state_dict'])
         if ckpt.get('expert_lora_state_dict'):
             from .lora import load_expert_lora_state_dict

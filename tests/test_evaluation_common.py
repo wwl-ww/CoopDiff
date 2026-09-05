@@ -28,7 +28,11 @@ def test_index_entry_and_paths(tmp_path):
 
 
 def test_checkpoint_preflight_rejects_missing_lora():
-    payload = {"checkpoint_version": 3, "tribrain_state_dict": {"x": 1}}
+    payload = {
+        "checkpoint_version": 4,
+        "architecture": "interface_coordinate_v1",
+        "tribrain_state_dict": {"x": 1},
+    }
     try:
         evaluation_common.validate_checkpoint_payload(payload)
     except ValueError as error:
@@ -37,9 +41,25 @@ def test_checkpoint_preflight_rejects_missing_lora():
         raise AssertionError("checkpoint without LoRA must be rejected")
 
 
-def test_checkpoint_preflight_accepts_complete_payload():
+def test_checkpoint_preflight_rejects_legacy_architecture():
     payload = {
         "checkpoint_version": 3,
+        "tribrain_state_dict": {"x": 1},
+        "expert_lora_state_dict": {str(i): i for i in range(336)},
+        "expert_lora_config": {"rank": 4},
+    }
+    try:
+        evaluation_common.validate_checkpoint_payload(payload)
+    except ValueError as error:
+        assert "checkpoint_version=4" in str(error)
+    else:
+        raise AssertionError("legacy architecture checkpoint must be rejected")
+
+
+def test_checkpoint_preflight_accepts_complete_payload():
+    payload = {
+        "checkpoint_version": 4,
+        "architecture": "interface_coordinate_v1",
         "tribrain_state_dict": {"x": 1},
         "expert_lora_state_dict": {str(i): i for i in range(336)},
         "expert_lora_config": {"rank": 4},

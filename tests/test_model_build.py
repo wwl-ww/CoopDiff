@@ -37,7 +37,6 @@ def test_tribrain_build():
 
     out = tribrain(node_features, node_coords, node_types)
 
-    assert out['s_se3'].shape == (1, 6), f"s_se3 shape: {out['s_se3'].shape}"
     assert out['confidence'].shape == (1, 1)
     assert out['state'].shape == (1, 2)
     assert len(out['film_params']) == 12  # 6 layers × 2 subgraphs
@@ -46,7 +45,6 @@ def test_tribrain_build():
         # 48 (the expert's scalar channel count), not node_dim=128.
         assert gamma.shape == (1, tribrain.film_dim)
         assert beta.shape == (1, tribrain.film_dim)
-    assert out['merge_gate'].shape == (1, 3), f"merge_gate shape: {out['merge_gate'].shape}"
 
     # Count parameters
     n_params = sum(p.numel() for p in tribrain.parameters())
@@ -246,44 +244,6 @@ def test_reflect_pipeline():
     print("  [OK] TriReflect pipeline")
 
 
-def test_merging():
-    """Score merging: direct addition (L0 ablation) + residual-gated (default)."""
-    from tricoopdiff.merging import merge_direct_addition, merge_residual_gated
-
-    B = 4
-    scores_1 = {
-        'tr_score': torch.randn(B, 3),
-        'rot_score': torch.randn(B, 3),
-        'tor_score': torch.randn(B, 10),
-    }
-    scores_2 = {
-        'tr_score': torch.randn(B, 3),
-        'rot_score': torch.randn(B, 3),
-        'tor_score': torch.randn(B, 10),
-    }
-
-    # Direct addition (L0 ablation): s_q = s_q1 + s_q2
-    merged = merge_direct_addition(scores_1, scores_2)
-    for k in ['tr_score', 'rot_score', 'tor_score']:
-        expected = scores_1[k] + scores_2[k]
-        assert torch.allclose(merged[k], expected)
-
-    # Residual-gated merge (default). zero gate → s_q = s_q1 (transparent);
-    # unit gate → s_q = s_q2.
-    gate_zero = torch.zeros(B, 3)
-    merged_zero = merge_residual_gated(scores_1, scores_2, gate_zero)
-    assert 'merge_gates' in merged_zero
-    for k in ['tr_score', 'rot_score', 'tor_score']:
-        assert torch.allclose(merged_zero[k], scores_1[k]), k
-
-    gate_one = torch.ones(B, 3)
-    merged_one = merge_residual_gated(scores_1, scores_2, gate_one)
-    for k in ['tr_score', 'rot_score', 'tor_score']:
-        assert torch.allclose(merged_one[k], scores_2[k]), k
-
-    print("  [OK] Score merging")
-
-
 def test_deepternary_dockq_alignment():
     """Primary DockQ matches DeepTernary's ternary-coordinate convention."""
     from tricoopdiff.evaluate import compute_deepternary_dockq
@@ -318,7 +278,6 @@ if __name__ == "__main__":
     test_frozen_expert_stays_eval()
     test_score_sanitizer_handles_infinity()
     test_reflect_pipeline()
-    test_merging()
     test_deepternary_dockq_alignment()
 
     print("\n=== All tests passed ===")

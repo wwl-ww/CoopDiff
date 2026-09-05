@@ -526,8 +526,10 @@ class TriBrain(nn.Module):
     TriBrain: the coordination brain of TriCoopDiff.
 
     Takes the full ternary graph → pools to tokens → equivariant transformer →
-    produces FiLM modulation parameters for both subgraphs, SE(3) score,
-    clash confidence, and state predictions.
+    produces branch-specific FiLM modulation parameters, clash confidence,
+    and state predictions. Rigid interface scores come exclusively from the
+    two equivariant DiffDock experts; TriBrain no longer predicts an unrelated
+    Cartesian POI score.
 
     This is the ONLY trainable module. ~2.2M params in MVP configuration.
     """
@@ -582,17 +584,8 @@ class TriBrain(nn.Module):
             dropout=dropout,
         )
 
-        # Output heads
-        # The SE3 head takes h_cond + geometry embedding + diffusion-time embedding:
-        # the SE3 score target depends on BOTH t_se3 (via σ_tr/σ_rot) and the noisy
-        # coordinates (via the POI pose relative to E3). Without the geometry
-        # encoder the head is coordinate-blind and cannot regress the target.
-        self.time_freqs = 16
-        self.geo_dim = 64
-        self.geo_encoder = SE3GeometryEncoder(geo_dim=self.geo_dim)
-        self.se3_head = SE3ScoreHead(
-            hidden_dim=node_dim, in_dim=node_dim + self.geo_dim + 2 * self.time_freqs,
-        )
+        # Scalar auxiliary heads. Rigid-body vector scores must remain
+        # equivariant and are therefore supplied by the DiffDock experts.
         self.judge_head = JudgeHead(hidden_dim=node_dim)         # ~16k
         self.state_head = StateHead(hidden_dim=node_dim)         # ~16k
 
@@ -611,17 +604,14 @@ class TriBrain(nn.Module):
             FiLMHead(node_dim, film_dim) for _ in range(num_conv_layers_per_expert * 2)
         ])
 
-        # Residual merge gate: s_q = s_q1 + g * (s_q2 - s_q1), zero-init → transparent.
-        self.merge_gate_head = MergeGateHead(node_dim)
-
     def forward(
         self,
         node_features: torch.Tensor,
         node_coords: torch.Tensor,
         node_types: torch.Tensor,
         batch: torch.Tensor = None,
-        t: torch.Tensor = None,
-        t_se3: torch.Tensor = None,
+        t_e3l: torch.Tensor = None,
+        t_pol: torch.Tensor = None,
     ) -> dict:
         """
         Args:
@@ -629,18 +619,12 @@ class TriBrain(nn.Module):
             node_coords: [N_total, 3] all node coordinates
             node_types: [N_total] 0=E3, 1=POI, 2=PROTAC
             batch: [N_total] batch index
-            t: [B] PROTAC diffusion time. Conditions the FiLM / merge-gate path so
-                the coordination signal stays on the same clock as the frozen
-                DiffDock expert. If None, the FiLM path remains time-agnostic
-                (backward-compatible).
-            t_se3: [B] SE3 diffusion time (noise-schedule variable). Conditions the
-                SE3 head, whose score target is a function of σ(t_se3). If None, a
-                zero-time embedding is used (backward-compatible; SE3 head sees only
-                geometry, as before this fix).
+            t_e3l: [B] diffusion time for the E3--Ligand expert.
+            t_pol: [B] diffusion time for the POI--Ligand expert. Defaults to
+                ``t_e3l`` when both interface processes use the same schedule.
 
         Returns:
             dict with:
-              's_se3': [B, 6] E3-POI rigid body score
               'confidence': [B, 1] clash confidence
               'state': [B, 2] (ΔΔG, p_productive)
               'film_params': list of (gamma, beta) tuples, length = 2 * num_conv_layers
@@ -655,51 +639,38 @@ class TriBrain(nn.Module):
         transformer_out = self.transformer(pooled)
         h_cond = transformer_out['combined']  # [B, node_dim]
 
-        # 3. Output heads
-        # The SE3 head is conditioned on t_se3 (score target varies with σ) AND on
-        # the noisy coordinates (score target depends on the POI pose relative to
-        # E3). The FiLM / merge path is conditioned separately on the PROTAC clock
-        # `t`, matching the frozen expert's diffusion schedule; zero-FiLM parity was
-        # previously leaking when FiLM stayed time-agnostic while the expert scores
-        # changed across σ(t).
-        h_geo = self.geo_encoder(node_coords, node_types, batch)  # [B, geo_dim]
-        if t_se3 is not None:
-            t_emb = fourier_time_embedding(t_se3, self.time_freqs)  # [B, 2·n_freqs]
-        else:
-            t_emb = torch.zeros(
-                h_cond.shape[0], 2 * self.time_freqs,
-                device=h_cond.device, dtype=h_cond.dtype,
-            )
-        h_se3 = torch.cat([h_cond, h_geo, t_emb], dim=-1)  # [B, node_dim+geo_dim+2·n_freqs]
-        s_se3 = self.se3_head(h_se3)            # [B, 6]
+        # 3. Auxiliary scalar heads.
         confidence = self.judge_head(h_cond)      # [B, 1]
         state = self.state_head(h_cond)           # [B, 2]
 
-        # 4. FiLM parameters for each layer of each subgraph
-        if t is not None:
-            h_film = self.film_shared(h_cond + fourier_time_embedding(t, self.node_dim // 2))  # [B, node_dim]
-        else:
-            h_film = self.film_shared(h_cond)  # [B, node_dim]
+        # 4. Each expert is conditioned by its own interface clock. Reusing one
+        # embedding here would recreate the train/inference mismatch that the
+        # interface-coordinate formulation is intended to remove.
+        if t_pol is None:
+            t_pol = t_e3l
+        h_film_e3l = h_cond
+        h_film_pol = h_cond
+        if t_e3l is not None:
+            h_film_e3l = h_film_e3l + fourier_time_embedding(
+                t_e3l, self.node_dim // 2,
+            )
+        if t_pol is not None:
+            h_film_pol = h_film_pol + fourier_time_embedding(
+                t_pol, self.node_dim // 2,
+            )
+        h_film_e3l = self.film_shared(h_film_e3l)
+        h_film_pol = self.film_shared(h_film_pol)
         film_params = []
-        for head in self.film_heads:
+        for index, head in enumerate(self.film_heads):
+            h_film = h_film_e3l if index < self.num_conv_layers else h_film_pol
             gamma, beta = head(h_film)
             film_params.append((gamma, beta))
 
-        # 5. Residual merge gate (s_q = s_q1 + g * (s_q2 - s_q1)); zero at init.
-        # Keep it on the same PROTAC diffusion clock as the FiLM path / frozen
-        # expert. Otherwise non-zero gate motion would still be predicted from a
-        # time-agnostic token even though the two expert score fields change with
-        # σ(t), reintroducing a coordination-path parity mismatch.
-        merge_gate_h = h_cond + fourier_time_embedding(t, self.node_dim // 2) if t is not None else h_cond
-        merge_gate = self.merge_gate_head(merge_gate_h)  # [B, 3]
-
         return {
-            's_se3': s_se3,
             'confidence': confidence,
             'state': state,
             'film_params': film_params,  # list of (gamma, beta), len=num_conv_layers*2
             'h_cond': h_cond,
-            'merge_gate': merge_gate,  # [B, 3] residual gate (tr, rot, tor)
         }
 
 

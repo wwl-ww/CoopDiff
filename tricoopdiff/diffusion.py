@@ -264,6 +264,49 @@ class MultiRateDiffusion(nn.Module):
 
         return noisy_pos, tr_update, rot_update, rot_omega
 
+    def add_noise_interface_pair(
+        self,
+        ligand_pos: torch.Tensor,
+        poi_pos: torch.Tensor,
+        t_e3l: torch.Tensor,
+        t_pol: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict, torch.Tensor]:
+        """Noise two relative interface poses and reconstruct one ternary pose.
+
+        ``E3--Ligand`` and ``POI--Ligand`` are independent DiffDock forward
+        variables.  We first noise Ligand once relative to E3 and once relative
+        to the clean POI.  A rigid alignment then maps the second noisy Ligand
+        pose onto the first and applies the same transform to POI.  Consequently
+        each expert observes exactly one native DiffDock marginal, while all
+        coordinates remain in one consistent global frame.
+        """
+        noisy_ligand, tr_e3l, rot_e3l, omega_e3l = self.add_noise_protac(
+            ligand_pos, t_e3l, t_e3l, t_e3l,
+        )
+        noisy_ligand_pol, tr_pol, rot_pol, omega_pol = self.add_noise_protac(
+            ligand_pos, t_pol, t_pol, t_pol,
+        )
+        poi_to_global, poi_translation = rigid_transform_Kabsch_3D_torch_batch(
+            noisy_ligand_pol, noisy_ligand,
+        )
+        noisy_poi = (
+            torch.bmm(poi_pos, poi_to_global.transpose(-1, -2))
+            + poi_translation.transpose(-1, -2)
+        )
+        noise = {
+            "e3_ligand": {
+                "tr": tr_e3l,
+                "rot_matrix": rot_e3l,
+                "rot_omega": omega_e3l,
+            },
+            "poi_ligand": {
+                "tr_local": tr_pol,
+                "rot_matrix_local": rot_pol,
+                "rot_omega_local": omega_pol,
+            },
+        }
+        return noisy_ligand, noisy_poi, noise, poi_to_global
+
     def add_torsion_noise(
         self,
         ligand_pos: torch.Tensor,
@@ -513,6 +556,52 @@ class MultiRateDiffusion(nn.Module):
             out_pos[b] = flexible_pos[0] @ R_align[0].T + t_align[0].T
 
         return out_pos
+
+    def reverse_step_poi_ligand_interface(
+        self,
+        poi_pos: torch.Tensor,
+        ligand_pos: torch.Tensor,
+        tr_score: torch.Tensor,
+        rot_score: torch.Tensor,
+        t_tr: torch.Tensor,
+        t_rot: torch.Tensor,
+        dt_tr: torch.Tensor,
+        dt_rot: torch.Tensor,
+        add_noise: bool = True,
+        return_rotation: bool = False,
+    ):
+        """Denoise POI--Ligand pose while keeping the Ligand pose fixed.
+
+        The POI--Ligand expert predicts the rigid update that DiffDock would
+        apply to Ligand with POI fixed.  This method constructs that proposal
+        with the native DiffDock reverse step, then applies its exact inverse
+        rigid transform to POI.  The resulting relative pose is identical, but
+        the E3--Ligand pose established by the first expert is not disturbed.
+        """
+        empty_torsion = tr_score.new_zeros((tr_score.shape[0], 0))
+        proposed_ligand, _ = self.reverse_step_protac(
+            ligand_pos,
+            tr_score,
+            rot_score,
+            empty_torsion,
+            t_tr,
+            t_rot,
+            t_tr,
+            dt_tr,
+            dt_rot,
+            dt_tr,
+            add_noise=add_noise,
+        )
+        inverse_rotation, inverse_translation = (
+            rigid_transform_Kabsch_3D_torch_batch(proposed_ligand, ligand_pos)
+        )
+        updated_poi = (
+            torch.bmm(poi_pos, inverse_rotation.transpose(-1, -2))
+            + inverse_translation.transpose(-1, -2)
+        )
+        if return_rotation:
+            return updated_poi, inverse_rotation
+        return updated_poi
 
     def reverse_step_se3(
         self,

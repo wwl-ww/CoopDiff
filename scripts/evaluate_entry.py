@@ -270,9 +270,6 @@ def main():
         tribrain=tribrain,
         num_conv_layers=num_conv_layers,
         use_film=True,
-        # use_learned_merge defaults True: residual-gated merge (zero-init gate →
-        # s_q = s_q1), so the zero-FiLM baseline reproduces pure E3-L, not the
-        # double-counted s_q1 + s_q2.
     ).to(device)
     diffusion = MultiRateDiffusion()
     initializer = TernaryInitializer()

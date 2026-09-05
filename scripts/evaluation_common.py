@@ -34,8 +34,10 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=336):
     """Reject incomplete or legacy checkpoints before expensive inference."""
     if not isinstance(payload, dict):
         raise ValueError("checkpoint must contain a mapping")
-    if payload.get("checkpoint_version", 0) < 3:
-        raise ValueError("checkpoint_version must be at least 3")
+    if payload.get("checkpoint_version") != 4:
+        raise ValueError("interface-coordinate evaluation requires checkpoint_version=4")
+    if payload.get("architecture") != "interface_coordinate_v1":
+        raise ValueError("checkpoint architecture is not interface_coordinate_v1")
     if not payload.get("tribrain_state_dict"):
         raise ValueError("checkpoint has no TriBrain weights")
     lora = payload.get("expert_lora_state_dict")
