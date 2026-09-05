@@ -6,6 +6,7 @@
 
 | 文档 | 用途 | 何时阅读 |
 |---|---|---|
+| [TriCoopDiff 模型架构图.md](TriCoopDiff%20模型架构图.md) | 完整 Mermaid 模型图、模块职责与单步坐标更新 | 快速查看当前整体架构时 |
 | [TriFuse 架构与审计.md](TriFuse%20架构与审计.md) | `trifuse_v13` 数据流、参考系、训练契约与已知边界 | 快速理解或审计当前模型时 |
 | [TriCoopDiff 模型交接文档.md](TriCoopDiff%20模型交接文档.md) | `trifuse_v13` 架构、FiLM、训练和采样 | 修改核心模型前 |
 | [双DiffDock界面协同修正方案.md](双DiffDock界面协同修正方案.md) | 双 expert 的界面职责与刚体更新顺序 | 修改坐标动力学时 |
