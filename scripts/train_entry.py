@@ -2,7 +2,7 @@
 TriCoopDiff training entry point.
 
 Two-phase training:
-  Phase 1: General ternary pretraining (FiLM + SE3 heads only)
+  Phase 1: Interface score matching (branch FiLM + expert LoRA)
   Phase 2: PROTAC fine-tuning (all TriBrain heads, low LR, LoRA)
 
 Current scope: **B=1 sequential training** on real ternary complexes. The
@@ -70,7 +70,7 @@ def parse_args():
 
     # Phase
     p.add_argument("--phase", type=int, default=1, choices=[1, 2],
-                   help="1=pretrain (FiLM+SE3), 2=finetune (all heads)")
+                   help="1=interface score matching, 2=finetune auxiliary heads")
     p.add_argument("--resume", default=None, help="Resume from checkpoint")
 
     # Model config

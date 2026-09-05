@@ -1,17 +1,14 @@
 """
-TriBrain: Lightweight SE(3)-equivariant coordination network.
+TriBrain: lightweight conditioning network for two equivariant experts.
 
 The ONLY trainable module in TriCoopDiff (~2.2M params). Operates on the full
 ternary graph (E3 + POI + PROTAC, all edges including direct E3-POI).
 
-Architecture (MVP):
-  MultiScalePooling → EquivariantTransformer → Multi-Head Outputs
-  - SE3 head: predicts E3-POI rigid body score (s_SE3)
+Architecture:
+  MultiScalePooling → token processor → Multi-Head Outputs
   - FiLM heads: per-layer modulation params for two subgraphs
-  - Judge head: clash mask, confidence
+  - Judge head: confidence
   - State head: ΔΔG, productive probability
-
-Capacity upgrade path: 3-layer/32ch → 6-layer/64ch (~2.2M → ~5M params)
 """
 
 import math
