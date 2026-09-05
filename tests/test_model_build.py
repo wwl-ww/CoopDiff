@@ -139,6 +139,38 @@ def test_trifuse_links_chemical_features_to_local_contacts():
     print("  [OK] TriFuse binds chemical identity to local contacts")
 
 
+def test_trifuse_reads_sigma_and_solver_state():
+    """Equal geometry at different sigma/dt must produce different context."""
+    from tricoopdiff.trifuse import TriFuse
+
+    torch.manual_seed(13)
+    trifuse = TriFuse(
+        node_dim=32, input_dim=16, ns=8, nv=2,
+        num_transformer_layers=1,
+        num_conv_layers_per_expert=2,
+        dropout=0.0,
+    ).eval()
+    features = torch.randn(12, 16)
+    coords = torch.randn(12, 3)
+    node_types = torch.tensor([0] * 4 + [1] * 4 + [2] * 4)
+    time = torch.tensor([0.5])
+    low = torch.tensor([[-2.0, -2.0, -2.0, -2.0, -2.0,
+                         0.05, 0.05, 0.05, 0.5]])
+    high = torch.tensor([[2.0, 1.0, 2.0, 2.0, 1.0,
+                          0.10, 0.10, 0.10, 0.5]])
+    out_low = trifuse(
+        features, coords, node_types, t_e3l=time, t_pol=time,
+        diffusion_state=low,
+    )
+    out_high = trifuse(
+        features, coords, node_types, t_e3l=time, t_pol=time,
+        diffusion_state=high,
+    )
+    assert not torch.allclose(out_low['h_state'], out_high['h_state'])
+    assert not torch.allclose(out_low['h_e3l'], out_high['h_e3l'])
+    print("  [OK] TriFuse reads sigma and solver state")
+
+
 def test_film_zero_init():
     """FiLM is transparent at initialization (adaLN-Zero)."""
     from tricoopdiff.trifuse import FiLMHead
@@ -418,6 +450,7 @@ if __name__ == "__main__":
     test_trifuse_build()
     test_trifuse_reads_geometry_and_preserves_rigid_invariance()
     test_trifuse_links_chemical_features_to_local_contacts()
+    test_trifuse_reads_sigma_and_solver_state()
     test_film_zero_init()
     test_torsion_coordinator_zero_init_and_per_bond_control()
     test_torsion_coordinator_rejects_flat_native_shape()

@@ -231,6 +231,16 @@ def sample_single(
             dt_tor = t_tor.clone()
 
         tr_sigma, rot_sigma, tor_sigma = diffusion.t_to_sigma(t_tr, t_rot, t_tor)
+        pol_tr_sigma, pol_rot_sigma, _ = diffusion.t_to_sigma(
+            t_tr, t_rot, t_tor,
+        )
+        diffusion_state = torch.cat((
+            torch.log(torch.stack((
+                tr_sigma, rot_sigma, tor_sigma, pol_tr_sigma, pol_rot_sigma,
+            ), dim=-1).clamp_min(1e-8)),
+            torch.stack((dt_tr, dt_rot, dt_tor), dim=-1),
+            t_tr.unsqueeze(-1),
+        ), dim=-1)
 
         if bool(getattr(model.expert.model, "dynamic_max_cross", False)):
             receptor_crop_cutoff = tr_sigma * 3 + 20
@@ -249,6 +259,7 @@ def sample_single(
             e3_data, poi_d, lig_d, t_e3l=t_tr, t_pol=t_tr,
             r_e3_to_poi=r_e3_to_poi,
             receptor_crop_cutoff=receptor_crop_cutoff,
+            diffusion_state=diffusion_state,
         )
         if return_trace:
             step0_probe = getattr(model, '_last_step0_probe', None)

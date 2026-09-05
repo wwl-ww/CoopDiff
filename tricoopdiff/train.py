@@ -151,6 +151,19 @@ class TriCoopDiffTrainer:
         noisy_poi_data = {**poi_data, 'coords': noisy_poi}
         noisy_ligand_data = {**ligand_data, 'coords': noisy_ligand}
 
+        tr_sigma, rot_sigma, tor_sigma = self.diffusion.t_to_sigma(t, t, t)
+        pol_tr_sigma, pol_rot_sigma, _ = self.diffusion.t_to_sigma(
+            t_pol, t_pol, t_pol,
+        )
+        nominal_dt = t.new_full((B, 3), 1.0 / self.diffusion.inference_steps)
+        diffusion_state = torch.cat((
+            torch.log(torch.stack((
+                tr_sigma, rot_sigma, tor_sigma, pol_tr_sigma, pol_rot_sigma,
+            ), dim=-1).clamp_min(1e-8)),
+            nominal_dt,
+            (0.5 * (t + t_pol)).unsqueeze(-1),
+        ), dim=-1)
+
         output = self.model(
             noisy_e3_data,
             noisy_poi_data,
@@ -158,6 +171,7 @@ class TriCoopDiffTrainer:
             t_e3l=t,
             t_pol=t_pol,
             r_e3_to_poi=r_e3_to_poi,
+            diffusion_state=diffusion_state,
         )
 
         nonfinite_components = []
@@ -178,10 +192,6 @@ class TriCoopDiffTrainer:
         # Torsion: normalized by torus score_norm
         from .diffusion import so3_score_norm
 
-        tr_sigma, rot_sigma, tor_sigma = self.diffusion.t_to_sigma(t, t, t)
-        pol_tr_sigma, pol_rot_sigma, _ = self.diffusion.t_to_sigma(
-            t_pol, t_pol, t_pol,
-        )
         e3l = output['interface_scores']['e3_ligand']
         pol = output['interface_scores']['poi_ligand']
 
@@ -353,8 +363,8 @@ class TriCoopDiffTrainer:
         """
         from .lora import expert_lora_state_dict
         torch.save({
-            'checkpoint_version': 10,
-            'architecture': 'trifuse_v7',
+            'checkpoint_version': 11,
+            'architecture': 'trifuse_v8',
             'runtime_config': {
                 'activation_clamp': self.activation_clamp,
                 'torsion_expert_aux_weight': self.torsion_expert_aux_weight,
@@ -378,13 +388,13 @@ class TriCoopDiffTrainer:
         (weights + global step only).
         """
         ckpt = torch.load(path, map_location=self.device)
-        if ckpt.get('checkpoint_version') != 10:
+        if ckpt.get('checkpoint_version') != 11:
             raise ValueError(
-                "TriFuse training requires checkpoint_version=10"
+                "TriFuse training requires checkpoint_version=11"
             )
-        if ckpt.get('architecture') != 'trifuse_v7':
+        if ckpt.get('architecture') != 'trifuse_v8':
             raise ValueError(
-                "checkpoint architecture is not trifuse_v7"
+                "checkpoint architecture is not trifuse_v8"
             )
         saved_clamp = ckpt.get('runtime_config', {}).get('activation_clamp')
         if saved_clamp != self.activation_clamp:

@@ -539,6 +539,38 @@ class ContextProcessor(nn.Module):
         return {"combined": token}
 
 
+class TokenNegotiator(nn.Module):
+    """Let global, interface, linker, and diffusion-state tokens communicate."""
+
+    def __init__(self, hidden_dim: int, num_layers: int, dropout: float,
+                 num_token_types: int = 5):
+        super().__init__()
+        self.token_types = nn.Parameter(
+            torch.randn(num_token_types, hidden_dim) * 0.02
+        )
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=4,
+            dim_feedforward=hidden_dim * 2,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            layer, num_layers=num_layers,
+            norm=nn.LayerNorm(hidden_dim),
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        if tokens.ndim != 3 or tokens.shape[1] != self.token_types.shape[0]:
+            raise ValueError(
+                f"expected [B,{self.token_types.shape[0]},D] tokens, "
+                f"got {tuple(tokens.shape)}"
+            )
+        return self.encoder(tokens + self.token_types.unsqueeze(0))
+
+
 # ---------------------------------------------------------------------------
 # Equivariant Transformer
 # ---------------------------------------------------------------------------
@@ -873,12 +905,19 @@ class TriFuse(nn.Module):
             input_dim=input_dim, hidden_dim=node_dim,
         )
 
-        # The context is invariant, so process it with scalar residual blocks.
-        # Spatial vector predictions remain the responsibility of DiffDock.
-        self.transformer = ContextProcessor(
+        # Five compact invariant tokens communicate without materializing dense
+        # residue/atom attention. Spatial vector predictions remain owned by
+        # the equivariant DiffDock experts.
+        self.transformer = TokenNegotiator(
             hidden_dim=node_dim,
             num_layers=num_transformer_layers,
             dropout=dropout,
+        )
+        self.diffusion_state_encoder = nn.Sequential(
+            nn.LayerNorm(9),
+            nn.Linear(9, node_dim),
+            nn.SiLU(),
+            nn.Linear(node_dim, node_dim),
         )
 
         # Scalar auxiliary heads. Rigid-body vector scores must remain
@@ -904,6 +943,10 @@ class TriFuse(nn.Module):
         self.film_heads = nn.ModuleList([
             FiLMHead(node_dim, film_dim) for _ in range(num_conv_layers_per_expert * 2)
         ])
+        self.film_layer_embedding = nn.Embedding(
+            num_conv_layers_per_expert, node_dim,
+        )
+        self.film_branch_embedding = nn.Embedding(2, node_dim)
 
     def forward(
         self,
@@ -916,6 +959,7 @@ class TriFuse(nn.Module):
         lig_edge_index: torch.Tensor = None,
         lig_edge_mask: torch.Tensor = None,
         lig_mask_rotate=None,
+        diffusion_state: torch.Tensor = None,
     ) -> dict:
         """
         Args:
@@ -938,11 +982,25 @@ class TriFuse(nn.Module):
         # 1. Pool the ternary graph to compact tokens
         pooled = self.pooling(node_features, node_coords, node_types, batch)
 
-        # 2. Process global and interface-local tokens with shared weights. The
-        # two expert branches no longer receive an identical geometry context.
-        h_global = self.transformer(pooled['global'])['combined']
-        h_e3l = self.transformer(pooled['e3l'])['combined']
-        h_pol = self.transformer(pooled['pol'])['combined']
+        # 2. Negotiate between both interfaces, linker, and the physical noise
+        # state. Fourier(t) alone does not carry sigma units or solver step size.
+        if diffusion_state is None:
+            batch_size = pooled['global'].shape[0]
+            diffusion_state = pooled['global'].new_zeros(batch_size, 9)
+        if diffusion_state.shape != (pooled['global'].shape[0], 9):
+            raise ValueError(
+                f"diffusion_state must have shape [B,9], got {diffusion_state.shape}"
+            )
+        state_token = self.diffusion_state_encoder(diffusion_state)
+        linker_token = torch.stack([
+            tokens.mean(dim=0) for tokens in pooled['ligand_tokens']
+        ], dim=0)
+        tokens = torch.stack((
+            pooled['global'], pooled['e3l'], pooled['pol'], linker_token,
+            state_token,
+        ), dim=1)
+        negotiated = self.transformer(tokens)
+        h_global, h_e3l, h_pol, h_linker, h_state = negotiated.unbind(dim=1)
         h_cond = h_global + 0.5 * (h_e3l + h_pol)
         if len(pooled['ligand_tokens']) != 1:
             raise ValueError("TriFuse bond contexts currently require one graph")
@@ -975,7 +1033,14 @@ class TriFuse(nn.Module):
         h_film_pol = self.film_shared(h_film_pol)
         film_params = []
         for index, head in enumerate(self.film_heads):
-            h_film = h_film_e3l if index < self.num_conv_layers else h_film_pol
+            branch = 0 if index < self.num_conv_layers else 1
+            layer = index % self.num_conv_layers
+            h_film = h_film_e3l if branch == 0 else h_film_pol
+            h_film = (
+                h_film
+                + self.film_layer_embedding.weight[layer]
+                + self.film_branch_embedding.weight[branch]
+            )
             gamma, beta = head(h_film)
             film_params.append((gamma, beta))
 
@@ -986,6 +1051,8 @@ class TriFuse(nn.Module):
             'h_cond': h_cond,
             'h_e3l': h_e3l,
             'h_pol': h_pol,
+            'h_linker': h_linker,
+            'h_state': h_state,
             'bond_context': bond_context,
         }
 

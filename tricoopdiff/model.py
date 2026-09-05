@@ -68,6 +68,7 @@ class TriCoopDiff(nn.Module):
         r_e3_to_poi: torch.Tensor = None,
         pocket_guide: torch.Tensor = None,
         receptor_crop_cutoff: torch.Tensor = None,
+        diffusion_state: torch.Tensor = None,
     ) -> dict:
         """
         Single diffusion step forward pass.
@@ -237,6 +238,10 @@ class TriCoopDiff(nn.Module):
                 lig_edge_index=tri_graph['lig_edge_index'],
                 lig_edge_mask=tri_graph['lig_edge_mask'],
                 lig_mask_rotate=tri_graph['lig_mask_rotate'],
+                diffusion_state=(
+                    diffusion_state[b:b + 1]
+                    if diffusion_state is not None else None
+                ),
             )
 
             film_params_b = tri_out['film_params']
