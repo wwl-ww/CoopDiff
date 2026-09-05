@@ -24,8 +24,6 @@ export TRITON_CACHE_DIR="$RUNTIME_ROOT/triton"
 export TORCHINDUCTOR_CACHE_DIR="$RUNTIME_ROOT/torchinductor"
 export TMPDIR="$RUNTIME_ROOT/tmp"
 export TRICOOPDIFF_CACHE_DIR="$RUNTIME_ROOT/diffdock"
-export NAN_CLAMP=100
-
 python -c "import runpy; tests=runpy.run_path('tests/test_torsion_utils.py'); tests['test_modify_conformer_torsion_angles_copies_and_rotates']()"
 
 python scripts/check_phase1_readiness.py \
@@ -42,6 +40,7 @@ PYTHONUNBUFFERED=1 python scripts/train_entry.py \
     --seed 0 \
     --lr 1e-4 \
     --weight_decay 1e-4 \
+    --nan-clamp 100 \
     --phase 1 \
     --expert_model_dir checkpoints/score_model \
     --cache_dir results/featurize_cache_deepternary \

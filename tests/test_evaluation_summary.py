@@ -34,7 +34,7 @@ def test_report_reads_walker_counts_from_ensemble(tmp_path):
     path = tmp_path / "case.json"
     path.write_text(json.dumps({
         "case": "demo",
-        "run_config": {"tribrain_checkpoint": "/abs/best.pt"},
+        "run_config": {"trifuse_checkpoint": "/abs/best.pt"},
         "ensemble": {"n_valid_walkers": 31, "n_nan_walkers": 1,
                      "selection_metric": "dockq",
                      "conformational_analysis": {

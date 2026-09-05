@@ -6,7 +6,10 @@
 
 | 文档 | 用途 | 何时阅读 |
 |---|---|---|
-| [TriCoopDiff 模型交接文档.md](TriCoopDiff%20模型交接文档.md) | 模型架构、FiLM、扩散变量和训练目标 | 修改核心模型前 |
+| [TriCoopDiff 模型架构图.md](TriCoopDiff%20模型架构图.md) | 完整 Mermaid 模型图、模块职责与单步坐标更新 | 快速查看当前整体架构时 |
+| [TriFuse 架构与审计.md](TriFuse%20架构与审计.md) | `trifuse_v13` 数据流、参考系、训练契约与已知边界 | 快速理解或审计当前模型时 |
+| [TriCoopDiff 模型交接文档.md](TriCoopDiff%20模型交接文档.md) | `trifuse_v13` 架构、FiLM、训练和采样 | 修改核心模型前 |
+| [双DiffDock界面协同修正方案.md](双DiffDock界面协同修正方案.md) | 双 expert 的界面职责与刚体更新顺序 | 修改坐标动力学时 |
 | [三分子初始化策略方案.md](三分子初始化策略方案.md) | `native` 与 `coupled5a` 初始化、参考系和验收 | 修改采样或初始化时 |
 | [训练入口 SLURM 与 Phase1 smoke 交接文档.md](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md) | 环境预检、SLURM、缓存和训练入口 | 提交训练前 |
 | [DiffDock 审计文档.md](DiffDock%20审计文档.md) | 冻结二体专家的结构和扩散实现 | 修改 expert 集成时 |
@@ -16,8 +19,13 @@
 
 - DeepTernary 可复现实验基线为 **mean best DockQ 0.6588**（22 cases × 40 seeds）。
 - 与 DeepTernary 横向比较时，主指标必须调用其完整原子 `DockQ/dockq_util.py::cal_dockq`；Cα 或接触恢复近似值只能作为诊断指标。
-- 零 FiLM 时，合并采用 `s_q = s_q1 + g(s_q2-s_q1)` 且 `g=0`，应退化为 E3-L expert。
-- `coupled5a` 将 POI 与 PROTAC 放在共同口袋附近；该模式在无 `NAN_CLAMP` 时通过 sub1/sub2 native-inline parity。`native` 保留用于复现 DiffDock 二体先验。
+- E3 固定；动态状态是 E3–Ligand 与 POI–Ligand 两个相对刚体界面以及共享 Ligand torsion。
+- 两个 rigid proposal 从同一个旧 Ligand 生成；Ligand 采用 `sub1` proposal，POI 接收将 `sub2` proposal 对齐到 `sub1` proposal 的精确刚体变换。
+- TriFuse 使用组分类型、三组跨分子距离分布和接触统计，负责 branch-specific FiLM 与逐键 torsion 协调；它不输出刚体 merge gate 或独立 SE(3) score。
+- 训练分别对两个界面应用 native DiffDock forward noise，再重建唯一一致的全局坐标。
+- 新 checkpoint 必须是 version 16 且 `architecture=trifuse_v13`；旧版本必须拒绝。
+- version 16 记录 activation clamp、torsion expert 辅助损失与 LoRA warmup；训练与评估必须恢复一致配置。
+- 当前只定义 Phase 1；`judge_head/state_head` 缺少监督标签，因此保持冻结，不能用无损失的“Phase 2”假装完成微调。
 - Phase 1 使用官方 DeepTernary MGD cluster representatives 训练，并保持 train/validation/test 三个索引互不重叠。
 
 ## 维护规则

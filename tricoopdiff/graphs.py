@@ -3,7 +3,7 @@ Subgraph construction for TriCoopDiff.
 
 Two physically disconnected subgraphs (E3-L and POI-L) are constructed to match
 DiffDock's pretraining input distribution exactly (zero OOD).
-A third full ternary graph connects all three molecules for TriBrain coordination.
+A third full ternary graph connects all three molecules for TriFuse coordination.
 """
 
 import torch
@@ -134,23 +134,26 @@ def build_subgraph_pol(
     return graph
 
 
-def build_tribrain_graph(
+def build_trifuse_graph(
     e3_coords: torch.Tensor,
     e3_features: torch.Tensor,
     poi_coords: torch.Tensor,
     poi_features: torch.Tensor,
     ligand_coords: torch.Tensor,
     ligand_features: torch.Tensor,
+    lig_edge_index: torch.Tensor = None,
+    lig_edge_mask: torch.Tensor = None,
+    lig_mask_rotate=None,
 ) -> dict:
     """
-    Build the full ternary graph for TriBrain processing.
+    Build the full ternary graph for TriFuse processing.
 
-    Unlike the two subgraphs, this graph contains ALL nodes and ALL edge types:
-    E3 residues, POI residues, PROTAC atoms, plus all pairwise edges including
-    direct E3-POI protein-protein edges. This is where TriBrain learns three-body
-    coordination.
+    Unlike the two DiffDock subgraphs, this structure contains all E3 residues,
+    POI residues, and PROTAC atoms with explicit component labels. TriFuse
+    constructs invariant descriptors for all three cross-component pairs from
+    these coordinates; no dense edge tensor is materialized here.
 
-    Returns a flat dictionary (not HeteroData) for the custom TriBrain architecture.
+    Returns a flat dictionary (not HeteroData) for the custom TriFuse architecture.
 
     Args:
         e3_coords: [N_e3, 3]
@@ -190,9 +193,9 @@ def build_tribrain_graph(
 
     # Node type encoding: 0=E3, 1=POI, 2=PROTAC
     node_types = torch.cat([
-        torch.zeros(n_e3, dtype=torch.long),
-        torch.ones(n_poi, dtype=torch.long),
-        2 * torch.ones(n_lig, dtype=torch.long),
+        torch.zeros(n_e3, dtype=torch.long, device=node_coords.device),
+        torch.ones(n_poi, dtype=torch.long, device=node_coords.device),
+        2 * torch.ones(n_lig, dtype=torch.long, device=node_coords.device),
     ], dim=0)
 
     return {
@@ -202,6 +205,9 @@ def build_tribrain_graph(
         'n_e3': n_e3,
         'n_poi': n_poi,
         'n_lig': n_lig,
+        'lig_edge_index': lig_edge_index,
+        'lig_edge_mask': lig_edge_mask,
+        'lig_mask_rotate': lig_mask_rotate,
     }
 
 
@@ -304,7 +310,7 @@ def crop_receptor_to_ligand(
 
     # Align with native crop_beyond semantics: once the crop is stable, do not
     # over-prune to a single residue if the geometric cutoff happened to miss all
-    # residues at this step. The residual-gated expert already has a native-style
+    # residues at this step. The interface expert already has a native-style
     # fallback for fully empty cross graphs, so the crop should remain a genuine
     # receptor neighborhood whenever internal edges exist.
     if has_rec_graph and cropped_edge_index is not None and cropped_edge_index.shape[1] == 0 and keep_mask.sum() > 1:

@@ -12,18 +12,18 @@ import torch
 import numpy as np
 
 
-def test_tribrain_build():
-    """TriBrain builds with correct output shapes."""
-    from tricoopdiff.tribrain import TriBrain
+def test_trifuse_build():
+    """TriFuse builds with correct output shapes."""
+    from tricoopdiff.trifuse import TriFuse
 
-    tribrain = TriBrain(
+    trifuse = TriFuse(
         node_dim=128, ns=32, nv=4,
         num_transformer_layers=3,
         num_conv_layers_per_expert=6,
     )
 
     # Dummy ternary graph: 100 E3 residues + 150 POI residues + 80 PROTAC atoms
-    # TriBrain.forward expects UNBATCHED [N, ...] inputs (batch index derived
+    # TriFuse.forward expects UNBATCHED [N, ...] inputs (batch index derived
     # internally); the leading dim here was a stray batch of 1 that broke
     # per-batch softmax (result[mask] of shape [1] vs value [N]).
     N = 330
@@ -35,33 +35,175 @@ def test_tribrain_build():
         2 * torch.ones(80, dtype=torch.long),
     ])
 
-    out = tribrain(node_features, node_coords, node_types)
+    out = trifuse(node_features, node_coords, node_types)
 
-    assert out['s_se3'].shape == (1, 6), f"s_se3 shape: {out['s_se3'].shape}"
     assert out['confidence'].shape == (1, 1)
     assert out['state'].shape == (1, 2)
+    assert out['score_gains'].shape == (1, 5)
+    assert torch.allclose(out['score_gains'], torch.ones_like(out['score_gains']))
+    assert out['h_e3l'].shape == (1, trifuse.node_dim)
+    assert out['h_pol'].shape == (1, trifuse.node_dim)
+    assert not torch.allclose(out['h_e3l'], out['h_pol'])
     assert len(out['film_params']) == 12  # 6 layers × 2 subgraphs
     for gamma, beta in out['film_params']:
-        # FiLMHead outputs [B, film_dim] per (gamma, beta); film_dim defaults to
-        # 48 (the expert's scalar channel count), not node_dim=128.
-        assert gamma.shape == (1, tribrain.film_dim)
-        assert beta.shape == (1, tribrain.film_dim)
-    assert out['merge_gate'].shape == (1, 3), f"merge_gate shape: {out['merge_gate'].shape}"
+        # FiLM is specific to each ligand atom and expert layer.
+        assert gamma.shape == (80, trifuse.film_dim)
+        assert beta.shape == (80, trifuse.film_dim)
 
     # Count parameters
-    n_params = sum(p.numel() for p in tribrain.parameters())
-    print(f"  TriBrain params: {n_params:,}")
-    # Small MVP config (ns=32, nv=4, 3 transformer layers — the TriBrain defaults
-    # used by the smoke test) is ~340k params. (The ~2.2M figure in early docs
-    # assumed ns=48, nv=10.) Sanity: non-trivial but not bloated.
-    assert 200_000 < n_params < 1_000_000, f"Unexpected TriBrain params: {n_params:,}"
+    n_params = sum(p.numel() for p in trifuse.parameters())
+    print(f"  TriFuse params: {n_params:,}")
+    # The atom-contact and bond encoders intentionally increase capacity while
+    # remaining well below the 2.5M P0 budget.
+    assert 500_000 < n_params < 2_500_000, f"Unexpected TriFuse params: {n_params:,}"
 
-    print("  [OK] TriBrain build")
+    print("  [OK] TriFuse build")
+
+
+def test_trifuse_reads_geometry_and_preserves_rigid_invariance():
+    """Context changes with interfaces, not with a common rigid transform."""
+    from tricoopdiff.diffusion import so3_exp
+    from tricoopdiff.trifuse import TriFuse
+
+    torch.manual_seed(3)
+    trifuse = TriFuse(
+        node_dim=32, input_dim=16, ns=8, nv=2,
+        num_transformer_layers=1,
+        num_conv_layers_per_expert=2,
+        film_dim=4,
+        dropout=0.0,
+    ).eval()
+    features = torch.randn(15, 16)
+    coords = torch.randn(15, 3)
+    node_types = torch.tensor([0] * 5 + [1] * 6 + [2] * 4)
+    time = torch.tensor([0.4])
+
+    base = trifuse(
+        features, coords, node_types, t_e3l=time, t_pol=time,
+    )['h_cond']
+    changed_coords = coords.clone()
+    changed_coords[node_types == 1] += torch.tensor([12.0, 0.0, 0.0])
+    changed = trifuse(
+        features, changed_coords, node_types, t_e3l=time, t_pol=time,
+    )['h_cond']
+    assert not torch.allclose(base, changed, atol=1e-5)
+
+    rotation = so3_exp(torch.tensor([[0.4, -0.2, 0.3]]))[0]
+    transformed = coords @ rotation.T + torch.tensor([8.0, -4.0, 2.0])
+    rigid = trifuse(
+        features, transformed, node_types, t_e3l=time, t_pol=time,
+    )['h_cond']
+    assert torch.allclose(base, rigid, atol=2e-5), (base - rigid).abs().max()
+
+    swapped_types = node_types.clone()
+    swapped_types[node_types == 0] = 1
+    swapped_types[node_types == 1] = 0
+    swapped = trifuse(
+        features, coords, swapped_types, t_e3l=time, t_pol=time,
+    )['h_cond']
+    assert not torch.allclose(base, swapped, atol=1e-5)
+    print("  [OK] TriFuse geometry sensitivity and rigid invariance")
+
+
+def test_trifuse_links_chemical_features_to_local_contacts():
+    """Moving chemical identities between near/far atoms changes context."""
+    from tricoopdiff.trifuse import TriFuse
+
+    torch.manual_seed(7)
+    trifuse = TriFuse(
+        node_dim=32, input_dim=16, ns=8, nv=2,
+        num_transformer_layers=1,
+        num_conv_layers_per_expert=2,
+        dropout=0.0,
+    ).eval()
+    features = torch.randn(9, 16)
+    node_types = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2])
+    coords = torch.tensor([
+        [0.0, 0.0, 0.0], [8.0, 0.0, 0.0], [16.0, 0.0, 0.0],
+        [0.0, 3.0, 0.0], [8.0, 3.0, 0.0], [16.0, 3.0, 0.0],
+        [0.0, 1.0, 0.0], [8.0, 7.0, 0.0], [16.0, 12.0, 0.0],
+    ])
+    time = torch.tensor([0.3])
+    base = trifuse(features, coords, node_types, t_e3l=time, t_pol=time)[
+        'h_cond'
+    ]
+
+    # Permuting features within the Ligand preserves component-level pooling
+    # and all geometry-only descriptors, but changes which identity is at the
+    # closest E3/POI contacts.
+    permuted = features.clone()
+    permuted[6:9] = permuted[torch.tensor([8, 7, 6])]
+    changed = trifuse(
+        permuted, coords, node_types, t_e3l=time, t_pol=time,
+    )['h_cond']
+    assert not torch.allclose(base, changed, atol=1e-5)
+    print("  [OK] TriFuse binds chemical identity to local contacts")
+
+
+def test_trifuse_reads_sigma_and_solver_state():
+    """Equal geometry at different sigma/dt must produce different context."""
+    from tricoopdiff.trifuse import TriFuse
+
+    torch.manual_seed(13)
+    trifuse = TriFuse(
+        node_dim=32, input_dim=16, ns=8, nv=2,
+        num_transformer_layers=1,
+        num_conv_layers_per_expert=2,
+        dropout=0.0,
+    ).eval()
+    features = torch.randn(12, 16)
+    coords = torch.randn(12, 3)
+    node_types = torch.tensor([0] * 4 + [1] * 4 + [2] * 4)
+    time = torch.tensor([0.5])
+    low = torch.tensor([[-2.0, -2.0, -2.0, -2.0, -2.0,
+                         0.05, 0.05, 0.05, 0.5]])
+    high = torch.tensor([[2.0, 1.0, 2.0, 2.0, 1.0,
+                          0.10, 0.10, 0.10, 0.5]])
+    out_low = trifuse(
+        features, coords, node_types, t_e3l=time, t_pol=time,
+        diffusion_state=low,
+    )
+    out_high = trifuse(
+        features, coords, node_types, t_e3l=time, t_pol=time,
+        diffusion_state=high,
+    )
+    assert not torch.allclose(out_low['h_state'], out_high['h_state'])
+    assert not torch.allclose(out_low['h_e3l'], out_high['h_e3l'])
+    print("  [OK] TriFuse reads sigma and solver state")
+
+
+def test_trifuse_distinguishes_mirrored_interface_handedness():
+    """Signed local geometry distinguishes mirror images with equal distances."""
+    from tricoopdiff.trifuse import TriFuse
+
+    torch.manual_seed(23)
+    trifuse = TriFuse(
+        node_dim=32, input_dim=16, num_transformer_layers=1,
+        num_conv_layers_per_expert=2, dropout=0.0,
+    ).eval()
+    features = torch.randn(9, 16)
+    node_types = torch.tensor([0] * 3 + [1] * 3 + [2] * 3)
+    coords = torch.tensor([
+        [-2.0, 0.0, 1.0], [-2.0, 1.0, 0.0], [-2.0, -1.0, 0.0],
+        [2.0, 0.0, 1.0], [2.0, 1.0, 0.0], [2.0, -1.0, 0.0],
+        [0.0, 0.0, 0.0], [0.0, 1.0, 1.0], [0.0, 2.0, 0.5],
+    ])
+    edges = torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]])
+    base = trifuse(
+        features, coords, node_types, lig_edge_index=edges,
+    )['h_cond']
+    mirrored = coords.clone()
+    mirrored[:, 2] *= -1
+    reflected = trifuse(
+        features, mirrored, node_types, lig_edge_index=edges,
+    )['h_cond']
+    assert not torch.allclose(base, reflected, atol=1e-5)
+    print("  [OK] TriFuse distinguishes mirrored interface handedness")
 
 
 def test_film_zero_init():
     """FiLM is transparent at initialization (adaLN-Zero)."""
-    from tricoopdiff.tribrain import FiLMHead
+    from tricoopdiff.trifuse import FiLMHead
 
     head = FiLMHead(hidden_dim=64)
     h = torch.randn(2, 64)
@@ -76,23 +218,159 @@ def test_film_zero_init():
     print("  [OK] FiLM zero-init transparent")
 
 
+def test_trifuse_atom_film_can_select_ligand_regions():
+    """A trained FiLM head can assign different scalar gates per atom."""
+    from tricoopdiff.trifuse import TriFuse
+
+    torch.manual_seed(19)
+    trifuse = TriFuse(
+        node_dim=32, input_dim=16, num_transformer_layers=1,
+        num_conv_layers_per_expert=2, film_dim=8, dropout=0.0,
+    ).eval()
+    torch.nn.init.normal_(trifuse.film_heads[0].net.weight, std=0.02)
+    features = torch.randn(12, 16)
+    coords = torch.randn(12, 3)
+    node_types = torch.tensor([0] * 4 + [1] * 4 + [2] * 4)
+    gamma, _ = trifuse(features, coords, node_types)['film_params'][0]
+    assert gamma.shape == (4, 8)
+    assert not torch.allclose(gamma[0], gamma[1])
+    print("  [OK] FiLM can select individual ligand atoms")
+
+
+def test_score_control_is_identity_bounded_and_trainable():
+    """Score calibration starts exact identity and cannot reverse direction."""
+    from tricoopdiff.trifuse import ScoreControlHead
+
+    head = ScoreControlHead(hidden_dim=16, max_delta=0.25)
+    context = torch.randn(3, 16)
+    assert torch.equal(head(context), torch.ones(3, 5))
+    torch.nn.init.normal_(head.net[-1].weight)
+    gains = head(context)
+    assert bool(((gains >= 0.75) & (gains <= 1.25)).all())
+    print("  [OK] Score controls are identity-initialized and bounded")
+
+
+def test_layerwise_bridge_starts_exactly_transparent():
+    """The dual-stream bridge must not perturb native zero-init experts."""
+    from tricoopdiff.trifuse import LayerwiseExpertBridge
+
+    bridge = LayerwiseExpertBridge(
+        scalar_dim=8, hidden_dim=16, num_layers=3,
+    )
+    e3l = torch.randn(5, 8)
+    pol = torch.randn(5, 8)
+    delta_e3l, delta_pol = bridge(e3l, pol, 1)
+    for delta in (*delta_e3l, *delta_pol):
+        assert torch.equal(delta, torch.zeros_like(delta))
+    torch.nn.init.normal_(bridge.output.weight, std=0.02)
+    delta_e3l, delta_pol = bridge(e3l, pol, 1)
+    for delta in (*delta_e3l, *delta_pol):
+        assert bool((delta.abs() <= bridge.max_delta).all())
+    print("  [OK] Layerwise expert bridge is transparent and bounded")
+
+
+def test_torsion_coordinator_zero_init_and_per_bond_control():
+    """Shared torsion starts neutral but can make independent bond decisions."""
+    from tricoopdiff.trifuse import TorsionCoordinator
+
+    coordinator = TorsionCoordinator(context_dim=8, hidden_dim=4)
+    context = torch.randn(2, 8)
+    score_e3l = torch.tensor([[1.0, 4.0], [-2.0, 6.0]])
+    score_pol = torch.tensor([[3.0, -2.0], [4.0, 2.0]])
+    score, weight, residual = coordinator(context, score_e3l, score_pol)
+
+    assert torch.allclose(weight, torch.full_like(weight, 0.5))
+    assert torch.allclose(residual, torch.zeros_like(residual))
+    assert torch.allclose(score, 0.5 * (score_e3l + score_pol))
+    assert score.shape == score_e3l.shape
+    print("  [OK] Torsion coordinator neutral initialization")
+
+
+def test_torsion_coordinator_rejects_flat_native_shape():
+    """The coordinator boundary requires an explicit batch dimension."""
+    from tricoopdiff.trifuse import TorsionCoordinator
+
+    coordinator = TorsionCoordinator(context_dim=8, hidden_dim=4)
+    try:
+        coordinator(torch.randn(1, 8), torch.randn(3), torch.randn(3))
+    except ValueError as error:
+        assert "[B,K]" in str(error)
+    else:
+        raise AssertionError("flat native torsion score must be normalized first")
+
+
+def test_torsion_coordinator_does_not_overflow_finite_evidence():
+    """Finite expert scores must not overflow inside feature construction."""
+    from tricoopdiff.trifuse import TorsionCoordinator
+
+    coordinator = TorsionCoordinator(context_dim=8, hidden_dim=4).eval()
+    context = torch.zeros(1, 8)
+    score = torch.full((1, 3), 1e30)
+    coordinated, weight, residual = coordinator(context, score, score)
+    assert torch.isfinite(coordinated).all()
+    assert torch.isfinite(weight).all()
+    assert torch.isfinite(residual).all()
+
+
+def test_bond_context_is_local_to_each_rotatable_bond():
+    """Distinct endpoints/fragments must produce distinct bond contexts."""
+    from tricoopdiff.trifuse import BondContextEncoder
+
+    torch.manual_seed(11)
+    encoder = BondContextEncoder(hidden_dim=16)
+    ligand_tokens = torch.randn(5, 16)
+    ligand_coords = torch.tensor([
+        [0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [2.8, 0.3, 0.0],
+        [4.2, 0.3, 0.0], [5.6, 1.0, 0.0],
+    ])
+    edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]])
+    edge_mask = torch.tensor([False, True, True, False])
+    mask_rotate = torch.tensor([
+        [False, False, True, True, True],
+        [False, False, False, True, True],
+    ])
+    context = encoder(
+        ligand_tokens, ligand_coords, edge_index, edge_mask,
+        mask_rotate, torch.randn(1, 16),
+    )
+    assert context.shape == (1, 2, 16)
+    assert not torch.allclose(context[:, 0], context[:, 1])
+    print("  [OK] Rotatable bonds receive local contexts")
+
+
+def test_expert_telemetry_conditions_bond_context():
+    """Branch activation evidence must reach the shared torsion decision."""
+    from tricoopdiff.trifuse import (
+        TELEMETRY_PER_LAYER, TELEMETRY_TAIL, TriFuse,
+    )
+
+    torch.manual_seed(17)
+    trifuse = TriFuse(
+        node_dim=32, input_dim=16, num_transformer_layers=1,
+        num_conv_layers_per_expert=2, dropout=0.0,
+    ).eval()
+    width = 2 * TELEMETRY_PER_LAYER + TELEMETRY_TAIL
+    bonds = torch.randn(1, 3, 32)
+    quiet = torch.zeros(1, width)
+    stressed = torch.ones(1, width)
+    base = trifuse.condition_bonds_on_telemetry(bonds, quiet, quiet)
+    changed = trifuse.condition_bonds_on_telemetry(bonds, stressed, quiet)
+    assert base.shape == bonds.shape
+    assert not torch.allclose(base, changed)
+    print("  [OK] Expert telemetry conditions bond contexts")
+
+
 def test_diffusion_schedules():
     """Diffusion schedules produce valid noise levels."""
-    from tricoopdiff.diffusion import MultiRateDiffusion, so3_score_norm
+    from tricoopdiff.diffusion import InterfaceDiffusion, so3_score_norm
 
-    diffusion = MultiRateDiffusion(inference_steps=20)
+    diffusion = InterfaceDiffusion(inference_steps=20)
 
     # Test sigma schedule
     t = torch.tensor([0.0, 0.5, 1.0])
     tr, rot, tor = diffusion.t_to_sigma(t, t, t)
     assert tr[0] < tr[1] < tr[2], "Sigma should increase with t"
     assert abs(tr[0].item() - 0.1) < 0.05, f"Sigma at t=0 should be ~0.1, got {tr[0].item()}"
-
-    # Test lambda masks
-    t_high = torch.tensor([0.8])
-    t_low = torch.tensor([0.3])
-    assert diffusion.get_lambda_q(t_high).item() == 1.0
-    assert diffusion.get_lambda_q(t_low).item() == 0.0
 
     # Test SO(3) score norm
     sigma = torch.tensor([0.5, 1.0])
@@ -107,7 +385,7 @@ def test_graph_construction():
     """Subgraph construction produces valid HeteroData."""
     from tricoopdiff.graphs import (
         build_subgraph_e3l, build_subgraph_pol,
-        build_tribrain_graph, transform_ligand_to_poi_frame,
+        build_trifuse_graph, transform_ligand_to_poi_frame,
     )
 
     N_e3, N_poi, N_lig = 100, 150, 80
@@ -147,7 +425,7 @@ def test_graph_construction():
     assert torch.allclose(after, before @ rotation, atol=1e-6)
 
     # Ternary graph
-    tri = build_tribrain_graph(e3_coords, e3_feat, poi_coords, poi_feat, lig_coords, lig_feat)
+    tri = build_trifuse_graph(e3_coords, e3_feat, poi_coords, poi_feat, lig_coords, lig_feat)
     assert tri['node_coords'].shape == (N_e3 + N_poi + N_lig, 3)
     assert tri['n_e3'] == N_e3
     assert tri['n_poi'] == N_poi
@@ -208,15 +486,15 @@ def test_frozen_expert_stays_eval():
 
 
 def test_score_sanitizer_handles_infinity():
-    """Inference fallback must replace NaN and both infinities with finite values."""
+    """Inference must detect non-finite scores without hiding their values."""
     from tricoopdiff.sampler import _sanitize_score
 
     score = torch.tensor([[1.0, float("nan"), float("inf"), -float("inf")]])
     sanitized, changed = _sanitize_score(score)
     assert changed
-    assert torch.isfinite(sanitized).all()
+    assert torch.equal(torch.isfinite(sanitized), torch.isfinite(score))
 
-    print("  [OK] Score sanitizer handles infinities")
+    print("  [OK] Score guard rejects rather than sanitizes infinities")
 
 
 def test_reflect_pipeline():
@@ -246,44 +524,6 @@ def test_reflect_pipeline():
     print("  [OK] TriReflect pipeline")
 
 
-def test_merging():
-    """Score merging: direct addition (L0 ablation) + residual-gated (default)."""
-    from tricoopdiff.merging import merge_direct_addition, merge_residual_gated
-
-    B = 4
-    scores_1 = {
-        'tr_score': torch.randn(B, 3),
-        'rot_score': torch.randn(B, 3),
-        'tor_score': torch.randn(B, 10),
-    }
-    scores_2 = {
-        'tr_score': torch.randn(B, 3),
-        'rot_score': torch.randn(B, 3),
-        'tor_score': torch.randn(B, 10),
-    }
-
-    # Direct addition (L0 ablation): s_q = s_q1 + s_q2
-    merged = merge_direct_addition(scores_1, scores_2)
-    for k in ['tr_score', 'rot_score', 'tor_score']:
-        expected = scores_1[k] + scores_2[k]
-        assert torch.allclose(merged[k], expected)
-
-    # Residual-gated merge (default). zero gate → s_q = s_q1 (transparent);
-    # unit gate → s_q = s_q2.
-    gate_zero = torch.zeros(B, 3)
-    merged_zero = merge_residual_gated(scores_1, scores_2, gate_zero)
-    assert 'merge_gates' in merged_zero
-    for k in ['tr_score', 'rot_score', 'tor_score']:
-        assert torch.allclose(merged_zero[k], scores_1[k]), k
-
-    gate_one = torch.ones(B, 3)
-    merged_one = merge_residual_gated(scores_1, scores_2, gate_one)
-    for k in ['tr_score', 'rot_score', 'tor_score']:
-        assert torch.allclose(merged_one[k], scores_2[k]), k
-
-    print("  [OK] Score merging")
-
-
 def test_deepternary_dockq_alignment():
     """Primary DockQ matches DeepTernary's ternary-coordinate convention."""
     from tricoopdiff.evaluate import compute_deepternary_dockq
@@ -310,15 +550,26 @@ def test_deepternary_dockq_alignment():
 if __name__ == "__main__":
     print("=== TriCoopDiff Smoke Tests ===\n")
 
-    test_tribrain_build()
+    test_trifuse_build()
+    test_trifuse_reads_geometry_and_preserves_rigid_invariance()
+    test_trifuse_links_chemical_features_to_local_contacts()
+    test_trifuse_reads_sigma_and_solver_state()
+    test_trifuse_distinguishes_mirrored_interface_handedness()
     test_film_zero_init()
+    test_trifuse_atom_film_can_select_ligand_regions()
+    test_score_control_is_identity_bounded_and_trainable()
+    test_layerwise_bridge_starts_exactly_transparent()
+    test_torsion_coordinator_zero_init_and_per_bond_control()
+    test_torsion_coordinator_rejects_flat_native_shape()
+    test_torsion_coordinator_does_not_overflow_finite_evidence()
+    test_bond_context_is_local_to_each_rotatable_bond()
+    test_expert_telemetry_conditions_bond_context()
     test_diffusion_schedules()
     test_graph_construction()
     test_initializer_body_frame()
     test_frozen_expert_stays_eval()
     test_score_sanitizer_handles_infinity()
     test_reflect_pipeline()
-    test_merging()
     test_deepternary_dockq_alignment()
 
     print("\n=== All tests passed ===")

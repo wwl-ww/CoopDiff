@@ -1,13 +1,13 @@
 """
-TriCoopDiff: Top-level model orchestrating two-body experts and TriBrain.
+TriCoopDiff: Top-level model orchestrating two-body experts and TriFuse.
 
 The forward pass at each diffusion step:
 1. Build two disconnected subgraphs (E3-L, POI-L) + full ternary graph
-2. TriBrain processes the ternary graph → FiLM params + s_SE3
+2. TriFuse processes the ternary graph → branch-specific FiLM params
 3. Two-body experts run forward with per-layer FiLM modulation
-4. Scores from two subgraphs are merged (residual-gated by default; direct-add
-   only for the L0 ablation)
-5. Output: combined PROTAC scores + E3-POI rigid body score
+4. Return both interface score fields without merging their rigid coordinates
+5. The sampler updates E3--Ligand directly and applies the inverse POI--Ligand
+   rigid update to POI
 """
 
 import torch
@@ -16,12 +16,12 @@ import torch.nn as nn
 from .graphs import (
     build_subgraph_e3l,
     build_subgraph_pol,
-    build_tribrain_graph,
+    build_trifuse_graph,
     crop_receptor_to_ligand,
     transform_ligand_to_poi_frame,
 )
 from .expert import FrozenDiffDock
-from .tribrain import TriBrain
+from .trifuse import TriFuse
 from .film import apply_film
 
 
@@ -31,49 +31,41 @@ class TriCoopDiff(nn.Module):
 
     Components:
     - Two frozen DiffDock experts (shared weights, two subgraphs)
-    - One trainable TriBrain (~2.2M params)
+    - One trainable TriFuse interface controller
     - Multi-rate diffusion process
-    - Score merging by a zero-initialized residual gate
+    - Explicit E3--Ligand and POI--Ligand interface score fields
     """
 
     def __init__(
         self,
         frozen_expert: FrozenDiffDock,
-        tribrain: TriBrain,
+        trifuse: TriFuse,
         num_conv_layers: int = 11,
         use_film: bool = True,
-        use_learned_merge: bool = True,
     ):
         """
         Args:
             frozen_expert: FrozenDiffDock wrapping DiffDock CGModel
-            tribrain: TriBrain coordination network
+            trifuse: TriFuse coordination network
             num_conv_layers: number of conv layers in the expert (11 for DiffDock-L)
             use_film: if False, skip FiLM modulation (L0 ablation)
-            use_learned_merge: if True (default), merge via TriBrain's residual
-                gate ``s_q = s_q1 + g*(s_q2 - s_q1)`` (zero-init → transparent).
-                If False, fall back to ``merge_direct_addition`` (L0 ablation
-                that double-counts both subgraphs).
         """
         super().__init__()
         self.expert = frozen_expert
-        self.tribrain = tribrain
+        self.trifuse = trifuse
         self.num_conv_layers = num_conv_layers
         self.use_film = use_film
-        self.use_learned_merge = use_learned_merge
-
-        self._layer_cache = {}
 
     def forward(
         self,
         e3_data: dict,
         poi_data: dict,
         ligand_data: dict,
-        t: torch.Tensor,
-        t_se3: torch.Tensor = None,
+        t_e3l: torch.Tensor,
+        t_pol: torch.Tensor = None,
         r_e3_to_poi: torch.Tensor = None,
-        pocket_guide: torch.Tensor = None,
         receptor_crop_cutoff: torch.Tensor = None,
+        diffusion_state: torch.Tensor = None,
     ) -> dict:
         """
         Single diffusion step forward pass.
@@ -84,13 +76,13 @@ class TriCoopDiff(nn.Module):
             poi_data: dict with 'coords' [B,N_poi,3], 'features' [B,N_poi,D_rec]
             ligand_data: dict with 'coords' [B,N_lig,3], 'features' [B,N_lig,D_lig],
                          'edge_index', 'edge_attr', 'edge_mask', 'mask_rotate' (optional)
-            t: [B] diffusion time for PROTAC DOFs
-            t_se3: [B] diffusion time for SE3 DOFs (defaults to t if None)
+            t_e3l: [B] diffusion time for the E3--Ligand interface.
+            t_pol: [B] diffusion time for the POI--Ligand interface. Defaults
+                to ``t_e3l``.
             r_e3_to_poi: [B,3,3] rotation from E3 frame to POI frame. Defaults to
                 identity (backward-compatible). The sampler tracks this inverse
                 body-frame map directly so subgraph2 sees the correct
                 PROTAC-POI relative geometry.
-            pocket_guide: [B,3] optional pocket center for guidance potential
             receptor_crop_cutoff: [B] optional native-style receptor crop radius
                 per complex. When provided, each two-body subgraph keeps only the
                 receptor residues within this cutoff of the current ligand pose
@@ -99,26 +91,31 @@ class TriCoopDiff(nn.Module):
 
         Returns:
             dict with:
-              's_q': dict with 'tr', 'rot', 'tor' PROTAC scores
-              's_se3': [B,6] E3-POI rigid body score
-              'film_params': list of FiLM params (for analysis)
+              'interface_scores': raw E3--Ligand and mapped POI--Ligand scores
+              'torsion_score': TriFuse-coordinated shared Ligand torsion score
               'confidence': [B,1] clash confidence
               'state': [B,2] thermodynamic state predictions
         """
-        if t_se3 is None:
-            t_se3 = t
+        if t_pol is None:
+            t_pol = t_e3l
 
-        B = t.shape[0]
-        device = t.device
+        B = t_e3l.shape[0]
+        device = t_e3l.device
 
         # ------------------------------------------------------------------
         # 1-5: Iterate over batch (HeteroData subgraphs are per-complex)
         # ------------------------------------------------------------------
-        all_s_q = {'tr': [], 'rot': [], 'tor': []}
-        all_s_se3 = []
-        all_s_se3_components = {'tr': [], 'rot': []}
+        all_expert_scores = {
+            'sub1': {'tr': [], 'rot': [], 'tor': []},
+            'sub2': {'tr': [], 'rot': [], 'tor': []},
+        }
+        all_expert_telemetry = {'sub1': [], 'sub2': []}
+        all_torsion_scores = []
+        all_torsion_weights = []
+        all_torsion_residuals = []
         all_confidence = []
         all_state = []
+        all_score_gains = []
 
         for b in range(B):
             # Compute E3↔POI relative transform. `r_e3_to_poi` maps E3-frame
@@ -213,28 +210,36 @@ class TriCoopDiff(nn.Module):
                 lig_mask_rotate=ligand_data.get('mask_rotate'),
             )
 
-            # Build ternary graph for TriBrain
-            tri_graph = build_tribrain_graph(
+            # Build ternary graph for TriFuse
+            tri_graph = build_trifuse_graph(
                 e3_coords=e3_data['coords'][b],
                 e3_features=e3_data['features'][b],
                 poi_coords=poi_data['coords'][b],
                 poi_features=poi_data['features'][b],
                 ligand_coords=ligand_data['coords'][b],
                 ligand_features=ligand_data['features'][b],
+                lig_edge_index=ligand_data.get('edge_index'),
+                lig_edge_mask=ligand_data.get('edge_mask'),
+                lig_mask_rotate=ligand_data.get('mask_rotate'),
             )
 
-            # TriBrain forward (node features are 2D [N, D]; no batch dim).
-            # Use the same PROTAC diffusion clock `t` that conditions the frozen
-            # DiffDock expert so the FiLM / merge-gate path stays transparent under
-            # zero-init. Passing `t_se3` here would make FiLM params drift with the
-            # POI SE3 schedule even when the expert is evaluating the ligand branch
-            # at a different noise level, breaking the native zero-FiLM parity path.
-            tri_out = self.tribrain(
+            # TriFuse forward (node features are 2D [N, D]; no batch dim).
+            # TriFuse receives both interface clocks and builds branch-specific
+            # FiLM conditions. The experts are never conditioned with a clock
+            # belonging to a different relative pose.
+            tri_out = self.trifuse(
                 node_features=tri_graph['node_features'],
                 node_coords=tri_graph['node_coords'],
                 node_types=tri_graph['node_types'],
-                t=t[b:b + 1],
-                t_se3=t_se3[b:b + 1],
+                t_e3l=t_e3l[b:b + 1],
+                t_pol=t_pol[b:b + 1],
+                lig_edge_index=tri_graph['lig_edge_index'],
+                lig_edge_mask=tri_graph['lig_edge_mask'],
+                lig_mask_rotate=tri_graph['lig_mask_rotate'],
+                diffusion_state=(
+                    diffusion_state[b:b + 1]
+                    if diffusion_state is not None else None
+                ),
             )
 
             film_params_b = tri_out['film_params']
@@ -247,18 +252,14 @@ class TriCoopDiff(nn.Module):
             sub1_probe = {} if debug_step0 else None
             sub2_probe = {} if debug_step0 else None
             if self.use_film:
-                from .lora import set_expert_lora_branch
-                set_expert_lora_branch(self.expert, "sub1")
-                scores_1 = _expert_forward_with_film(
-                    self.expert, sub1, t[b:b+1], film_params_b[:self.num_conv_layers],
-                    trace_prefix=f"sub1/b{b}",
-                    debug_probe=sub1_probe,
-                )
-                set_expert_lora_branch(self.expert, "sub2")
-                scores_2 = _expert_forward_with_film(
-                    self.expert, sub2, t[b:b+1], film_params_b[self.num_conv_layers:],
-                    trace_prefix=f"sub2/b{b}",
-                    debug_probe=sub2_probe,
+                scores_1, scores_2 = _dual_expert_forward_with_bridge(
+                    self.expert, sub1, sub2,
+                    t_e3l[b:b + 1], t_pol[b:b + 1],
+                    film_params_b[:self.num_conv_layers],
+                    film_params_b[self.num_conv_layers:],
+                    self.trifuse.layerwise_bridge,
+                    probe_e3l=sub1_probe,
+                    probe_pol=sub2_probe,
                 )
             else:
                 # L0 ablation: no FiLM, use native expert forward
@@ -266,6 +267,9 @@ class TriCoopDiff(nn.Module):
                 raw_out2 = self.expert(sub2)
                 scores_1 = {'tr_score': raw_out1[0], 'rot_score': raw_out1[1], 'tor_score': raw_out1[2]}
                 scores_2 = {'tr_score': raw_out2[0], 'rot_score': raw_out2[1], 'tor_score': raw_out2[2]}
+                telemetry_dim = self.num_conv_layers * 8 + 8
+                scores_1['telemetry'] = t_e3l.new_zeros(1, telemetry_dim)
+                scores_2['telemetry'] = t_pol.new_zeros(1, telemetry_dim)
 
             if debug_step0:
                 def _score_debug(scores):
@@ -308,7 +312,6 @@ class TriCoopDiff(nn.Module):
                     'sub2': sub2_probe,
                     'scores_sub1': _score_debug(scores_1),
                     'scores_sub2': _score_debug(scores_2),
-                    'merge_gate': tri_out['merge_gate'].detach().cpu().view(-1).tolist(),
                 }
 
             # --- Frame fix: rotate sub2's tr/rot scores back to E3 frame ---
@@ -321,44 +324,106 @@ class TriCoopDiff(nn.Module):
             scores_2['tr_score'] = scores_2['tr_score'] @ r_poi_to_e3
             scores_2['rot_score'] = scores_2['rot_score'] @ r_poi_to_e3
 
-            # Merge scores. Default = residual-gated (transparent): s_q = s_q1 +
-            # g*(s_q2 - s_q1), g from TriBrain's zero-init MergeGateHead → at init
-            # s_q = s_q1 (pure E3-L). merge_direct_addition is the L0 ablation.
-            if self.use_learned_merge:
-                from .merging import merge_residual_gated
-                merged = merge_residual_gated(scores_1, scores_2, tri_out['merge_gate'])
-            else:
-                from .merging import merge_direct_addition
-                merged = merge_direct_addition(scores_1, scores_2)
+            # TriFuse may calibrate magnitudes but never invent a Cartesian
+            # direction. Identity-zero-init gains preserve native parity.
+            gains = tri_out['score_gains']
+            scores_1['tr_score'] = scores_1['tr_score'] * gains[:, 0:1]
+            scores_1['rot_score'] = scores_1['rot_score'] * gains[:, 1:2]
+            scores_2['tr_score'] = scores_2['tr_score'] * gains[:, 2:3]
+            scores_2['rot_score'] = scores_2['rot_score'] * gains[:, 3:4]
+
+            # Native DiffDock drops the batch dimension from torsion scores for
+            # a single graph. Restore the model-level [B,K] contract before
+            # coordination and aggregation. Besides serving the coordinator,
+            # this prevents a future B>1 loop from concatenating torsions into
+            # one flat [B*K] vector.
+            for scores in (scores_1, scores_2):
+                if scores['tor_score'].ndim == 1:
+                    scores['tor_score'] = scores['tor_score'].unsqueeze(0)
+
+            # Preserve both expert fields after mapping them into the common E3
+            # frame.  Downstream joint coordination must be able to distinguish
+            # the two interface constraints. Both remain available to the
+            # sampler and loss in a common E3 frame.
+            for score_name, output_name in (
+                ('tr_score', 'tr'),
+                ('rot_score', 'rot'),
+                ('tor_score', 'tor'),
+            ):
+                all_expert_scores['sub1'][output_name].append(
+                    scores_1[score_name]
+                )
+                all_expert_scores['sub2'][output_name].append(
+                    scores_2[score_name]
+                )
+            all_expert_telemetry['sub1'].append(scores_1['telemetry'])
+            all_expert_telemetry['sub2'].append(scores_2['telemetry'])
 
             if debug_step0:
-                self._last_step0_probe['scores_merge'] = _score_debug(merged)
+                self._last_step0_probe['scores_sub2_mapped'] = _score_debug(scores_2)
 
-            all_s_q['tr'].append(merged['tr_score'])
-            all_s_q['rot'].append(merged['rot_score'])
-            all_s_q['tor'].append(merged['tor_score'])
-
-            all_s_se3.append(tri_out['s_se3'])
-            all_s_se3_components['tr'].append(tri_out['s_se3'][:, :3])
-            all_s_se3_components['rot'].append(tri_out['s_se3'][:, 3:])
+            # Torsion is the only coordinate shared by both interface states.
+            # The experts provide two interface-local opinions; TriFuse makes
+            # the single executable decision for every rotatable bond.
+            if scores_1['tor_score'].numel() and scores_2['tor_score'].numel():
+                bond_context = self.trifuse.condition_bonds_on_telemetry(
+                    tri_out['bond_context'], scores_1['telemetry'],
+                    scores_2['telemetry'],
+                )
+                torsion_score, torsion_weight, torsion_residual = (
+                    self.trifuse.torsion_coordinator(
+                        bond_context,
+                        scores_1['tor_score'],
+                        scores_2['tor_score'],
+                    )
+                )
+            elif scores_1['tor_score'].numel():
+                torsion_score = scores_1['tor_score']
+                torsion_weight = torch.ones_like(torsion_score)
+                torsion_residual = torch.zeros_like(torsion_score)
+            else:
+                torsion_score = scores_2['tor_score']
+                torsion_weight = torch.zeros_like(torsion_score)
+                torsion_residual = torch.zeros_like(torsion_score)
+            all_torsion_scores.append(torsion_score)
+            all_torsion_weights.append(torsion_weight)
+            all_torsion_residuals.append(torsion_residual)
             all_confidence.append(tri_out['confidence'])
             all_state.append(tri_out['state'])
+            all_score_gains.append(gains)
 
         # Stack batch results. Each v[b] carries a leading batch dim of 1
         # (e.g. tr/rot are [1,3], tor is [1,K]), so torch.cat along dim 0
         # yields [B,3]/[B,K] for both B=1 and B>1. (The previous
         # torch.stack(...).squeeze(0) left a stray [B,1,3] for B>1.)
-        s_q = {k: torch.cat(v, dim=0) for k, v in all_s_q.items()}
+        expert_scores = {
+            branch: {
+                name: torch.cat(values, dim=0)
+                for name, values in branch_scores.items()
+            }
+            for branch, branch_scores in all_expert_scores.items()
+        }
 
         return {
-            's_q': s_q,
-            's_se3': torch.cat(all_s_se3, dim=0),
-            's_se3_components': {
-                'tr': torch.cat(all_s_se3_components['tr'], dim=0),
-                'rot': torch.cat(all_s_se3_components['rot'], dim=0),
+            'interface_scores': {
+                'e3_ligand': expert_scores['sub1'],
+                'poi_ligand': expert_scores['sub2'],
+            },
+            'torsion_score': (
+                torch.cat(all_torsion_scores, dim=0)
+                * torch.cat(all_score_gains, dim=0)[:, 4:5]
+            ),
+            'torsion_coordination': {
+                'e3l_weight': torch.cat(all_torsion_weights, dim=0),
+                'residual': torch.cat(all_torsion_residuals, dim=0),
             },
             'confidence': torch.cat(all_confidence, dim=0),
             'state': torch.cat(all_state, dim=0),
+            'score_gains': torch.cat(all_score_gains, dim=0),
+            'expert_telemetry': {
+                'e3_ligand': torch.cat(all_expert_telemetry['sub1'], dim=0),
+                'poi_ligand': torch.cat(all_expert_telemetry['sub2'], dim=0),
+            },
         }
 
     def _expert_forward_with_film(
@@ -370,6 +435,251 @@ class TriCoopDiff(nn.Module):
         """Method retained for backwards-compatible callers; delegates to the
         module-level `_expert_forward_with_film`."""
         return _expert_forward_with_film(self.expert, data, t, film_params)
+
+
+def _prepare_expert_stream(expert, data, t, branch, probe=None):
+    """Prepare one DiffDock stream for lock-step dual-expert execution."""
+    model = expert.model
+    from .lora import set_expert_lora_branch
+    set_expert_lora_branch(expert, branch)
+    _set_time_embeddings(data, t, model)
+    tr_sigma, rot_sigma, tor_sigma = model.t_to_sigma(
+        *[data.complex_t[name] for name in ('tr', 'rot', 'tor')]
+    )
+    (lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh,
+     lig_edge_weight, rec_node_attr, rec_edge_index, rec_edge_attr,
+     rec_edge_sh, rec_edge_weight) = model.embedding(data)
+    cross_cutoff = (
+        (tr_sigma * 3 + 20).unsqueeze(1)
+        if model.dynamic_max_cross else model.cross_max_distance
+    )
+    (lr_edge_index, lr_edge_attr_raw, lr_edge_sh, rev_lr_edge_sh,
+     lr_edge_weight) = model.build_cross_conv_graph(data, cross_cutoff)
+    lr_edge_attr = model.cross_edge_embedding(lr_edge_attr_raw)
+    node_attr = torch.cat((lig_node_attr, rec_node_attr), dim=0)
+    n_lig = len(lig_node_attr)
+    lr_edge_index = lr_edge_index.clone()
+    lr_edge_index[1] += n_lig
+    edge_index = torch.cat((
+        lig_edge_index, lr_edge_index, rec_edge_index + n_lig,
+        torch.flip(lr_edge_index, dims=(0,)),
+    ), dim=1)
+    edge_attr = torch.cat((
+        lig_edge_attr, lr_edge_attr, rec_edge_attr, lr_edge_attr,
+    ), dim=0)
+    edge_sh = torch.cat((
+        lig_edge_sh, lr_edge_sh, rec_edge_sh, rev_lr_edge_sh,
+    ), dim=0)
+    edge_weight = (
+        torch.cat((lig_edge_weight, lr_edge_weight, rec_edge_weight,
+                   lr_edge_weight), dim=0)
+        if torch.is_tensor(lig_edge_weight)
+        else torch.ones((edge_index.shape[1], 1), device=edge_index.device)
+    )
+    s1 = lig_edge_index.shape[1]
+    s2 = s1 + lr_edge_index.shape[1]
+    s3 = s2 + rec_edge_index.shape[1]
+    if probe is not None:
+        probe.update({
+            'complex_t': {
+                name: float(data.complex_t[name][0].item())
+                for name in ('tr', 'rot', 'tor')
+            },
+            'sigma': {
+                'tr': float(tr_sigma.reshape(-1)[0].item()),
+                'rot': float(rot_sigma.reshape(-1)[0].item()),
+                'tor': float(tor_sigma.reshape(-1)[0].item()),
+            },
+            'node_counts': {
+                'ligand': int(n_lig), 'receptor': int(len(rec_node_attr)),
+            },
+            'edge_counts': {
+                'ligand': int(lig_edge_index.shape[1]),
+                'cross': int(lr_edge_index.shape[1]),
+                'receptor': int(rec_edge_index.shape[1]),
+            },
+            'embedding_finite': {
+                'ligand': bool(torch.isfinite(lig_node_attr).all().item()),
+                'receptor': bool(torch.isfinite(rec_node_attr).all().item()),
+                'cross_attr': bool(torch.isfinite(lr_edge_attr).all().item()),
+            },
+            'layer_activations': [],
+        })
+    return {
+        'expert': expert, 'model': model, 'data': data, 'branch': branch,
+        'node_attr': node_attr, 'n_lig': n_lig,
+        'edge_index': edge_index, 'edge_attr': edge_attr,
+        'edge_sh': edge_sh, 'edge_weight': edge_weight,
+        's1': s1, 's2': s2, 's3': s3,
+        'tr_sigma': tr_sigma, 'rot_sigma': rot_sigma, 'tor_sigma': tor_sigma,
+        'counts': (n_lig, len(rec_node_attr), lig_edge_index.shape[1],
+                   lr_edge_index.shape[1], rec_edge_index.shape[1]),
+        'telemetry': [],
+        'probe': probe,
+    }
+
+
+def _advance_expert_stream(stream, layer_index):
+    """Run exactly one convolution and return its pre-FiLM activations."""
+    model = stream['model']
+    expert = stream['expert']
+    node_attr = stream['node_attr']
+    edge_index = stream['edge_index']
+    edge_attr = stream['edge_attr']
+    s1, s2, s3 = stream['s1'], stream['s2'], stream['s3']
+    if layer_index < len(model.conv_layers) - 1:
+        edge_attr_layer = torch.cat((
+            edge_attr, node_attr[edge_index[0], :model.ns],
+            node_attr[edge_index[1], :model.ns],
+        ), dim=-1)
+        layer_edge_index = edge_index
+        layer_edge_sh = stream['edge_sh']
+        layer_edge_weight = stream['edge_weight']
+        if model.differentiate_convolutions:
+            edge_attr_layer = [
+                edge_attr_layer[:s1], edge_attr_layer[s1:s2],
+                edge_attr_layer[s2:s3], edge_attr_layer[s3:],
+            ]
+    else:
+        edge_attr_layer = torch.cat((
+            edge_attr[:s2], node_attr[edge_index[0, :s2], :model.ns],
+            node_attr[edge_index[1, :s2], :model.ns],
+        ), dim=-1)
+        layer_edge_index = edge_index[:, :s2]
+        layer_edge_sh = stream['edge_sh'][:s2]
+        layer_edge_weight = stream['edge_weight'][:s2]
+        if model.differentiate_convolutions:
+            edge_attr_layer = [edge_attr_layer[:s1], edge_attr_layer[s1:s2]]
+
+    layer = model.conv_layers[layer_index]
+    if bool(getattr(expert, 'lora_enabled', False)) and torch.is_grad_enabled():
+        from torch.utils.checkpoint import checkpoint
+
+        def forward(node_attr_input):
+            from .lora import set_expert_lora_branch
+            set_expert_lora_branch(expert, stream['branch'])
+            return layer(
+                node_attr_input, layer_edge_index, edge_attr_layer,
+                layer_edge_sh, edge_weight=layer_edge_weight,
+            )
+        node_attr = checkpoint(forward, node_attr, use_reentrant=False)
+    else:
+        from .lora import set_expert_lora_branch
+        set_expert_lora_branch(expert, stream['branch'])
+        node_attr = layer(
+            node_attr, layer_edge_index, edge_attr_layer, layer_edge_sh,
+            edge_weight=layer_edge_weight,
+        )
+    stream['node_attr'] = node_attr
+    return node_attr
+
+
+def _film_and_record_stream(stream, gamma, beta):
+    """Apply native clamp + scalar FiLM and append invariant telemetry."""
+    import os
+    node_attr = stream['node_attr']
+    model = stream['model']
+    n_lig = stream['n_lig']
+    clamp_fraction = node_attr.new_zeros(())
+    nan_clamp = os.environ.get('NAN_CLAMP')
+    if nan_clamp:
+        threshold = float(nan_clamp)
+        clamp_fraction = (
+            node_attr.detach().abs() > threshold
+        ).to(node_attr.dtype).mean()
+        node_attr = node_attr.clamp(-threshold, threshold)
+    ligand_mask = torch.zeros(
+        node_attr.shape[0], dtype=torch.bool, device=node_attr.device,
+    )
+    ligand_mask[:n_lig] = True
+    node_attr = apply_film(
+        node_attr, gamma, beta, node_mask=ligand_mask,
+        scalar_dim=model.ns,
+    )
+    stream['node_attr'] = node_attr
+    ligand = node_attr[:n_lig]
+    receptor = node_attr[n_lig:]
+    lig_scalar = ligand[:, :model.ns]
+    lig_vector = ligand[:, model.ns:]
+    rec_scalar = receptor[:, :model.ns]
+
+    def log_rms(value):
+        return (torch.log1p(torch.sqrt(value.square().mean()))
+                if value.numel() else node_attr.new_zeros(()))
+
+    stream['telemetry'].append(torch.stack((
+        torch.tanh(lig_scalar.mean() / 10.0), log_rms(lig_scalar),
+        torch.log1p(lig_scalar.abs().max()), log_rms(lig_vector),
+        (torch.log1p(lig_vector.abs().max()) if lig_vector.numel()
+         else node_attr.new_zeros(())),
+        log_rms(rec_scalar), clamp_fraction,
+        torch.isfinite(node_attr).to(node_attr.dtype).mean(),
+    )))
+    if stream['probe'] is not None:
+        stream['probe']['layer_activations'].append({
+            'layer': len(stream['telemetry']) - 1,
+            'finite': bool(torch.isfinite(node_attr).all().item()),
+            'absmax': float(
+                torch.nan_to_num(node_attr.detach()).abs().max().item()
+            ),
+            'ligand_absmax': float(
+                torch.nan_to_num(ligand.detach()).abs().max().item()
+            ),
+            'clamp_fraction': float(clamp_fraction.detach().item()),
+        })
+
+
+def _finish_expert_stream(stream):
+    model = stream['model']
+    n_lig = stream['n_lig']
+    ligand_attr = stream['node_attr'][:n_lig]
+    graph_sigma_emb = model.timestep_emb_func(stream['data'].complex_t['tr'])
+    scores = stream['expert'].compute_scores(
+        stream['data'], ligand_attr, graph_sigma_emb,
+        stream['tr_sigma'], stream['rot_sigma'], stream['tor_sigma'],
+    )
+    count_values = ligand_attr.new_tensor([float(value) for value in stream['counts']])
+    score_norms = torch.stack([
+        torch.log1p(torch.linalg.vector_norm(scores[name]))
+        if scores[name].numel() else ligand_attr.new_zeros(())
+        for name in ('tr_score', 'rot_score', 'tor_score')
+    ])
+    scores['telemetry'] = torch.cat((
+        torch.cat(stream['telemetry'], dim=0),
+        torch.log1p(count_values) / 10.0, score_norms,
+    )).unsqueeze(0)
+    return scores
+
+
+def _dual_expert_forward_with_bridge(
+    expert, data_e3l, data_pol, t_e3l, t_pol,
+    film_e3l, film_pol, bridge, probe_e3l=None, probe_pol=None,
+):
+    """Run two experts in Jacobi lock-step with exactly two conv calls/layer."""
+    e3l = _prepare_expert_stream(
+        expert, data_e3l, t_e3l, 'sub1', probe=probe_e3l,
+    )
+    pol = _prepare_expert_stream(
+        expert, data_pol, t_pol, 'sub2', probe=probe_pol,
+    )
+    if e3l['n_lig'] != pol['n_lig']:
+        raise ValueError("dual streams must share canonical ligand atom IDs")
+    for layer_index in range(len(expert.model.conv_layers)):
+        attr_e3l = _advance_expert_stream(e3l, layer_index)
+        attr_pol = _advance_expert_stream(pol, layer_index)
+        (delta_e3l, delta_pol) = bridge(
+            attr_e3l[:e3l['n_lig'], :expert.ns],
+            attr_pol[:pol['n_lig'], :expert.ns], layer_index,
+        )
+        gamma_e3l, beta_e3l = film_e3l[layer_index]
+        gamma_pol, beta_pol = film_pol[layer_index]
+        _film_and_record_stream(
+            e3l, gamma_e3l + delta_e3l[0], beta_e3l + delta_e3l[1],
+        )
+        _film_and_record_stream(
+            pol, gamma_pol + delta_pol[0], beta_pol + delta_pol[1],
+        )
+    return _finish_expert_stream(e3l), _finish_expert_stream(pol)
 
 
 def _expert_forward_with_film(
@@ -453,6 +763,7 @@ def _expert_forward_with_film(
     fallback_triggered = False
     fallback_cross_edges = 0
     fallback_cutoff_value = None
+    layer_telemetry = []
     if lr_edge_index.shape[1] == 0 and rec_node_attr.shape[0] > 1 and rec_edge_index.shape[1] > 0:
         # Zero-FiLM parity must be measured against the true vendored DiffDock
         # path. Do NOT silently expand the cross cutoff here: native sampling.py
@@ -607,9 +918,14 @@ def _expert_forward_with_film(
         # after every convolution; omitting it here meant zero-FiLM native and
         # inline forwards diverged only on the high-magnitude POI branch.
         nan_clamp = os.environ.get("NAN_CLAMP")
+        pre_clamp_fraction = node_attr.new_zeros(())
         if nan_clamp:
+            threshold = float(nan_clamp)
+            pre_clamp_fraction = (
+                node_attr.detach().abs() > threshold
+            ).to(node_attr.dtype).mean()
             node_attr = torch.clamp(
-                node_attr, min=-float(nan_clamp), max=float(nan_clamp)
+                node_attr, min=-threshold, max=threshold
             )
 
         # --- FiLM modulation (scalar block only, ligand nodes only) ---
@@ -622,6 +938,29 @@ def _expert_forward_with_film(
         node_attr = apply_film(
             node_attr, gamma, beta, node_mask=lig_mask, scalar_dim=expert.ns
         )
+
+        lig_current = node_attr[:n_lig]
+        rec_current = node_attr[n_lig:]
+        lig_scalar = lig_current[:, :model.ns]
+        lig_vector = lig_current[:, model.ns:]
+        rec_scalar = rec_current[:, :model.ns]
+
+        def _log_rms(value):
+            if value.numel() == 0:
+                return node_attr.new_zeros(())
+            return torch.log1p(torch.sqrt(value.square().mean()))
+
+        layer_telemetry.append(torch.stack((
+            torch.tanh(lig_scalar.mean() / 10.0),
+            _log_rms(lig_scalar),
+            torch.log1p(lig_scalar.abs().max()),
+            _log_rms(lig_vector),
+            (torch.log1p(lig_vector.abs().max())
+             if lig_vector.numel() else node_attr.new_zeros(())),
+            _log_rms(rec_scalar),
+            pre_clamp_fraction,
+            torch.isfinite(node_attr).to(node_attr.dtype).mean(),
+        )))
 
         if nan_trace:
             prefix = trace_prefix or "expert"
@@ -643,6 +982,20 @@ def _expert_forward_with_film(
         data, lig_node_attr, graph_sigma_emb,
         tr_sigma, rot_sigma, tor_sigma
     )
+    count_values = node_attr.new_tensor([
+        float(n_lig), float(rec_node_attr.shape[0]),
+        float(lig_edge_index.shape[1]), float(lr_edge_index.shape[1]),
+        float(rec_edge_index.shape[1]),
+    ])
+    score_norms = torch.stack([
+        torch.log1p(torch.linalg.vector_norm(scores[name]))
+        if scores[name].numel() else node_attr.new_zeros(())
+        for name in ('tr_score', 'rot_score', 'tor_score')
+    ])
+    telemetry_tail = torch.cat((torch.log1p(count_values) / 10.0, score_norms))
+    scores['telemetry'] = torch.cat((
+        torch.cat(layer_telemetry, dim=0), telemetry_tail,
+    )).unsqueeze(0)
 
     if nan_trace:
         prefix = trace_prefix or "expert"
@@ -693,7 +1046,7 @@ def _set_time_embeddings(data, t, model):
         }
 
 
-def zero_film_verification(expert, data, tribrain, tri_graph, t=None, atol=1e-5):
+def zero_film_verification(expert, data, trifuse, tri_graph, t=None, atol=1e-5):
     """
     Verify that zero-initialized FiLM is transparent: the expert output under
     zero FiLM (gamma=beta=0 from the zero-initialized FiLMHead) must equal the
@@ -702,8 +1055,8 @@ def zero_film_verification(expert, data, tribrain, tri_graph, t=None, atol=1e-5)
     Args:
         expert: FrozenDiffDock wrapping the CGModel
         data: HeteroData subgraph (single protein + PROTAC), already on device
-        tribrain: TriBrain (zero-initialized FiLM heads)
-        tri_graph: dict from build_tribrain_graph (node_coords/features/types)
+        trifuse: TriFuse (zero-initialized FiLM heads)
+        tri_graph: dict from build_trifuse_graph (node_coords/features/types)
         t: [1] diffusion time tensor (defaults to 0.5)
         atol: absolute tolerance for torch.allclose
 
@@ -726,7 +1079,7 @@ def zero_film_verification(expert, data, tribrain, tri_graph, t=None, atol=1e-5)
 
     # --- FiLM forward with (guaranteed-zero) FiLM params ---
     with torch.no_grad():
-        tri_out = tribrain(
+        tri_out = trifuse(
             node_features=tri_graph['node_features'],
             node_coords=tri_graph['node_coords'],
             node_types=tri_graph['node_types'],

@@ -1,6 +1,7 @@
 """Reusable model runtime for in-process evaluation of many ternary cases."""
 
 import json
+import os
 from argparse import Namespace
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import yaml
 
 from evaluation_common import validate_checkpoint_payload
 from featurize_common import featurize_complex
-from tricoopdiff.diffusion import MultiRateDiffusion, TernaryInitializer
+from tricoopdiff.diffusion import InterfaceDiffusion, TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
 from tricoopdiff.expert_factory import build_diffdock_expert
 from tricoopdiff.lora import (
@@ -17,7 +18,7 @@ from tricoopdiff.lora import (
     load_expert_lora_state_dict,
 )
 from tricoopdiff.model import TriCoopDiff
-from tricoopdiff.tribrain import TriBrain
+from tricoopdiff.trifuse import TriFuse
 
 
 class EvaluationRunner:
@@ -36,6 +37,10 @@ class EvaluationRunner:
             self.checkpoint_path = self.root / self.checkpoint_path
         self.checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
         validate_checkpoint_payload(self.checkpoint)
+        self.activation_clamp = float(
+            self.checkpoint["runtime_config"]["activation_clamp"]
+        )
+        os.environ["NAN_CLAMP"] = str(self.activation_clamp)
 
         self.model_dir = Path(model_dir)
         if not self.model_dir.is_absolute():
@@ -55,7 +60,7 @@ class EvaluationRunner:
         )
         self.model = None
         self.input_dim = None
-        self.diffusion = MultiRateDiffusion()
+        self.diffusion = InterfaceDiffusion()
         self.initializer = TernaryInitializer()
 
     def _ensure_model(self, input_dim):
@@ -66,18 +71,18 @@ class EvaluationRunner:
                     f"to {input_dim}"
                 )
             return
-        tribrain = TriBrain(
+        trifuse = TriFuse(
             node_dim=128, input_dim=input_dim,
             num_conv_layers_per_expert=self.expert.num_conv_layers,
             film_dim=self.expert.ns,
         )
         self.model = TriCoopDiff(
             frozen_expert=self.expert,
-            tribrain=tribrain,
+            trifuse=trifuse,
             num_conv_layers=self.expert.num_conv_layers,
             use_film=True,
         ).to(self.device)
-        self.model.tribrain.load_state_dict(self.checkpoint["tribrain_state_dict"])
+        self.model.trifuse.load_state_dict(self.checkpoint["trifuse_state_dict"])
         self.model.eval()
         self.input_dim = input_dim
 
@@ -120,7 +125,8 @@ class EvaluationRunner:
             "init_mode": init_mode,
             "t_anchor": (t_anchor if t_anchor is not None else
                          (0.7 if init_mode == "anchor_local" else 1.0)),
-            "tribrain_checkpoint": str(self.checkpoint_path.resolve()),
+            "trifuse_checkpoint": str(self.checkpoint_path.resolve()),
+            "activation_clamp": self.activation_clamp,
             "expert_model_dir": str(self.model_dir),
             "dockq_implementation": (
                 "DeepTernary/DockQ/dockq_util.py::cal_dockq"

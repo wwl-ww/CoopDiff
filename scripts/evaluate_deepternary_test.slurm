@@ -39,7 +39,7 @@ python scripts/select_best_checkpoint.py \
 # Fail cheaply inside this allocation before starting the 70-case matrix.
 PYTHONUNBUFFERED=1 python scripts/evaluate_index.py \
     --index data/ternary_test.json \
-    --tribrain-ckpt "$CHECKPOINT" \
+    --trifuse-ckpt "$CHECKPOINT" \
     --out-dir results/deepternary_test/preflight \
     --cache-dir results/featurize_cache_deepternary \
     --limit 1 \
@@ -58,7 +58,7 @@ python scripts/summarize_evaluation_reports.py \
 set +e
 PYTHONUNBUFFERED=1 python scripts/evaluate_index.py \
     --index data/ternary_test.json \
-    --tribrain-ckpt "$CHECKPOINT" \
+    --trifuse-ckpt "$CHECKPOINT" \
     --out-dir results/deepternary_test/cases \
     --cache-dir results/featurize_cache_deepternary \
     --n-walkers 32 \

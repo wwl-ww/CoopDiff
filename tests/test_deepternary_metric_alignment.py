@@ -1,6 +1,7 @@
 """Regression tests that keep metric semantics aligned with DeepTernary."""
 
 import importlib.util
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +29,23 @@ def test_rigid_fit_recovers_known_transform():
     target = source @ rotation + np.asarray([4., -2., 7.])
     fitted_r, fitted_t = exact._fit_rigid(source, target)
     assert np.max(np.abs(source @ fitted_r + fitted_t - target)) < 1e-10
+
+
+def test_sdf_ligand_records_preserve_atom_order():
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    molecule = Chem.AddHs(Chem.MolFromSmiles("CCO"))
+    AllChem.EmbedMolecule(molecule, randomSeed=0)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "ligand.sdf"
+        writer = Chem.SDWriter(str(path))
+        writer.write(molecule)
+        writer.close()
+        lines, indices, coords = exact._ligand_records(path)
+    assert len(indices) == molecule.GetNumAtoms()
+    assert coords.shape == (molecule.GetNumAtoms(), 3)
+    assert all(lines[index].startswith(("ATOM", "HETATM")) for index in indices)
 
 
 def test_approximate_metric_matches_deepternary_reference():

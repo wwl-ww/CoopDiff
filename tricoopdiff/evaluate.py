@@ -602,7 +602,7 @@ def evaluate_model(
     Args:
         model: TriCoopDiff (already on ``device``).
         e3_data/poi_data/ligand_data: B=1 featurized dicts (featurize_common).
-        diffusion: MultiRateDiffusion.
+        diffusion: InterfaceDiffusion.
         initializer: TernaryInitializer (default: fresh one).
         device: 'cuda' or 'cpu'.
         n_walkers: number of independent trajectories.

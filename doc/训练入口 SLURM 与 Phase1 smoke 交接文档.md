@@ -42,7 +42,7 @@ sbatch scripts/train_deepternary_smoke.slurm
 sbatch scripts/train_deepternary_phase1.slurm
 ```
 
-Smoke 验收至少检查：退出码 0；所有 loss/梯度有限；训练和验证均有有效 batch；协调器参数发生更新；每 epoch checkpoint 可读；验证阶段保持 eval mode。日志应打印 total、score、physical、SE3 translation 和 SE3 rotation loss，避免某个目标长期无梯度而不自知。
+Smoke 验收至少检查：退出码 0；两个界面的 loss、总 loss和全部 TriFuse/LoRA/bridge 梯度有限；训练和验证均有有效 batch；FiLM/LoRA/torsion coordinator 参数发生更新；每 epoch checkpoint 可读；验证阶段保持 eval mode。日志应分别打印 E3–Ligand 与 POI–Ligand 的 translation、rotation、branch torsion 和 joint torsion loss。产出的 checkpoint 必须是 version 16 且标记 `architecture=trifuse_v13`；旧版本应明确失败。
 
 ## 产物管理
 

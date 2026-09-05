@@ -1,5 +1,5 @@
 """
-FiLM (Feature-wise Linear Modulation) for injecting TriBrain coordination
+FiLM (Feature-wise Linear Modulation) for injecting TriFuse coordination
 signals into the frozen two-body expert.
 
 Follows the DiT adaLN-Zero paradigm: each FiLM head is zero-initialized so that
@@ -8,7 +8,7 @@ to native DiffDock).
 
 NOTE: only ``apply_film`` from this module is used by the production path
 (model.py:_expert_forward_with_film). The actual FiLM (γ, β) heads live in
-``tribrain.py:FiLMHead``. The former standalone ``FiLMSharedMLP`` /
+``trifuse.py:FiLMHead``. The former standalone ``FiLMSharedMLP`` /
 ``FiLMLayerHead`` classes here were dead code and have been removed.
 """
 
@@ -31,8 +31,9 @@ def apply_film(
 
     Args:
         node_attr: [N, D] node features
-        gamma: [B, scalar_dim] scale modulation (broadcast over masked nodes)
-        beta: [B, scalar_dim] shift modulation
+        gamma: [1, scalar_dim] graph modulation or [N_mask, scalar_dim]
+            node-specific scale modulation
+        beta: shape matching ``gamma``
         node_mask: [N] bool, if provided, only modulate masked nodes (e.g., ligand only)
         scalar_dim: number of leading scalar channels to modulate. Defaults to
                     full feature width (legacy behaviour).
@@ -46,7 +47,11 @@ def apply_film(
     if node_mask is not None:
         # Only modulate the specified subset of nodes (e.g., ligand atoms)
         modulated = node_attr.clone()
-        # gamma/beta: [B, scalar_dim] broadcast over the masked (ligand) nodes.
+        if gamma.shape[0] not in (1, int(node_mask.sum().item())):
+            raise ValueError(
+                "FiLM batch must be one or match the selected node count: "
+                f"{gamma.shape[0]} vs {int(node_mask.sum().item())}"
+            )
         modulated[node_mask, :scalar_dim] = (
             modulated[node_mask, :scalar_dim] * (1 + gamma) + beta
         )

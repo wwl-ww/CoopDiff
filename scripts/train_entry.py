@@ -1,9 +1,10 @@
 """
 TriCoopDiff training entry point.
 
-Two-phase training:
-  Phase 1: General ternary pretraining (FiLM + SE3 heads only)
-  Phase 2: PROTAC fine-tuning (all TriBrain heads, low LR, LoRA)
+Supervised training:
+  Phase 1: Interface score matching (TriFuse control + expert LoRA).
+  Auxiliary confidence/state training is intentionally unavailable until the
+  dataset and loss expose explicit labels.
 
 Current scope: **B=1 sequential training** on real ternary complexes. The
 featurized data is produced on the fly from a JSON index (``make_deepternary_index.py``)
@@ -58,6 +59,14 @@ def parse_args():
     )
     p.add_argument("--lr", type=float, default=1e-3)         # paper: lr=1e-3, Plateau scheduler
     p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument(
+        "--nan-clamp", type=float, default=100.0,
+        help="Per-layer expert activation clamp recorded in v16 checkpoints",
+    )
+    p.add_argument(
+        "--torsion-expert-aux-weight", type=float, default=0.25,
+        help="Weight for per-expert torsion losses in addition to joint torsion",
+    )
     p.add_argument("--lora_rank", type=int, default=0,
                    help="Rank of independent sub1/sub2 expert adapters; 0 disables LoRA")
     p.add_argument("--lora_alpha", type=float, default=8.0)
@@ -67,16 +76,20 @@ def parse_args():
     p.add_argument("--lora_early_alpha", type=float, default=4.0)
     p.add_argument("--lora_lr", type=float, default=1e-5)
     p.add_argument("--lora_early_lr", type=float, default=5e-6)
+    p.add_argument(
+        "--lora-warmup-steps", type=int, default=100,
+        help="Train TriFuse alone before enabling expert LoRA adapters",
+    )
 
     # Phase
-    p.add_argument("--phase", type=int, default=1, choices=[1, 2],
-                   help="1=pretrain (FiLM+SE3), 2=finetune (all heads)")
+    p.add_argument("--phase", type=int, default=1, choices=[1],
+                   help="interface score matching (the only defined phase)")
     p.add_argument("--resume", default=None, help="Resume from checkpoint")
 
     # Model config
-    # TriBrain params
-    p.add_argument("--ns", type=int, default=32, help="TriBrain scalar channels")
-    p.add_argument("--nv", type=int, default=4, help="TriBrain vector channels")
+    # TriFuse params
+    p.add_argument("--ns", type=int, default=32, help="TriFuse scalar channels")
+    p.add_argument("--nv", type=int, default=4, help="TriFuse vector channels")
     p.add_argument("--num_transformer_layers", type=int, default=3)
     p.add_argument("--node_dim", type=int, default=128)
     # Frozen DiffDock-L expert (ns=48, nv=10, num_conv_layers=11). These are read
@@ -136,6 +149,9 @@ def _load_entries(data_json):
 
 def main():
     args = parse_args()
+    if args.nan_clamp <= 0:
+        raise SystemExit("FATAL: --nan-clamp must be positive")
+    os.environ["NAN_CLAMP"] = str(args.nan_clamp)
     device = torch.device(args.device)
 
     np.random.seed(args.seed)
@@ -157,10 +173,11 @@ def main():
     print(f"  Device: {device}")
     print(f"  Epochs: {args.epochs}, Batch: {args.batch_size}, LR: {args.lr}")
     print(f"  Seed: {args.seed}")
+    print(f"  Expert activation clamp: {args.nan_clamp:g}")
 
     # ----------------------------------------------------------------
     # 0. Featurize the first sample to derive the receptor feature dim
-    #    (TriBrain's input_dim must match the featurized ternary nodes).
+    #    (TriFuse's input_dim must match the featurized ternary nodes).
     # ----------------------------------------------------------------
     entries = _load_entries(args.train_data)
     if not entries:
@@ -230,14 +247,13 @@ def main():
             if batch_idx % args.log_interval == 0:
                 print(f"  Epoch {epoch} | Batch {batch_idx} | "
                       f"loss={loss_dict['loss_total']:.4f} | "
-                      f"score={loss_dict['loss_score']:.4f} "
-                      f"(tr={loss_dict['loss_score_tr']:.4f}, "
-                      f"rot={loss_dict['loss_score_rot']:.4f}, "
-                      f"tor={loss_dict['loss_score_tor']:.4f}) | "
-                      f"se3={loss_dict['loss_se3']:.4f} "
-                      f"(tr={loss_dict['loss_se3_tr']:.4f}, "
-                      f"rot={loss_dict['loss_se3_rot']:.4f}) | "
-                      f"phys={loss_dict['loss_phys']:.4f}")
+                      f"e3l=(tr={loss_dict['loss_e3l_tr']:.4f}, "
+                      f"rot={loss_dict['loss_e3l_rot']:.4f}) | "
+                      f"pol=(tr={loss_dict['loss_pol_tr']:.4f}, "
+                      f"rot={loss_dict['loss_pol_rot']:.4f}) | "
+                      f"tor=(joint={loss_dict['loss_score_tor']:.4f}, "
+                      f"e3l={loss_dict['loss_e3l_tor']:.4f}, "
+                      f"pol={loss_dict['loss_pol_tor']:.4f})")
 
         if n_skipped:
             raise RuntimeError(
@@ -258,16 +274,17 @@ def main():
 
         # Log
         train_loss_avg = np.mean([d['loss_total'] for d in train_losses]) if train_losses else float('nan')
-        train_se3_avg = np.mean([d['loss_se3'] for d in train_losses]) if train_losses else float('nan')
-        train_se3_tr_avg = np.mean([d['loss_se3_tr'] for d in train_losses]) if train_losses else float('nan')
-        train_se3_rot_avg = np.mean([d['loss_se3_rot'] for d in train_losses]) if train_losses else float('nan')
-        train_phys_avg = np.mean([d['loss_phys'] for d in train_losses]) if train_losses else float('nan')
+        train_e3l_avg = np.mean([
+            d['loss_e3l_tr'] + d['loss_e3l_rot'] for d in train_losses
+        ])
+        train_pol_avg = np.mean([
+            d['loss_pol_tr'] + d['loss_pol_rot'] for d in train_losses
+        ])
         dt = time.time() - t0
         print(f"  Epoch {epoch}/{args.epochs} | "
               f"train_loss={train_loss_avg:.4f} | "
-              f"se3={train_se3_avg:.4f} "
-              f"(tr={train_se3_tr_avg:.4f}, rot={train_se3_rot_avg:.4f}) | "
-              f"phys={train_phys_avg:.4f} | "
+              f"e3l={train_e3l_avg:.4f} | "
+              f"pol={train_pol_avg:.4f} | "
               f"val_loss={val_loss:.4f} | "
               f"skipped={n_skipped} | "
               f"lr={trainer.optimizer.param_groups[0]['lr']:.2e} | "
@@ -288,10 +305,7 @@ def main():
     # 5. Final save
     # ----------------------------------------------------------------
     print("[5/6] Saving final model...")
-    final_path = os.path.join(
-        args.output_dir,
-        "tricoopdiff_zero.pt" if args.phase == 1 else "tricoopdiff_ft.pt"
-    )
+    final_path = os.path.join(args.output_dir, "tricoopdiff_zero.pt")
     trainer.save_checkpoint(final_path)
     print(f"Done. Model saved to {final_path}")
 
@@ -299,9 +313,9 @@ def main():
 def build_trainer(args, device, input_dim=None):
     """Build model, diffusion, and trainer."""
     from tricoopdiff import TriCoopDiff
-    from tricoopdiff.tribrain import TriBrain
+    from tricoopdiff.trifuse import TriFuse
     from tricoopdiff.expert_factory import build_diffdock_expert
-    from tricoopdiff.diffusion import MultiRateDiffusion
+    from tricoopdiff.diffusion import InterfaceDiffusion
     from tricoopdiff.train import TriCoopDiffTrainer
 
     # Build frozen DiffDock-L expert from pretrained weights (self-contained
@@ -332,10 +346,10 @@ def build_trainer(args, device, input_dim=None):
         input_dim = args.node_dim
         print(f"[warn] input_dim not provided; defaulting to node_dim={input_dim}")
 
-    # Build TriBrain (the only trainable module). film_dim MUST equal the expert's
-    # scalar channel count (ns=48 for DiffDock-L) — it is independent of TriBrain's
+    # Build TriFuse (the only trainable module). film_dim MUST equal the expert's
+    # scalar channel count (ns=48 for DiffDock-L) — it is independent of TriFuse's
     # own internal width (args.ns).
-    tribrain = TriBrain(
+    trifuse = TriFuse(
         node_dim=args.node_dim,
         input_dim=input_dim,
         ns=args.ns,
@@ -345,10 +359,10 @@ def build_trainer(args, device, input_dim=None):
         film_dim=frozen_expert.ns,
     )
 
-    model = TriCoopDiff(frozen_expert, tribrain, num_conv_layers=num_conv_layers)
+    model = TriCoopDiff(frozen_expert, trifuse, num_conv_layers=num_conv_layers)
 
     # Build diffusion
-    diffusion = MultiRateDiffusion(inference_steps=20)
+    diffusion = InterfaceDiffusion(inference_steps=20)
 
     # Build trainer
     trainer = TriCoopDiffTrainer(
@@ -359,6 +373,9 @@ def build_trainer(args, device, input_dim=None):
         lora_lr=getattr(args, 'lora_lr', 1e-5),
         lora_early_lr=getattr(args, 'lora_early_lr', 5e-6),
         lora_early_layers=getattr(args, 'lora_early_layers', 4),
+        activation_clamp=args.nan_clamp,
+        torsion_expert_aux_weight=args.torsion_expert_aux_weight,
+        lora_warmup_steps=args.lora_warmup_steps,
         device=device,
     )
 
@@ -369,33 +386,11 @@ def _guarded_train_step(trainer, batch):
     """Return ``None`` without stepping when a batch is numerically invalid."""
     from tricoopdiff.train import NonFiniteTrainingError
 
-    trainer.model.train()
-    trainer.optimizer.zero_grad(set_to_none=True)
     try:
-        loss_dict = trainer.compute_loss(**batch)
+        return trainer.train_step(**batch)
     except NonFiniteTrainingError as error:
         print(f"[train] SKIP {error}", flush=True)
         return None
-    total = loss_dict['loss_total']
-    if not torch.isfinite(total):
-        print(f"[train] SKIP case={batch.get('case', 'unknown')}: non-finite total loss", flush=True)
-        return None
-    total.backward()
-    grad_norm = torch.nn.utils.clip_grad_norm_(
-        trainer.model.tribrain.parameters(), max_norm=1.0,
-    )
-    if not torch.isfinite(grad_norm):
-        trainer.optimizer.zero_grad(set_to_none=True)
-        print(
-            f"[train] SKIP case={batch.get('case', 'unknown')}: non-finite gradients",
-            flush=True,
-        )
-        return None
-    trainer.optimizer.step()
-    trainer.global_step += 1
-    result = {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
-    result['lr'] = trainer.optimizer.param_groups[0]['lr']
-    return result
 
 
 def validate(trainer, val_loader, device):
@@ -444,7 +439,7 @@ class TernaryDataLoader:
     Each entry is featurized on the fly via ``featurize_complex`` (with an
     on-disk cache so subsequent epochs skip ESM2). The loader yields a **B=1**
     batch dict whose keys match ``TriCoopDiffTrainer.compute_loss``::
-        {'e3_data': ..., 'poi_data': ..., 'ligand_data': ..., 't_se3_data': None}
+        {'e3_data': ..., 'poi_data': ..., 'ligand_data': ...}
 
     By default featurization failures abort training. Silently changing the
     effective dataset would make validation/checkpoint selection misleading.
@@ -487,7 +482,6 @@ class TernaryDataLoader:
             'e3_data': e3_data,
             'poi_data': poi_data,
             'ligand_data': ligand_data,
-            't_se3_data': None,
         }
 
 

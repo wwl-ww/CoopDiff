@@ -18,7 +18,7 @@ does NOT import ``../DiffDock``.
 import numpy as np
 import torch
 
-from .diffusion import MultiRateDiffusion, TernaryInitializer
+from .diffusion import InterfaceDiffusion, TernaryInitializer
 
 
 @torch.no_grad()
@@ -34,29 +34,19 @@ def _tensor_summary(tensor: torch.Tensor) -> dict:
 
 
 def _sanitize_score(score):
-    """
-    Replace NaN/inf entries in a score tensor with a small fraction of its mean
-    |score|, mirroring the vendored DiffDock inference fallback (``sampling.py``
-    ~L139-150). DiffDock's own loop does this because when the PROTAC drifts far
-    from the receptor the cross edges vanish and the expert emits NaN scores;
-    without the sanitize those NaNs leak into the pose via the reverse update.
+    """Detect a non-finite score without inventing a replacement value.
+
+    The historical name is retained for local callers, but sanitization is no
+    longer performed. A non-finite expert prediction invalidates the walker
+    before coordinates are updated; ``nan_to_num`` would hide an OOD state and
+    create a pose that is not sampled from the learned reverse process.
 
     Returns:
-        (sanitized_score, had_nonfinite)
+        (original_score, had_nonfinite)
     """
     if score is None or score.numel() == 0:
         return score, False
     had_nonfinite = bool(torch.isnan(score).any() or torch.isinf(score).any())
-    if had_nonfinite:
-        finite_values = score[torch.isfinite(score)].abs()
-        eps = (
-            0.01 * finite_values.mean()
-            if finite_values.numel()
-            else torch.tensor(0.01, device=score.device, dtype=score.dtype)
-        )
-        score = torch.nan_to_num(
-            score, nan=eps.item(), posinf=eps.item(), neginf=-eps.item()
-        )
     return score, had_nonfinite
 
 
@@ -72,7 +62,7 @@ def _nearest_interface_anchor(e3_coords: torch.Tensor, poi_coords: torch.Tensor)
 @torch.no_grad()
 def sample_single(
     model,
-    diffusion: MultiRateDiffusion,
+    diffusion: InterfaceDiffusion,
     initializer: TernaryInitializer,
     e3_data: dict,
     poi_data: dict,
@@ -91,7 +81,7 @@ def sample_single(
 
     Args:
         model: ``TriCoopDiff`` (already on ``device``; set to eval mode here).
-        diffusion: ``MultiRateDiffusion`` (holds sigma schedules + reverse steps).
+        diffusion: ``InterfaceDiffusion`` (holds sigma schedules + reverse steps).
         initializer: ``TernaryInitializer``.
         e3_data/poi_data/ligand_data: B=1 featurized dicts (see featurize_common).
         steps: number of reverse steps (default: diffusion.inference_steps).
@@ -209,8 +199,6 @@ def sample_single(
         t_tr = torch.tensor([schedule["tr_schedule"][i]], device=device, dtype=torch.float32)
         t_rot = torch.tensor([schedule["rot_schedule"][i]], device=device, dtype=torch.float32)
         t_tor = torch.tensor([schedule["tor_schedule"][i]], device=device, dtype=torch.float32)
-        t_se3_tr = torch.tensor([schedule["se3_tr_schedule"][i]], device=device, dtype=torch.float32)
-        t_se3_rot = torch.tensor([schedule["se3_rot_schedule"][i]], device=device, dtype=torch.float32)
         if i < steps - 1:
             dt_tr = torch.tensor(
                 [schedule["tr_schedule"][i] - schedule["tr_schedule"][i + 1]],
@@ -224,14 +212,6 @@ def sample_single(
                 [schedule["tor_schedule"][i] - schedule["tor_schedule"][i + 1]],
                 device=device, dtype=torch.float32,
             )
-            dt_se3_tr = torch.tensor(
-                [schedule["se3_tr_schedule"][i] - schedule["se3_tr_schedule"][i + 1]],
-                device=device, dtype=torch.float32,
-            )
-            dt_se3_rot = torch.tensor(
-                [schedule["se3_rot_schedule"][i] - schedule["se3_rot_schedule"][i + 1]],
-                device=device, dtype=torch.float32,
-            )
         else:
             # Match vendored DiffDock's sampling driver: the final deterministic
             # step uses dt = t_i (actual_steps=19 with a length-20 schedule), not
@@ -239,11 +219,18 @@ def sample_single(
             dt_tr = t_tr.clone()
             dt_rot = t_rot.clone()
             dt_tor = t_tor.clone()
-            dt_se3_tr = t_se3_tr.clone()
-            dt_se3_rot = t_se3_rot.clone()
 
         tr_sigma, rot_sigma, tor_sigma = diffusion.t_to_sigma(t_tr, t_rot, t_tor)
-        se3_tr_sigma, se3_rot_sigma = diffusion.se3_t_to_sigma(t_se3_tr, t_se3_rot)
+        pol_tr_sigma, pol_rot_sigma, _ = diffusion.t_to_sigma(
+            t_tr, t_rot, t_tor,
+        )
+        diffusion_state = torch.cat((
+            torch.log(torch.stack((
+                tr_sigma, rot_sigma, tor_sigma, pol_tr_sigma, pol_rot_sigma,
+            ), dim=-1).clamp_min(1e-8)),
+            torch.stack((dt_tr, dt_rot, dt_tor), dim=-1),
+            t_tr.unsqueeze(-1),
+        ), dim=-1)
 
         if bool(getattr(model.expert.model, "dynamic_max_cross", False)):
             receptor_crop_cutoff = tr_sigma * 3 + 20
@@ -259,38 +246,81 @@ def sample_single(
             setattr(model, '_debug_step0_probe', True)
             setattr(model, '_last_step0_probe', None)
         out = model(
-            e3_data, poi_d, lig_d, t=t_tr, t_se3=t_se3_tr,
+            e3_data, poi_d, lig_d, t_e3l=t_tr, t_pol=t_tr,
             r_e3_to_poi=r_e3_to_poi,
             receptor_crop_cutoff=receptor_crop_cutoff,
+            diffusion_state=diffusion_state,
         )
         if return_trace:
             step0_probe = getattr(model, '_last_step0_probe', None)
             setattr(model, '_debug_step0_probe', False)
         else:
             step0_probe = None
+        interface_scores = out["interface_scores"]
         s_q = {}
         sanitized_components = []
-        for name, value in out["s_q"].items():
+        for name, value in (
+            ("tr", interface_scores["e3_ligand"]["tr"]),
+            ("rot", interface_scores["e3_ligand"]["rot"]),
+            ("tor", out["torsion_score"]),
+        ):
             s_q[name], had_nonfinite = _sanitize_score(value)
             if had_nonfinite:
-                sanitized_components.append(name)
-        s_se3, se3_had_nonfinite = _sanitize_score(out["s_se3"])
+                sanitized_components.append(f"e3_ligand.{name}")
+        s_pol = {}
+        for name in ("tr", "rot"):
+            s_pol[name], had_nonfinite = _sanitize_score(
+                interface_scores["poi_ligand"][name]
+            )
+            if had_nonfinite:
+                sanitized_components.append(f"poi_ligand.{name}")
         if freeze_poi:
-            s_se3 = torch.zeros_like(s_se3)
-            se3_had_nonfinite = False
-        if sanitized_components or se3_had_nonfinite:
+            s_pol = {name: torch.zeros_like(value) for name, value in s_pol.items()}
+        if sanitized_components:
             nonfinite_score_steps.append({
                 "step": i,
-                "s_q": sanitized_components,
-                "s_se3": bool(se3_had_nonfinite),
+                "components": sanitized_components,
             })
+            if return_trace:
+                trace.append({
+                    "stage": "rejected",
+                    "step": i,
+                    "reason": "nonfinite_score",
+                    "components": sanitized_components,
+                })
+            break
 
         add_noise = i < steps - 1  # no stochastic noise on the final step
 
+        old_ligand_pos = ligand_pos
         rigid_ligand_pos, rigid_target_pos = diffusion.reverse_step_protac(
             ligand_pos, s_q["tr"], s_q["rot"], s_q["tor"],
             t_tr, t_rot, t_tor, dt_tr, dt_rot, dt_tor, add_noise=add_noise,
         )
+
+        # Both experts scored the same old ternary state. Construct both rigid
+        # proposals from that state before changing any coordinates. Aligning
+        # the POI-side proposal to the E3-side proposal produces one consistent
+        # ternary pose: E3 stays fixed, Ligand follows sub1, and POI carries the
+        # exact transform required to preserve sub2's proposed interface.
+        if not freeze_poi:
+            poi_pos, rot_matrix = diffusion.reverse_step_poi_ligand_interface(
+                poi_pos,
+                source_ligand_pos=old_ligand_pos,
+                target_ligand_pos=rigid_ligand_pos,
+                tr_score=s_pol["tr"],
+                rot_score=s_pol["rot"],
+                t_tr=t_tr,
+                t_rot=t_rot,
+                dt_tr=dt_tr,
+                dt_rot=dt_rot,
+                add_noise=add_noise,
+                return_rotation=True,
+            )
+            # The interface composition applies ``old @ rot_matrix.T``;
+            # compose the tracked global-to-body map in the same order.
+            r_e3_to_poi = rot_matrix @ r_e3_to_poi
+
         ligand_pos = rigid_ligand_pos
 
         # Torsion reverse (PROTAC rotatable bonds) — only when the conformer has
@@ -307,16 +337,6 @@ def sample_single(
                 rigid_target_pos=rigid_target_pos,
             )
 
-        if not freeze_poi:
-            poi_pos, rot_matrix = diffusion.reverse_step_se3(
-                poi_pos, s_se3, t_se3_tr, t_se3_rot, dt_se3_tr, dt_se3_rot,
-                add_noise=add_noise, return_rotation=True,
-            )
-            # reverse_step_se3 applies ``current_centered @ rot_matrix.T``.
-            # Consequently the new inverse/body-frame map is
-            # ``rot_matrix @ old_inverse`` for row-vector coordinates.
-            r_e3_to_poi = rot_matrix @ r_e3_to_poi
-
         if return_trace:
             lig_com = ligand_pos.mean(dim=1)[0]
             poi_com = poi_pos.mean(dim=1)[0]
@@ -325,30 +345,26 @@ def sample_single(
                 "step": i,
                 "add_noise": add_noise,
                 "sanitized_components": sanitized_components,
-                "sanitized_se3": bool(se3_had_nonfinite),
                 "freeze_poi": bool(freeze_poi),
                 "t": {
                     "tr": float(t_tr.item()),
                     "rot": float(t_rot.item()),
                     "tor": float(t_tor.item()),
-                    "se3_tr": float(t_se3_tr.item()),
-                    "se3_rot": float(t_se3_rot.item()),
                 },
                 "dt": {
                     "tr": float(dt_tr.item()),
                     "rot": float(dt_rot.item()),
                     "tor": float(dt_tor.item()),
-                    "se3_tr": float(dt_se3_tr.item()),
-                    "se3_rot": float(dt_se3_rot.item()),
                 },
                 "sigma": {
                     "tr": float(tr_sigma.item()),
                     "rot": float(rot_sigma.item()),
                     "tor": float(tor_sigma.item()),
-                    "se3_tr": float(se3_tr_sigma.item()),
-                    "se3_rot": float(se3_rot_sigma.item()),
                 },
-                "receptor_crop_cutoff": float(receptor_crop_cutoff.item()),
+                "receptor_crop_cutoff": (
+                    float(receptor_crop_cutoff.item())
+                    if receptor_crop_cutoff is not None else None
+                ),
                 "ligand_com": lig_com.detach().cpu().numpy().tolist(),
                 "poi_com": poi_com.detach().cpu().numpy().tolist(),
                 "ligand_pocket_dist": float(torch.linalg.vector_norm(lig_com - e3_center[0]).item()),
@@ -361,7 +377,8 @@ def sample_single(
                     "tr": _tensor_summary(s_q["tr"]),
                     "rot": _tensor_summary(s_q["rot"]),
                     "tor": _tensor_summary(s_q["tor"]),
-                    "se3": _tensor_summary(s_se3),
+                    "poi_ligand_tr": _tensor_summary(s_pol["tr"]),
+                    "poi_ligand_rot": _tensor_summary(s_pol["rot"]),
                 },
                 "step0_probe": step0_probe,
             }
@@ -377,6 +394,9 @@ def sample_single(
         "poi_coords": poi_pos[0].detach().cpu().numpy(),
         "valid": not nonfinite_score_steps,
         "nonfinite_score_steps": nonfinite_score_steps,
+        "termination_reason": (
+            "nonfinite_score" if nonfinite_score_steps else "completed"
+        ),
     }
     if return_trajectory:
         result["trajectory"] = trajectory
@@ -387,7 +407,7 @@ def sample_single(
 
 def sample_ensemble(
     model,
-    diffusion: MultiRateDiffusion,
+    diffusion: InterfaceDiffusion,
     initializer: TernaryInitializer,
     e3_data: dict,
     poi_data: dict,
