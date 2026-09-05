@@ -256,18 +256,12 @@ class TriCoopDiff(nn.Module):
             sub1_probe = {} if debug_step0 else None
             sub2_probe = {} if debug_step0 else None
             if self.use_film:
-                from .lora import set_expert_lora_branch
-                set_expert_lora_branch(self.expert, "sub1")
-                scores_1 = _expert_forward_with_film(
-                    self.expert, sub1, t_e3l[b:b+1], film_params_b[:self.num_conv_layers],
-                    trace_prefix=f"sub1/b{b}",
-                    debug_probe=sub1_probe,
-                )
-                set_expert_lora_branch(self.expert, "sub2")
-                scores_2 = _expert_forward_with_film(
-                    self.expert, sub2, t_pol[b:b+1], film_params_b[self.num_conv_layers:],
-                    trace_prefix=f"sub2/b{b}",
-                    debug_probe=sub2_probe,
+                scores_1, scores_2 = _dual_expert_forward_with_bridge(
+                    self.expert, sub1, sub2,
+                    t_e3l[b:b + 1], t_pol[b:b + 1],
+                    film_params_b[:self.num_conv_layers],
+                    film_params_b[self.num_conv_layers:],
+                    self.trifuse.layerwise_bridge,
                 )
             else:
                 # L0 ablation: no FiLM, use native expert forward
@@ -443,6 +437,208 @@ class TriCoopDiff(nn.Module):
         """Method retained for backwards-compatible callers; delegates to the
         module-level `_expert_forward_with_film`."""
         return _expert_forward_with_film(self.expert, data, t, film_params)
+
+
+def _prepare_expert_stream(expert, data, t, branch):
+    """Prepare one DiffDock stream for lock-step dual-expert execution."""
+    model = expert.model
+    from .lora import set_expert_lora_branch
+    set_expert_lora_branch(expert, branch)
+    _set_time_embeddings(data, t, model)
+    tr_sigma, rot_sigma, tor_sigma = model.t_to_sigma(
+        *[data.complex_t[name] for name in ('tr', 'rot', 'tor')]
+    )
+    (lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh,
+     lig_edge_weight, rec_node_attr, rec_edge_index, rec_edge_attr,
+     rec_edge_sh, rec_edge_weight) = model.embedding(data)
+    cross_cutoff = (
+        (tr_sigma * 3 + 20).unsqueeze(1)
+        if model.dynamic_max_cross else model.cross_max_distance
+    )
+    (lr_edge_index, lr_edge_attr_raw, lr_edge_sh, rev_lr_edge_sh,
+     lr_edge_weight) = model.build_cross_conv_graph(data, cross_cutoff)
+    lr_edge_attr = model.cross_edge_embedding(lr_edge_attr_raw)
+    node_attr = torch.cat((lig_node_attr, rec_node_attr), dim=0)
+    n_lig = len(lig_node_attr)
+    lr_edge_index = lr_edge_index.clone()
+    lr_edge_index[1] += n_lig
+    edge_index = torch.cat((
+        lig_edge_index, lr_edge_index, rec_edge_index + n_lig,
+        torch.flip(lr_edge_index, dims=(0,)),
+    ), dim=1)
+    edge_attr = torch.cat((
+        lig_edge_attr, lr_edge_attr, rec_edge_attr, lr_edge_attr,
+    ), dim=0)
+    edge_sh = torch.cat((
+        lig_edge_sh, lr_edge_sh, rec_edge_sh, rev_lr_edge_sh,
+    ), dim=0)
+    edge_weight = (
+        torch.cat((lig_edge_weight, lr_edge_weight, rec_edge_weight,
+                   lr_edge_weight), dim=0)
+        if torch.is_tensor(lig_edge_weight)
+        else torch.ones((edge_index.shape[1], 1), device=edge_index.device)
+    )
+    s1 = lig_edge_index.shape[1]
+    s2 = s1 + lr_edge_index.shape[1]
+    s3 = s2 + rec_edge_index.shape[1]
+    return {
+        'expert': expert, 'model': model, 'data': data, 'branch': branch,
+        'node_attr': node_attr, 'n_lig': n_lig,
+        'edge_index': edge_index, 'edge_attr': edge_attr,
+        'edge_sh': edge_sh, 'edge_weight': edge_weight,
+        's1': s1, 's2': s2, 's3': s3,
+        'tr_sigma': tr_sigma, 'rot_sigma': rot_sigma, 'tor_sigma': tor_sigma,
+        'counts': (n_lig, len(rec_node_attr), lig_edge_index.shape[1],
+                   lr_edge_index.shape[1], rec_edge_index.shape[1]),
+        'telemetry': [],
+    }
+
+
+def _advance_expert_stream(stream, layer_index):
+    """Run exactly one convolution and return its pre-FiLM activations."""
+    model = stream['model']
+    expert = stream['expert']
+    node_attr = stream['node_attr']
+    edge_index = stream['edge_index']
+    edge_attr = stream['edge_attr']
+    s1, s2, s3 = stream['s1'], stream['s2'], stream['s3']
+    if layer_index < len(model.conv_layers) - 1:
+        edge_attr_layer = torch.cat((
+            edge_attr, node_attr[edge_index[0], :model.ns],
+            node_attr[edge_index[1], :model.ns],
+        ), dim=-1)
+        layer_edge_index = edge_index
+        layer_edge_sh = stream['edge_sh']
+        layer_edge_weight = stream['edge_weight']
+        if model.differentiate_convolutions:
+            edge_attr_layer = [
+                edge_attr_layer[:s1], edge_attr_layer[s1:s2],
+                edge_attr_layer[s2:s3], edge_attr_layer[s3:],
+            ]
+    else:
+        edge_attr_layer = torch.cat((
+            edge_attr[:s2], node_attr[edge_index[0, :s2], :model.ns],
+            node_attr[edge_index[1, :s2], :model.ns],
+        ), dim=-1)
+        layer_edge_index = edge_index[:, :s2]
+        layer_edge_sh = stream['edge_sh'][:s2]
+        layer_edge_weight = stream['edge_weight'][:s2]
+        if model.differentiate_convolutions:
+            edge_attr_layer = [edge_attr_layer[:s1], edge_attr_layer[s1:s2]]
+
+    layer = model.conv_layers[layer_index]
+    if bool(getattr(expert, 'lora_enabled', False)) and torch.is_grad_enabled():
+        from torch.utils.checkpoint import checkpoint
+
+        def forward(node_attr_input):
+            from .lora import set_expert_lora_branch
+            set_expert_lora_branch(expert, stream['branch'])
+            return layer(
+                node_attr_input, layer_edge_index, edge_attr_layer,
+                layer_edge_sh, edge_weight=layer_edge_weight,
+            )
+        node_attr = checkpoint(forward, node_attr, use_reentrant=False)
+    else:
+        from .lora import set_expert_lora_branch
+        set_expert_lora_branch(expert, stream['branch'])
+        node_attr = layer(
+            node_attr, layer_edge_index, edge_attr_layer, layer_edge_sh,
+            edge_weight=layer_edge_weight,
+        )
+    stream['node_attr'] = node_attr
+    return node_attr
+
+
+def _film_and_record_stream(stream, gamma, beta):
+    """Apply native clamp + scalar FiLM and append invariant telemetry."""
+    import os
+    node_attr = stream['node_attr']
+    model = stream['model']
+    n_lig = stream['n_lig']
+    clamp_fraction = node_attr.new_zeros(())
+    nan_clamp = os.environ.get('NAN_CLAMP')
+    if nan_clamp:
+        threshold = float(nan_clamp)
+        clamp_fraction = (
+            node_attr.detach().abs() > threshold
+        ).to(node_attr.dtype).mean()
+        node_attr = node_attr.clamp(-threshold, threshold)
+    ligand_mask = torch.zeros(
+        node_attr.shape[0], dtype=torch.bool, device=node_attr.device,
+    )
+    ligand_mask[:n_lig] = True
+    node_attr = apply_film(
+        node_attr, gamma, beta, node_mask=ligand_mask,
+        scalar_dim=model.ns,
+    )
+    stream['node_attr'] = node_attr
+    ligand = node_attr[:n_lig]
+    receptor = node_attr[n_lig:]
+    lig_scalar = ligand[:, :model.ns]
+    lig_vector = ligand[:, model.ns:]
+    rec_scalar = receptor[:, :model.ns]
+
+    def log_rms(value):
+        return (torch.log1p(torch.sqrt(value.square().mean()))
+                if value.numel() else node_attr.new_zeros(()))
+
+    stream['telemetry'].append(torch.stack((
+        torch.tanh(lig_scalar.mean() / 10.0), log_rms(lig_scalar),
+        torch.log1p(lig_scalar.abs().max()), log_rms(lig_vector),
+        (torch.log1p(lig_vector.abs().max()) if lig_vector.numel()
+         else node_attr.new_zeros(())),
+        log_rms(rec_scalar), clamp_fraction,
+        torch.isfinite(node_attr).to(node_attr.dtype).mean(),
+    )))
+
+
+def _finish_expert_stream(stream):
+    model = stream['model']
+    n_lig = stream['n_lig']
+    ligand_attr = stream['node_attr'][:n_lig]
+    graph_sigma_emb = model.timestep_emb_func(stream['data'].complex_t['tr'])
+    scores = stream['expert'].compute_scores(
+        stream['data'], ligand_attr, graph_sigma_emb,
+        stream['tr_sigma'], stream['rot_sigma'], stream['tor_sigma'],
+    )
+    count_values = ligand_attr.new_tensor([float(value) for value in stream['counts']])
+    score_norms = torch.stack([
+        torch.log1p(torch.linalg.vector_norm(scores[name]))
+        if scores[name].numel() else ligand_attr.new_zeros(())
+        for name in ('tr_score', 'rot_score', 'tor_score')
+    ])
+    scores['telemetry'] = torch.cat((
+        torch.cat(stream['telemetry'], dim=0),
+        torch.log1p(count_values) / 10.0, score_norms,
+    )).unsqueeze(0)
+    return scores
+
+
+def _dual_expert_forward_with_bridge(
+    expert, data_e3l, data_pol, t_e3l, t_pol,
+    film_e3l, film_pol, bridge,
+):
+    """Run two experts in Jacobi lock-step with exactly two conv calls/layer."""
+    e3l = _prepare_expert_stream(expert, data_e3l, t_e3l, 'sub1')
+    pol = _prepare_expert_stream(expert, data_pol, t_pol, 'sub2')
+    if e3l['n_lig'] != pol['n_lig']:
+        raise ValueError("dual streams must share canonical ligand atom IDs")
+    for layer_index in range(len(expert.model.conv_layers)):
+        attr_e3l = _advance_expert_stream(e3l, layer_index)
+        attr_pol = _advance_expert_stream(pol, layer_index)
+        (delta_e3l, delta_pol) = bridge(
+            attr_e3l[:e3l['n_lig'], :expert.ns],
+            attr_pol[:pol['n_lig'], :expert.ns], layer_index,
+        )
+        gamma_e3l, beta_e3l = film_e3l[layer_index]
+        gamma_pol, beta_pol = film_pol[layer_index]
+        _film_and_record_stream(
+            e3l, gamma_e3l + delta_e3l[0], beta_e3l + delta_e3l[1],
+        )
+        _film_and_record_stream(
+            pol, gamma_pol + delta_pol[0], beta_pol + delta_pol[1],
+        )
+    return _finish_expert_stream(e3l), _finish_expert_stream(pol)
 
 
 def _expert_forward_with_film(

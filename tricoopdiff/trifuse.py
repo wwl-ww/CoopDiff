@@ -827,6 +827,43 @@ class ScoreControlHead(nn.Module):
         return 1.0 + self.max_delta * torch.tanh(self.net(context))
 
 
+class LayerwiseExpertBridge(nn.Module):
+    """Exchange aligned ligand scalar evidence between experts after each conv."""
+
+    def __init__(self, scalar_dim: int, hidden_dim: int,
+                 num_layers: int, max_delta: float = 0.1):
+        super().__init__()
+        self.scalar_dim = scalar_dim
+        self.max_delta = float(max_delta)
+        self.input = nn.Sequential(
+            nn.LayerNorm(scalar_dim * 4),
+            nn.Linear(scalar_dim * 4, hidden_dim),
+            nn.SiLU(),
+        )
+        self.layer_embedding = nn.Embedding(num_layers, hidden_dim)
+        self.output = nn.Linear(hidden_dim, scalar_dim * 4)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(self, scalar_e3l: torch.Tensor, scalar_pol: torch.Tensor,
+                layer_index: int):
+        if scalar_e3l.shape != scalar_pol.shape:
+            raise ValueError("dual expert ligand scalar shapes differ")
+        if scalar_e3l.ndim != 2 or scalar_e3l.shape[1] != self.scalar_dim:
+            raise ValueError("expert bridge expects [N_lig, scalar_dim]")
+        bounded_e3l = torch.tanh(scalar_e3l / 10.0)
+        bounded_pol = torch.tanh(scalar_pol / 10.0)
+        hidden = self.input(torch.cat((
+            bounded_e3l, bounded_pol,
+            bounded_e3l - bounded_pol,
+            bounded_e3l * bounded_pol,
+        ), dim=-1))
+        hidden = hidden + self.layer_embedding.weight[layer_index]
+        delta = self.max_delta * torch.tanh(self.output(hidden))
+        e3l_gamma, e3l_beta, pol_gamma, pol_beta = delta.chunk(4, dim=-1)
+        return (e3l_gamma, e3l_beta), (pol_gamma, pol_beta)
+
+
 class TorsionCoordinator(nn.Module):
     """Resolve two interface opinions into one score per rotatable bond.
 
@@ -983,6 +1020,10 @@ class TriFuse(nn.Module):
         self.judge_head = JudgeHead(hidden_dim=node_dim)         # ~16k
         self.state_head = StateHead(hidden_dim=node_dim)         # ~16k
         self.score_control_head = ScoreControlHead(hidden_dim=node_dim)
+        self.layerwise_bridge = LayerwiseExpertBridge(
+            scalar_dim=film_dim, hidden_dim=node_dim,
+            num_layers=num_conv_layers_per_expert,
+        )
         self.torsion_coordinator = TorsionCoordinator(
             context_dim=node_dim,
         )

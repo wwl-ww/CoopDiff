@@ -44,10 +44,10 @@ TriFuse 不合并 rigid score、不输出 Ligand/POI SE(3) residual，也不替�
 新架构 checkpoint 必须同时满足：
 
 - `checkpoint_version == 7`；
-- `architecture == "trifuse_v12"`；
+- `architecture == "trifuse_v13"`；
 - 包含与当前 branch-specific FiLM/LoRA 配置匹配的状态。
 
-加载器必须拒绝 version 14 及更早 checkpoint；不提供静默迁移路径。旧 checkpoint 缺少 reflection-sensitive 局部方向几何，只能留作历史结果。
+加载器必须拒绝 version 15 及更早 checkpoint；不提供静默迁移路径。旧 checkpoint 缺少同步 dual-stream layerwise bridge，只能留作历史结果。
 
 Expert 每层卷积采用固定 activation clamp 100，并将该值写入 checkpoint 的 `runtime_config`。这是冻结 DiffDock/LoRA 路径的显式数值策略；它不能替代界面坐标加噪，也不得在训练与评估之间改变。
 
@@ -59,4 +59,4 @@ Expert 每层卷积采用固定 activation clamp 100，并将该值写入 checkp
 - `L2 → L1` 变换前后 POI–Ligand 跨界面距离保持不变；
 - 两分支输出有限，TriFuse 协调后的 torsion 只应用一次；
 - forward-only、optimizer step 和 smoke training 全程 finite；
-- v14 及更早 checkpoint 被明确拒绝，v15 架构标识不匹配时立即失败。
+- v15 及更早 checkpoint 被明确拒绝，v16 架构标识不匹配时立即失败。

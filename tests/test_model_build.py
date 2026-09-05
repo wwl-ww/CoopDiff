@@ -250,6 +250,25 @@ def test_score_control_is_identity_bounded_and_trainable():
     print("  [OK] Score controls are identity-initialized and bounded")
 
 
+def test_layerwise_bridge_starts_exactly_transparent():
+    """The dual-stream bridge must not perturb native zero-init experts."""
+    from tricoopdiff.trifuse import LayerwiseExpertBridge
+
+    bridge = LayerwiseExpertBridge(
+        scalar_dim=8, hidden_dim=16, num_layers=3,
+    )
+    e3l = torch.randn(5, 8)
+    pol = torch.randn(5, 8)
+    delta_e3l, delta_pol = bridge(e3l, pol, 1)
+    for delta in (*delta_e3l, *delta_pol):
+        assert torch.equal(delta, torch.zeros_like(delta))
+    torch.nn.init.normal_(bridge.output.weight, std=0.02)
+    delta_e3l, delta_pol = bridge(e3l, pol, 1)
+    for delta in (*delta_e3l, *delta_pol):
+        assert bool((delta.abs() <= bridge.max_delta).all())
+    print("  [OK] Layerwise expert bridge is transparent and bounded")
+
+
 def test_torsion_coordinator_zero_init_and_per_bond_control():
     """Shared torsion starts neutral but can make independent bond decisions."""
     from tricoopdiff.trifuse import TorsionCoordinator
@@ -539,6 +558,7 @@ if __name__ == "__main__":
     test_film_zero_init()
     test_trifuse_atom_film_can_select_ligand_regions()
     test_score_control_is_identity_bounded_and_trainable()
+    test_layerwise_bridge_starts_exactly_transparent()
     test_torsion_coordinator_zero_init_and_per_bond_control()
     test_torsion_coordinator_rejects_flat_native_shape()
     test_torsion_coordinator_does_not_overflow_finite_evidence()
