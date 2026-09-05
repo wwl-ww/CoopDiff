@@ -173,19 +173,35 @@ def scatter_max_per_batch(feat, batch, n_batch):
 
 
 class TernaryGeometryEncoder(nn.Module):
-    """Encode typed molecular features and invariant three-body geometry."""
+    """Encode typed components and their chemically labelled local contacts.
+
+    Global distance histograms alone cannot distinguish which residue or atom
+    participates in an interface.  For each component pair we therefore select
+    the nearest ``max_pair_tokens`` contacts and fuse both endpoint features
+    with an RBF encoding of their separation.  Only scalar distances enter this
+    controller, so the resulting context remains invariant to a common rigid
+    transform; equivariant rigid scores remain owned by the experts.
+    """
 
     PAIRS = ((0, 2), (1, 2), (0, 1))  # E3-L, POI-L, E3-POI
 
     def __init__(self, input_dim: int, hidden_dim: int = 128,
-                 n_rbf: int = 16, max_distance: float = 40.0):
+                 n_rbf: int = 16, max_distance: float = 40.0,
+                 max_pair_tokens: int = 24):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.n_rbf = n_rbf
         self.max_distance = float(max_distance)
+        if max_pair_tokens <= 0:
+            raise ValueError("max_pair_tokens must be positive")
+        self.max_pair_tokens = int(max_pair_tokens)
         self.feature_proj = nn.Linear(input_dim, hidden_dim)
         self.type_embedding = nn.Embedding(3, hidden_dim)
         self.component_queries = nn.Parameter(torch.randn(3, hidden_dim) * 0.02)
+        self.pair_type_embedding = nn.Embedding(len(self.PAIRS), hidden_dim)
+        self.pair_queries = nn.Parameter(
+            torch.randn(len(self.PAIRS), hidden_dim) * 0.02
+        )
         self.register_buffer(
             "rbf_centers", torch.linspace(0.0, max_distance, n_rbf),
         )
@@ -199,9 +215,15 @@ class TernaryGeometryEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.pair_net = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 2 + n_rbf),
+            nn.Linear(hidden_dim * 2 + n_rbf, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
         self.fusion = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 4),
-            nn.Linear(hidden_dim * 4, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 7),
+            nn.Linear(hidden_dim * 7, hidden_dim * 2),
             nn.SiLU(),
             nn.Linear(hidden_dim * 2, hidden_dim),
         )
@@ -222,6 +244,40 @@ class TernaryGeometryEncoder(nn.Module):
         ))
         return torch.cat((rbf, statistics), dim=0)
 
+    def _local_pair_token(
+        self,
+        features_a: torch.Tensor,
+        coords_a: torch.Tensor,
+        features_b: torch.Tensor,
+        coords_b: torch.Tensor,
+        pair_index: int,
+    ) -> torch.Tensor:
+        """Pool the closest feature-labelled contacts for one interface."""
+        distances = torch.cdist(coords_a, coords_b)
+        n_pairs = distances.numel()
+        k = min(self.max_pair_tokens, n_pairs)
+        values, flat_indices = torch.topk(
+            distances.reshape(-1), k=k, largest=False, sorted=True,
+        )
+        index_a = torch.div(flat_indices, coords_b.shape[0], rounding_mode="floor")
+        index_b = flat_indices.remainder(coords_b.shape[0])
+        offsets = values[:, None] - self.rbf_centers[None, :]
+        distance_rbf = torch.exp(
+            -0.5 * (offsets / self.rbf_width) ** 2
+        )
+        pair_features = self.pair_net(torch.cat((
+            features_a[index_a], features_b[index_b], distance_rbf,
+        ), dim=-1))
+        pair_features = pair_features + self.pair_type_embedding.weight[pair_index]
+        attention = torch.softmax(
+            pair_features @ self.pair_queries[pair_index], dim=0,
+        )
+        return (
+            (pair_features * attention[:, None]).sum(dim=0)
+            + pair_features.mean(dim=0)
+            + pair_features.max(dim=0).values
+        ) / 3.0
+
     def forward(self, node_features: torch.Tensor, node_coords: torch.Tensor,
                 node_types: torch.Tensor, batch: torch.Tensor = None) -> torch.Tensor:
         if batch is None:
@@ -239,6 +295,7 @@ class TernaryGeometryEncoder(nn.Module):
             batch_mask = batch == batch_index
             component_tokens = []
             component_coords = []
+            component_features_by_type = []
             component_descriptors = []
             for component_type in range(3):
                 mask = batch_mask & (node_types == component_type)
@@ -259,6 +316,7 @@ class TernaryGeometryEncoder(nn.Module):
                 ) / 3.0
                 component_tokens.append(token)
                 component_coords.append(coords)
+                component_features_by_type.append(component_features)
                 centered = coords - coords.mean(dim=0, keepdim=True)
                 radius = torch.sqrt(centered.square().sum(dim=-1).mean())
                 component_descriptors.extend((
@@ -270,12 +328,20 @@ class TernaryGeometryEncoder(nn.Module):
                 self._pair_descriptor(component_coords[a], component_coords[b])
                 for a, b in self.PAIRS
             ]
+            local_pair_tokens = [
+                self._local_pair_token(
+                    component_features_by_type[a], component_coords[a],
+                    component_features_by_type[b], component_coords[b],
+                    pair_index,
+                )
+                for pair_index, (a, b) in enumerate(self.PAIRS)
+            ]
             geometry = torch.cat((
                 *pair_descriptors, torch.stack(component_descriptors),
             ))
             geometry_token = self.geometry_net(geometry)
             outputs.append(self.fusion(torch.cat((
-                *component_tokens, geometry_token,
+                *component_tokens, *local_pair_tokens, geometry_token,
             ))))
         return torch.stack(outputs, dim=0)
 

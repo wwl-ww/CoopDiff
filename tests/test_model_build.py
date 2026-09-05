@@ -102,6 +102,41 @@ def test_trifuse_reads_geometry_and_preserves_rigid_invariance():
     print("  [OK] TriFuse geometry sensitivity and rigid invariance")
 
 
+def test_trifuse_links_chemical_features_to_local_contacts():
+    """Moving chemical identities between near/far atoms changes context."""
+    from tricoopdiff.trifuse import TriFuse
+
+    torch.manual_seed(7)
+    trifuse = TriFuse(
+        node_dim=32, input_dim=8, ns=8, nv=2,
+        num_transformer_layers=1,
+        num_conv_layers_per_expert=2,
+        dropout=0.0,
+    ).eval()
+    features = torch.randn(9, 8)
+    node_types = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2])
+    coords = torch.tensor([
+        [0.0, 0.0, 0.0], [8.0, 0.0, 0.0], [16.0, 0.0, 0.0],
+        [0.0, 3.0, 0.0], [8.0, 3.0, 0.0], [16.0, 3.0, 0.0],
+        [0.0, 1.0, 0.0], [8.0, 7.0, 0.0], [16.0, 12.0, 0.0],
+    ])
+    time = torch.tensor([0.3])
+    base = trifuse(features, coords, node_types, t_e3l=time, t_pol=time)[
+        'h_cond'
+    ]
+
+    # Permuting features within the Ligand preserves component-level pooling
+    # and all geometry-only descriptors, but changes which identity is at the
+    # closest E3/POI contacts.
+    permuted = features.clone()
+    permuted[6:9] = permuted[torch.tensor([8, 7, 6])]
+    changed = trifuse(
+        permuted, coords, node_types, t_e3l=time, t_pol=time,
+    )['h_cond']
+    assert not torch.allclose(base, changed, atol=1e-5)
+    print("  [OK] TriFuse binds chemical identity to local contacts")
+
+
 def test_film_zero_init():
     """FiLM is transparent at initialization (adaLN-Zero)."""
     from tricoopdiff.trifuse import FiLMHead
@@ -354,6 +389,7 @@ if __name__ == "__main__":
 
     test_trifuse_build()
     test_trifuse_reads_geometry_and_preserves_rigid_invariance()
+    test_trifuse_links_chemical_features_to_local_contacts()
     test_film_zero_init()
     test_torsion_coordinator_zero_init_and_per_bond_control()
     test_torsion_coordinator_rejects_flat_native_shape()

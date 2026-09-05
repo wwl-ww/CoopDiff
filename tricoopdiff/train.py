@@ -353,8 +353,8 @@ class TriCoopDiffTrainer:
         """
         from .lora import expert_lora_state_dict
         torch.save({
-            'checkpoint_version': 7,
-            'architecture': 'trifuse_v4',
+            'checkpoint_version': 8,
+            'architecture': 'trifuse_v5',
             'runtime_config': {
                 'activation_clamp': self.activation_clamp,
                 'torsion_expert_aux_weight': self.torsion_expert_aux_weight,
@@ -378,13 +378,13 @@ class TriCoopDiffTrainer:
         (weights + global step only).
         """
         ckpt = torch.load(path, map_location=self.device)
-        if ckpt.get('checkpoint_version') != 7:
+        if ckpt.get('checkpoint_version') != 8:
             raise ValueError(
-                "TriFuse training requires checkpoint_version=7"
+                "TriFuse training requires checkpoint_version=8"
             )
-        if ckpt.get('architecture') != 'trifuse_v4':
+        if ckpt.get('architecture') != 'trifuse_v5':
             raise ValueError(
-                "checkpoint architecture is not trifuse_v4"
+                "checkpoint architecture is not trifuse_v5"
             )
         saved_clamp = ckpt.get('runtime_config', {}).get('activation_clamp')
         if saved_clamp != self.activation_clamp:

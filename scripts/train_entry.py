@@ -60,7 +60,7 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument(
         "--nan-clamp", type=float, default=100.0,
-        help="Per-layer expert activation clamp recorded in v7 checkpoints",
+        help="Per-layer expert activation clamp recorded in v8 checkpoints",
     )
     p.add_argument(
         "--torsion-expert-aux-weight", type=float, default=0.25,
