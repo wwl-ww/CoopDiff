@@ -40,6 +40,7 @@ PYTHONUNBUFFERED=1 python scripts/train_entry.py \
     --seed 0 \
     --lr 1e-4 \
     --weight_decay 1e-4 \
+    --nan-clamp 100 \
     --phase 1 \
     --expert_model_dir checkpoints/score_model \
     --cache_dir results/featurize_cache_deepternary \

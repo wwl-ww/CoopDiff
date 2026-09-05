@@ -1,6 +1,7 @@
 """Reusable model runtime for in-process evaluation of many ternary cases."""
 
 import json
+import os
 from argparse import Namespace
 from pathlib import Path
 
@@ -36,6 +37,10 @@ class EvaluationRunner:
             self.checkpoint_path = self.root / self.checkpoint_path
         self.checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
         validate_checkpoint_payload(self.checkpoint)
+        self.activation_clamp = float(
+            self.checkpoint["runtime_config"]["activation_clamp"]
+        )
+        os.environ["NAN_CLAMP"] = str(self.activation_clamp)
 
         self.model_dir = Path(model_dir)
         if not self.model_dir.is_absolute():
@@ -121,6 +126,7 @@ class EvaluationRunner:
             "t_anchor": (t_anchor if t_anchor is not None else
                          (0.7 if init_mode == "anchor_local" else 1.0)),
             "tribrain_checkpoint": str(self.checkpoint_path.resolve()),
+            "activation_clamp": self.activation_clamp,
             "expert_model_dir": str(self.model_dir),
             "dockq_implementation": (
                 "DeepTernary/DockQ/dockq_util.py::cal_dockq"

@@ -38,6 +38,7 @@ PYTHONUNBUFFERED=1 python scripts/train_entry.py \
     --epochs 1 \
     --batch_size 1 \
     --lr 1e-4 \
+    --nan-clamp 100 \
     --phase 1 \
     --expert_model_dir checkpoints/score_model \
     --cache_dir results/featurize_cache_deepternary_smoke \

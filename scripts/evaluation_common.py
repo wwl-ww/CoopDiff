@@ -38,6 +38,9 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=336):
         raise ValueError("interface-coordinate evaluation requires checkpoint_version=4")
     if payload.get("architecture") != "interface_coordinate_v1":
         raise ValueError("checkpoint architecture is not interface_coordinate_v1")
+    activation_clamp = payload.get("runtime_config", {}).get("activation_clamp")
+    if not isinstance(activation_clamp, (int, float)) or activation_clamp <= 0:
+        raise ValueError("checkpoint has no valid runtime activation_clamp")
     if not payload.get("tribrain_state_dict"):
         raise ValueError("checkpoint has no TriBrain weights")
     lora = payload.get("expert_lora_state_dict")

@@ -47,10 +47,14 @@ class TriCoopDiffTrainer:
         lora_lr: float = 1e-5,
         lora_early_lr: float = 5e-6,
         lora_early_layers: int = 4,
+        activation_clamp: float = 100.0,
     ):
         self.model = model.to(device)
         self.diffusion = diffusion
         self.device = device
+        if activation_clamp <= 0:
+            raise ValueError("activation_clamp must be positive")
+        self.activation_clamp = float(activation_clamp)
 
         # Only TriBrain is trainable; experts are frozen
         parameter_groups = [{
@@ -335,6 +339,9 @@ class TriCoopDiffTrainer:
         torch.save({
             'checkpoint_version': 4,
             'architecture': 'interface_coordinate_v1',
+            'runtime_config': {
+                'activation_clamp': self.activation_clamp,
+            },
             'global_step': self.global_step,
             'tribrain_state_dict': self.model.tribrain.state_dict(),
             'expert_lora_state_dict': expert_lora_state_dict(self.model.expert),
@@ -360,6 +367,12 @@ class TriCoopDiffTrainer:
             )
         if ckpt.get('architecture') != 'interface_coordinate_v1':
             raise ValueError("checkpoint architecture is not interface_coordinate_v1")
+        saved_clamp = ckpt.get('runtime_config', {}).get('activation_clamp')
+        if saved_clamp != self.activation_clamp:
+            raise ValueError(
+                f"checkpoint activation_clamp={saved_clamp!r} does not match "
+                f"runtime activation_clamp={self.activation_clamp!r}"
+            )
         self.model.tribrain.load_state_dict(ckpt['tribrain_state_dict'])
         if ckpt.get('expert_lora_state_dict'):
             from .lora import load_expert_lora_state_dict

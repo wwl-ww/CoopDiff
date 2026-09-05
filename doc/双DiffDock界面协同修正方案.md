@@ -47,6 +47,8 @@ TriBrain 不合并 expert score、不输出 Ligand/POI residual score，也不�
 
 加载器必须拒绝 version 3 及更早 checkpoint；不提供 legacy merge 或静默迁移路径。旧 checkpoint 的参数语义与新坐标动力学不同，只能留作历史结果，不能用于恢复、微调或正式评估。
 
+Expert 每层卷积采用固定 activation clamp 100，并将该值写入 checkpoint 的 `runtime_config`。这是冻结 DiffDock/LoRA 路径的显式数值策略；它不能替代界面坐标加噪，也不得在训练与评估之间改变。
+
 ## 验收门禁
 
 - SE(3) 正反变换、组合和全局等变性测试通过；

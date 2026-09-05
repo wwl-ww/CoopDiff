@@ -31,6 +31,7 @@ def test_checkpoint_preflight_rejects_missing_lora():
     payload = {
         "checkpoint_version": 4,
         "architecture": "interface_coordinate_v1",
+        "runtime_config": {"activation_clamp": 100.0},
         "tribrain_state_dict": {"x": 1},
     }
     try:
@@ -60,11 +61,28 @@ def test_checkpoint_preflight_accepts_complete_payload():
     payload = {
         "checkpoint_version": 4,
         "architecture": "interface_coordinate_v1",
+        "runtime_config": {"activation_clamp": 100.0},
         "tribrain_state_dict": {"x": 1},
         "expert_lora_state_dict": {str(i): i for i in range(336)},
         "expert_lora_config": {"rank": 4},
     }
     evaluation_common.validate_checkpoint_payload(payload)
+
+
+def test_checkpoint_preflight_rejects_missing_runtime_config():
+    payload = {
+        "checkpoint_version": 4,
+        "architecture": "interface_coordinate_v1",
+        "tribrain_state_dict": {"x": 1},
+        "expert_lora_state_dict": {str(i): i for i in range(336)},
+        "expert_lora_config": {"rank": 4},
+    }
+    try:
+        evaluation_common.validate_checkpoint_payload(payload)
+    except ValueError as error:
+        assert "activation_clamp" in str(error)
+    else:
+        raise AssertionError("checkpoint without runtime clamp must be rejected")
 
 
 def test_completed_report_requires_matching_checkpoint(tmp_path):

@@ -77,7 +77,11 @@ def build_parser():
     p.add_argument("--case", default="5T35_D_A_759",
                    help="Ternary complex case name (directory under --protac-dir)")
     p.add_argument("--tribrain-ckpt", default=None,
-                   help="Version-3 trained TriBrain + LoRA checkpoint")
+                   help="Version-4 interface-coordinate checkpoint")
+    p.add_argument(
+        "--nan-clamp", type=float, default=100.0,
+        help="Activation clamp for an explicit zero-init baseline",
+    )
     p.add_argument("--allow-zero-init", action="store_true",
                    help="Explicitly allow evaluation without trained weights")
     p.add_argument("--lora-rank", type=int, default=4)
@@ -115,6 +119,10 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    if args.nan_clamp <= 0:
+        raise SystemExit("FATAL: --nan-clamp must be positive")
+    if args.tribrain_ckpt is None:
+        os.environ["NAN_CLAMP"] = str(args.nan_clamp)
 
     if args.tribrain_ckpt is None and not args.allow_zero_init:
         print("FATAL: --tribrain-ckpt is required; use --allow-zero-init only "
@@ -167,6 +175,7 @@ def main():
     print(f"  device={device}  model-dir={args.model_dir}", flush=True)
     print(f"  n_walkers={args.n_walkers}  steps={args.steps}", flush=True)
     print(f"  tribrain_ckpt={args.tribrain_ckpt or '(zero-init baseline)'}", flush=True)
+    print(f"  activation_clamp={os.environ.get('NAN_CLAMP', 'from checkpoint')}", flush=True)
     print("=" * 72, flush=True)
 
     # Production single-case and indexed evaluation intentionally share one
@@ -325,6 +334,7 @@ def main():
         "init_mode": args.init_mode,
         "t_anchor": args.t_anchor if args.t_anchor is not None else (0.7 if args.init_mode == "anchor_local" else 1.0),
         "tribrain_checkpoint": args.tribrain_ckpt,
+        "activation_clamp": args.nan_clamp,
         "expert_model_dir": args.model_dir,
         "expert_checkpoint": args.ckpt,
     }

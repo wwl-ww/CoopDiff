@@ -22,6 +22,7 @@
 - TriBrain 只负责 branch-specific FiLM 和 scalar auxiliary heads，不输出 merge gate、坐标 residual 或独立 SE(3) score。
 - 训练分别对两个界面应用 native DiffDock forward noise，再重建唯一一致的全局坐标。
 - 新 checkpoint 必须是 version 4 且 `architecture=interface_coordinate_v1`；version 3 必须拒绝。
+- version 4 同时记录 `runtime_config.activation_clamp=100`；训练与评估必须恢复同一 expert 数值策略。
 - Phase 1 使用官方 DeepTernary MGD cluster representatives 训练，并保持 train/validation/test 三个索引互不重叠。
 
 ## 维护规则

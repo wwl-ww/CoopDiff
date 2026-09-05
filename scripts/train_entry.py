@@ -58,6 +58,10 @@ def parse_args():
     )
     p.add_argument("--lr", type=float, default=1e-3)         # paper: lr=1e-3, Plateau scheduler
     p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument(
+        "--nan-clamp", type=float, default=100.0,
+        help="Per-layer expert activation clamp recorded in v4 checkpoints",
+    )
     p.add_argument("--lora_rank", type=int, default=0,
                    help="Rank of independent sub1/sub2 expert adapters; 0 disables LoRA")
     p.add_argument("--lora_alpha", type=float, default=8.0)
@@ -136,6 +140,9 @@ def _load_entries(data_json):
 
 def main():
     args = parse_args()
+    if args.nan_clamp <= 0:
+        raise SystemExit("FATAL: --nan-clamp must be positive")
+    os.environ["NAN_CLAMP"] = str(args.nan_clamp)
     device = torch.device(args.device)
 
     np.random.seed(args.seed)
@@ -157,6 +164,7 @@ def main():
     print(f"  Device: {device}")
     print(f"  Epochs: {args.epochs}, Batch: {args.batch_size}, LR: {args.lr}")
     print(f"  Seed: {args.seed}")
+    print(f"  Expert activation clamp: {args.nan_clamp:g}")
 
     # ----------------------------------------------------------------
     # 0. Featurize the first sample to derive the receptor feature dim
@@ -357,6 +365,7 @@ def build_trainer(args, device, input_dim=None):
         lora_lr=getattr(args, 'lora_lr', 1e-5),
         lora_early_lr=getattr(args, 'lora_early_lr', 5e-6),
         lora_early_layers=getattr(args, 'lora_early_layers', 4),
+        activation_clamp=args.nan_clamp,
         device=device,
     )
 
