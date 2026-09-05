@@ -41,6 +41,9 @@ echo "git_commit=$(git rev-parse HEAD)"
 echo "git_status=$(git status --porcelain | wc -l) modified_paths"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 python -c "import runpy; tests=runpy.run_path('tests/test_torsion_utils.py'); tests['test_modify_conformer_torsion_angles_copies_and_rotates']()"
+python tests/test_model_build.py
+python tests/test_lora.py
+python tests/test_training_contract.py
 
 python scripts/make_deepternary_index.py \
     --min-ligand-heavy-atoms 1
@@ -66,6 +69,7 @@ PYTHONUNBUFFERED=1 python scripts/train_entry.py \
     --epochs 1 \
     --batch_size 1 \
     --seed 0 \
+    --random-flip-proteins \
     --lr 1e-4 \
     --weight_decay 1e-4 \
     --nan-clamp 100 \
@@ -93,6 +97,7 @@ PYTHONUNBUFFERED=1 python scripts/train_entry.py \
     --epochs 100 \
     --batch_size 1 \
     --seed 0 \
+    --random-flip-proteins \
     --lr 1e-4 \
     --weight_decay 1e-4 \
     --nan-clamp 100 \

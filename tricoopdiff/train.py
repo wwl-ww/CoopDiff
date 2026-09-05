@@ -16,6 +16,8 @@ Current implementation uses B=1 sequential optimization; batched variable-size
 graphs remain future work.
 """
 
+import os
+
 import torch
 import numpy as np
 from typing import Optional
@@ -374,7 +376,12 @@ class TriCoopDiffTrainer:
         omitted to avoid duplicating the pretrained checkpoint.
         """
         from .lora import expert_lora_state_dict
-        torch.save({
+        lora_state = expert_lora_state_dict(self.model.expert)
+        if len(lora_state) != 336:
+            raise RuntimeError(
+                f"checkpoint contract requires 336 LoRA tensors, got {len(lora_state)}"
+            )
+        payload = {
             'checkpoint_version': 16,
             'architecture': 'trifuse_v13',
             'runtime_config': {
@@ -384,14 +391,17 @@ class TriCoopDiffTrainer:
             },
             'global_step': self.global_step,
             'trifuse_state_dict': self.model.trifuse.state_dict(),
-            'expert_lora_state_dict': expert_lora_state_dict(self.model.expert),
+            'expert_lora_state_dict': lora_state,
             'expert_lora_config': getattr(
                 self.model.expert, 'lora_config', None,
             ),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'scheduler_type': type(self.scheduler).__name__,
-        }, path)
+        }
+        temporary_path = f"{path}.tmp"
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, path)
 
     def load_checkpoint(self, path: str):
         """Load model checkpoint (for fine-tuning / resume).
@@ -409,6 +419,15 @@ class TriCoopDiffTrainer:
             raise ValueError(
                 "checkpoint architecture is not trifuse_v13"
             )
+        saved_lora_config = ckpt.get('expert_lora_config')
+        runtime_lora_config = getattr(self.model.expert, 'lora_config', None)
+        if saved_lora_config != runtime_lora_config:
+            raise ValueError(
+                f"checkpoint expert_lora_config={saved_lora_config!r} does not "
+                f"match runtime config={runtime_lora_config!r}"
+            )
+        if len(ckpt.get('expert_lora_state_dict', {})) != 336:
+            raise ValueError("checkpoint must contain exactly 336 LoRA tensors")
         saved_clamp = ckpt.get('runtime_config', {}).get('activation_clamp')
         if saved_clamp != self.activation_clamp:
             raise ValueError(

@@ -20,6 +20,9 @@ case：80% 从全部成员选择，20% 优先选择官方 representative；无
 representative 时退化为全部成员。Validation 固定使用每个 cluster 的首个
 representative，保证 checkpoint 选择可复现。
 
+与 DeepTernary 一致，训练期以 50% 概率交换两个 protein 的角色；交换时整个
+三元状态一起平移到新的固定 protein 参考系。Validation 不做随机交换。
+
 正式 benchmark 不参与 `t_anchor`、epoch 或 checkpoint 选择。
 
 ## 正式评估

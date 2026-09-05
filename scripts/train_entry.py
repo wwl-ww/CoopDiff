@@ -57,6 +57,10 @@ def parse_args():
         "--max-val-clusters", type=int, default=None,
         help="Bound validation clusters for an allocated smoke run only",
     )
+    p.add_argument(
+        "--random-flip-proteins", action="store_true",
+        help="Randomly swap the fixed/moving protein roles during training",
+    )
 
     # Training
     p.add_argument("--output_dir", required=True, help="Checkpoint output directory")
@@ -162,6 +166,16 @@ def _load_entries(data_json):
     return _load_index(data_json)[0]
 
 
+def swap_protein_reference(e3_data, poi_data, ligand_data):
+    """Swap protein roles and express all coordinates in the new E3 frame."""
+    new_origin = poi_data['coords'].mean(dim=1, keepdim=True)
+    return (
+        {**poi_data, 'coords': poi_data['coords'] - new_origin},
+        {**e3_data, 'coords': e3_data['coords'] - new_origin},
+        {**ligand_data, 'coords': ligand_data['coords'] - new_origin},
+    )
+
+
 def main():
     args = parse_args()
     if args.nan_clamp <= 0:
@@ -221,6 +235,7 @@ def main():
         args.train_data, score_model_args,
         shuffle=True, device=str(device), cache_dir=args.cache_dir,
         skip_on_error=False, max_clusters=args.max_train_clusters,
+        random_flip_proteins=args.random_flip_proteins,
     )
     val_loader = TernaryDataLoader(
         args.val_data, score_model_args,
@@ -252,11 +267,6 @@ def main():
         t0 = time.time()
         for batch_idx, batch in enumerate(train_loader):
             loss_dict = _guarded_train_step(trainer, batch)
-            if loss_dict is None:
-                n_skipped += 1
-                print(f"  Epoch {epoch} | Batch {batch_idx} | SKIP non-finite loss",
-                      flush=True)
-                continue
             train_losses.append(loss_dict)
 
             if batch_idx % args.log_interval == 0:
@@ -398,14 +408,13 @@ def build_trainer(args, device, input_dim=None):
 
 
 def _guarded_train_step(trainer, batch):
-    """Return ``None`` without stepping when a batch is numerically invalid."""
+    """Abort immediately when a batch is numerically invalid."""
     from tricoopdiff.train import NonFiniteTrainingError
 
     try:
         return trainer.train_step(**batch)
     except NonFiniteTrainingError as error:
-        print(f"[train] SKIP {error}", flush=True)
-        return None
+        raise RuntimeError(f"training aborted on first non-finite batch: {error}") from error
 
 
 def validate(trainer, val_loader, device):
@@ -461,7 +470,8 @@ class TernaryDataLoader:
     """
 
     def __init__(self, data_json, score_model_args, shuffle=True, device="cuda",
-                 cache_dir=None, skip_on_error=False, max_clusters=None):
+                 cache_dir=None, skip_on_error=False, max_clusters=None,
+                 random_flip_proteins=False):
         self.entries, self.clusters, self.entries_by_case = _load_index(data_json)
         if max_clusters is not None:
             if max_clusters <= 0:
@@ -478,6 +488,7 @@ class TernaryDataLoader:
         self.device = device
         self.cache_dir = cache_dir
         self.skip_on_error = skip_on_error
+        self.random_flip_proteins = bool(random_flip_proteins)
         self.skipped = []
 
     def __iter__(self):
@@ -530,6 +541,14 @@ class TernaryDataLoader:
             entry["case"], entry["protein1"], entry["protein2"], entry["ligand"],
             self.score_model_args, self.device, cache_dir=self.cache_dir,
         )
+        if self.random_flip_proteins and np.random.random() < 0.5:
+            # Re-express the entire ternary state in the old POI-centered frame,
+            # then exchange branch identities. This matches DeepTernary's
+            # training-only random protein flip while preserving the invariant
+            # that the current E3/reference partner is centered at the origin.
+            e3_data, poi_data, ligand_data = swap_protein_reference(
+                e3_data, poi_data, ligand_data,
+            )
         return {
             'case': entry['case'],
             'e3_data': e3_data,
