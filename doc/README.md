@@ -6,6 +6,7 @@
 
 | 文档 | 用途 | 何时阅读 |
 |---|---|---|
+| [TriFuse 架构与审计.md](TriFuse%20架构与审计.md) | `trifuse_v13` 数据流、参考系、训练契约与已知边界 | 快速理解或审计当前模型时 |
 | [TriCoopDiff 模型交接文档.md](TriCoopDiff%20模型交接文档.md) | `trifuse_v13` 架构、FiLM、训练和采样 | 修改核心模型前 |
 | [双DiffDock界面协同修正方案.md](双DiffDock界面协同修正方案.md) | 双 expert 的界面职责与刚体更新顺序 | 修改坐标动力学时 |
 | [三分子初始化策略方案.md](三分子初始化策略方案.md) | `native` 与 `coupled5a` 初始化、参考系和验收 | 修改采样或初始化时 |
@@ -23,6 +24,7 @@
 - 训练分别对两个界面应用 native DiffDock forward noise，再重建唯一一致的全局坐标。
 - 新 checkpoint 必须是 version 16 且 `architecture=trifuse_v13`；旧版本必须拒绝。
 - version 16 记录 activation clamp、torsion expert 辅助损失与 LoRA warmup；训练与评估必须恢复一致配置。
+- 当前只定义 Phase 1；`judge_head/state_head` 缺少监督标签，因此保持冻结，不能用无损失的“Phase 2”假装完成微调。
 - Phase 1 使用官方 DeepTernary MGD cluster representatives 训练，并保持 train/validation/test 三个索引互不重叠。
 
 ## 维护规则

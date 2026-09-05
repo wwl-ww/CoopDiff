@@ -599,6 +599,7 @@ class TokenNegotiator(nn.Module):
         self.encoder = nn.TransformerEncoder(
             layer, num_layers=num_layers,
             norm=nn.LayerNorm(hidden_dim),
+            enable_nested_tensor=False,
         )
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -773,7 +774,7 @@ def fourier_time_embedding(t: torch.Tensor, n_freqs: int = 16) -> torch.Tensor:
 
 
 class JudgeHead(nn.Module):
-    """Predicts per-atom clash mask and global confidence."""
+    """Reserved global confidence head; frozen until labels are available."""
 
     def __init__(self, hidden_dim: int = 128):
         super().__init__()
@@ -949,9 +950,9 @@ class TriFuse(nn.Module):
     """
     Geometry-aware controller coordinating both docking interfaces.
 
-    Takes the full ternary graph → pools to tokens → equivariant transformer →
-    produces branch-specific FiLM modulation parameters, clash confidence,
-    and state predictions. Rigid interface scores come exclusively from the
+    Takes the full ternary graph → typed geometry tokens → token negotiation →
+    branch-specific FiLM, bounded score controls, and bond decisions. Reserved
+    confidence/state outputs remain frozen until supervised. Rigid scores come from the
     two equivariant DiffDock experts; TriFuse no longer predicts an unrelated
     Cartesian POI score.
 

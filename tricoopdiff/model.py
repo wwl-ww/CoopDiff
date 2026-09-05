@@ -31,7 +31,7 @@ class TriCoopDiff(nn.Module):
 
     Components:
     - Two frozen DiffDock experts (shared weights, two subgraphs)
-    - One trainable TriFuse (~2.2M params)
+    - One trainable TriFuse interface controller
     - Multi-rate diffusion process
     - Explicit E3--Ligand and POI--Ligand interface score fields
     """
@@ -56,8 +56,6 @@ class TriCoopDiff(nn.Module):
         self.num_conv_layers = num_conv_layers
         self.use_film = use_film
 
-        self._layer_cache = {}
-
     def forward(
         self,
         e3_data: dict,
@@ -66,7 +64,6 @@ class TriCoopDiff(nn.Module):
         t_e3l: torch.Tensor,
         t_pol: torch.Tensor = None,
         r_e3_to_poi: torch.Tensor = None,
-        pocket_guide: torch.Tensor = None,
         receptor_crop_cutoff: torch.Tensor = None,
         diffusion_state: torch.Tensor = None,
     ) -> dict:
@@ -86,7 +83,6 @@ class TriCoopDiff(nn.Module):
                 identity (backward-compatible). The sampler tracks this inverse
                 body-frame map directly so subgraph2 sees the correct
                 PROTAC-POI relative geometry.
-            pocket_guide: [B,3] optional pocket center for guidance potential
             receptor_crop_cutoff: [B] optional native-style receptor crop radius
                 per complex. When provided, each two-body subgraph keeps only the
                 receptor residues within this cutoff of the current ligand pose
@@ -262,6 +258,8 @@ class TriCoopDiff(nn.Module):
                     film_params_b[:self.num_conv_layers],
                     film_params_b[self.num_conv_layers:],
                     self.trifuse.layerwise_bridge,
+                    probe_e3l=sub1_probe,
+                    probe_pol=sub2_probe,
                 )
             else:
                 # L0 ablation: no FiLM, use native expert forward
@@ -439,7 +437,7 @@ class TriCoopDiff(nn.Module):
         return _expert_forward_with_film(self.expert, data, t, film_params)
 
 
-def _prepare_expert_stream(expert, data, t, branch):
+def _prepare_expert_stream(expert, data, t, branch, probe=None):
     """Prepare one DiffDock stream for lock-step dual-expert execution."""
     model = expert.model
     from .lora import set_expert_lora_branch
@@ -481,6 +479,32 @@ def _prepare_expert_stream(expert, data, t, branch):
     s1 = lig_edge_index.shape[1]
     s2 = s1 + lr_edge_index.shape[1]
     s3 = s2 + rec_edge_index.shape[1]
+    if probe is not None:
+        probe.update({
+            'complex_t': {
+                name: float(data.complex_t[name][0].item())
+                for name in ('tr', 'rot', 'tor')
+            },
+            'sigma': {
+                'tr': float(tr_sigma.reshape(-1)[0].item()),
+                'rot': float(rot_sigma.reshape(-1)[0].item()),
+                'tor': float(tor_sigma.reshape(-1)[0].item()),
+            },
+            'node_counts': {
+                'ligand': int(n_lig), 'receptor': int(len(rec_node_attr)),
+            },
+            'edge_counts': {
+                'ligand': int(lig_edge_index.shape[1]),
+                'cross': int(lr_edge_index.shape[1]),
+                'receptor': int(rec_edge_index.shape[1]),
+            },
+            'embedding_finite': {
+                'ligand': bool(torch.isfinite(lig_node_attr).all().item()),
+                'receptor': bool(torch.isfinite(rec_node_attr).all().item()),
+                'cross_attr': bool(torch.isfinite(lr_edge_attr).all().item()),
+            },
+            'layer_activations': [],
+        })
     return {
         'expert': expert, 'model': model, 'data': data, 'branch': branch,
         'node_attr': node_attr, 'n_lig': n_lig,
@@ -491,6 +515,7 @@ def _prepare_expert_stream(expert, data, t, branch):
         'counts': (n_lig, len(rec_node_attr), lig_edge_index.shape[1],
                    lr_edge_index.shape[1], rec_edge_index.shape[1]),
         'telemetry': [],
+        'probe': probe,
     }
 
 
@@ -590,6 +615,18 @@ def _film_and_record_stream(stream, gamma, beta):
         log_rms(rec_scalar), clamp_fraction,
         torch.isfinite(node_attr).to(node_attr.dtype).mean(),
     )))
+    if stream['probe'] is not None:
+        stream['probe']['layer_activations'].append({
+            'layer': len(stream['telemetry']) - 1,
+            'finite': bool(torch.isfinite(node_attr).all().item()),
+            'absmax': float(
+                torch.nan_to_num(node_attr.detach()).abs().max().item()
+            ),
+            'ligand_absmax': float(
+                torch.nan_to_num(ligand.detach()).abs().max().item()
+            ),
+            'clamp_fraction': float(clamp_fraction.detach().item()),
+        })
 
 
 def _finish_expert_stream(stream):
@@ -616,11 +653,15 @@ def _finish_expert_stream(stream):
 
 def _dual_expert_forward_with_bridge(
     expert, data_e3l, data_pol, t_e3l, t_pol,
-    film_e3l, film_pol, bridge,
+    film_e3l, film_pol, bridge, probe_e3l=None, probe_pol=None,
 ):
     """Run two experts in Jacobi lock-step with exactly two conv calls/layer."""
-    e3l = _prepare_expert_stream(expert, data_e3l, t_e3l, 'sub1')
-    pol = _prepare_expert_stream(expert, data_pol, t_pol, 'sub2')
+    e3l = _prepare_expert_stream(
+        expert, data_e3l, t_e3l, 'sub1', probe=probe_e3l,
+    )
+    pol = _prepare_expert_stream(
+        expert, data_pol, t_pol, 'sub2', probe=probe_pol,
+    )
     if e3l['n_lig'] != pol['n_lig']:
         raise ValueError("dual streams must share canonical ligand atom IDs")
     for layer_index in range(len(expert.model.conv_layers)):

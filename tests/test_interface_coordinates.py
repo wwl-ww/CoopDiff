@@ -8,6 +8,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from tricoopdiff.diffusion import InterfaceDiffusion
+from tricoopdiff.graphs import transform_ligand_to_poi_frame
 
 
 def _triangle(center):
@@ -86,8 +87,36 @@ def test_interface_pair_noise_reconstructs_finite_frames():
     )
     assert set(noise) == {"e3_ligand", "poi_ligand"}
 
+    # The returned matrix is the inverse/body-frame map: the same rotation
+    # that placed the clean POI into the global noisy frame must recover its
+    # centered template coordinates when applied on the right to row vectors.
+    recovered_poi = (
+        noisy_poi - noisy_poi.mean(dim=1, keepdim=True)
+    ) @ global_to_poi
+    clean_centered = poi - poi.mean(dim=1, keepdim=True)
+    assert torch.allclose(recovered_poi, clean_centered, atol=2e-5)
+
+    local_vector = torch.tensor([[0.3, -0.7, 1.1]])
+    global_vector = local_vector @ global_to_poi.transpose(-1, -2)
+    assert torch.allclose(global_vector @ global_to_poi, local_vector, atol=1e-6)
+
+
+def test_body_frame_transform_centers_poi_and_roundtrips_ligand():
+    rotation = torch.tensor([
+        [0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0],
+    ])
+    e3_center = torch.tensor([0.0, 0.0, 0.0])
+    poi_center = torch.tensor([6.0, -2.0, 3.0])
+    ligand = torch.tensor([[7.0, -1.0, 3.5], [8.0, -3.0, 2.0]])
+    local = transform_ligand_to_poi_frame(
+        ligand, poi_center - e3_center, rotation,
+    )
+    recovered = local @ rotation.T + poi_center
+    assert torch.allclose(recovered, ligand, atol=1e-6)
+
 
 if __name__ == "__main__":
     test_interface_composition_preserves_poi_side_relative_geometry()
     test_interface_pair_noise_reconstructs_finite_frames()
+    test_body_frame_transform_centers_poi_and_roundtrips_ligand()
     print("Interface-coordinate tests passed")

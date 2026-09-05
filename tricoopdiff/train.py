@@ -1,18 +1,19 @@
 """
 Training pipeline for interface-coordinate TriCoopDiff.
 
-Gradient flow (the two-body experts are frozen, requires_grad=False everywhere,
-so every gradient reaches TriFuse through branch-specific FiLM parameters):
-  L_E3L → E3--Ligand expert → branch FiLM → TriFuse
-  L_POL → POI--Ligand expert → branch FiLM → TriFuse
-  L_tor → shared linker torsion score → both expert adapters
+Gradient flow (the pretrained expert base stays frozen while independent LoRA
+adapters and TriFuse are trainable):
+  L_E3L → E3--Ligand expert → sub1 LoRA / FiLM / bridge → TriFuse
+  L_POL → POI--Ligand expert → sub2 LoRA / FiLM / bridge → TriFuse
+  L_tor → per-bond coordinator → both expert torsion opinions
 
-Two training phases:
-  Phase 1: Train FiLM heads and expert adapters (freeze judge/state heads)
-  Phase 2: Unfreeze all TriFuse heads
+Current supervised phase:
+  Phase 1: Train interface control, FiLM, bridge, torsion coordination, and
+  expert adapters. Auxiliary judge/state heads stay frozen because the current
+  dataset does not provide their labels.
 
 Current implementation uses B=1 sequential optimization; batched variable-size
-graphs and LoRA are not implemented yet.
+graphs remain future work.
 """
 
 import torch
@@ -33,8 +34,7 @@ class TriCoopDiffTrainer:
     """
     Trainer for TriCoopDiff model.
 
-    Handles the multi-task loss, gradient isolation (frozen experts),
-    and two-phase training strategy.
+    Handles interface score matching and gradient isolation of frozen experts.
     """
 
     def __init__(
@@ -352,8 +352,8 @@ class TriCoopDiffTrainer:
         """
         Switch training phase.
 
-        Phase 1: Train FiLM heads and expert adapters (freeze judge/state)
-        Phase 2: Unfreeze all TriFuse heads
+        Only Phase 1 is currently defined. The auxiliary judge/state heads have
+        no targets in ``compute_loss`` and must not be advertised as trainable.
         """
         if phase == 1:
             # Freeze judge and state heads
@@ -361,10 +361,11 @@ class TriCoopDiffTrainer:
                 param.requires_grad = False
             for param in self.model.trifuse.state_head.parameters():
                 param.requires_grad = False
-        elif phase == 2:
-            # Unfreeze everything in TriFuse
-            for param in self.model.trifuse.parameters():
-                param.requires_grad = True
+        else:
+            raise ValueError(
+                "only phase=1 is implemented; phase=2 requires explicit "
+                "confidence/state labels and losses"
+            )
 
     def save_checkpoint(self, path: str):
         """Save model checkpoint.

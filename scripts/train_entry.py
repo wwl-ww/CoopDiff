@@ -1,9 +1,10 @@
 """
 TriCoopDiff training entry point.
 
-Two-phase training:
-  Phase 1: Interface score matching (branch FiLM + expert LoRA)
-  Phase 2: PROTAC fine-tuning (all TriFuse heads, low LR, LoRA)
+Supervised training:
+  Phase 1: Interface score matching (TriFuse control + expert LoRA).
+  Auxiliary confidence/state training is intentionally unavailable until the
+  dataset and loss expose explicit labels.
 
 Current scope: **B=1 sequential training** on real ternary complexes. The
 featurized data is produced on the fly from a JSON index (``make_deepternary_index.py``)
@@ -81,8 +82,8 @@ def parse_args():
     )
 
     # Phase
-    p.add_argument("--phase", type=int, default=1, choices=[1, 2],
-                   help="1=interface score matching, 2=finetune auxiliary heads")
+    p.add_argument("--phase", type=int, default=1, choices=[1],
+                   help="interface score matching (the only defined phase)")
     p.add_argument("--resume", default=None, help="Resume from checkpoint")
 
     # Model config
@@ -304,10 +305,7 @@ def main():
     # 5. Final save
     # ----------------------------------------------------------------
     print("[5/6] Saving final model...")
-    final_path = os.path.join(
-        args.output_dir,
-        "tricoopdiff_zero.pt" if args.phase == 1 else "tricoopdiff_ft.pt"
-    )
+    final_path = os.path.join(args.output_dir, "tricoopdiff_zero.pt")
     trainer.save_checkpoint(final_path)
     print(f"Done. Model saved to {final_path}")
 
