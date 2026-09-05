@@ -1,5 +1,8 @@
 # TriCoopDiff 文档索引
 
+- [Phase 1 数据协议](./Phase%201%20数据协议.md)：正式联合训练池、cluster
+  切分/采样规则及 PROTAC/Molecular Glue benchmark 协议。
+
 本目录只保留长期有效的设计、验证和运行文档。代码、测试与最新结果始终优先于文档；实验产物位于 `results/`，不要把临时日志或 agent 交接稿放入 `doc/`。
 
 ## 阅读顺序
@@ -26,7 +29,8 @@
 - 新 checkpoint 必须是 version 16 且 `architecture=trifuse_v13`；旧版本必须拒绝。
 - version 16 记录 activation clamp、torsion expert 辅助损失与 LoRA warmup；训练与评估必须恢复一致配置。
 - 当前只定义 Phase 1；`judge_head/state_head` 缺少监督标签，因此保持冻结，不能用无损失的“Phase 2”假装完成微调。
-- Phase 1 使用官方 DeepTernary MGD cluster representatives 训练，并保持 train/validation/test 三个索引互不重叠。
+- Phase 1 使用 PROTAC/Molecular Glue 官方训练成员的去 benchmark 同 PDB
+  交集（7,198 cases、653 merged clusters），并按 cluster 留出内部 validation。
 
 ## 维护规则
 

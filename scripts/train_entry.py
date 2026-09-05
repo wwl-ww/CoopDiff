@@ -49,6 +49,14 @@ def parse_args():
     # Data
     p.add_argument("--train_data", required=True, help="Training data JSON")
     p.add_argument("--val_data", required=True, help="Validation data JSON")
+    p.add_argument(
+        "--max-train-clusters", type=int, default=None,
+        help="Bound training clusters for an allocated smoke run only",
+    )
+    p.add_argument(
+        "--max-val-clusters", type=int, default=None,
+        help="Bound validation clusters for an allocated smoke run only",
+    )
 
     # Training
     p.add_argument("--output_dir", required=True, help="Checkpoint output directory")
@@ -123,7 +131,7 @@ def _load_score_model_args(expert_model_dir):
         return Namespace(**yaml.full_load(f))
 
 
-def _load_entries(data_json):
+def _load_index(data_json):
     """Read an index and resolve portable or stale-checkout input paths."""
     with open(data_json) as f:
         index = json.load(f)
@@ -144,7 +152,14 @@ def _load_entries(data_json):
                 )
             entry[key] = str(path.resolve())
         resolved.append(entry)
-    return resolved
+    entries_by_case = {entry['case']: entry for entry in resolved}
+    clusters = index.get('clusters') if isinstance(index, dict) else None
+    return resolved, clusters, entries_by_case
+
+
+def _load_entries(data_json):
+    """Backward-compatible flat-entry accessor."""
+    return _load_index(data_json)[0]
 
 
 def main():
@@ -205,12 +220,12 @@ def main():
     train_loader = TernaryDataLoader(
         args.train_data, score_model_args,
         shuffle=True, device=str(device), cache_dir=args.cache_dir,
-        skip_on_error=False,
+        skip_on_error=False, max_clusters=args.max_train_clusters,
     )
     val_loader = TernaryDataLoader(
         args.val_data, score_model_args,
         shuffle=False, device=str(device), cache_dir=args.cache_dir,
-        skip_on_error=False,
+        skip_on_error=False, max_clusters=args.max_val_clusters,
     )
 
     # ----------------------------------------------------------------
@@ -446,8 +461,18 @@ class TernaryDataLoader:
     """
 
     def __init__(self, data_json, score_model_args, shuffle=True, device="cuda",
-                 cache_dir=None, skip_on_error=False):
-        self.entries = _load_entries(data_json)
+                 cache_dir=None, skip_on_error=False, max_clusters=None):
+        self.entries, self.clusters, self.entries_by_case = _load_index(data_json)
+        if max_clusters is not None:
+            if max_clusters <= 0:
+                raise ValueError('max_clusters must be positive')
+            if self.clusters:
+                self.clusters = self.clusters[:max_clusters]
+            else:
+                self.entries = self.entries[:max_clusters]
+                self.entries_by_case = {
+                    entry['case']: entry for entry in self.entries
+                }
         self.score_model_args = score_model_args
         self.shuffle = shuffle
         self.device = device
@@ -456,11 +481,8 @@ class TernaryDataLoader:
         self.skipped = []
 
     def __iter__(self):
-        indices = list(range(len(self.entries)))
-        if self.shuffle:
-            np.random.shuffle(indices)
-        for i in indices:
-            entry = self.entries[i]
+        entries = self._epoch_entries()
+        for i, entry in enumerate(entries):
             try:
                 yield self._load_one(entry)
             except Exception as e:
@@ -470,7 +492,38 @@ class TernaryDataLoader:
                 print(f"[data] SKIP {entry.get('case', i)}: {e}", flush=True)
 
     def __len__(self):
-        return len(self.entries)
+        return len(self.clusters) if self.clusters else len(self.entries)
+
+    def _epoch_entries(self):
+        """Select one case per cluster, following DeepTernary's 80/20 rule."""
+        if not self.clusters:
+            selected = list(self.entries)
+        elif self.shuffle:
+            selected = []
+            for cluster in self.clusters:
+                items = [case for case in cluster['items']
+                         if case in self.entries_by_case]
+                representatives = [case for case in cluster.get('representative', [])
+                                   if case in self.entries_by_case]
+                if not items:
+                    raise RuntimeError('cluster has no materialized entries')
+                candidates = items if np.random.random() < 0.8 else (
+                    representatives or items)
+                selected.append(self.entries_by_case[np.random.choice(candidates)])
+        else:
+            selected = []
+            for cluster in self.clusters:
+                candidates = [case for case in cluster.get('representative', [])
+                              if case in self.entries_by_case]
+                if not candidates:
+                    candidates = [case for case in cluster['items']
+                                  if case in self.entries_by_case]
+                if not candidates:
+                    raise RuntimeError('cluster has no materialized entries')
+                selected.append(self.entries_by_case[candidates[0]])
+        if self.shuffle:
+            np.random.shuffle(selected)
+        return selected
 
     def _load_one(self, entry):
         e3_data, poi_data, ligand_data, _ = featurize_complex(

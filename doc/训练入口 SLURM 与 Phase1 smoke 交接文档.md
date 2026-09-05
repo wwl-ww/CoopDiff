@@ -5,7 +5,7 @@
 小型诊断应写成可复现 Python 脚本，提交 Git 后交由同学运行。训练、完整 GPU parity 和大规模评估才使用 SLURM。有效 GPU 分区包括 `gpu_a800`、`gpu_h100`、`gpu_h200`；提交前用真实调度器检查，不依赖静态 `sinfo` 包装输出。
 
 ```bash
-sbatch scripts/train_deepternary_smoke.slurm
+sbatch scripts/train_deepternary_phase1.slurm
 squeue -j <job_id>
 sacct -j <job_id> --format=JobID,State,ExitCode,Elapsed,NodeList
 ```
@@ -22,23 +22,23 @@ sacct -j <job_id> --format=JobID,State,ExitCode,Elapsed,NodeList
 
 ## Phase 1 门禁
 
-训练前必须具备新鲜的：
+训练前必须具备：
 
-1. `results/sampling_parity_regression.json`：sub1/sub2 全部 finite/pass；
-2. `results/initialization_frame_check.json`：全部 frame checks 通过；
-3. 有效且互不重叠的 `data/ternary_train.json`、`data/ternary_val.json` 和
-   `data/ternary_test.json`，所有路径在当前 clone 可解析；
+1. PROTAC/Molecular Glue 联合训练池固定为 7,198 cases、653 merged clusters；
+2. 按 cluster 划分且互不重叠的 `data/ternary_train.json` 和
+   `data/ternary_val.json`；
+3. 两个正式 benchmark 的同 PDB case 已从训练池排除；
 4. `checkpoints/score_model/model_parameters.yml` 与 expert 权重。
 
 使用 `scripts/check_phase1_readiness.py` 汇总，只有 `ready=true` 才能进入正式训练。清理 `results/` 后必须重新生成门禁报告。
 
 ## Smoke 与正式训练
 
-```bash
-# DeepTernary 独立 train/val 小样本 smoke
-sbatch scripts/train_deepternary_smoke.slurm
+为节省调度次数，正式 wrapper 在同一个 allocation 中依次生成/验证索引、运行
+104-train/8-validation cluster smoke，然后从头运行 100-epoch Phase 1。任一门禁
+失败都会阻止正式训练启动：
 
-# smoke 验收后才运行正式 Phase 1
+```bash
 sbatch scripts/train_deepternary_phase1.slurm
 ```
 

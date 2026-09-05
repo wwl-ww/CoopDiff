@@ -1,18 +1,97 @@
 #!/usr/bin/env python
-"""Convert the official DeepTernary TernaryDB release for TriCoopDiff.
+"""Build the leak-controlled joint DeepTernary training indexes.
 
 The release stores each complex as ``pdbs/<case>/gt_complex.pdb`` with the two
 protein partners normalized to chains A and B and the ligand as HETATM records.
-This script exports the three files consumed by ``TernaryDataLoader`` and uses
-DeepTernary's published sequence clusters rather than making a random split.
+The training pool is the exact member intersection of DeepTernary's published
+PROTAC and Molecular Glue training cluster files. Cases sharing a PDB ID with
+either official benchmark are excluded. Cluster relationships from both tasks
+are merged, then a deterministic cluster-level train/validation split is made.
 """
 
 import argparse
 import json
+import random
 from pathlib import Path
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+class UnionFind:
+    """Minimal disjoint-set implementation used to merge cluster relations."""
+
+    def __init__(self, items):
+        self.parent = {item: item for item in items}
+
+    def find(self, item):
+        parent = self.parent[item]
+        if parent != item:
+            self.parent[item] = self.find(parent)
+        return self.parent[item]
+
+    def union(self, left, right):
+        left_root, right_root = self.find(left), self.find(right)
+        if left_root != right_root:
+            self.parent[right_root] = left_root
+
+
+def case_pdb_id(case):
+    """Return the case-insensitive four-character PDB identifier."""
+    return case.split('_', 1)[0].upper()
+
+
+def cluster_members(clusters):
+    """Return the unique item members represented by a cluster file."""
+    return {case for cluster in clusters for case in cluster.get('items', [])}
+
+
+def merge_cluster_intersection(cluster_sets, excluded_pdb_ids=()):
+    """Intersect member pools and union all within-source cluster relations."""
+    if not cluster_sets:
+        return []
+    shared = set.intersection(*(cluster_members(clusters) for clusters in cluster_sets))
+    excluded_pdb_ids = {value.upper() for value in excluded_pdb_ids}
+    shared = {case for case in shared if case_pdb_id(case) not in excluded_pdb_ids}
+    union_find = UnionFind(shared)
+    representative_cases = set()
+    for clusters in cluster_sets:
+        for cluster in clusters:
+            members = [case for case in cluster.get('items', []) if case in shared]
+            if members:
+                anchor = members[0]
+                for member in members[1:]:
+                    union_find.union(anchor, member)
+            representative_cases.update(
+                case for case in cluster.get('representative', []) if case in shared
+            )
+    components = {}
+    for case in shared:
+        components.setdefault(union_find.find(case), []).append(case)
+    merged = []
+    for members in components.values():
+        members = sorted(members)
+        representatives = sorted(set(members) & representative_cases)
+        merged.append({
+            'representative': representatives or [members[0]],
+            'items': members,
+        })
+    return sorted(merged, key=lambda cluster: cluster['items'][0])
+
+
+def split_clusters(clusters, validation_fraction=0.1, seed=0):
+    """Make a deterministic cluster-level split without member leakage."""
+    if not 0 < validation_fraction < 1:
+        raise ValueError('validation_fraction must be between 0 and 1')
+    order = list(range(len(clusters)))
+    random.Random(seed).shuffle(order)
+    n_validation = max(1, round(len(clusters) * validation_fraction))
+    validation_ids = set(order[:n_validation])
+    train = [cluster for index, cluster in enumerate(clusters)
+             if index not in validation_ids]
+    validation = [cluster for index, cluster in enumerate(clusters)
+                  if index in validation_ids]
+    return train, validation
 
 
 def select_cluster_cases(clusters, mode='representative', excluded=None):
@@ -123,7 +202,7 @@ def export_case(case, pdb_root, output_root):
     }
 
 
-def build_index(cases, pdb_root, output_root, min_ligand_heavy_atoms=20):
+def build_index(cases, pdb_root, output_root, min_ligand_heavy_atoms=1):
     """Export available cases and retain explicit rejection reasons."""
     entries, rejected = [], []
     for index, case in enumerate(cases, start=1):
@@ -143,62 +222,101 @@ def build_index(cases, pdb_root, output_root, min_ligand_heavy_atoms=20):
     return entries, rejected
 
 
-def write_index(path, entries, rejected, metadata):
+def write_index(path, entries, rejected, metadata, clusters=None):
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps({
+    payload = {
         'entries': entries,
         'rejected': rejected,
         'metadata': metadata,
-    }, indent=2), encoding='utf-8')
+    }
+    if clusters is not None:
+        entry_cases = {entry['case'] for entry in entries}
+        payload['clusters'] = [{
+            'representative': [
+                case for case in cluster['representative'] if case in entry_cases
+            ],
+            'items': [case for case in cluster['items'] if case in entry_cases],
+        } for cluster in clusters]
+        payload['clusters'] = [cluster for cluster in payload['clusters']
+                               if cluster['items']]
+    output.write_text(json.dumps(payload, indent=2), encoding='utf-8')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--release-root', default='data/TernaryDB_release')
-    parser.add_argument('--task', choices=['MGD', 'PROTAC'], default='MGD')
-    parser.add_argument('--cluster-mode', choices=['representative', 'all'],
-                        default='representative')
+    parser.add_argument('--protac-clusters',
+                        default='DeepTernary/data/PROTAC/train_clusters_poc6.json')
+    parser.add_argument('--mgd-clusters', default=(
+        'DeepTernary/data/MolecularGlue/train_clusters_poc3_exUNL.json'))
+    parser.add_argument('--protac-test', default='DeepTernary/data/PROTAC/protac22.txt')
+    parser.add_argument('--mgd-test', default='DeepTernary/data/MolecularGlue/test_all.txt')
+    parser.add_argument('--validation-fraction', type=float, default=0.1)
+    parser.add_argument('--split-seed', type=int, default=0)
+    parser.add_argument('--expect-pool-cases', type=int, default=7198)
+    parser.add_argument('--expect-pool-clusters', type=int, default=653)
     parser.add_argument('--output-root', default='data/ternary_deepternary')
     parser.add_argument('--index-dir', default='data')
     parser.add_argument('--limit', type=int, default=None)
     parser.add_argument('--min-ligand-heavy-atoms', '--min-ligand-atoms',
-                        dest='min_ligand_heavy_atoms', type=int, default=20)
+                        dest='min_ligand_heavy_atoms', type=int, default=1,
+                        help='Structural sanity threshold; official cluster '
+                             'membership is otherwise preserved')
     args = parser.parse_args()
 
     release = Path(args.release_root)
-    task_dir = release / args.task
-    clusters = json.loads((task_dir / 'train_clusters.json').read_text())
-    val_cases = read_case_list(
-        task_dir / ('val.csv' if args.task == 'PROTAC' else 'val.txt')
+    protac_clusters = json.loads(Path(args.protac_clusters).read_text())
+    mgd_clusters = json.loads(Path(args.mgd_clusters).read_text())
+    benchmark_cases = read_case_list(args.protac_test) + read_case_list(args.mgd_test)
+    benchmark_pdb_ids = {case_pdb_id(case) for case in benchmark_cases}
+    clusters = merge_cluster_intersection(
+        [protac_clusters, mgd_clusters], benchmark_pdb_ids,
     )
-    test_cases = read_case_list(
-        task_dir / ('test.csv' if args.task == 'PROTAC' else 'test.txt')
+    pool_cases = sum(len(cluster['items']) for cluster in clusters)
+    if pool_cases != args.expect_pool_cases or len(clusters) != args.expect_pool_clusters:
+        raise RuntimeError(
+            'joint-pool contract changed: expected '
+            f'{args.expect_pool_cases} cases/{args.expect_pool_clusters} clusters, '
+            f'found {pool_cases} cases/{len(clusters)} clusters'
+        )
+    train_clusters, validation_clusters = split_clusters(
+        clusters, args.validation_fraction, args.split_seed,
     )
-    splits = {
-        'train': select_cluster_cases(
-            clusters, args.cluster_mode, excluded=set(val_cases) | set(test_cases),
-        ),
-        'val': val_cases,
-        'test': test_cases,
-    }
-    for split, cases in splits.items():
+    splits = {'train': train_clusters, 'val': validation_clusters}
+    total_rejected = 0
+    for split, split_cluster_list in splits.items():
+        cases = sorted({case for cluster in split_cluster_list
+                        for case in cluster['items']})
         if args.limit is not None:
             cases = cases[:args.limit]
         entries, rejected = build_index(
             cases, release / 'pdbs', Path(args.output_root) / split,
             min_ligand_heavy_atoms=args.min_ligand_heavy_atoms,
         )
+        total_rejected += len(rejected)
         destination = Path(args.index_dir) / f'ternary_{split}.json'
         write_index(destination, entries, rejected, {
-            'task': args.task,
-            'cluster_mode': args.cluster_mode if split == 'train' else None,
+            'protocol': 'joint_train_intersection_v1',
+            'sampling': ('cluster_80pct_any_20pct_representative'
+                         if split == 'train' else 'fixed_representative'),
             'requested': len(cases),
+            'clusters_requested': len(split_cluster_list),
+            'joint_pool_cases': sum(len(cluster['items']) for cluster in clusters),
+            'joint_pool_clusters': len(clusters),
+            'excluded_benchmark_pdb_ids': sorted(benchmark_pdb_ids),
+            'validation_fraction': args.validation_fraction,
+            'split_seed': args.split_seed,
             'min_ligand_heavy_atoms': args.min_ligand_heavy_atoms,
             'accepted': len(entries),
             'rejected': len(rejected),
-        })
+        }, clusters=split_cluster_list)
         print(f'{split}: {len(entries)} accepted, {len(rejected)} rejected -> {destination}')
+    if total_rejected:
+        raise RuntimeError(
+            f'{total_rejected} joint-pool cases failed materialization; '
+            'refusing to start training with a silently reduced dataset'
+        )
 
 
 if __name__ == '__main__':
