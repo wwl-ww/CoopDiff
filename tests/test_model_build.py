@@ -52,10 +52,9 @@ def test_trifuse_build():
     # Count parameters
     n_params = sum(p.numel() for p in trifuse.parameters())
     print(f"  TriFuse params: {n_params:,}")
-    # Small MVP config (ns=32, nv=4, 3 transformer layers — the TriFuse defaults
-    # used by the smoke test) is ~340k params. (The ~2.2M figure in early docs
-    # assumed ns=48, nv=10.) Sanity: non-trivial but not bloated.
-    assert 200_000 < n_params < 1_000_000, f"Unexpected TriFuse params: {n_params:,}"
+    # The atom-contact and bond encoders intentionally increase capacity while
+    # remaining well below the 2.5M P0 budget.
+    assert 500_000 < n_params < 2_500_000, f"Unexpected TriFuse params: {n_params:,}"
 
     print("  [OK] TriFuse build")
 
@@ -111,12 +110,12 @@ def test_trifuse_links_chemical_features_to_local_contacts():
 
     torch.manual_seed(7)
     trifuse = TriFuse(
-        node_dim=32, input_dim=8, ns=8, nv=2,
+        node_dim=32, input_dim=16, ns=8, nv=2,
         num_transformer_layers=1,
         num_conv_layers_per_expert=2,
         dropout=0.0,
     ).eval()
-    features = torch.randn(9, 8)
+    features = torch.randn(9, 16)
     node_types = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2])
     coords = torch.tensor([
         [0.0, 0.0, 0.0], [8.0, 0.0, 0.0], [16.0, 0.0, 0.0],
@@ -198,6 +197,32 @@ def test_torsion_coordinator_does_not_overflow_finite_evidence():
     assert torch.isfinite(coordinated).all()
     assert torch.isfinite(weight).all()
     assert torch.isfinite(residual).all()
+
+
+def test_bond_context_is_local_to_each_rotatable_bond():
+    """Distinct endpoints/fragments must produce distinct bond contexts."""
+    from tricoopdiff.trifuse import BondContextEncoder
+
+    torch.manual_seed(11)
+    encoder = BondContextEncoder(hidden_dim=16)
+    ligand_tokens = torch.randn(5, 16)
+    ligand_coords = torch.tensor([
+        [0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [2.8, 0.3, 0.0],
+        [4.2, 0.3, 0.0], [5.6, 1.0, 0.0],
+    ])
+    edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]])
+    edge_mask = torch.tensor([False, True, True, False])
+    mask_rotate = torch.tensor([
+        [False, False, True, True, True],
+        [False, False, False, True, True],
+    ])
+    context = encoder(
+        ligand_tokens, ligand_coords, edge_index, edge_mask,
+        mask_rotate, torch.randn(1, 16),
+    )
+    assert context.shape == (1, 2, 16)
+    assert not torch.allclose(context[:, 0], context[:, 1])
+    print("  [OK] Rotatable bonds receive local contexts")
 
 
 def test_diffusion_schedules():
@@ -397,6 +422,7 @@ if __name__ == "__main__":
     test_torsion_coordinator_zero_init_and_per_bond_control()
     test_torsion_coordinator_rejects_flat_native_shape()
     test_torsion_coordinator_does_not_overflow_finite_evidence()
+    test_bond_context_is_local_to_each_rotatable_bond()
     test_diffusion_schedules()
     test_graph_construction()
     test_initializer_body_frame()

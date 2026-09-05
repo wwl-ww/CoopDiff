@@ -141,6 +141,9 @@ def build_trifuse_graph(
     poi_features: torch.Tensor,
     ligand_coords: torch.Tensor,
     ligand_features: torch.Tensor,
+    lig_edge_index: torch.Tensor = None,
+    lig_edge_mask: torch.Tensor = None,
+    lig_mask_rotate=None,
 ) -> dict:
     """
     Build the full ternary graph for TriFuse processing.
@@ -202,6 +205,9 @@ def build_trifuse_graph(
         'n_e3': n_e3,
         'n_poi': n_poi,
         'n_lig': n_lig,
+        'lig_edge_index': lig_edge_index,
+        'lig_edge_mask': lig_edge_mask,
+        'lig_mask_rotate': lig_mask_rotate,
     }
 
 

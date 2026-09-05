@@ -219,6 +219,9 @@ class TriCoopDiff(nn.Module):
                 poi_features=poi_data['features'][b],
                 ligand_coords=ligand_data['coords'][b],
                 ligand_features=ligand_data['features'][b],
+                lig_edge_index=ligand_data.get('edge_index'),
+                lig_edge_mask=ligand_data.get('edge_mask'),
+                lig_mask_rotate=ligand_data.get('mask_rotate'),
             )
 
             # TriFuse forward (node features are 2D [N, D]; no batch dim).
@@ -231,6 +234,9 @@ class TriCoopDiff(nn.Module):
                 node_types=tri_graph['node_types'],
                 t_e3l=t_e3l[b:b + 1],
                 t_pol=t_pol[b:b + 1],
+                lig_edge_index=tri_graph['lig_edge_index'],
+                lig_edge_mask=tri_graph['lig_edge_mask'],
+                lig_mask_rotate=tri_graph['lig_mask_rotate'],
             )
 
             film_params_b = tri_out['film_params']
@@ -350,7 +356,7 @@ class TriCoopDiff(nn.Module):
             if scores_1['tor_score'].numel() and scores_2['tor_score'].numel():
                 torsion_score, torsion_weight, torsion_residual = (
                     self.trifuse.torsion_coordinator(
-                        tri_out['h_cond'],
+                        tri_out['bond_context'],
                         scores_1['tor_score'],
                         scores_2['tor_score'],
                     )

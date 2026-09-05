@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .diffdock.constants import lig_feature_dims
+
 # torch_scatter is a common dependency but may need separate install.
 # Fall back to manual scatter if unavailable.
 try:
@@ -172,6 +174,87 @@ def scatter_max_per_batch(feat, batch, n_batch):
     return torch.stack(outputs, dim=0)
 
 
+class LigandFeatureEncoder(nn.Module):
+    """Embed DiffDock categorical ligand features without treating IDs as floats."""
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        categorical_dims, scalar_dim = lig_feature_dims
+        if scalar_dim:
+            raise ValueError("TriFuse expects categorical-only DiffDock ligand features")
+        self.categorical_dims = tuple(categorical_dims)
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(size, hidden_dim) for size in self.categorical_dims
+        ])
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if features.shape[-1] < len(self.embeddings):
+            raise ValueError(
+                f"ligand features require {len(self.embeddings)} categorical columns"
+            )
+        encoded = features.new_zeros(features.shape[0], self.norm.normalized_shape[0])
+        for column, (embedding, size) in enumerate(zip(
+            self.embeddings, self.categorical_dims,
+        )):
+            indices = features[:, column].long().clamp_(0, size - 1)
+            encoded = encoded + embedding(indices)
+        return self.norm(encoded / math.sqrt(len(self.embeddings)))
+
+
+class BondContextEncoder(nn.Module):
+    """Build one context token per canonical rotatable bond."""
+
+    def __init__(self, hidden_dim: int, n_rbf: int = 16,
+                 max_distance: float = 8.0):
+        super().__init__()
+        self.register_buffer(
+            "rbf_centers", torch.linspace(0.0, max_distance, n_rbf),
+        )
+        self.rbf_width = max_distance / max(n_rbf - 1, 1)
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 4 + n_rbf + 2),
+            nn.Linear(hidden_dim * 4 + n_rbf + 2, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+
+    def forward(self, ligand_tokens: torch.Tensor, ligand_coords: torch.Tensor,
+                edge_index: torch.Tensor, edge_mask: torch.Tensor,
+                mask_rotate, global_context: torch.Tensor) -> torch.Tensor:
+        if edge_index is None or edge_mask is None or not bool(edge_mask.any()):
+            return global_context.new_zeros(global_context.shape[0], 0,
+                                            global_context.shape[-1])
+        bonds = edge_index[:, edge_mask].T.long()
+        left = ligand_tokens[bonds[:, 0]]
+        right = ligand_tokens[bonds[:, 1]]
+        lengths = torch.linalg.vector_norm(
+            ligand_coords[bonds[:, 0]] - ligand_coords[bonds[:, 1]], dim=-1,
+        )
+        distance_rbf = torch.exp(
+            -0.5 * ((lengths[:, None] - self.rbf_centers[None, :])
+                    / self.rbf_width) ** 2
+        )
+        if mask_rotate is None:
+            fragment = lengths.new_zeros(len(bonds), 2)
+        else:
+            rotate = torch.as_tensor(
+                mask_rotate, device=lengths.device, dtype=lengths.dtype,
+            )
+            if rotate.ndim == 3:
+                rotate = rotate[0]
+            if rotate.shape[0] != len(bonds):
+                raise ValueError("rotatable-bond and fragment-mask counts differ")
+            fraction = rotate.mean(dim=-1)
+            fragment = torch.stack((fraction, 1.0 - fraction), dim=-1)
+        global_per_bond = global_context.expand(len(bonds), -1)
+        token = self.net(torch.cat((
+            left, right, (left - right).abs(), global_per_bond,
+            distance_rbf, fragment,
+        ), dim=-1))
+        return token.unsqueeze(0)
+
+
 class TernaryGeometryEncoder(nn.Module):
     """Encode typed components and their chemically labelled local contacts.
 
@@ -187,7 +270,7 @@ class TernaryGeometryEncoder(nn.Module):
 
     def __init__(self, input_dim: int, hidden_dim: int = 128,
                  n_rbf: int = 16, max_distance: float = 40.0,
-                 max_pair_tokens: int = 24):
+                 max_pair_tokens: int = 24, contacts_per_ligand: int = 4):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.n_rbf = n_rbf
@@ -195,7 +278,11 @@ class TernaryGeometryEncoder(nn.Module):
         if max_pair_tokens <= 0:
             raise ValueError("max_pair_tokens must be positive")
         self.max_pair_tokens = int(max_pair_tokens)
-        self.feature_proj = nn.Linear(input_dim, hidden_dim)
+        if contacts_per_ligand <= 0:
+            raise ValueError("contacts_per_ligand must be positive")
+        self.contacts_per_ligand = int(contacts_per_ligand)
+        self.protein_feature_proj = nn.Linear(input_dim, hidden_dim)
+        self.ligand_feature_encoder = LigandFeatureEncoder(hidden_dim)
         self.type_embedding = nn.Embedding(3, hidden_dim)
         self.component_queries = nn.Parameter(torch.randn(3, hidden_dim) * 0.02)
         self.pair_type_embedding = nn.Embedding(len(self.PAIRS), hidden_dim)
@@ -226,6 +313,12 @@ class TernaryGeometryEncoder(nn.Module):
         self.interface_fusion = nn.Sequential(
             nn.LayerNorm(hidden_dim * 4),
             nn.Linear(hidden_dim * 4, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+        self.ligand_contact_fusion = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 3),
+            nn.Linear(hidden_dim * 3, hidden_dim * 2),
             nn.SiLU(),
             nn.Linear(hidden_dim * 2, hidden_dim),
         )
@@ -286,6 +379,39 @@ class TernaryGeometryEncoder(nn.Module):
             + pair_features.max(dim=0).values
         ) / 3.0
 
+    def _ligand_centric_contacts(
+        self,
+        protein_features: torch.Tensor,
+        protein_coords: torch.Tensor,
+        ligand_features: torch.Tensor,
+        ligand_coords: torch.Tensor,
+        pair_index: int,
+    ) -> torch.Tensor:
+        """Return one contact token per ligand atom with guaranteed coverage."""
+        distances = torch.cdist(ligand_coords, protein_coords)
+        k = min(self.contacts_per_ligand, protein_coords.shape[0])
+        values, protein_indices = torch.topk(
+            distances, k=k, dim=1, largest=False, sorted=True,
+        )
+        ligand_indices = torch.arange(
+            ligand_coords.shape[0], device=ligand_coords.device,
+        )[:, None].expand(-1, k)
+        offsets = values[..., None] - self.rbf_centers
+        distance_rbf = torch.exp(-0.5 * (offsets / self.rbf_width) ** 2)
+        contacts = self.pair_net(torch.cat((
+            ligand_features[ligand_indices],
+            protein_features[protein_indices],
+            distance_rbf,
+        ), dim=-1))
+        contacts = contacts + self.pair_type_embedding.weight[pair_index]
+        scores = contacts @ self.pair_queries[pair_index]
+        weights = torch.softmax(scores, dim=1)
+        return (
+            (contacts * weights[..., None]).sum(dim=1)
+            + contacts.mean(dim=1)
+            + contacts.max(dim=1).values
+        ) / 3.0
+
     def forward(self, node_features: torch.Tensor, node_coords: torch.Tensor,
                 node_types: torch.Tensor, batch: torch.Tensor = None) -> torch.Tensor:
         if batch is None:
@@ -295,11 +421,21 @@ class TernaryGeometryEncoder(nn.Module):
             )
         node_types = node_types.to(device=node_features.device)
         node_coords = node_coords.to(device=node_features.device)
-        features = self.feature_proj(node_features) + self.type_embedding(node_types)
+        features = node_features.new_zeros(node_features.shape[0], self.hidden_dim)
+        protein_mask = node_types != 2
+        ligand_mask = node_types == 2
+        features[protein_mask] = self.protein_feature_proj(
+            node_features[protein_mask]
+        )
+        features[ligand_mask] = self.ligand_feature_encoder(
+            node_features[ligand_mask]
+        )
+        features = features + self.type_embedding(node_types)
 
         global_outputs = []
         e3l_outputs = []
         pol_outputs = []
+        ligand_token_outputs = []
         n_batch = int(batch.max().item()) + 1
         for batch_index in range(n_batch):
             batch_mask = batch == batch_index
@@ -338,13 +474,24 @@ class TernaryGeometryEncoder(nn.Module):
                 self._pair_descriptor(component_coords[a], component_coords[b])
                 for a, b in self.PAIRS
             ]
+            e3_contacts = self._ligand_centric_contacts(
+                component_features_by_type[0], component_coords[0],
+                component_features_by_type[2], component_coords[2], 0,
+            )
+            pol_contacts = self._ligand_centric_contacts(
+                component_features_by_type[1], component_coords[1],
+                component_features_by_type[2], component_coords[2], 1,
+            )
+            ligand_tokens = self.ligand_contact_fusion(torch.cat((
+                component_features_by_type[2], e3_contacts, pol_contacts,
+            ), dim=-1))
             local_pair_tokens = [
+                e3_contacts.mean(dim=0),
+                pol_contacts.mean(dim=0),
                 self._local_pair_token(
-                    component_features_by_type[a], component_coords[a],
-                    component_features_by_type[b], component_coords[b],
-                    pair_index,
-                )
-                for pair_index, (a, b) in enumerate(self.PAIRS)
+                    component_features_by_type[0], component_coords[0],
+                    component_features_by_type[1], component_coords[1], 2,
+                ),
             ]
             geometry = torch.cat((
                 *pair_descriptors, torch.stack(component_descriptors),
@@ -361,10 +508,12 @@ class TernaryGeometryEncoder(nn.Module):
                 component_tokens[1], component_tokens[2],
                 local_pair_tokens[1], geometry_token,
             ))))
+            ligand_token_outputs.append(ligand_tokens)
         return {
             "global": torch.stack(global_outputs, dim=0),
             "e3l": torch.stack(e3l_outputs, dim=0),
             "pol": torch.stack(pol_outputs, dim=0),
+            "ligand_tokens": ligand_token_outputs,
         }
 
 
@@ -632,7 +781,15 @@ class TorsionCoordinator(nn.Module):
             raise ValueError("torsion context and scores have different batches")
 
         n_torsions = score_e3l.shape[1]
-        context_per_bond = context.unsqueeze(1).expand(-1, n_torsions, -1)
+        if context.ndim == 2:
+            context_per_bond = context.unsqueeze(1).expand(-1, n_torsions, -1)
+        elif context.ndim == 3 and context.shape[1] == n_torsions:
+            context_per_bond = context
+        else:
+            raise ValueError(
+                "torsion context must have shape [B,D] or [B,K,D], got "
+                f"{tuple(context.shape)} for K={n_torsions}"
+            )
         bounded_e3l = torch.tanh(score_e3l)
         bounded_pol = torch.tanh(score_pol)
         bond_evidence = torch.stack(
@@ -731,6 +888,7 @@ class TriFuse(nn.Module):
         self.torsion_coordinator = TorsionCoordinator(
             context_dim=node_dim,
         )
+        self.bond_context_encoder = BondContextEncoder(node_dim)
 
         # FiLM: shared MLP → per-layer heads (12 heads = 6 layers × 2 subgraphs)
         self.film_shared = nn.Sequential(
@@ -755,6 +913,9 @@ class TriFuse(nn.Module):
         batch: torch.Tensor = None,
         t_e3l: torch.Tensor = None,
         t_pol: torch.Tensor = None,
+        lig_edge_index: torch.Tensor = None,
+        lig_edge_mask: torch.Tensor = None,
+        lig_mask_rotate=None,
     ) -> dict:
         """
         Args:
@@ -783,6 +944,13 @@ class TriFuse(nn.Module):
         h_e3l = self.transformer(pooled['e3l'])['combined']
         h_pol = self.transformer(pooled['pol'])['combined']
         h_cond = h_global + 0.5 * (h_e3l + h_pol)
+        if len(pooled['ligand_tokens']) != 1:
+            raise ValueError("TriFuse bond contexts currently require one graph")
+        ligand_mask = node_types == 2
+        bond_context = self.bond_context_encoder(
+            pooled['ligand_tokens'][0], node_coords[ligand_mask],
+            lig_edge_index, lig_edge_mask, lig_mask_rotate, h_cond,
+        )
 
         # 3. Auxiliary scalar heads.
         confidence = self.judge_head(h_cond)      # [B, 1]
@@ -818,6 +986,7 @@ class TriFuse(nn.Module):
             'h_cond': h_cond,
             'h_e3l': h_e3l,
             'h_pol': h_pol,
+            'bond_context': bond_context,
         }
 
 
