@@ -66,3 +66,9 @@ DeepTernary/
 
 # Results & audit outputs (large, generated)
 results/
+
+# Local Codex/agent skills (installed outside source control)
+/.codex/
+/.agents/
+/.skills/
+/skills/

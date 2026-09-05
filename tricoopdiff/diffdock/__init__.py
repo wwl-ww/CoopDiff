@@ -1,21 +1,27 @@
-"""Vendored DiffDock core (model + reverse sampling), self-contained.
+"""Vendored DiffDock model core and data featurization.
 
-This subpackage vendors the parts of DiffDock that TriCoopDiff needs to build
-and run the frozen DiffDock-L expert, plus the reverse-sampling loop, so the
-project no longer depends on the sibling ``../DiffDock`` checkout.
+This subpackage vendors everything TriCoopDiff needs from DiffDock: the model
+core to build/run the frozen DiffDock-L expert and the data-featurization
+modules — so the project no longer depends on the
+sibling ``../DiffDock`` checkout at all.
 
 Upstream source: github.com/gcorso/DiffDock commit 47eb91a (+ uncommitted
 ``nan-stability-fixes`` working-tree changes). The only permitted divergences
 from upstream are:
-  1. relative imports (``.models`` / ``.utils``) + a lazy ``esm`` import +
-     feature-dims moved to ``constants.py`` (drops RDKit / BioPython / ProDy /
-     fair-esm from the model core);
+  1. imports rewritten to ``tricoopdiff.diffdock.*`` + a lazy ``esm`` import +
+     feature-dims moved to ``constants.py`` (keeps RDKit / BioPython / ProDy /
+     fair-esm out of the *model core*; the vendored ``.datasets`` +
+     ``.utils.inference_utils`` featurization modules do pull them, but only
+     when featurization is imported);
   2. the NaN root-cause fix (``NAN_CLAMP`` clamp + ``NAN_TRACE`` diagnostics +
      ``tor_bonds[0]`` sigma indexing) in ``models/cg_model.py``, the
-     ``NAN_TRACE`` tensor-product diagnostics in ``models/tensor_layers.py``,
-     and the NaN fallback gate (Bug B) in ``sampling.py``.
+     ``NAN_TRACE`` tensor-product diagnostics in ``models/tensor_layers.py``.
 
-Data featurization (``InferenceDataset`` / ``datasets/process_mols.py``) is NOT
-vendored here and still lives in ``../DiffDock``.
+Data featurization (``InferenceDataset`` / ``get_sequences`` /
+``datasets/process_mols.py`` / ``utils/inference_utils.py``) is vendored under
+``.datasets`` and ``.utils.inference_utils``; scripts import it via
+``tricoopdiff.diffdock.datasets.*`` / ``tricoopdiff.diffdock.utils.inference_utils``
+instead of the old ``from utils.inference_utils`` / ``from datasets.*`` imports
+that required the ``../DiffDock`` checkout on ``sys.path``.
 """
 from . import constants  # noqa: F401

@@ -1,51 +1,134 @@
 #!/usr/bin/env python
 """
-Shared featurization utilities for TriCoopDiff training + smoke test.
+Shared production featurization for TriCoopDiff training and evaluation.
 
-Extracts the featurization path that ``scripts/mvp_smoke_test.py`` validated
-(receptor/ligand subgraph featurization via DiffDock's ``InferenceDataset`` +
-on-the-fly ESM2-650M embeddings) into a single reusable module.
+Builds receptor/ligand subgraphs through DiffDock's ``InferenceDataset`` and
+generates ESM2-650M embeddings on demand.
 
-These functions depend on the sibling ``../DiffDock`` checkout for *data
-featurization only* (``InferenceDataset`` / ``get_sequences``), which is why they
-live under ``scripts/`` rather than the self-contained ``tricoopdiff/`` package.
-The model itself runs entirely on the vendored ``tricoopdiff.diffdock.*``.
+The featurization modules (``InferenceDataset`` / ``get_sequences`` /
+``datasets.process_mols``) are vendored under ``tricoopdiff.diffdock``
+(``.datasets`` + ``.utils.inference_utils``), so these functions import them via
+``tricoopdiff.diffdock.*`` and no longer need the external DiffDock checkout.
+They still live under ``scripts/`` rather than ``tricoopdiff/`` because they mix
+project data paths (``DeepTernary/output/...``) with the vendored featurization.
 """
 
+import hashlib
+import json
 import os
 import sys
+import gc
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_DIFFDOCK_DIR = _PROJECT_ROOT.parent / "DiffDock"
+
 
 # Make the project root importable so `import tricoopdiff.*` works regardless of
 # how this module is invoked (it is not pip-installed).
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-# (1) Import diffdock_compat FIRST — its import-time side effect patches
+# Import diffdock_compat FIRST — its import-time side effect patches
 # torch_cluster / torch_scatter with pure-PyTorch fallbacks before the vendored
-# cg_model and ../DiffDock's process_mols bind those symbols at import time.
+# cg_model and the vendored process_mols bind those symbols at import time.
 import tricoopdiff.diffdock_compat  # noqa: F401
 
-# (2) Add ../DiffDock to sys.path for data featurization ONLY.
-if not _DIFFDOCK_DIR.exists():
-    raise RuntimeError(f"DiffDock checkout not found at {_DIFFDOCK_DIR}")
-sys.path.insert(0, str(_DIFFDOCK_DIR))
-
+import numpy as np
 import torch
 from torch_geometric.loader import DataLoader
 
-from utils.inference_utils import InferenceDataset, get_sequences
+from tricoopdiff.diffdock.utils.inference_utils import InferenceDataset, get_sequences
 
 # DiffDock's SO(3)/torus cache lookup resolves relative to CWD; the cache files
 # live in the project root. Chdir there so score lookups find them (SLURM also
 # does this, but interactive runs may not).
 os.chdir(_PROJECT_ROOT)
 
+# Featurization cache schema version. Bump whenever the geometry/frame handling
+# of the produced data changes, so stale on-disk caches (written before the
+# shared-reference-frame fix) are invalidated instead of silently reused.
+_FEATURIZE_CACHE_VERSION = 4
+
+
+def _featurize_signature(protein1, protein2, ligand_path, score_model_args):
+    """Fingerprint source structures and model preprocessing arguments."""
+    digest = hashlib.sha256()
+    for path in (protein1, protein2, ligand_path):
+        resolved = Path(path).resolve()
+        digest.update(str(resolved).encode())
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    digest.update(
+        json.dumps(vars(score_model_args), sort_keys=True, default=str).encode()
+    )
+    return digest.hexdigest()
+
+
+def _protein_ca_centroid(pdb_path):
+    """Cα centroid of a protein PDB in its crystal frame.
+
+    Mirrors DiffDock's ``moad_extract_receptor_structure``: the receptor coords
+    are all Cα positions (column 1 of ``datasets.parse_chi.get_coords``), and the
+    centroid that ``inference_utils`` subtracts is their mean. Returns float32 [3].
+    """
+    import prody as pr
+    from tricoopdiff.diffdock.datasets.parse_chi import get_coords
+
+    pdb = pr.parsePDB(pdb_path)
+    coords = get_coords(pdb)          # [n_res, 14, 3]; column 1 = Cα
+    ca = coords[:, 1, :]              # [n_res, 3]
+    center = np.nanmean(ca, axis=0)
+    if not np.all(np.isfinite(center)):
+        raise RuntimeError(f"could not compute Cα centroid for {pdb_path}")
+    return center.astype(np.float32)
+
+
+def _ligand_heavy_centroid(ligand_path):
+    """Heavy-atom centroid of the ligand conformer in its crystal frame.
+
+    The featurizer runs with ``remove_hs=True``, so hydrogens are dropped before
+    taking the mean to match the featurized (H-free) ligand. Returns float32 [3].
+    """
+    from rdkit import Chem
+
+    ext = Path(ligand_path).suffix.lower()
+    if ext == ".sdf":
+        mol = Chem.SDMolSupplier(ligand_path, removeHs=False, sanitize=False)[0]
+    elif ext == ".pdb":
+        mol = Chem.MolFromPDBFile(ligand_path, removeHs=False, sanitize=False)
+    elif ext == ".mol2":
+        mol = Chem.MolFromMol2File(ligand_path, removeHs=False, sanitize=False)
+    else:
+        mol = Chem.MolFromMolFile(ligand_path, removeHs=False, sanitize=False)
+    if mol is None or mol.GetNumConformers() == 0:
+        raise RuntimeError(f"could not read ligand conformer from {ligand_path}")
+    conf = mol.GetConformer()
+    # Filter heavy atoms directly (atomic number > 1) to match remove_hs=True,
+    # without calling RemoveHs (which can trip on unsanitized PROTACs).
+    pos = np.asarray([
+        list(conf.GetAtomPosition(a.GetIdx()))
+        for a in mol.GetAtoms() if a.GetAtomicNum() > 1
+    ], dtype=np.float32)
+    if pos.shape[0] == 0:
+        raise RuntimeError(f"no heavy atoms found in ligand {ligand_path}")
+    return pos.mean(axis=0)
+
+
+def _true_relative_offsets(protein1, protein2, ligand_path):
+    """True inter-molecule translations in the shared crystal frame.
+
+    Returns ``(t_e3_to_poi, lig_offset)``, both float32 [3]:
+      * ``t_e3_to_poi`` = POI Cα centroid − E3 Cα centroid  (E3→POI translation)
+      * ``lig_offset``   = PROTAC heavy centroid − E3 Cα centroid  (PROTAC in E3 frame)
+    """
+    e3_center = _protein_ca_centroid(protein1)
+    poi_center = _protein_ca_centroid(protein2)
+    lig_center = _ligand_heavy_centroid(ligand_path)
+    return poi_center - e3_center, lig_center - e3_center
+
 
 def generate_esm_embeddings(protein_paths, device):
-    """Generate ESM2-650M embeddings for protein PDBs (mirrors experiment1).
+    """Generate ESM2-650M embeddings for protein PDBs.
 
     Returns: dict {protein_path: [per-chain torch.Tensor (n_res, 1280)]}.
     """
@@ -70,10 +153,18 @@ def generate_esm_embeddings(protein_paths, device):
     unique_embeddings = embedder.embed_from_fasta(unique_seqs, batch_size=4)
     seq_to_emb = dict(zip(unique_seqs, unique_embeddings))
 
-    return {
+    result = {
         path: [seq_to_emb[s].cpu() for s in chain_seqs]
         for path, chain_seqs in per_protein_info
     }
+    # This helper is called lazily once per uncached training case. ESM2-650M is
+    # much larger than the score model, so retaining one allocator block per
+    # call eventually exhausts a single GPU even with B=1.
+    del embedder, unique_embeddings, seq_to_emb
+    gc.collect()
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return result
 
 
 def featurize_subgraph(case_label, protein_path, ligand_path, chain_embs,
@@ -100,6 +191,10 @@ def featurize_subgraph(case_label, protein_path, ligand_path, chain_embs,
             False if not hasattr(score_model_args, "not_knn_only_graph")
             else not score_model_args.not_knn_only_graph
         ),
+        # These are crystallographic training/evaluation SDFs. The generic
+        # DiffDock inference path regenerates file conformers by default, which
+        # destroys the ternary pose even when its centroid is restored later.
+        preserve_ligand_conformer=True,
     )
     loader = DataLoader(dataset=dataset, batch_size=1, shuffle=False)
     return next(iter(loader))
@@ -175,12 +270,22 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
         in the exact format ``TriCoopDiff.forward`` / ``compute_loss`` expect
         (B=1, on ``device``); ``receptor_feat_dim`` is the receptor feature dim
         (1281 for DiffDock-L).
+
+        Frame convention (BUG-18): E3 stays at its featurized coords (Cα centroid
+        at the origin); POI and PROTAC are re-expressed in that same E3 frame via
+        the true crystal-frame translations, so ``model.forward``'s on-the-fly
+        ``t_e3_to_poi = poi_center - e3_center`` recovers the real E3→POI
+        translation instead of the 0 that ``InferenceDataset``'s per-molecule
+        centering would otherwise produce.
     """
     for p in (protein1, protein2, ligand_path):
         if p is not None and not Path(p).is_absolute():
             raise ValueError(f"expected absolute path, got: {p}")
 
     cache_path = None
+    cache_signature = _featurize_signature(
+        protein1, protein2, ligand_path, score_model_args
+    )
     if cache_dir is not None:
         cache_path = Path(cache_dir) / f"{case_label.replace('/', '_')}.pt"
         if cache_path.exists():
@@ -188,10 +293,17 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
             # which PyTorch 2.6's default weights_only=True refuses to unpickle.
             # The file is written by us (trusted), so full unpickling is safe.
             cached = torch.load(cache_path, map_location="cpu", weights_only=False)
-            e3 = _to_device_and_batch(cached['e3_data'], device)
-            poi = _to_device_and_batch(cached['poi_data'], device)
-            lig = _to_device_and_batch(cached['ligand_data'], device)
-            return e3, poi, lig, cached['receptor_feat_dim']
+            if (
+                cached.get('cache_version') == _FEATURIZE_CACHE_VERSION
+                and cached.get('source_signature') == cache_signature
+            ):
+                e3 = _to_device_and_batch(cached['e3_data'], device)
+                poi = _to_device_and_batch(cached['poi_data'], device)
+                lig = _to_device_and_batch(cached['ligand_data'], device)
+                return e3, poi, lig, cached['receptor_feat_dim']
+            # else: stale cache written before the shared-reference-frame fix
+            # (BUG-18) — fall through and re-featurize so the corrected geometry
+            # is never silently replaced by the old per-molecule-centered one.
 
     embeddings_map = generate_esm_embeddings([protein1, protein2], device)
 
@@ -212,6 +324,24 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
     ligand_data = extract_ligand(e3_graph, device)  # ligand identical in both
     receptor_feat_dim = e3_data['features'].shape[-1]
 
+    # BUG-18 fix: ``InferenceDataset`` independently centers each molecule at its
+    # own centroid (E3, POI and PROTAC each end up at the origin), destroying the
+    # inter-molecule relative translations — t_e3_to_poi collapses to 0 and the
+    # model would learn to denoise everything onto the origin. Recover the true
+    # centroids from the raw files and re-express POI + PROTAC in the shared E3
+    # reference frame (E3 itself stays at its featurized, centroid-at-origin
+    # coords). After this, model.forward's ``t_e3_to_poi = poi_center - e3_center``
+    # recovers the true E3→POI translation instead of 0.
+    t_e3_to_poi, lig_offset = _true_relative_offsets(protein1, protein2, ligand_path)
+    poi_data['coords'] = poi_data['coords'] + torch.tensor(
+        t_e3_to_poi, dtype=poi_data['coords'].dtype, device=poi_data['coords'].device
+    ).view(1, 1, 3)
+    ligand_data['coords'] = ligand_data['coords'] + torch.tensor(
+        lig_offset, dtype=ligand_data['coords'].dtype, device=ligand_data['coords'].device
+    ).view(1, 1, 3)
+    print(f"[data] {case_label}: t_e3_to_poi={t_e3_to_poi.tolist()} "
+          f"(|.|={float(np.linalg.norm(t_e3_to_poi)):.2f} Å)", flush=True)
+
     if cache_path is not None:
         os.makedirs(cache_dir, exist_ok=True)
         torch.save({
@@ -219,6 +349,9 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
             'poi_data': _strip_batch_and_cpu(poi_data),
             'ligand_data': _strip_batch_and_cpu(ligand_data),
             'receptor_feat_dim': receptor_feat_dim,
+            't_e3_to_poi': torch.tensor(t_e3_to_poi, dtype=torch.float32),
+            'cache_version': _FEATURIZE_CACHE_VERSION,
+            'source_signature': cache_signature,
         }, cache_path)
 
     return e3_data, poi_data, ligand_data, receptor_feat_dim

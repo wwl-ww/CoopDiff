@@ -14,7 +14,7 @@ import numpy as np
 
 def test_tribrain_build():
     """TriBrain builds with correct output shapes."""
-    from tricoopdiff.tribrain import TriBrain, MultiScalePooling, EquivariantTransformer
+    from tricoopdiff.tribrain import TriBrain
 
     tribrain = TriBrain(
         node_dim=128, ns=32, nv=4,
@@ -23,14 +23,17 @@ def test_tribrain_build():
     )
 
     # Dummy ternary graph: 100 E3 residues + 150 POI residues + 80 PROTAC atoms
+    # TriBrain.forward expects UNBATCHED [N, ...] inputs (batch index derived
+    # internally); the leading dim here was a stray batch of 1 that broke
+    # per-batch softmax (result[mask] of shape [1] vs value [N]).
     N = 330
-    node_features = torch.randn(1, N, 128)
-    node_coords = torch.randn(1, N, 3)
+    node_features = torch.randn(N, 128)
+    node_coords = torch.randn(N, 3)
     node_types = torch.cat([
         torch.zeros(100, dtype=torch.long),
         torch.ones(150, dtype=torch.long),
         2 * torch.ones(80, dtype=torch.long),
-    ]).unsqueeze(0)
+    ])
 
     out = tribrain(node_features, node_coords, node_types)
 
@@ -39,13 +42,19 @@ def test_tribrain_build():
     assert out['state'].shape == (1, 2)
     assert len(out['film_params']) == 12  # 6 layers × 2 subgraphs
     for gamma, beta in out['film_params']:
-        assert gamma.shape == (1, 128)
-        assert beta.shape == (1, 128)
+        # FiLMHead outputs [B, film_dim] per (gamma, beta); film_dim defaults to
+        # 48 (the expert's scalar channel count), not node_dim=128.
+        assert gamma.shape == (1, tribrain.film_dim)
+        assert beta.shape == (1, tribrain.film_dim)
+    assert out['merge_gate'].shape == (1, 3), f"merge_gate shape: {out['merge_gate'].shape}"
 
     # Count parameters
     n_params = sum(p.numel() for p in tribrain.parameters())
     print(f"  TriBrain params: {n_params:,}")
-    assert 1_500_000 < n_params < 3_000_000, f"Expected ~2.2M params, got {n_params:,}"
+    # Small MVP config (ns=32, nv=4, 3 transformer layers — the TriBrain defaults
+    # used by the smoke test) is ~340k params. (The ~2.2M figure in early docs
+    # assumed ns=48, nv=10.) Sanity: non-trivial but not bloated.
+    assert 200_000 < n_params < 1_000_000, f"Unexpected TriBrain params: {n_params:,}"
 
     print("  [OK] TriBrain build")
 
@@ -124,6 +133,19 @@ def test_graph_construction():
     assert sub2['receptor'].pos.shape == (N_poi, 3)
     assert sub2['ligand'].pos.shape == (N_lig, 3)
 
+    # POI and ligand must undergo the same frame change before entering the
+    # POI-L expert. Their relative vectors are preserved by the shared rigid
+    # transform; transforming only the ligand recreates the historical sub2 NaN.
+    translation = torch.tensor([4.0, -2.0, 7.0])
+    rotation = torch.tensor([[0.0, -1.0, 0.0],
+                             [1.0, 0.0, 0.0],
+                             [0.0, 0.0, 1.0]])
+    poi_local = transform_ligand_to_poi_frame(poi_coords, translation, rotation)
+    lig_local = transform_ligand_to_poi_frame(lig_coords, translation, rotation)
+    before = lig_coords[0] - poi_coords[0]
+    after = lig_local[0] - poi_local[0]
+    assert torch.allclose(after, before @ rotation, atol=1e-6)
+
     # Ternary graph
     tri = build_tribrain_graph(e3_coords, e3_feat, poi_coords, poi_feat, lig_coords, lig_feat)
     assert tri['node_coords'].shape == (N_e3 + N_poi + N_lig, 3)
@@ -134,17 +156,82 @@ def test_graph_construction():
     print("  [OK] Graph construction")
 
 
+def test_initializer_body_frame():
+    """The rotation returned by POI initialization is the inverse frame map."""
+    from tricoopdiff.diffusion import TernaryInitializer
+    from tricoopdiff.graphs import transform_ligand_to_poi_frame
+
+    np.random.seed(7)
+    torch.manual_seed(7)
+    template = torch.tensor([
+        [0.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 3.0],
+    ])
+    e3_center = torch.zeros(1, 3)
+    initialized, body_rotation = TernaryInitializer().initialize_poi(
+        e3_center, template, return_rotation=True, init_mode="coupled5a",
+    )
+    translation = initialized[0].mean(0) - e3_center[0]
+    local = transform_ligand_to_poi_frame(
+        initialized[0], translation, body_rotation[0],
+    )
+    expected = template - template.mean(0)
+    assert torch.allclose(local, expected, atol=1e-5), (local, expected)
+
+    print("  [OK] Initializer body-frame rotation")
+
+
+def test_frozen_expert_stays_eval():
+    """Parent train mode must not reactivate a frozen pretrained expert."""
+    import torch.nn as nn
+    from tricoopdiff.expert import FrozenDiffDock
+
+    class DummyExpert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dropout = nn.Dropout(0.5)
+            self.ns, self.nv = 4, 1
+            self.sh_irreps = None
+            self.device = "cpu"
+
+    frozen = FrozenDiffDock(DummyExpert(), num_conv_layers=1)
+    parent = nn.Module()
+    parent.add_module("expert", frozen)
+    parent.train()
+    assert not frozen.training
+    assert not frozen.model.training
+    assert all(not parameter.requires_grad for parameter in frozen.parameters())
+
+    print("  [OK] Frozen expert remains in eval mode")
+
+
+def test_score_sanitizer_handles_infinity():
+    """Inference fallback must replace NaN and both infinities with finite values."""
+    from tricoopdiff.sampler import _sanitize_score
+
+    score = torch.tensor([[1.0, float("nan"), float("inf"), -float("inf")]])
+    sanitized, changed = _sanitize_score(score)
+    assert changed
+    assert torch.isfinite(sanitized).all()
+
+    print("  [OK] Score sanitizer handles infinities")
+
+
 def test_reflect_pipeline():
     """TriReflect detects clashes and runs minimization."""
     from tricoopdiff.reflect import detect_clashes, tricoop_reflect
 
-    # Create two overlapping atoms → should clash
-    coords = np.array([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]])
-    atomic_numbers = np.array([6, 6])  # both carbon, VDW=1.7
+    # Create two non-bonded atoms well inside VDW contact → should clash.
+    # (0.5Å is skipped by the covalent-radius 1-2 heuristic, which treats very
+    # close pairs as a possible bond when no bond graph is supplied.)
+    coords = np.array([[0.0, 0.0, 0.0], [2.5, 0.0, 0.0]])
+    atomic_numbers = np.array([6, 6])  # both carbon, VDW=1.7 → contact 3.4Å
 
     clashes = detect_clashes(coords, atomic_numbers, vdw_scale=1.0)
-    # C VDW radius = 1.7, 2*1.7=3.4, 0.5 < 3.4 → clash
-    assert clashes.sum() > 0, "Should detect clash for atoms 0.5Å apart"
+    # 2.5 < 3.4 (VDW contact) and 2.5 > 1.2×(0.76+0.76)=1.82 (not bonded) → clash
+    assert clashes.sum() > 0, "Should detect clash for non-bonded C atoms 2.5Å apart"
 
     # Non-clashing pair
     coords_far = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
@@ -160,8 +247,8 @@ def test_reflect_pipeline():
 
 
 def test_merging():
-    """Score merging by direct addition and learned coordination."""
-    from tricoopdiff.merging import merge_direct_addition, LearnedCoordinationLayer
+    """Score merging: direct addition (L0 ablation) + residual-gated (default)."""
+    from tricoopdiff.merging import merge_direct_addition, merge_residual_gated
 
     B = 4
     scores_1 = {
@@ -175,19 +262,49 @@ def test_merging():
         'tor_score': torch.randn(B, 10),
     }
 
-    # Direct addition
+    # Direct addition (L0 ablation): s_q = s_q1 + s_q2
     merged = merge_direct_addition(scores_1, scores_2)
     for k in ['tr_score', 'rot_score', 'tor_score']:
         expected = scores_1[k] + scores_2[k]
         assert torch.allclose(merged[k], expected)
 
-    # Learned coordination
-    coord = LearnedCoordinationLayer(hidden_dim=128)
-    h_cond = torch.randn(B, 128)
-    merged_c = coord(scores_1, scores_2, h_cond)
-    assert 'merge_weights' in merged_c
+    # Residual-gated merge (default). zero gate → s_q = s_q1 (transparent);
+    # unit gate → s_q = s_q2.
+    gate_zero = torch.zeros(B, 3)
+    merged_zero = merge_residual_gated(scores_1, scores_2, gate_zero)
+    assert 'merge_gates' in merged_zero
+    for k in ['tr_score', 'rot_score', 'tor_score']:
+        assert torch.allclose(merged_zero[k], scores_1[k]), k
+
+    gate_one = torch.ones(B, 3)
+    merged_one = merge_residual_gated(scores_1, scores_2, gate_one)
+    for k in ['tr_score', 'rot_score', 'tor_score']:
+        assert torch.allclose(merged_one[k], scores_2[k]), k
 
     print("  [OK] Score merging")
+
+
+def test_deepternary_dockq_alignment():
+    """Primary DockQ matches DeepTernary's ternary-coordinate convention."""
+    from tricoopdiff.evaluate import compute_deepternary_dockq
+
+    e3 = np.array([[0.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 6.0, 0.0]])
+    ligand = np.array([[2.0, 0.0, 0.0], [2.0, 3.0, 0.0]])
+    poi = np.array([[4.0, 0.0, 0.0], [4.0, 3.0, 0.0]])
+    perfect = compute_deepternary_dockq(ligand, e3, poi, ligand, e3, poi)
+    assert perfect is not None
+    assert abs(perfect["dockq"] - 1.0) < 1e-7
+    assert abs(perfect["fnat"] - 1.0) < 1e-7
+    assert perfect["lrms"] < 1e-7
+    assert perfect["irms"] < 1e-7
+
+    displaced = compute_deepternary_dockq(
+        ligand, e3, poi, ligand + 20.0, e3, poi + 20.0
+    )
+    assert displaced is not None
+    assert displaced["dockq"] < perfect["dockq"]
+
+    print("  [OK] DeepTernary DockQ alignment")
 
 
 if __name__ == "__main__":
@@ -197,7 +314,11 @@ if __name__ == "__main__":
     test_film_zero_init()
     test_diffusion_schedules()
     test_graph_construction()
+    test_initializer_body_frame()
+    test_frozen_expert_stays_eval()
+    test_score_sanitizer_handles_infinity()
     test_reflect_pipeline()
     test_merging()
+    test_deepternary_dockq_alignment()
 
     print("\n=== All tests passed ===")

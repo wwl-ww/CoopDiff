@@ -1,12 +1,15 @@
 """
-Multi-rate diffusion process for TriCoopDiff.
+Diffusion process for TriCoopDiff.
 
-Different degrees of freedom use different noise decay rates:
-- PROTAC (translation, rotation, torsion): fast noise decay (λ_q, threshold t=0.7)
-- E3-POI rigid body: slow noise decay (λ_SE3, threshold t=0.5)
-
-This is an empirical noise schedule trick, not a strict SDE derivation.
-The threshold-based λ definition is a non-differentiable engineering approximation.
+PROTAC (translation, rotation, torsion) and the E3-POI rigid body (SE3: 3
+translation + 3 rotation) each follow an exponential σ(t) noise schedule, but
+with DIFFERENT σ bounds — faster noise decay for the PROTAC DOFs, slower for the
+SE3 rigid body. All schedules are FULL-RANGE: noise is sampled at the raw σ(t)
+for every t ∈ [0, 1], with no λ_q / λ_SE3 cutoff masking. (The earlier
+threshold-based λ multi-rate masking was removed in the debug-se3-loss work so
+that the forward noise process, the reverse denoising steps, and the DSM
+training target all use the same full σ schedule — the forward/reverse
+asymmetry that masking introduced left the low-t regime untrained at inference.)
 
 Reference frame: E3 fixed at origin. POI moves relative to E3. PROTAC is
 globally defined in the E3 reference frame.
@@ -35,13 +38,17 @@ class MultiRateDiffusion(nn.Module):
 
     def __init__(
         self,
-        # PROTAC noise parameters (from DiffDock-L paper: 0.1→19, 0.03→1.55)
+        # PROTAC noise parameters (from checkpoints/score_model/model_parameters.yml:
+        # tr 0.1→19, rot 0.03→1.55, tor 0.0314→3.14). The tor bounds MUST match the
+        # yml — the expert's baked-in score normalization (expert.py, via
+        # model.t_to_sigma) uses 0.0314/3.14, so a mismatched 0.03/1.55 here makes
+        # the reverse-step tor_g ~4.8× too weak and decouples forward/reverse σ.
         tr_sigma_min: float = 0.1,
         tr_sigma_max: float = 19.0,
         rot_sigma_min: float = 0.03,
         rot_sigma_max: float = 1.55,
-        tor_sigma_min: float = 0.03,
-        tor_sigma_max: float = 1.55,
+        tor_sigma_min: float = 0.0314,
+        tor_sigma_max: float = 3.14,
         # Temperature sampling (from DiffDock v1.1 default_inference_args.yaml)
         temp_sampling_tr: float = 1.17,
         temp_sampling_rot: float = 2.06,
@@ -57,9 +64,15 @@ class MultiRateDiffusion(nn.Module):
         se3_tr_sigma_max: float = 20.0,
         se3_rot_sigma_min: float = 0.05,
         se3_rot_sigma_max: float = 1.0,
-        # Multi-rate thresholds
-        lambda_q_threshold: float = 0.7,   # PROTAC noise cutoff
-        lambda_se3_threshold: float = 0.5,  # SE3 noise cutoff (slower)
+        # DEPRECATED multi-rate thresholds. The λ_q/λ_SE3 cutoff masking was
+        # removed from the forward/reverse path in the debug-se3-loss work
+        # (add_noise_* / reverse_step_* now use the full σ schedule for all t).
+        # Retained only so legacy diagnostic scripts and tests can still
+        # reference/override them (scripts/diagnose_loss_se3.py,
+        # scripts/verify_se3_sigma_consistency.py,
+        # tests/test_model_build.py). Production code never consults them.
+        lambda_q_threshold: float = 0.7,   # deprecated PROTAC noise cutoff
+        lambda_se3_threshold: float = 0.5,  # deprecated SE3 noise cutoff (slower)
         # Schedule
         inference_steps: int = 20,
     ):
@@ -78,7 +91,9 @@ class MultiRateDiffusion(nn.Module):
         self.se3_rot_sigma_min = se3_rot_sigma_min
         self.se3_rot_sigma_max = se3_rot_sigma_max
 
-        # Multi-rate thresholds
+        # Deprecated multi-rate thresholds — see the constructor note above.
+        # Kept as attributes for backward compatibility with legacy diagnostic
+        # scripts; the production noise/reverse paths no longer consult them.
         self.lambda_q_threshold = lambda_q_threshold
         self.lambda_se3_threshold = lambda_se3_threshold
 
@@ -120,21 +135,31 @@ class MultiRateDiffusion(nn.Module):
         return tr_sigma, rot_sigma
 
     # ------------------------------------------------------------------
-    # Multi-rate λ masking
+    # Deprecated: multi-rate λ masking (removed from the production path)
     # ------------------------------------------------------------------
 
     def get_lambda_q(self, t: torch.Tensor) -> torch.Tensor:
         """
-        PROTAC noise multiplier λ_q(t).
-        λ_q(t) = 1 for t > threshold, 0 for t <= threshold.
-        This is a stepwise, non-differentiable engineering approximation.
+        DEPRECATED. PROTAC noise multiplier λ_q(t).
+
+        λ_q(t) = 1 for t > threshold, 0 for t <= threshold. This stepwise,
+        non-differentiable mask was removed from the production forward/reverse
+        path in the debug-se3-loss work: ``add_noise_protac`` and
+        ``reverse_step_protac`` now use the full σ schedule for all t. Retained
+        only for legacy diagnostic scripts/tests (e.g. scripts/diagnose_loss_se3.py,
+        tests/test_model_build.py); production code must not call it.
         """
         return (t > self.lambda_q_threshold).float()
 
     def get_lambda_se3(self, t: torch.Tensor) -> torch.Tensor:
         """
-        SE3 noise multiplier λ_SE3(t).
-        λ_SE3(t) = 1 for t > threshold, 0 for t <= threshold.
+        DEPRECATED. SE3 noise multiplier λ_SE3(t).
+
+        λ_SE3(t) = 1 for t > threshold, 0 for t <= threshold. Removed from the
+        production path (``add_noise_se3`` / ``reverse_step_se3`` now use the full
+        σ schedule). Retained only for legacy diagnostic scripts/tests (e.g.
+        scripts/verify_se3_sigma_consistency.py); production
+        code must not call it.
         """
         return (t > self.lambda_se3_threshold).float()
 
@@ -151,6 +176,12 @@ class MultiRateDiffusion(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Add Gaussian noise to PROTAC translation and rotation (rigid-body DOFs).
+
+        The PROTAC forward process is FULL-RANGE: noise is sampled at the raw
+        σ(t) level for all t ∈ [0, 1], with NO λ_q cutoff. This keeps the forward
+        process consistent with ``reverse_step_protac`` (which denoises at the full
+        σ schedule, never applying λ) and with the DSM training target. The previous
+        λ_q cutoff made the forward schedule asymmetric with the reverse step.
 
         Torsion angles are perturbed separately by ``add_torsion_noise`` (applied
         after this rigid transform), mirroring DiffDock's ``modify_conformer``.
@@ -169,16 +200,27 @@ class MultiRateDiffusion(nn.Module):
         device = ligand_pos.device
 
         tr_sigma, rot_sigma, tor_sigma = self.t_to_sigma(t_tr, t_rot, t_tor)
-        lambda_q = self.get_lambda_q(t_tr)
 
         # Translation noise
-        tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1) * lambda_q.unsqueeze(-1)
+        tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1)
 
-        # Rotation noise (SO(3))
-        rot_update, rot_omega = sample_so3_noise(B, rot_sigma * lambda_q, device)
+        # Rotation noise (SO(3)) — wrapped sampling, matching the frozen expert's
+        # and so3_score_vec's IGSO(3) convention (see sample_so3_noise_wrapped).
+        rot_update, rot_omega = sample_so3_noise_wrapped(B, rot_sigma, device)
 
-        noisy_pos = ligand_pos + tr_update.unsqueeze(1)
-        noisy_pos = torch.bmm(noisy_pos, rot_update)
+        # Rotate about the ligand centre, then translate in the world frame —
+        # mirrors DiffDock's modify_conformer: (pos - centre) @ Rᵀ + tr + centre.
+        # The transpose is REQUIRED: DiffDock applies the rotation as @ Rᵀ =
+        # @ exp(-[ω]×), while the frozen expert was trained on that convention. A
+        # bare @ R = @ exp([ω]×) makes the expert read the pose as rotation -ω and
+        # emit score_vec(σ,-ω) = -score_vec(σ,ω) — the sign opposite of the training
+        # target score_vec(σ,ω) — so reverse_step_protac amplifies |ω| (zero-FiLM
+        # PROTAC-rotation divergence, the documented DockQ collapse).
+        # (The previous (pos + tr) @ R rotated about the ORIGIN and rotated the
+        # translation vector too, so the wrapped sampler's near-π angles teleported
+        # the ligand away from its pocket — exploding the tr-score target mismatch.)
+        lig_center = ligand_pos.mean(dim=1, keepdim=True)
+        noisy_pos = torch.bmm(ligand_pos - lig_center, rot_update.transpose(-1, -2)) + tr_update.unsqueeze(1) + lig_center
 
         return noisy_pos, tr_update, rot_update, rot_omega
 
@@ -191,6 +233,13 @@ class MultiRateDiffusion(nn.Module):
         """
         Add Gaussian noise to E3-POI rigid body transformation.
 
+        The SE3 forward process is FULL-RANGE: noise is sampled at the raw
+        σ(t) level for all t ∈ [0, 1], with NO λ_SE3 cutoff. This keeps the
+        forward process consistent with ``reverse_step_se3`` (which denoises at
+        the full σ schedule, never applying λ) and with the DSM training target.
+        The previous λ cutoff made the SE3 head train only on t ∈ (0.5, 1] while
+        inference queried t ∈ [0.05, 1.0], so the low-t regime was untrained.
+
         Args:
             poi_pos: [B, N_poi, 3] clean POI positions (relative to E3 origin)
             t_se3_tr, t_se3_rot: [B] diffusion times for SE3 DOFs
@@ -202,10 +251,9 @@ class MultiRateDiffusion(nn.Module):
         device = poi_pos.device
 
         tr_sigma, rot_sigma = self.se3_t_to_sigma(t_se3_tr, t_se3_rot)
-        lambda_se3 = self.get_lambda_se3(t_se3_tr)
 
-        tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1) * lambda_se3.unsqueeze(-1)
-        rot_update, rot_omega = sample_so3_noise(B, rot_sigma * lambda_se3, device)
+        tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1)
+        rot_update, rot_omega = sample_so3_noise(B, rot_sigma, device)
 
         # Apply to POI center of mass
         poi_center = poi_pos.mean(dim=1, keepdim=True)
@@ -226,6 +274,10 @@ class MultiRateDiffusion(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Add Gaussian noise to PROTAC rotatable-bond torsion angles.
+
+        Full-range (no λ_q cutoff), matching ``reverse_step_torsion`` and the
+        torsion DSM target over all t ∈ [0, 1] — the previous λ_q gate made the
+        forward schedule asymmetric with the reverse step.
 
         Translation/rotation perturb the whole conformer; torsion rotates each
         rotatable bond's downstream atoms around the bond axis. This mirrors
@@ -251,13 +303,12 @@ class MultiRateDiffusion(nn.Module):
         device = ligand_pos.device
 
         _, _, tor_sigma = self.t_to_sigma(t_tor, t_tor, t_tor)
-        lambda_q = self.get_lambda_q(t_tor)
 
         # Rotatable bond edges (one direction each), same row order as mask_rotate.
         rot_edges = lig_edge_index.T[lig_edge_mask]  # [n_rot, 2]
         n_rot = rot_edges.shape[0]
 
-        tor_update = torch.randn(B, n_rot, device=device) * tor_sigma.unsqueeze(-1) * lambda_q.unsqueeze(-1)
+        tor_update = torch.randn(B, n_rot, device=device) * tor_sigma.unsqueeze(-1)
 
         # A batch of 1 may carry mask_rotate as a bare ndarray; a batch of N as a
         # list of per-complex masks. Normalize to a per-element list.
@@ -301,11 +352,14 @@ class MultiRateDiffusion(nn.Module):
         dt_rot: torch.Tensor,
         dt_tor: torch.Tensor,
         add_noise: bool = True,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Single reverse SDE step for PROTAC DOFs (Euler-Maruyama).
+        Single reverse SDE step for PROTAC rigid-body DOFs (Euler-Maruyama).
 
-        dx = [score * σ² + noise] * dt
+        Mirrors DiffDock's ``modify_conformer_batch(...)`` rigid stage exactly:
+        compute tr/rot perturbations, apply the rotation about the ligand COM,
+        and return both the updated coordinates and the rigid-frame target that
+        the torsion step should Kabsch-align back to.
         """
         B = ligand_pos.shape[0]
         device = ligand_pos.device
@@ -355,14 +409,17 @@ class MultiRateDiffusion(nn.Module):
                 rot_z = torch.randn(B, 3, device=device)
                 rot_perturb = rot_perturb + rot_g * torch.sqrt(dt_rot).unsqueeze(-1) * rot_z
 
-        # Apply updates
-        ligand_pos = ligand_pos + tr_perturb.unsqueeze(1)
-        rot_matrix = so3_exp(rot_perturb)
+        # Apply rigid-body updates in the same order as native DiffDock:
+        # rotate about the ligand COM, then translate in world coordinates.
+        # The returned rigid pose is the pre-torsion reference that the native
+        # torsion branch Kabsch-aligns back to. ``tor_score`` is intentionally
+        # unused here because native ``modify_conformer_batch(...)`` applies
+        # torsion in a second stage after the rigid update.
         ligand_center = ligand_pos.mean(dim=1, keepdim=True)
-        ligand_centered = ligand_pos - ligand_center
-        ligand_pos = ligand_center + torch.bmm(ligand_centered, rot_matrix)
+        rot_matrix = so3_exp(rot_perturb)
+        rigid_pos = torch.bmm(ligand_pos - ligand_center, rot_matrix.transpose(-1, -2)) + tr_perturb.unsqueeze(1) + ligand_center
 
-        return ligand_pos
+        return rigid_pos, rigid_pos.clone()
 
     def reverse_step_torsion(
         self,
@@ -374,6 +431,7 @@ class MultiRateDiffusion(nn.Module):
         lig_edge_mask: torch.Tensor,
         lig_mask_rotate,
         add_noise: bool = True,
+        rigid_target_pos: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Single reverse SDE step for PROTAC torsion DOFs (Euler-Maruyama).
@@ -385,7 +443,7 @@ class MultiRateDiffusion(nn.Module):
         global drift into the already-denoised tr/rot DOFs.
 
         Args:
-            ligand_pos: [B, N_lig, 3] current conformer (after tr/rot reverse)
+            ligand_pos: [B, N_lig, 3] current rigid-body conformer (after tr/rot reverse)
             tor_score: [B, n_rot] torsion score
             t_tor: [B] torsion diffusion time
             dt_tor: [B] reverse step size (t_i - t_{i+1} > 0)
@@ -393,6 +451,8 @@ class MultiRateDiffusion(nn.Module):
             lig_edge_mask: [E] bool rotatable-bond mask
             lig_mask_rotate: [n_rot, N_lig] bool, or per-complex list
             add_noise: add stochastic noise (False on the final step)
+            rigid_target_pos: [B, N_lig, 3] optional pre-torsion rigid pose to
+                align back to. When None, defaults to ``ligand_pos``.
 
         Returns:
             [B, N_lig, 3] conformer with torsion angles updated
@@ -402,13 +462,34 @@ class MultiRateDiffusion(nn.Module):
         B = ligand_pos.shape[0]
         device = ligand_pos.device
 
+        if rigid_target_pos is None:
+            rigid_target_pos = ligand_pos
+
         _, _, tor_sigma = self.t_to_sigma(t_tor, t_tor, t_tor)
         tor_g = tor_sigma * np.sqrt(2 * np.log(self.tor_sigma_max / self.tor_sigma_min))
 
-        tor_perturb = tor_g**2 * dt_tor.unsqueeze(-1) * tor_score
-        if add_noise:
-            tor_z = torch.randn(B, tor_score.shape[-1], device=device)
-            tor_perturb = tor_perturb + tor_g * torch.sqrt(dt_tor).unsqueeze(-1) * tor_z
+        # Torsion update (with temperature sampling). Mirrors the tr/rot branches
+        # in reverse_step_protac and DiffDock's sampling.py:202-205. Without this,
+        # temp_sampling_tor=7.04 was defined but never read, collapsing the torsion
+        # drift to ~1/25 of native and letting noise dominate the denoising.
+        if self.temp_sampling[2] != 1.0:
+            ts = self.temp_sampling[2]
+            tpsi = self.temp_psi[2]
+            tsd = self.temp_sigma_data[2]
+            tor_sigma_data = torch.exp(torch.tensor(
+                tsd * np.log(self.tor_sigma_max) + (1 - tsd) * np.log(self.tor_sigma_min),
+                device=device, dtype=tor_sigma.dtype,
+            ))
+            lambda_tor = (tor_sigma_data + tor_sigma) / (tor_sigma_data + tor_sigma / ts)
+            tor_perturb = (tor_g**2 * dt_tor.unsqueeze(-1) * (lambda_tor + ts * tpsi / 2) * tor_score)
+            if add_noise:
+                tor_z = torch.randn(B, tor_score.shape[-1], device=device)
+                tor_perturb = tor_perturb + tor_g * torch.sqrt(dt_tor * (1 + tpsi)).unsqueeze(-1) * tor_z
+        else:
+            tor_perturb = tor_g**2 * dt_tor.unsqueeze(-1) * tor_score
+            if add_noise:
+                tor_z = torch.randn(B, tor_score.shape[-1], device=device)
+                tor_perturb = tor_perturb + tor_g * torch.sqrt(dt_tor).unsqueeze(-1) * tor_z
 
         rot_edges = lig_edge_index.T[lig_edge_mask]  # [n_rot, 2]
         if not isinstance(lig_mask_rotate, (list, tuple)):
@@ -416,17 +497,18 @@ class MultiRateDiffusion(nn.Module):
 
         out_pos = ligand_pos.clone()
         for b in range(B):
-            rigid_pos = out_pos[b].unsqueeze(0)  # [1, N_lig, 3] pre-torsion pose
+            rigid_pos = rigid_target_pos[b].unsqueeze(0)  # [1, N_lig, 3] native rigid reference
+            torsion_input = ligand_pos[b].unsqueeze(0)    # [1, N_lig, 3] pose to deform torsionally
             mr = lig_mask_rotate[b]
             if isinstance(mr, torch.Tensor):
                 mr = mr.detach().cpu().numpy()
             tp = tor_perturb[b].detach().cpu().numpy()
             flexible_pos = modify_conformer_torsion_angles(
-                rigid_pos[0].detach().cpu(), rot_edges, mr, tp, as_numpy=False
+                torsion_input[0].detach().cpu(), rot_edges, mr, tp, as_numpy=False
             ).to(device).unsqueeze(0)  # [1, N_lig, 3] torsion-perturbed pose
 
-            # Kabsch-align back to the rigid pose so the torsion update stays an
-            # internal-coordinate change (no global drift into tr/rot).
+            # Kabsch-align back to the native rigid reference so the torsion update
+            # stays an internal-coordinate change (no global drift into tr/rot).
             R_align, t_align = rigid_transform_Kabsch_3D_torch_batch(flexible_pos, rigid_pos)
             out_pos[b] = flexible_pos[0] @ R_align[0].T + t_align[0].T
 
@@ -473,12 +555,13 @@ class MultiRateDiffusion(nn.Module):
             rot_z = torch.randn(B, 3, device=device)
             rot_perturb = rot_perturb + rot_g * torch.sqrt(dt_se3_rot).unsqueeze(-1) * rot_z
 
-        # Apply to POI
+        # Apply to POI using the same row-vector rigid-body convention as the
+        # ligand update. The sampler tracks the inverse/body-frame map as
+        # ``rot_matrix @ previous_inverse``.
         poi_center = poi_pos.mean(dim=1, keepdim=True)
         poi_centered = poi_pos - poi_center
-        poi_center = poi_center + tr_perturb.unsqueeze(1)
         rot_matrix = so3_exp(rot_perturb)
-        poi_pos = poi_center + torch.bmm(poi_centered, rot_matrix)
+        poi_pos = torch.bmm(poi_centered, rot_matrix.transpose(-1, -2)) + tr_perturb.unsqueeze(1) + poi_center
 
         if return_rotation:
             return poi_pos, rot_matrix
@@ -488,12 +571,12 @@ class MultiRateDiffusion(nn.Module):
     # Inference schedules
     # ------------------------------------------------------------------
 
-    def get_inference_schedule(self, steps: int = None) -> dict:
+    def get_inference_schedule(self, steps: int = None, t_start: float = 1.0) -> dict:
         """
         Returns time discretization for reverse diffusion.
 
-        PROTAC DOFs: linear schedule from t=1 to t=0
-        SE3 DOFs: linear schedule from t=1 to t=0 (but noise decays slower due to λ)
+        PROTAC DOFs: linear schedule from t=1 to t=0 (full-range, no λ_q cutoff)
+        SE3 DOFs: linear schedule from t=1 to t=0 (full-range, no λ_SE3 cutoff)
 
         Returns dict with:
             'tr_schedule': [steps+1] PROTAC translation times
@@ -504,7 +587,9 @@ class MultiRateDiffusion(nn.Module):
         """
         if steps is None:
             steps = self.inference_steps
-        schedule = np.linspace(1.0, 0.0, steps + 1)
+        if not 0.0 < t_start <= 1.0:
+            raise ValueError(f"t_start must be in (0, 1], got {t_start}")
+        schedule = np.linspace(float(t_start), 0.0, steps + 1)
         return {
             'tr_schedule': schedule.copy(),
             'rot_schedule': schedule.copy(),
@@ -523,8 +608,10 @@ class TernaryInitializer:
     Initializes the three-molecule system at t=1 (fully noised).
 
     Reference: E3 fixed at origin (COM=0).
-    PROTAC: randomly placed in a spherical shell around E3 pocket (±10Å).
-    POI: randomly placed in a spherical shell 30-60Å from E3.
+    ``native`` reproduces DiffDock's wide PROTAC prior and places POI on a
+    30-60 Å shell. ``coupled5a`` is the validated numerical fallback. The
+    ``anchor_local`` mode preserves the observed E3-POI separation and places
+    PROTAC near a predicted interface anchor with bounded local perturbations.
     """
 
     def __init__(
@@ -533,43 +620,132 @@ class TernaryInitializer:
         protac_shell_max: float = 10.0,
         poi_shell_min: float = 30.0,
         poi_shell_max: float = 60.0,
+        coupled_radius: float = 5.0,
     ):
         self.protac_shell_min = protac_shell_min
         self.protac_shell_max = protac_shell_max
         self.poi_shell_min = poi_shell_min
         self.poi_shell_max = poi_shell_max
+        self.coupled_radius = coupled_radius
 
     def initialize_protac(
         self,
-        e3_pocket_center: torch.Tensor,
+        e3_center: torch.Tensor,
         ligand_template: torch.Tensor,
+        lig_edge_index=None,
+        lig_edge_mask=None,
+        lig_mask_rotate=None,
+        tr_sigma_max: float = None,
+        init_mode: str = "native",
+        anchor_center: torch.Tensor = None,
+        local_radius: float = 5.0,
     ) -> torch.Tensor:
         """
-        Initialize PROTAC near E3 pocket.
+        Initialize the PROTAC at t=1 (fully noised).
+
+        Two modes:
+
+        * **Legacy shell** (``tr_sigma_max is None``): random point on a
+          spherical shell ``[protac_shell_min, protac_shell_max]`` around
+          ``e3_center`` + a random rotation about the origin, keeping the
+          template torsion angles. Kept for backward compatibility with the old
+          call sites; NOT what native DiffDock does.
+
+        * **Native** (``tr_sigma_max`` given, matching DiffDock's
+          ``randomize_position`` — the 0.844 E3-L baseline path): (1) uniform
+          torsion angles in [-π, π] on all rotatable bonds (``no_torsion: false``),
+          (2) rotate the conformer about its own COM, (3) translate its COM onto
+          the receptor COM (``receptor.pos.mean(0)`` = ``e3_center``), (4) add a
+          Gaussian translation N(0, tr_sigma_max²). This is what makes the
+          zero-FiLM baseline seed-comparable to native DiffDock.
 
         Args:
-            e3_pocket_center: [B, 3] pocket center coordinates
-            ligand_template: [N_lig, 3] template ligand geometry
+            e3_center: [B, 3] receptor (E3) centroid — native ``receptor.pos.mean(0)``.
+            ligand_template: [N_lig, 3] template ligand geometry.
+            lig_edge_index: [2, E] ligand internal bond edges (native init only).
+            lig_edge_mask: [E] bool rotatable-bond mask (native init only).
+            lig_mask_rotate: [n_rot, N_lig] bool, or list of per-complex masks.
+            tr_sigma_max: translation std for the native Gaussian step (DiffDock's
+                ``initial_noise_std_proportion=-1.0`` -> std = tr_sigma_max = 19.0).
+                When None, use the legacy spherical-shell init.
+
         Returns:
-            [B, N_lig, 3] initialized ligand positions
+            [B, N_lig, 3] initialized ligand positions.
         """
-        B = e3_pocket_center.shape[0]
+        if init_mode not in {"native", "coupled5a", "anchor_local"}:
+            raise ValueError(f"unknown initialization mode: {init_mode}")
+        B = e3_center.shape[0]
         N_lig = ligand_template.shape[0]
-        device = e3_pocket_center.device
+        device = e3_center.device
 
-        # Random position on spherical shell + random rotation
-        r = (
-            self.protac_shell_min
-            + torch.rand(B, device=device) * (self.protac_shell_max - self.protac_shell_min)
-        )
-        direction = torch.randn(B, 3, device=device)
-        direction = direction / torch.linalg.vector_norm(direction, dim=-1, keepdim=True)
+        # --- Legacy spherical-shell init -------------------------------------
+        if tr_sigma_max is None:
+            r = (
+                self.protac_shell_min
+                + torch.rand(B, device=device) * (self.protac_shell_max - self.protac_shell_min)
+            )
+            direction = torch.randn(B, 3, device=device)
+            direction = direction / torch.linalg.vector_norm(
+                direction, dim=-1, keepdim=True
+            ).clamp_min(1e-8)
+            translation = e3_center + r.unsqueeze(-1) * direction
+            rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)
+            ligand_pos = ligand_template.unsqueeze(0).repeat(B, 1, 1)
+            ligand_pos = torch.bmm(ligand_pos, rot) + translation.unsqueeze(1)
+            return ligand_pos
 
-        translation = e3_pocket_center + r.unsqueeze(-1) * direction
-        rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)
+        # --- Native DiffDock init (randomize_position) -----------------------
+        from .diffdock.utils.torsion import modify_conformer_torsion_angles
 
-        ligand_pos = ligand_template.unsqueeze(0).repeat(B, 1, 1)
-        ligand_pos = torch.bmm(ligand_pos, rot) + translation.unsqueeze(1)
+        ligand_pos = ligand_template.unsqueeze(0).repeat(B, 1, 1)  # [B, N_lig, 3]
+
+        # (1) uniform-random torsion angles in [-pi, pi] (no_torsion: false).
+        if lig_edge_mask is not None and bool(lig_edge_mask.any()):
+            rot_edges = lig_edge_index.T[lig_edge_mask]  # [n_rot, 2]
+            n_rot = rot_edges.shape[0]
+            if not isinstance(lig_mask_rotate, (list, tuple)):
+                lig_mask_rotate = [lig_mask_rotate] * B
+            torsion_updates = np.random.uniform(low=-np.pi, high=np.pi, size=(B, n_rot))
+            for b in range(B):
+                mr = lig_mask_rotate[b]
+                if isinstance(mr, torch.Tensor):
+                    mr = mr.detach().cpu().numpy()
+                ligand_pos[b] = modify_conformer_torsion_angles(
+                    ligand_pos[b].detach().cpu(), rot_edges, mr,
+                    torsion_updates[b], as_numpy=False,
+                ).to(device)
+
+        # (2) rotate about the ligand's own COM, then translate onto the selected
+        # anchor. ``anchor_local`` uses a small-angle rotation and a bounded
+        # displacement; ``native``/``coupled5a`` retain their historical priors.
+        # Match vendored DiffDock randomize_position exactly: it draws a single
+        # rotation matrix, applies `@ random_rotation.T`, and then centers onto the
+        # receptor COM before the Gaussian translation. Keeping the transpose here
+        # is important for seed-level parity with the native initialization path.
+        ligand_center = ligand_pos.mean(dim=1, keepdim=True)  # [B, 1, 3]
+        if init_mode == "anchor_local":
+            rot = so3_exp(
+                torch.randn(B, 3, device=device, dtype=ligand_pos.dtype) * 0.25
+            )
+        else:
+            rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)  # [B, 3, 3]
+        ligand_pos = torch.bmm(ligand_pos - ligand_center, rot.transpose(-1, -2)) + e3_center.unsqueeze(1)
+
+        # (3) Gaussian translation N(0, tr_sigma_max^2) (initial_noise_std_proportion=-1.0).
+        if init_mode in {"coupled5a", "anchor_local"}:
+            radius = torch.rand(B, device=device) * (self.coupled_radius if init_mode == "coupled5a" else local_radius)
+            direction = torch.randn(B, 3, device=device)
+            direction = direction / torch.linalg.vector_norm(
+                direction, dim=-1, keepdim=True
+            ).clamp_min(1e-8)
+            tr_update = direction * radius.unsqueeze(-1)
+            if init_mode == "anchor_local":
+                if anchor_center is None:
+                    raise ValueError("anchor_local requires anchor_center")
+                ligand_pos = ligand_pos - e3_center.unsqueeze(1) + anchor_center.unsqueeze(1)
+        else:
+            tr_update = torch.randn(B, 3, device=device) * tr_sigma_max
+        ligand_pos = ligand_pos + tr_update.unsqueeze(1)
 
         return ligand_pos
 
@@ -578,34 +754,49 @@ class TernaryInitializer:
         e3_center: torch.Tensor,
         poi_template: torch.Tensor,
         return_rotation: bool = False,
+        init_mode: str = "native",
+        local_radius: float = 5.0,
     ):
         """
-        Initialize POI in a spherical shell around E3.
+        Initialize POI using the selected prior. ``anchor_local`` preserves its
+        current E3-frame center and only applies a bounded local perturbation.
 
         Args:
             e3_center: [B, 3] E3 center (typically origin)
             poi_template: [N_poi, 3] template POI geometry
         Returns:
             [B, N_poi, 3] initialized POI positions. If ``return_rotation`` is
-            True, returns ``(poi_pos, rot)`` where ``rot`` [B,3,3] is the random
-            orientation applied to the template (for cumulative SE3 tracking).
+            True, returns ``(poi_pos, rot)`` where ``rot`` [B,3,3] maps current
+            E3-frame row vectors back into the POI template/body frame.
         """
+        if init_mode not in {"native", "coupled5a", "anchor_local"}:
+            raise ValueError(f"unknown initialization mode: {init_mode}")
         B = e3_center.shape[0]
         N_poi = poi_template.shape[0]
         device = e3_center.device
 
-        r = (
-            self.poi_shell_min
-            + torch.rand(B, device=device) * (self.poi_shell_max - self.poi_shell_min)
-        )
+        if init_mode == "coupled5a":
+            r = torch.rand(B, device=device) * self.coupled_radius
+        elif init_mode == "anchor_local":
+            r = torch.rand(B, device=device) * local_radius
+        else:
+            r = self.poi_shell_min + torch.rand(B, device=device) * (self.poi_shell_max - self.poi_shell_min)
         direction = torch.randn(B, 3, device=device)
-        direction = direction / torch.linalg.vector_norm(direction, dim=-1, keepdim=True)
-
-        translation = e3_center + r.unsqueeze(-1) * direction
-        rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)
+        direction = direction / torch.linalg.vector_norm(
+            direction, dim=-1, keepdim=True
+        ).clamp_min(1e-8)
 
         poi_pos = poi_template.unsqueeze(0).repeat(B, 1, 1)
-        poi_pos = torch.bmm(poi_pos, rot) + translation.unsqueeze(1)
+        poi_center = poi_pos.mean(dim=1, keepdim=True)
+        if init_mode == "anchor_local":
+            rot = so3_exp(
+                torch.randn(B, 3, device=device, dtype=poi_pos.dtype) * 0.25
+            )
+            translation = poi_center.squeeze(1) + r.unsqueeze(-1) * direction
+        else:
+            translation = e3_center + r.unsqueeze(-1) * direction
+            rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)
+        poi_pos = torch.bmm(poi_pos - poi_center, rot.transpose(-1, -2)) + translation.unsqueeze(1)
 
         if return_rotation:
             return poi_pos, rot
@@ -633,6 +824,51 @@ def sample_so3_noise(
     """
     B = batch_size
     omega = torch.randn(B, 3, device=device) * sigma.unsqueeze(-1)
+    return so3_exp(omega), omega
+
+
+def sample_so3_noise_wrapped(
+    batch_size: int, sigma: torch.Tensor, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sample noise on SO(3) matching DiffDock's wrapped `so3.sample_vec` convention.
+
+    Draws a uniform unit direction × a wrapped angle sampled from the IGSO(3)
+    CDF in [0, π], returning the wrapped so(3) vector ω and its rotation matrix.
+    This is the convention the frozen expert and `so3_score_vec` assume.
+
+    Contrast with `sample_so3_noise` (R³ Gaussian ω ~ N(0, σ²I)): that sampler is
+    only valid for the Euclidean DSM target (-ω/σ²) used by the SE3 head. For the
+    PROTAC rotation the target/expert use the wrapped IGSO(3) score, and an R³
+    sampler emits ‖ω‖ > π for σ > 1.0, where `so3_score_vec` extrapolates past
+    the valid [0, π] table — a systematic bias of up to ~64% at σ = 1.55.
+
+    Args:
+        batch_size: number of samples
+        sigma: [B] noise level per sample
+        device: torch device
+    Returns:
+        (rotation_matrices [B, 3, 3], omega [B, 3]) with ‖omega‖ ∈ [0, π]
+    """
+    _init_so3_cache()
+    B = batch_size
+    sigma_np = sigma.detach().cpu().numpy() if hasattr(sigma, 'cpu') else np.asarray(sigma)
+    sigma_np = np.clip(np.atleast_1d(sigma_np).astype(float), _MIN_EPS, _MAX_EPS)
+    eps_idx = (np.log10(sigma_np) - np.log10(_MIN_EPS)) / (
+        np.log10(_MAX_EPS) - np.log10(_MIN_EPS)) * _N_EPS
+    eps_idx = np.clip(np.around(eps_idx).astype(int), 0, _N_EPS - 1)
+
+    # Inverse-CDF sampling of the wrapped angle, mirroring so3.sample(): draw
+    # u ~ U[0,1) and linearly interpolate u against the CDF row → angle ∈ [0, π].
+    u = torch.rand(B, device=device).cpu().numpy()
+    angles_np = np.array([
+        np.interp(u[i], _cdf_vals[eps_idx[i]], _omegas_array) for i in range(B)
+    ])
+    angles = torch.from_numpy(angles_np).float().to(device)
+
+    direction = torch.randn(B, 3, device=device)
+    direction = direction / torch.linalg.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
+    omega = direction * angles.unsqueeze(-1)  # [B, 3], ‖ω‖ ∈ [0, π]
     return so3_exp(omega), omega
 
 
@@ -714,7 +950,13 @@ def _init_so3_cache(cache_dir=None):
         return
 
     import os as _os
-    cache_dir = cache_dir or '.'
+    from pathlib import Path as _Path
+    cache_dir = cache_dir or _os.environ.get(
+        "TRICOOPDIFF_CACHE_DIR",
+        str(_Path(__file__).resolve().parents[1]
+            / "results/runtime_cache/diffdock"),
+    )
+    _os.makedirs(cache_dir, exist_ok=True)
     omega_file = _os.path.join(cache_dir, '.so3_omegas_array4.npy')
     score_file = _os.path.join(cache_dir, '.so3_exp_score_norms4.npy')
     score_norm_file = _os.path.join(cache_dir, '.so3_score_norms4.npy')
@@ -724,6 +966,9 @@ def _init_so3_cache(cache_dir=None):
         _exp_score_norms = np.load(score_file)
         if _os.path.exists(score_norm_file):
             _score_norms = np.load(score_norm_file)
+        cdf_file = _os.path.join(cache_dir, '.so3_cdf_vals4.npy')
+        if _os.path.exists(cdf_file):
+            _cdf_vals = np.load(cdf_file)
         return
 
     _eps_array = 10 ** np.linspace(np.log10(_MIN_EPS), np.log10(_MAX_EPS), _N_EPS)

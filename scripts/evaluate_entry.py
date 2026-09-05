@@ -32,27 +32,27 @@ import sys
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_DIFFDOCK_DIR = _PROJECT_ROOT.parent / "DiffDock"
+
 
 # Make the project root + this script's dir importable (not pip-installed).
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# (1) Import diffdock_compat FIRST — patches torch_cluster/torch_scatter before
-# the vendored cg_model and ../DiffDock bind those symbols at import time.
+# Import diffdock_compat FIRST — patches torch_cluster/torch_scatter before
+# the vendored cg_model and the vendored process_mols bind those symbols at
+# import time.
 import tricoopdiff.diffdock_compat  # noqa: F401
-
-# (2) Add ../DiffDock to sys.path for data featurization ONLY.
-if not _DIFFDOCK_DIR.exists():
-    print(f"FATAL: DiffDock checkout not found at {_DIFFDOCK_DIR}", flush=True)
-    sys.exit(1)
-sys.path.insert(0, str(_DIFFDOCK_DIR))
 
 import torch
 import yaml
 from argparse import Namespace
 
 from featurize_common import featurize_complex
+from evaluation_common import (
+    load_index_entry,
+    resolve_entry_paths,
+    validate_checkpoint_payload,
+)
 
 from tricoopdiff.expert_factory import build_diffdock_expert
 from tricoopdiff.tribrain import TriBrain
@@ -68,13 +68,24 @@ os.chdir(_PROJECT_ROOT)
 def build_parser():
     p = argparse.ArgumentParser(description="TriCoopDiff MVP evaluation entry point")
     p.add_argument("--protac-dir", default="DeepTernary/output/protac22")
+    p.add_argument("--index", default=None,
+                   help="Official ternary JSON index containing --case")
+    p.add_argument("--native-root", default="data/TernaryDB_release/pdbs",
+                   help="Root containing <case>/gt_complex.pdb for indexed data")
     p.add_argument("--model-dir", default="checkpoints/score_model")
     p.add_argument("--ckpt", default="best_ema_inference_epoch_model.pt")
     p.add_argument("--case", default="5T35_D_A_759",
                    help="Ternary complex case name (directory under --protac-dir)")
     p.add_argument("--tribrain-ckpt", default=None,
-                   help="Optional trained TriBrain checkpoint (default: zero-init "
-                        "baseline = no loading)")
+                   help="Version-3 trained TriBrain + LoRA checkpoint")
+    p.add_argument("--allow-zero-init", action="store_true",
+                   help="Explicitly allow evaluation without trained weights")
+    p.add_argument("--lora-rank", type=int, default=4)
+    p.add_argument("--lora-alpha", type=float, default=8.0)
+    p.add_argument("--lora-start-layer", type=int, default=0)
+    p.add_argument("--lora-early-layers", type=int, default=4)
+    p.add_argument("--lora-early-rank", type=int, default=2)
+    p.add_argument("--lora-early-alpha", type=float, default=4.0)
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--n-walkers", type=int, default=32,
@@ -86,11 +97,29 @@ def build_parser():
                         "(shared with train_entry.py)")
     p.add_argument("--out", default=None,
                    help="Path to dump the JSON report (default: stdout only)")
+    p.add_argument("--debug-trace", action="store_true",
+                   help="Also emit a single-walker per-step trajectory trace for parity debugging")
+    p.add_argument("--debug-seed", type=int, default=0,
+                   help="Seed used by --debug-trace single-walker trajectory")
+    p.add_argument(
+        "--freeze-poi",
+        action="store_true",
+        help="Keep the POI fixed and disable SE3 reverse updates for strict E3-L parity evaluation.",
+    )
+    p.add_argument("--init-mode", choices=["native", "coupled5a", "anchor_local"], default="coupled5a",
+                   help="Ternary initialization prior (default: stable 0-5 A coupled prior)")
+    p.add_argument("--t-anchor", type=float, default=None,
+                   help="Starting diffusion time for anchor_local (default: 0.7)")
     return p
 
 
 def main():
     args = build_parser().parse_args()
+
+    if args.tribrain_ckpt is None and not args.allow_zero_init:
+        print("FATAL: --tribrain-ckpt is required; use --allow-zero-init only "
+              "for an explicit baseline", flush=True)
+        sys.exit(2)
 
     if args.device == "cuda" and not torch.cuda.is_available():
         print("FATAL: --device cuda requested but CUDA is unavailable", flush=True)
@@ -102,18 +131,36 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
 
-    # Resolve the case directory + input files.
-    protac_dir = _PROJECT_ROOT / args.protac_dir
-    case_dir = protac_dir / args.case
-    if not case_dir.exists():
-        print(f"FATAL: case directory not found: {case_dir}", flush=True)
-        sys.exit(1)
-
-    protein1 = str(case_dir / "protein1.pdb")   # E3
-    protein2 = str(case_dir / "protein2.pdb")   # POI
-    _sdf = case_dir / "ligand.sdf"
-    _pdb = case_dir / "ligand.pdb"
-    ligand_path = str(_sdf if _sdf.exists() else _pdb)
+    # Resolve either an official index entry or a legacy case directory.
+    if args.index:
+        index_path = Path(args.index)
+        if not index_path.is_absolute():
+            index_path = _PROJECT_ROOT / index_path
+        try:
+            entry = load_index_entry(index_path, args.case)
+            paths = resolve_entry_paths(entry, _PROJECT_ROOT)
+        except (OSError, KeyError, ValueError) as error:
+            print(f"FATAL: invalid indexed case: {error}", flush=True)
+            sys.exit(2)
+        protein1 = str(paths["protein1"])
+        protein2 = str(paths["protein2"])
+        ligand_path = str(paths["ligand"])
+        case_dir = (_PROJECT_ROOT / args.native_root / args.case).resolve()
+    else:
+        case_dir = _PROJECT_ROOT / args.protac_dir / args.case
+        if not case_dir.exists():
+            print(f"FATAL: case directory not found: {case_dir}", flush=True)
+            sys.exit(1)
+        protein1 = str(case_dir / "protein1.pdb")
+        protein2 = str(case_dir / "protein2.pdb")
+        _sdf = case_dir / "ligand.sdf"
+        _pdb = case_dir / "ligand.pdb"
+        ligand_path = str(_sdf if _sdf.exists() else _pdb)
+        paths = {
+            "protein1": Path(protein1),
+            "protein2": Path(protein2),
+            "ligand": Path(ligand_path),
+        }
 
     print("=" * 72, flush=True)
     print(f"TriCoopDiff MVP evaluation — case {args.case}", flush=True)
@@ -122,11 +169,58 @@ def main():
     print(f"  tribrain_ckpt={args.tribrain_ckpt or '(zero-init baseline)'}", flush=True)
     print("=" * 72, flush=True)
 
+    # Production single-case and indexed evaluation intentionally share one
+    # runtime. Keep the code below only for the explicit zero-init diagnostic.
+    if args.tribrain_ckpt is not None:
+        from evaluation_runner import EvaluationRunner, write_report_atomic
+
+        native_pdb = case_dir / "gt_complex.pdb"
+        if not native_pdb.exists():
+            native_pdb = case_dir / "complex.pdb"
+        try:
+            runner = EvaluationRunner(
+                _PROJECT_ROOT, checkpoint=args.tribrain_ckpt,
+                device=args.device, model_dir=args.model_dir,
+                expert_checkpoint=args.ckpt,
+            )
+            report = runner.evaluate_case(
+                args.case, paths, cache_dir=_PROJECT_ROOT / args.cache_dir,
+                native_complex_pdb=native_pdb if native_pdb.is_file() else None,
+                n_walkers=args.n_walkers, steps=args.steps, seed=args.seed,
+                freeze_poi=args.freeze_poi, init_mode=args.init_mode,
+                t_anchor=args.t_anchor, debug_trace=args.debug_trace,
+                debug_seed=args.debug_seed,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            print(f"FATAL: trained evaluation failed: {error}", flush=True)
+            sys.exit(2)
+        print(json.dumps(report, indent=2), flush=True)
+        if args.out is not None:
+            out_path = Path(args.out)
+            if not out_path.is_absolute():
+                out_path = _PROJECT_ROOT / out_path
+            write_report_atomic(report, out_path)
+            print(f"\n[saved] {out_path}", flush=True)
+        return
+
     # --- Load score-model args (featurization hyperparams) --------------------
     with open(_PROJECT_ROOT / args.model_dir / "model_parameters.yml") as f:
         score_model_args = Namespace(**yaml.full_load(f))
     print(f"[cfg] ns={score_model_args.ns} nv={score_model_args.nv} "
           f"num_conv_layers={score_model_args.num_conv_layers}", flush=True)
+
+    trained_ckpt = None
+    if args.tribrain_ckpt is not None:
+        ckpt_path = _PROJECT_ROOT / args.tribrain_ckpt
+        if not ckpt_path.exists():
+            print(f"FATAL: --tribrain-ckpt not found: {ckpt_path}", flush=True)
+            sys.exit(1)
+        trained_ckpt = torch.load(ckpt_path, map_location=device)
+        try:
+            validate_checkpoint_payload(trained_ckpt)
+        except ValueError as error:
+            print(f"FATAL: invalid trained checkpoint: {error}", flush=True)
+            sys.exit(2)
 
     # --- Build the frozen expert ---------------------------------------------
     print("[expert] building frozen DiffDock-L expert...", flush=True)
@@ -136,6 +230,18 @@ def main():
         ckpt=args.ckpt,
         num_conv_layers=score_model_args.num_conv_layers,
     )
+    if isinstance(trained_ckpt, dict) and trained_ckpt.get("expert_lora_state_dict"):
+        from tricoopdiff.lora import inject_expert_lora
+        config = trained_ckpt.get("expert_lora_config") or {
+            "rank": args.lora_rank,
+            "alpha": args.lora_alpha,
+            "start_layer": args.lora_start_layer,
+            "early_layers": args.lora_early_layers,
+            "early_rank": args.lora_early_rank,
+            "early_alpha": args.lora_early_alpha,
+        }
+        count = inject_expert_lora(expert, **config)
+        print(f"[expert] injected {count} LoRA linear layers", flush=True)
     num_conv_layers = expert.num_conv_layers
     print(f"[expert] loaded (num_conv_layers={num_conv_layers}, ns={expert.ns})",
           flush=True)
@@ -164,7 +270,9 @@ def main():
         tribrain=tribrain,
         num_conv_layers=num_conv_layers,
         use_film=True,
-        use_learned_merge=False,
+        # use_learned_merge defaults True: residual-gated merge (zero-init gate →
+        # s_q = s_q1), so the zero-FiLM baseline reproduces pure E3-L, not the
+        # double-counted s_q1 + s_q2.
     ).to(device)
     diffusion = MultiRateDiffusion()
     initializer = TernaryInitializer()
@@ -173,15 +281,15 @@ def main():
 
     # --- Optional: load a trained TriBrain checkpoint ------------------------
     if args.tribrain_ckpt is not None:
-        ckpt_path = _PROJECT_ROOT / args.tribrain_ckpt
-        if not ckpt_path.exists():
-            print(f"FATAL: --tribrain-ckpt not found: {ckpt_path}", flush=True)
-            sys.exit(1)
-        ckpt = torch.load(ckpt_path, map_location=device)
-        if "tribrain_state_dict" in ckpt:
-            model.tribrain.load_state_dict(ckpt["tribrain_state_dict"])
+        if "tribrain_state_dict" in trained_ckpt:
+            model.tribrain.load_state_dict(trained_ckpt["tribrain_state_dict"])
+            if trained_ckpt.get("expert_lora_state_dict"):
+                from tricoopdiff.lora import load_expert_lora_state_dict
+                load_expert_lora_state_dict(
+                    model.expert, trained_ckpt["expert_lora_state_dict"],
+                )
         else:
-            model.tribrain.load_state_dict(ckpt)
+            model.tribrain.load_state_dict(trained_ckpt)
         print(f"[model] loaded TriBrain weights from {ckpt_path}", flush=True)
 
     # --- Evaluate ------------------------------------------------------------
@@ -200,8 +308,29 @@ def main():
         initializer=initializer, device=device,
         n_walkers=args.n_walkers, steps=args.steps,
         native_complex_pdb=native_complex_pdb,
+        debug_trace=args.debug_trace, debug_seed=args.debug_seed,
+        freeze_poi=args.freeze_poi,
+        init_mode=args.init_mode,
+        t_anchor=args.t_anchor,
+        deepternary_dockq_paths={
+            "protein1_pdb": protein1,
+            "protein2_pdb": protein2,
+            "ligand_pdb": ligand_path,
+            "deepternary_root": str(_PROJECT_ROOT / "DeepTernary"),
+        },
     )
     report["case"] = args.case
+    report["run_config"] = {
+        "seed": args.seed,
+        "n_walkers": args.n_walkers,
+        "steps": args.steps if args.steps is not None else diffusion.inference_steps,
+        "freeze_poi": args.freeze_poi,
+        "init_mode": args.init_mode,
+        "t_anchor": args.t_anchor if args.t_anchor is not None else (0.7 if args.init_mode == "anchor_local" else 1.0),
+        "tribrain_checkpoint": args.tribrain_ckpt,
+        "expert_model_dir": args.model_dir,
+        "expert_checkpoint": args.ckpt,
+    }
 
     print("\n" + "=" * 72, flush=True)
     print("REPORT", flush=True)

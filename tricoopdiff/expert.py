@@ -9,12 +9,10 @@ Key constraint: each subgraph contains exactly one protein + PROTAC, matching
 DiffDock's pretraining input distribution exactly (zero OOD).
 """
 
-import copy
 import torch
 import torch.nn as nn
 import numpy as np
 from e3nn import o3
-from torch_scatter import scatter_mean
 
 # Vendored DiffDock so3/torus score norms — single source of truth so the
 # FiLM-path score computation matches native CGModel.forward() exactly
@@ -73,6 +71,18 @@ class FrozenDiffDock(nn.Module):
         This is a thin wrapper around CGModel.embedding().
         """
         return self.model.embedding(data)
+
+    def train(self, mode: bool = True):
+        """Keep the frozen expert in evaluation mode.
+
+        ``requires_grad=False`` prevents parameter updates but does not disable
+        dropout or other training-mode behavior. Parent ``model.train()`` calls
+        recurse into children, so override it here to keep the pretrained expert
+        deterministic while still allowing TriBrain to train.
+        """
+        super().train(False)
+        self.model.eval()
+        return self
 
     def build_cross_graph(self, data, cross_cutoff):
         """Build cross edges between ligand and receptor."""
@@ -154,13 +164,20 @@ class FrozenDiffDock(nn.Module):
             global_pred[:, 9:] if not model.odd_parity else 0
         )
 
-        # Fix magnitude of tr/rot scores
+        # Fix magnitude of tr/rot scores. The vendored CGModel uses the same
+        # normalization pattern but does not guard zero norms; in TriCoopDiff that
+        # can surface during smoke/training as NaNs in score loss / Tweedie phys
+        # loss when a pathological graph makes final_conv emit an all-zero vector.
+        # Keep the raw norm for the magnitude head (native semantics) but clamp the
+        # divisor so direction normalization itself never divides by zero.
         tr_norm = torch.linalg.vector_norm(tr_pred, dim=1).unsqueeze(1)
-        tr_pred = tr_pred / tr_norm * model.tr_final_layer(
+        tr_unit = tr_pred / tr_norm.clamp_min(1e-8)
+        tr_pred = tr_unit * model.tr_final_layer(
             torch.cat([tr_norm, graph_sigma_emb], dim=1)
         )
         rot_norm = torch.linalg.vector_norm(rot_pred, dim=1).unsqueeze(1)
-        rot_pred = rot_pred / rot_norm * model.rot_final_layer(
+        rot_unit = rot_pred / rot_norm.clamp_min(1e-8)
+        rot_pred = rot_unit * model.rot_final_layer(
             torch.cat([rot_norm, graph_sigma_emb], dim=1)
         )
 

@@ -1,6 +1,6 @@
  -h
  # TriCoopDiff: PROTAC三元复合物协同扩散模型 交接文档
-> 版本：v2.4 | 最后更新：2026-07-31
+> 版本：v2.5 | 最后更新：2026-09-02。本文描述架构；运行方式与数据口径以文档索引中的现行指南为准。
 > 模型定位：带物理约束的扩散生成模型，用于 PROTAC 三元复合物结构预测与功能排序。冻结预训练二体专家（DiffDock）+ 轻量协调网络（TriBrain），输入图结构零OOD（内部激活存在 FiLM 调制偏移，消融验证）。同时输出结构系综和功能指标（协同性排序、生产性概率），不声称模拟真实物理动力学
 
 ---
@@ -232,15 +232,13 @@ TriBrain → h_tri [128]（等变Transformer全局池化）
 
 ### 2.5 Score组成
 
-**MVP score 分解（逐层 FiLM，DiT 范式）**：
+**MVP score 分解（逐层 FiLM + residual gate）**：
 ```
-最终三体score = 逐层FiLM调制后的E3-L二体score（子图1，6层Conv特征被TriBrain调制）
-              + 逐层FiLM调制后的POI-L二体score（子图2，6层Conv特征被TriBrain调制）
-              + TriBrain输出的独立三体力残差（E3-POI刚体score）
-              + 口袋引导score（基于物理的引导势，非网络输出，详见3.5节）
+PROTAC score = s_q1 + g · (s_q2 - s_q1) + pocket guidance
+POI rigid score = TriBrain SE(3) head
 ```
 
-> FiLM 调制作用于二体专家每一层 Conv 输出的特征（6 层全覆盖），通过乘法和加法变换逐层注入三体全局信息。调制后的特征自然逐层传递到后续层——不是"先算 score 再调"，而是"每层特征都被调过再继续"。三体残差和口袋引导是独立于二体之外的纯三体力，加性组合天然成立。引导强度随扩散时间 t 衰减（t 大→引导强，t 小→引导弱→0）。
+> FiLM 调制作用于二体专家每一层 Conv 输出。MergeGateHead 的权重与 bias 均为零初始化，所以训练起点 `g=0`、`s_q=s_q1`，严格保留 E3-L expert；训练后才逐步引入 POI-L 修正。sub2 的 tr/rot 在合并前旋回 E3 frame，torsion 不随参考系旋转。口袋引导是独立的物理引导项。
 
 **一个直观的协调例子**：
 - 二体专家独立计算：子图1中E3对PROTAC有向E3口袋的1Å拉力；子图2中POI对PROTAC有向POI口袋的1Å拉力。两个子图互不知情，方向相反，加起来linker断裂
@@ -255,19 +253,11 @@ TriBrain → h_tri [128]（等变Transformer全局池化）
 子图1 (E3-L): 前向 → s_q1 (PROTAC平移/旋转/二面角score，相对E3)
 子图2 (POI-L): 前向 → s_q2 (PROTAC平移/旋转/二面角score，相对POI)
 
-合并: s_q = s_q1 + s_q2    # 直接加和，不需要显式协调层
+合并: s_q = s_q1 + g * (s_q2 - s_q1)  # g 由 TriBrain 预测，零初始化
 更新: q(t-Δt) = q(t) + λ_q² · (s_q + s_guide_q) · Δt
 ```
 
-> **为什么直接加和？** 协调由 TriBrain 的 FiLM 调制在合并**之前**完成——如果 linker 超伸，FiLM ×0.5 同时削弱两边拉力。加和本身不做协调，协调已在特征层完成。
-
-> **直接加和的风险**：FiLM 是**特征级**调制（改 Conv 层输出），不是 score 级协调。特征被缩放了，经过非线性 score head 后，最终 score 的数值冲突不一定被精确消除。s_q1 和 s_q2 可能不在同一个参考系下打架。
-
-> **升级方案——轻量 Score 协调层（L1.5 消融）**：如果直接加和效果不好，在加和前插入一个 ~30k 参数的小 MLP：
-```
-s_q = ScoreFusion([s_q1, s_q2, h_tri])   # Linear(128*2+128→128)→ReLU→Linear(128→dim_q)
-```
-> FiLM 负责特征级粗调，协调层负责 score 级精调。两层保护，参数量增加可忽略。如果直接加和就够（消融验证），协调层可以去掉——它是保险，不是必需品。
+> 直接相加会在零 FiLM 时把两个 expert score 双重计数，破坏 native baseline。Residual gate 同时提供 score 级协调和透明初始化；`use_learned_merge=False` 的直接加和只保留为消融。
 
 ### 2.7 关键假设与未验证问题（诚实标注）
 
@@ -275,7 +265,7 @@ s_q = ScoreFusion([s_q1, s_q2, h_tri])   # Linear(128*2+128→128)→ReLU→Line
 
 | 假设 | 风险 | 验证方式 |
 |------|------|---------|
-| **Score 加和可分解**：`s_total = s_E3L + s_POIL + s_tri_residual` 在 FiLM 调制后近似成立 | 三个 score 不独立（通过 PROTAC 耦合），独立可加是近似 | 消融：比较完整模型 vs 去掉三体残差项 → 残差项的贡献是否 > 噪声水平 |
+| **Residual score 可学习**：`s_q2-s_q1` 能表达 POI 条件修正 | 两个 expert score 高度相关或尺度不同 | 监控 merge gate、分支 score 范数和完整模型消融 |
 | **扩散系综 ≈ 玻尔兹曼分布**：扩散采样得到的构象分布与真实热力学分布定性一致 | 扩散模型学的是训练数据分布，非平衡态分布 | 在已知 PROTAC 体系上对比采样分布和 MD 轨迹的布居比 → 定性比较 |
 | **通用三元→PROTAC 迁移**：通用三元学习的协调能力可迁移到 PROTAC | 几何特征差异大（配体大小、界面尺度、linker 角色） | 阶段1后在 PROTAC benchmark 上做 zero-shot 评估 → 如果效果差，重点放在 FT 版本 |
 | **零 OOD 与三体协调的平衡**：FiLM 调制越强 → 三体协调越好 → 但二体专家偏离预训练模式越多 | 存在最优注入强度，太强/太弱都不好 | 消融：不同 FiLM 初始化缩放因子 → 找到最优范围 |
@@ -678,7 +668,7 @@ s_guide_productive = -alpha_prod * t * (lysine_ca - e2_active_site_ref) / (dist_
 2.  **核心版本（2周）**：实现TriBrain完整结构（等变Transformer + 多尺度池化 + 多任务头）+ 多速率扩散，能正确生成合理结构
 3.  **采样版本（1周）**：实现后处理式TriReflect（物理检测 + 局部能量最小化）+ 多Walker独立采样，能生成无硬物理错误的构象系综。复本交换作为实验性可选升级
 4.  **训练版本（1周）**：实现三阶段训练流程，完成零样本预热和小样本微调
-5.  **分析版本（1周）**：实现自由能计算、协同性α计算、系综分析功能
+5.  **分析版本（已实现基础功能）**：固定 E3 坐标系的联合 PROTAC+POI 系综聚类、cluster population 与经验相对自由能、外部物理能量—布居一致性，以及实验 Kd/校准 ΔΔG 到协同性 α 的换算与排序评估。注意：walker 布居得到的是扩散模型的经验采样势，不是未经验证的绝对结合自由能；Phase 1 冻结且未校准的状态头不能用于宣称 α 预测。
 6.  **优化版本（后续）**：优化速度、增加更多物理损失、对接实验数据
 
 **依赖库**：
@@ -713,9 +703,9 @@ s_guide_productive = -alpha_prod * t * (lysine_ca - e2_active_site_ref) / (dist_
 ---
 
 ## 九、当前进度与待办
-- ✅ 整体架构设计完成
-- ✅ 所有模块设计和超参数确定
-- ⬜ 最小可运行版本实现
-- ⬜ 零样本预热训练
-- ⬜ 真实三元结构微调
-- ⬜ 湿实验验证
+- ✅ 核心模块、训练/评估入口和双分支 parity 门禁已实现
+- ✅ `coupled5a` 三体初始化通过 canonical parity/readiness
+- 🔄 Phase 1 smoke 与完整原子 DockQ 对齐进行中
+- ✅ 分析基础模块：系综聚类/布居、经验相对自由能、能量—布居相关、校准后协同性 α 与排序指标
+- ⚠️ 绝对结合自由能和可信 α 预测仍需平衡采样验证、外部能量或实验 Kd/α 数据校准
+- ⬜ 正式 Phase 1/2 训练、PROTAC 微调和湿实验验证
