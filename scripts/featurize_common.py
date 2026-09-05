@@ -344,7 +344,7 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
 
     if cache_path is not None:
         os.makedirs(cache_dir, exist_ok=True)
-        torch.save({
+        payload = {
             'e3_data': _strip_batch_and_cpu(e3_data),
             'poi_data': _strip_batch_and_cpu(poi_data),
             'ligand_data': _strip_batch_and_cpu(ligand_data),
@@ -352,6 +352,9 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
             't_e3_to_poi': torch.tensor(t_e3_to_poi, dtype=torch.float32),
             'cache_version': _FEATURIZE_CACHE_VERSION,
             'source_signature': cache_signature,
-        }, cache_path)
+        }
+        temporary_path = cache_path.with_suffix(cache_path.suffix + '.tmp')
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, cache_path)
 
     return e3_data, poi_data, ligand_data, receptor_feat_dim
