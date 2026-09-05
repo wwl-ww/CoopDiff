@@ -58,8 +58,10 @@ def parse_args():
         help="Bound validation clusters for an allocated smoke run only",
     )
     p.add_argument(
-        "--random-flip-proteins", action="store_true",
-        help="Randomly swap the fixed/moving protein roles during training",
+        "--random-flip-proteins", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Randomly swap fixed/moving protein roles during training "
+             "(use --no-random-flip-proteins for an ablation)",
     )
 
     # Training
