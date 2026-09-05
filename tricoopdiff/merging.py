@@ -1,5 +1,5 @@
 """
-Score merging strategies for combining two-body expert outputs.
+Score coordination strategies for combining two-body expert outputs.
 
 Default: Residual-gated merge -> s_q = s_q1 + g * (s_q2 - s_q1)
 
@@ -17,6 +17,69 @@ exactly the bug the residual-gated merge fixes.
 """
 
 import torch
+
+
+def coordinate_joint_interface_scores(
+    scores_1: dict,
+    scores_2: dict,
+    coupling: torch.Tensor,
+) -> tuple[dict, dict]:
+    """Build energy-consistent Ligand and POI scores from both interfaces.
+
+    ``scores_1`` is the E3--Ligand score and ``scores_2`` is the
+    POI--Ligand score after its vector components have been mapped into the E3
+    frame.  The second interface contributes equally and oppositely to the
+    translational and rotational scores of Ligand and POI.  Torsion remains a
+    Ligand-only degree of freedom.
+
+    ``coupling`` contains bounded, non-negative weights for translation,
+    rotation and torsion respectively.  This function deliberately accepts
+    the already constrained weights so their parameterization can evolve
+    independently of the score algebra.
+    """
+    if coupling.ndim != 2 or coupling.shape[1] != 3:
+        raise ValueError(
+            f"coupling must have shape [B, 3], got {tuple(coupling.shape)}"
+        )
+    if not torch.isfinite(coupling).all():
+        raise ValueError("coupling contains non-finite values")
+    if bool((coupling < 0).any()) or bool((coupling > 1).any()):
+        raise ValueError("coupling weights must lie in [0, 1]")
+
+    weights = {
+        "tr_score": coupling[:, 0],
+        "rot_score": coupling[:, 1],
+        "tor_score": coupling[:, 2],
+    }
+    ligand = {}
+    reaction = {}
+    for key in ("tr_score", "rot_score", "tor_score"):
+        s1 = scores_1.get(key)
+        s2 = scores_2.get(key)
+        if s1 is None:
+            ligand[key] = s2
+            if key != "tor_score" and s2 is not None:
+                reaction[key] = -weights[key].unsqueeze(-1) * s2
+            continue
+        if s2 is None or s2.numel() == 0:
+            ligand[key] = s1
+            if key != "tor_score":
+                reaction[key] = torch.zeros_like(s1)
+            continue
+        contribution = weights[key].unsqueeze(-1) * s2
+        ligand[key] = s1 + contribution
+        if key != "tor_score":
+            reaction[key] = -contribution
+
+    reaction["se3_score"] = torch.cat(
+        [reaction["tr_score"], reaction["rot_score"]], dim=-1,
+    )
+    ligand["coupling_weights"] = {
+        "tr": coupling[:, 0],
+        "rot": coupling[:, 1],
+        "tor": coupling[:, 2],
+    }
+    return ligand, reaction
 
 
 def merge_direct_addition(scores_1: dict, scores_2: dict) -> dict:
