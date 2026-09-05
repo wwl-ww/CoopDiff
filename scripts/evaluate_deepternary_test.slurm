@@ -14,7 +14,7 @@ conda activate tricoopdiff
 
 PROJECT_ROOT="/data/run01/scwb792/mwj/CoopDiff"
 cd "$PROJECT_ROOT"
-mkdir -p logs results/deepternary_test/cases
+mkdir -p logs results/deepternary_test/preflight results/deepternary_test/cases
 
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -27,13 +27,33 @@ if [ ! -f "$CHECKPOINT" ]; then
     exit 2
 fi
 
-TRAIN_LOG="${TRAIN_LOG:-logs/train_deepternary_phase1-154208.out}"
+TRAIN_LOG="${TRAIN_LOG:-logs/train_deepternary_phase1-154339.out}"
+STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-791}"
 python scripts/select_best_checkpoint.py \
     --log "$TRAIN_LOG" \
     --checkpoint "$CHECKPOINT" \
     --expected-epochs 100 \
-    --steps-per-epoch 1981 \
+    --steps-per-epoch "$STEPS_PER_EPOCH" \
     --out results/deepternary_test/checkpoint_selection.json
+
+# Fail cheaply inside this allocation before starting the 70-case matrix.
+PYTHONUNBUFFERED=1 python scripts/evaluate_index.py \
+    --index data/ternary_test.json \
+    --tribrain-ckpt "$CHECKPOINT" \
+    --out-dir results/deepternary_test/preflight \
+    --cache-dir results/featurize_cache_deepternary \
+    --limit 1 \
+    --n-walkers 1 \
+    --steps 20 \
+    --seed 0 \
+    --device cuda
+
+python scripts/summarize_evaluation_reports.py \
+    --reports-dir results/deepternary_test/preflight \
+    --require-trained \
+    --require-exact-dockq \
+    --out-json results/deepternary_test/preflight_summary.json \
+    --out-csv results/deepternary_test/preflight_summary.csv
 
 set +e
 PYTHONUNBUFFERED=1 python scripts/evaluate_index.py \

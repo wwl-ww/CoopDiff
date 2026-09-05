@@ -77,7 +77,8 @@ def main():
             "steps": args.steps,
         }
         if not args.no_resume and completed_report(
-                report_path, case, checkpoint, expected_config):
+                report_path, case, checkpoint, expected_config,
+                require_exact_dockq=True):
             print(f"[{position}/{len(entries)}] SKIP completed {case}", flush=True)
             continue
         print(f"[{position}/{len(entries)}] RUN {case}", flush=True)

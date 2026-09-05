@@ -50,7 +50,8 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=336):
         raise ValueError("checkpoint has no LoRA architecture config")
 
 
-def completed_report(path, case, checkpoint, expected_config=None):
+def completed_report(path, case, checkpoint, expected_config=None,
+                     require_exact_dockq=False):
     """Return true only for a valid, completed report with matching inputs."""
     destination = Path(path)
     if not destination.is_file():
@@ -66,7 +67,11 @@ def completed_report(path, case, checkpoint, expected_config=None):
         and config.get("tribrain_checkpoint") == checkpoint
         and ensemble.get("n_valid_walkers", 0) > 0
     )
-    return core_matches and all(
+    exact_dockq_matches = (
+        not require_exact_dockq
+        or report.get("structure", {}).get("dockq_best") is not None
+    )
+    return core_matches and exact_dockq_matches and all(
         config.get(key) == value for key, value in (expected_config or {}).items()
     )
 

@@ -62,3 +62,12 @@ def test_completed_report_requires_matching_checkpoint(tmp_path):
         path, "demo", "best.pt", {"seed": 1},
     )
     assert not evaluation_common.completed_report(path, "demo", "other.pt")
+    assert not evaluation_common.completed_report(
+        path, "demo", "best.pt", require_exact_dockq=True,
+    )
+    report = json.loads(path.read_text(encoding="utf-8"))
+    report["structure"] = {"dockq_best": 0.5}
+    path.write_text(json.dumps(report), encoding="utf-8")
+    assert evaluation_common.completed_report(
+        path, "demo", "best.pt", require_exact_dockq=True,
+    )
