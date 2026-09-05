@@ -77,7 +77,7 @@ def build_parser():
     p.add_argument("--case", default="5T35_D_A_759",
                    help="Ternary complex case name (directory under --protac-dir)")
     p.add_argument("--tribrain-ckpt", default=None,
-                   help="Version-5 joint-interface checkpoint")
+                   help="Version-6 geometric joint-interface checkpoint")
     p.add_argument(
         "--nan-clamp", type=float, default=100.0,
         help="Activation clamp for an explicit zero-init baseline",

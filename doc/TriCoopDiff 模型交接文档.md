@@ -35,9 +35,11 @@ E3 是固定全局参考系。动态状态为：
 
 TriBrain 读取三元上下文并输出：
 
-1. `sub1`、`sub2` 各层独立的 FiLM scale/shift；
-2. 逐键 torsion coordinator；
-3. scalar auxiliary heads，例如功能或置信度预测。
+1. E3、POI、Ligand 分别池化的类型 token；
+2. E3–L、POI–L、E3–POI 的 RBF 距离分布、接触比例和尺度编码；
+3. `sub1`、`sub2` 各层独立的 FiLM scale/shift；
+4. 逐键 torsion coordinator；
+5. scalar auxiliary heads，例如功能或置信度预测。
 
 TriBrain 不输出 rigid score、merge gate 或 SE(3) residual。刚体动力学完全由两个 DiffDock proposal 与显式群组合定义；TriBrain 只裁决物理上共享的 torsion。
 
@@ -61,7 +63,7 @@ TriBrain 不输出 rigid score、merge gate 或 SE(3) residual。刚体动力学
 
 ## Checkpoint 与恢复
 
-当前架构标识为 `joint_interface_v2`，checkpoint version 为 5。加载时必须同时验证 version、architecture、LoRA 配置和模型 shape。version 4 及更早版本缺少当前刚体组合或 torsion coordinator，必须硬拒绝。
+当前架构标识为 `geometric_joint_interface_v3`，checkpoint version 为 6。加载时必须同时验证 version、architecture、LoRA、activation clamp 和 torsion auxiliary weight。version 5 及更早版本没有当前三体几何 encoder，必须硬拒绝。
 
 ## 最小验收
 
@@ -69,6 +71,8 @@ TriBrain 不输出 rigid score、merge gate 或 SE(3) residual。刚体动力学
 - 相对/全局 frame round trip 和 SE(3) 等变测试；
 - 同源双 proposal 与 `L2 → L1` 跨界面距离不变量测试；
 - TriBrain torsion coordinator 零初始化、逐键输出及单次应用测试；
+- 三体 context 对界面几何和组分类型敏感，并对共同 SE(3) 变换保持不变；
+- 两侧 expert torsion 均接受辅助监督，正式入口检查全部 TriBrain/LoRA 梯度；
 - forward-only、单 optimizer step、训练/验证 smoke 全 finite；
 - v3 和错误 architecture checkpoint 均被明确拒绝。
 

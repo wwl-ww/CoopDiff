@@ -145,10 +145,10 @@ def build_tribrain_graph(
     """
     Build the full ternary graph for TriBrain processing.
 
-    Unlike the two subgraphs, this graph contains ALL nodes and ALL edge types:
-    E3 residues, POI residues, PROTAC atoms, plus all pairwise edges including
-    direct E3-POI protein-protein edges. This is where TriBrain learns three-body
-    coordination.
+    Unlike the two DiffDock subgraphs, this structure contains all E3 residues,
+    POI residues, and PROTAC atoms with explicit component labels. TriBrain
+    constructs invariant descriptors for all three cross-component pairs from
+    these coordinates; no dense edge tensor is materialized here.
 
     Returns a flat dictionary (not HeteroData) for the custom TriBrain architecture.
 

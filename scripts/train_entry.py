@@ -60,7 +60,11 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument(
         "--nan-clamp", type=float, default=100.0,
-        help="Per-layer expert activation clamp recorded in v5 checkpoints",
+        help="Per-layer expert activation clamp recorded in v6 checkpoints",
+    )
+    p.add_argument(
+        "--torsion-expert-aux-weight", type=float, default=0.25,
+        help="Weight for per-expert torsion losses in addition to joint torsion",
     )
     p.add_argument("--lora_rank", type=int, default=0,
                    help="Rank of independent sub1/sub2 expert adapters; 0 disables LoRA")
@@ -242,7 +246,9 @@ def main():
                       f"rot={loss_dict['loss_e3l_rot']:.4f}) | "
                       f"pol=(tr={loss_dict['loss_pol_tr']:.4f}, "
                       f"rot={loss_dict['loss_pol_rot']:.4f}) | "
-                      f"tor={loss_dict['loss_score_tor']:.4f}")
+                      f"tor=(joint={loss_dict['loss_score_tor']:.4f}, "
+                      f"e3l={loss_dict['loss_e3l_tor']:.4f}, "
+                      f"pol={loss_dict['loss_pol_tor']:.4f})")
 
         if n_skipped:
             raise RuntimeError(
@@ -366,6 +372,7 @@ def build_trainer(args, device, input_dim=None):
         lora_early_lr=getattr(args, 'lora_early_lr', 5e-6),
         lora_early_layers=getattr(args, 'lora_early_layers', 4),
         activation_clamp=args.nan_clamp,
+        torsion_expert_aux_weight=args.torsion_expert_aux_weight,
         device=device,
     )
 
@@ -376,33 +383,11 @@ def _guarded_train_step(trainer, batch):
     """Return ``None`` without stepping when a batch is numerically invalid."""
     from tricoopdiff.train import NonFiniteTrainingError
 
-    trainer.model.train()
-    trainer.optimizer.zero_grad(set_to_none=True)
     try:
-        loss_dict = trainer.compute_loss(**batch)
+        return trainer.train_step(**batch)
     except NonFiniteTrainingError as error:
         print(f"[train] SKIP {error}", flush=True)
         return None
-    total = loss_dict['loss_total']
-    if not torch.isfinite(total):
-        print(f"[train] SKIP case={batch.get('case', 'unknown')}: non-finite total loss", flush=True)
-        return None
-    total.backward()
-    grad_norm = torch.nn.utils.clip_grad_norm_(
-        trainer.model.tribrain.parameters(), max_norm=1.0,
-    )
-    if not torch.isfinite(grad_norm):
-        trainer.optimizer.zero_grad(set_to_none=True)
-        print(
-            f"[train] SKIP case={batch.get('case', 'unknown')}: non-finite gradients",
-            flush=True,
-        )
-        return None
-    trainer.optimizer.step()
-    trainer.global_step += 1
-    result = {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
-    result['lr'] = trainer.optimizer.param_groups[0]['lr']
-    return result
 
 
 def validate(trainer, val_loader, device):

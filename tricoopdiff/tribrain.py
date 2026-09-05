@@ -1,14 +1,8 @@
-"""
-TriBrain: lightweight conditioning network for two equivariant experts.
+"""Geometry-aware coordinator for the two equivariant DiffDock experts.
 
-The ONLY trainable module in TriCoopDiff (~2.2M params). Operates on the full
-ternary graph (E3 + POI + PROTAC, all edges including direct E3-POI).
-
-Architecture:
-  MultiScalePooling → token processor → Multi-Head Outputs
-  - FiLM heads: per-layer modulation params for two subgraphs
-  - Judge head: confidence
-  - State head: ΔΔG, productive probability
+TriBrain encodes typed E3, POI, and Ligand component tokens together with
+SE(3)-invariant cross-component distance statistics. It conditions independent
+expert FiLM paths and resolves their shared per-bond torsion decisions.
 """
 
 import math
@@ -589,7 +583,7 @@ class TriBrain(nn.Module):
     two equivariant DiffDock experts; TriBrain no longer predicts an unrelated
     Cartesian POI score.
 
-    This is the ONLY trainable module. ~2.2M params in MVP configuration.
+    Expert LoRA adapters are trainable alongside this coordinator.
     """
 
     def __init__(
@@ -608,9 +602,11 @@ class TriBrain(nn.Module):
             node_dim: internal representation dimension
             input_dim: input feature dimension (e.g. 1280 for ESM2).
                        Defaults to node_dim for backwards compatibility.
-            ns: scalar channel count
-            nv: vector channel count
-            num_transformer_layers: depth of equivariant transformer
+            ns: retained CLI compatibility parameter; rigid vector channels are
+                owned by DiffDock.
+            nv: retained CLI compatibility parameter; rigid vector channels are
+                owned by DiffDock.
+            num_transformer_layers: depth of scalar context processor
             num_conv_layers_per_expert: number of conv layers in each DiffDock expert
                                        (used to size the FiLM head list). DiffDock-L
                                        has 11 conv layers (NOT 6).

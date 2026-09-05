@@ -29,9 +29,12 @@ def test_index_entry_and_paths(tmp_path):
 
 def test_checkpoint_preflight_rejects_missing_lora():
     payload = {
-        "checkpoint_version": 5,
-        "architecture": "joint_interface_v2",
-        "runtime_config": {"activation_clamp": 100.0},
+        "checkpoint_version": 6,
+        "architecture": "geometric_joint_interface_v3",
+        "runtime_config": {
+            "activation_clamp": 100.0,
+            "torsion_expert_aux_weight": 0.25,
+        },
         "tribrain_state_dict": {"x": 1},
     }
     try:
@@ -52,16 +55,19 @@ def test_checkpoint_preflight_rejects_legacy_architecture():
     try:
         evaluation_common.validate_checkpoint_payload(payload)
     except ValueError as error:
-        assert "checkpoint_version=5" in str(error)
+        assert "checkpoint_version=6" in str(error)
     else:
         raise AssertionError("legacy architecture checkpoint must be rejected")
 
 
 def test_checkpoint_preflight_accepts_complete_payload():
     payload = {
-        "checkpoint_version": 5,
-        "architecture": "joint_interface_v2",
-        "runtime_config": {"activation_clamp": 100.0},
+        "checkpoint_version": 6,
+        "architecture": "geometric_joint_interface_v3",
+        "runtime_config": {
+            "activation_clamp": 100.0,
+            "torsion_expert_aux_weight": 0.25,
+        },
         "tribrain_state_dict": {"x": 1},
         "expert_lora_state_dict": {str(i): i for i in range(336)},
         "expert_lora_config": {"rank": 4},
@@ -71,8 +77,8 @@ def test_checkpoint_preflight_accepts_complete_payload():
 
 def test_checkpoint_preflight_rejects_missing_runtime_config():
     payload = {
-        "checkpoint_version": 5,
-        "architecture": "joint_interface_v2",
+        "checkpoint_version": 6,
+        "architecture": "geometric_joint_interface_v3",
         "tribrain_state_dict": {"x": 1},
         "expert_lora_state_dict": {str(i): i for i in range(336)},
         "expert_lora_config": {"rank": 4},

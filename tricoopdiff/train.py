@@ -48,6 +48,7 @@ class TriCoopDiffTrainer:
         lora_early_lr: float = 5e-6,
         lora_early_layers: int = 4,
         activation_clamp: float = 100.0,
+        torsion_expert_aux_weight: float = 0.25,
     ):
         self.model = model.to(device)
         self.diffusion = diffusion
@@ -55,6 +56,9 @@ class TriCoopDiffTrainer:
         if activation_clamp <= 0:
             raise ValueError("activation_clamp must be positive")
         self.activation_clamp = float(activation_clamp)
+        if torsion_expert_aux_weight < 0:
+            raise ValueError("torsion_expert_aux_weight must be non-negative")
+        self.torsion_expert_aux_weight = float(torsion_expert_aux_weight)
 
         # Only TriBrain is trainable; experts are frozen
         parameter_groups = [{
@@ -220,13 +224,23 @@ class TriCoopDiffTrainer:
             loss_score_tor = (
                 (output['torsion_score'] - tor_score_target) ** 2 / tor_norm
             ).mean()
+            loss_e3l_tor = (
+                (e3l['tor'] - tor_score_target) ** 2 / tor_norm
+            ).mean()
+            loss_pol_tor = (
+                (pol['tor'] - tor_score_target) ** 2 / tor_norm
+            ).mean()
         else:
             loss_score_tor = torch.tensor(0.0, device=device)
+            loss_e3l_tor = torch.tensor(0.0, device=device)
+            loss_pol_tor = torch.tensor(0.0, device=device)
 
         loss_score = (
             loss_e3l_tr + loss_e3l_rot
             + loss_pol_tr + loss_pol_rot
             + loss_score_tor
+            + self.torsion_expert_aux_weight
+            * 0.5 * (loss_e3l_tor + loss_pol_tor)
         )
         loss_total = loss_score
 
@@ -238,6 +252,8 @@ class TriCoopDiffTrainer:
             'loss_pol_tr': loss_pol_tr.item(),
             'loss_pol_rot': loss_pol_rot.item(),
             'loss_score_tor': loss_score_tor.item(),
+            'loss_e3l_tor': loss_e3l_tor.item(),
+            'loss_pol_tor': loss_pol_tor.item(),
         }
 
     def train_step(self, **batch) -> dict:
@@ -258,7 +274,7 @@ class TriCoopDiffTrainer:
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
         if not torch.isfinite(grad_norm):
             self.optimizer.zero_grad(set_to_none=True)
-            raise NonFiniteTrainingError("non-finite TriBrain gradients")
+            raise NonFiniteTrainingError("non-finite trainable gradients")
         self.optimizer.step()
         self.global_step += 1
 
@@ -337,10 +353,11 @@ class TriCoopDiffTrainer:
         """
         from .lora import expert_lora_state_dict
         torch.save({
-            'checkpoint_version': 5,
-            'architecture': 'joint_interface_v2',
+            'checkpoint_version': 6,
+            'architecture': 'geometric_joint_interface_v3',
             'runtime_config': {
                 'activation_clamp': self.activation_clamp,
+                'torsion_expert_aux_weight': self.torsion_expert_aux_weight,
             },
             'global_step': self.global_step,
             'tribrain_state_dict': self.model.tribrain.state_dict(),
@@ -361,17 +378,27 @@ class TriCoopDiffTrainer:
         (weights + global step only).
         """
         ckpt = torch.load(path, map_location=self.device)
-        if ckpt.get('checkpoint_version') != 5:
+        if ckpt.get('checkpoint_version') != 6:
             raise ValueError(
-                "joint-interface training requires checkpoint_version=5"
+                "geometric joint-interface training requires checkpoint_version=6"
             )
-        if ckpt.get('architecture') != 'joint_interface_v2':
-            raise ValueError("checkpoint architecture is not joint_interface_v2")
+        if ckpt.get('architecture') != 'geometric_joint_interface_v3':
+            raise ValueError(
+                "checkpoint architecture is not geometric_joint_interface_v3"
+            )
         saved_clamp = ckpt.get('runtime_config', {}).get('activation_clamp')
         if saved_clamp != self.activation_clamp:
             raise ValueError(
                 f"checkpoint activation_clamp={saved_clamp!r} does not match "
                 f"runtime activation_clamp={self.activation_clamp!r}"
+            )
+        saved_aux_weight = ckpt.get('runtime_config', {}).get(
+            'torsion_expert_aux_weight'
+        )
+        if saved_aux_weight != self.torsion_expert_aux_weight:
+            raise ValueError(
+                f"checkpoint torsion_expert_aux_weight={saved_aux_weight!r} "
+                f"does not match runtime value={self.torsion_expert_aux_weight!r}"
             )
         self.model.tribrain.load_state_dict(ckpt['tribrain_state_dict'])
         if ckpt.get('expert_lora_state_dict'):

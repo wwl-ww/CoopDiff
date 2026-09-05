@@ -34,13 +34,22 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=336):
     """Reject incomplete or legacy checkpoints before expensive inference."""
     if not isinstance(payload, dict):
         raise ValueError("checkpoint must contain a mapping")
-    if payload.get("checkpoint_version") != 5:
-        raise ValueError("joint-interface evaluation requires checkpoint_version=5")
-    if payload.get("architecture") != "joint_interface_v2":
-        raise ValueError("checkpoint architecture is not joint_interface_v2")
+    if payload.get("checkpoint_version") != 6:
+        raise ValueError(
+            "geometric joint-interface evaluation requires checkpoint_version=6"
+        )
+    if payload.get("architecture") != "geometric_joint_interface_v3":
+        raise ValueError(
+            "checkpoint architecture is not geometric_joint_interface_v3"
+        )
     activation_clamp = payload.get("runtime_config", {}).get("activation_clamp")
     if not isinstance(activation_clamp, (int, float)) or activation_clamp <= 0:
         raise ValueError("checkpoint has no valid runtime activation_clamp")
+    torsion_aux_weight = payload.get("runtime_config", {}).get(
+        "torsion_expert_aux_weight"
+    )
+    if not isinstance(torsion_aux_weight, (int, float)) or torsion_aux_weight < 0:
+        raise ValueError("checkpoint has no valid torsion_expert_aux_weight")
     if not payload.get("tribrain_state_dict"):
         raise ValueError("checkpoint has no TriBrain weights")
     lora = payload.get("expert_lora_state_dict")

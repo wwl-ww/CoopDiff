@@ -26,6 +26,7 @@ TriCoopDiff 以 E3 为固定全局参考系，扩散状态不是“全局 Ligand
 
 TriBrain 输出三类信息：
 
+- E3、POI、Ligand 类型感知 token，以及 E3–L、POI–L、E3–POI 距离/接触编码；
 - 两个 expert 各层独立的 FiLM 参数；
 - 基于两侧 per-bond score 和三体 context 的 torsion 权重与 residual；
 - 不改变坐标动力学的 scalar auxiliary heads。
@@ -42,11 +43,11 @@ TriBrain 不合并 rigid score、不输出 Ligand/POI SE(3) residual，也不替
 
 新架构 checkpoint 必须同时满足：
 
-- `checkpoint_version == 5`；
-- `architecture == "joint_interface_v2"`；
+- `checkpoint_version == 6`；
+- `architecture == "geometric_joint_interface_v3"`；
 - 包含与当前 branch-specific FiLM/LoRA 配置匹配的状态。
 
-加载器必须拒绝 version 4 及更早 checkpoint；不提供 legacy merge 或静默迁移路径。旧 checkpoint 缺少 torsion coordinator，且参数语义不同，只能留作历史结果。
+加载器必须拒绝 version 5 及更早 checkpoint；不提供静默迁移路径。旧 checkpoint 缺少真正读取坐标与组分类型的三体 encoder，只能留作历史结果。
 
 Expert 每层卷积采用固定 activation clamp 100，并将该值写入 checkpoint 的 `runtime_config`。这是冻结 DiffDock/LoRA 路径的显式数值策略；它不能替代界面坐标加噪，也不得在训练与评估之间改变。
 
@@ -58,4 +59,4 @@ Expert 每层卷积采用固定 activation clamp 100，并将该值写入 checkp
 - `L2 → L1` 变换前后 POI–Ligand 跨界面距离保持不变；
 - 两分支输出有限，TriBrain 协调后的 torsion 只应用一次；
 - forward-only、optimizer step 和 smoke training 全程 finite；
-- v4 及更早 checkpoint 被明确拒绝，v5 架构标识不匹配时立即失败。
+- v5 及更早 checkpoint 被明确拒绝，v6 架构标识不匹配时立即失败。
