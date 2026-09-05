@@ -63,7 +63,7 @@ TriFuse 不输出 rigid score、merge gate 或 SE(3) residual。刚体动力学�
 
 ## Checkpoint 与恢复
 
-当前架构标识为 `trifuse_v9`，checkpoint version 为 12。除 v8 的 token 协商外，每次 expert forward 会产生固定宽度的逐层 invariant telemetry；两侧 telemetry 进入逐键 torsion context，但不会形成同一步 FiLM 循环或重复 expert forward。旧权重不兼容。
+当前架构标识为 `trifuse_v10`，checkpoint version 为 13。每个 expert layer 对每个 ligand atom 生成独立的 scalar FiLM；vector irreps 不被直接调制，最终 FiLM 投影保持 zero-init。逐层 invariant telemetry 只进入后验 torsion 协调，不形成循环或重复 forward。旧权重不兼容。
 
 ## 最小验收
 

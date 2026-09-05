@@ -1042,18 +1042,19 @@ class TriFuse(nn.Module):
             h_film_pol = h_film_pol + fourier_time_embedding(
                 t_pol, self.node_dim // 2,
             )
-        h_film_e3l = self.film_shared(h_film_e3l)
-        h_film_pol = self.film_shared(h_film_pol)
+        ligand_tokens = pooled['ligand_tokens'][0]
         film_params = []
         for index, head in enumerate(self.film_heads):
             branch = 0 if index < self.num_conv_layers else 1
             layer = index % self.num_conv_layers
-            h_film = h_film_e3l if branch == 0 else h_film_pol
-            h_film = (
-                h_film
+            branch_context = h_film_e3l if branch == 0 else h_film_pol
+            atom_context = (
+                ligand_tokens
+                + branch_context[0]
                 + self.film_layer_embedding.weight[layer]
                 + self.film_branch_embedding.weight[branch]
             )
+            h_film = self.film_shared(atom_context)
             gamma, beta = head(h_film)
             film_params.append((gamma, beta))
 

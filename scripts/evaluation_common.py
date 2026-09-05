@@ -34,13 +34,13 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=336):
     """Reject incomplete or legacy checkpoints before expensive inference."""
     if not isinstance(payload, dict):
         raise ValueError("checkpoint must contain a mapping")
-    if payload.get("checkpoint_version") != 12:
+    if payload.get("checkpoint_version") != 13:
         raise ValueError(
-            "TriFuse evaluation requires checkpoint_version=12"
+            "TriFuse evaluation requires checkpoint_version=13"
         )
-    if payload.get("architecture") != "trifuse_v9":
+    if payload.get("architecture") != "trifuse_v10":
         raise ValueError(
-            "checkpoint architecture is not trifuse_v9"
+            "checkpoint architecture is not trifuse_v10"
         )
     activation_clamp = payload.get("runtime_config", {}).get("activation_clamp")
     if not isinstance(activation_clamp, (int, float)) or activation_clamp <= 0:

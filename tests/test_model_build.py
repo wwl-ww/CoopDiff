@@ -44,10 +44,9 @@ def test_trifuse_build():
     assert not torch.allclose(out['h_e3l'], out['h_pol'])
     assert len(out['film_params']) == 12  # 6 layers × 2 subgraphs
     for gamma, beta in out['film_params']:
-        # FiLMHead outputs [B, film_dim] per (gamma, beta); film_dim defaults to
-        # 48 (the expert's scalar channel count), not node_dim=128.
-        assert gamma.shape == (1, trifuse.film_dim)
-        assert beta.shape == (1, trifuse.film_dim)
+        # FiLM is specific to each ligand atom and expert layer.
+        assert gamma.shape == (80, trifuse.film_dim)
+        assert beta.shape == (80, trifuse.film_dim)
 
     # Count parameters
     n_params = sum(p.numel() for p in trifuse.parameters())
@@ -186,6 +185,25 @@ def test_film_zero_init():
         f"Beta not zero: max={beta.abs().max():.2e}"
 
     print("  [OK] FiLM zero-init transparent")
+
+
+def test_trifuse_atom_film_can_select_ligand_regions():
+    """A trained FiLM head can assign different scalar gates per atom."""
+    from tricoopdiff.trifuse import TriFuse
+
+    torch.manual_seed(19)
+    trifuse = TriFuse(
+        node_dim=32, input_dim=16, num_transformer_layers=1,
+        num_conv_layers_per_expert=2, film_dim=8, dropout=0.0,
+    ).eval()
+    torch.nn.init.normal_(trifuse.film_heads[0].net.weight, std=0.02)
+    features = torch.randn(12, 16)
+    coords = torch.randn(12, 3)
+    node_types = torch.tensor([0] * 4 + [1] * 4 + [2] * 4)
+    gamma, _ = trifuse(features, coords, node_types)['film_params'][0]
+    assert gamma.shape == (4, 8)
+    assert not torch.allclose(gamma[0], gamma[1])
+    print("  [OK] FiLM can select individual ligand atoms")
 
 
 def test_torsion_coordinator_zero_init_and_per_bond_control():
@@ -474,6 +492,7 @@ if __name__ == "__main__":
     test_trifuse_links_chemical_features_to_local_contacts()
     test_trifuse_reads_sigma_and_solver_state()
     test_film_zero_init()
+    test_trifuse_atom_film_can_select_ligand_regions()
     test_torsion_coordinator_zero_init_and_per_bond_control()
     test_torsion_coordinator_rejects_flat_native_shape()
     test_torsion_coordinator_does_not_overflow_finite_evidence()
