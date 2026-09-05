@@ -6,7 +6,7 @@
 
 | 文档 | 用途 | 何时阅读 |
 |---|---|---|
-| [TriCoopDiff 模型交接文档.md](TriCoopDiff%20模型交接文档.md) | `interface_coordinate_v1` 架构、FiLM、训练和采样 | 修改核心模型前 |
+| [TriCoopDiff 模型交接文档.md](TriCoopDiff%20模型交接文档.md) | `joint_interface_v2` 架构、FiLM、训练和采样 | 修改核心模型前 |
 | [双DiffDock界面协同修正方案.md](双DiffDock界面协同修正方案.md) | 双 expert 的界面职责与刚体更新顺序 | 修改坐标动力学时 |
 | [三分子初始化策略方案.md](三分子初始化策略方案.md) | `native` 与 `coupled5a` 初始化、参考系和验收 | 修改采样或初始化时 |
 | [训练入口 SLURM 与 Phase1 smoke 交接文档.md](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md) | 环境预检、SLURM、缓存和训练入口 | 提交训练前 |
@@ -18,11 +18,11 @@
 - DeepTernary 可复现实验基线为 **mean best DockQ 0.6588**（22 cases × 40 seeds）。
 - 与 DeepTernary 横向比较时，主指标必须调用其完整原子 `DockQ/dockq_util.py::cal_dockq`；Cα 或接触恢复近似值只能作为诊断指标。
 - E3 固定；动态状态是 E3–Ligand 与 POI–Ligand 两个相对刚体界面以及共享 Ligand torsion。
-- `sub1` 直接更新 Ligand；`sub2` 保持 Ligand fixed，通过精确逆刚体组合更新 POI；torsion 取两 expert proposal 的均值。
-- TriBrain 只负责 branch-specific FiLM 和 scalar auxiliary heads，不输出 merge gate、坐标 residual 或独立 SE(3) score。
+- 两个 rigid proposal 从同一个旧 Ligand 生成；Ligand 采用 `sub1` proposal，POI 接收将 `sub2` proposal 对齐到 `sub1` proposal 的精确刚体变换。
+- TriBrain 负责 branch-specific FiLM、逐键 torsion 协调和 scalar auxiliary heads；它不输出刚体 merge gate 或独立 SE(3) score。
 - 训练分别对两个界面应用 native DiffDock forward noise，再重建唯一一致的全局坐标。
-- 新 checkpoint 必须是 version 4 且 `architecture=interface_coordinate_v1`；version 3 必须拒绝。
-- version 4 同时记录 `runtime_config.activation_clamp=100`；训练与评估必须恢复同一 expert 数值策略。
+- 新 checkpoint 必须是 version 5 且 `architecture=joint_interface_v2`；旧版本必须拒绝。
+- version 5 同时记录 `runtime_config.activation_clamp=100`；训练与评估必须恢复同一 expert 数值策略。
 - Phase 1 使用官方 DeepTernary MGD cluster representatives 训练，并保持 train/validation/test 三个索引互不重叠。
 
 ## 维护规则

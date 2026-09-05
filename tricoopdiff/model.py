@@ -95,7 +95,7 @@ class TriCoopDiff(nn.Module):
         Returns:
             dict with:
               'interface_scores': raw E3--Ligand and mapped POI--Ligand scores
-              'torsion_score': mean score for the shared Ligand torsions
+              'torsion_score': TriBrain-coordinated shared Ligand torsion score
               'confidence': [B,1] clash confidence
               'state': [B,2] thermodynamic state predictions
         """
@@ -113,6 +113,8 @@ class TriCoopDiff(nn.Module):
             'sub2': {'tr': [], 'rot': [], 'tor': []},
         }
         all_torsion_scores = []
+        all_torsion_weights = []
+        all_torsion_residuals = []
         all_confidence = []
         all_state = []
 
@@ -334,17 +336,27 @@ class TriCoopDiff(nn.Module):
                 self._last_step0_probe['scores_sub2_mapped'] = _score_debug(scores_2)
 
             # Torsion is the only coordinate shared by both interface states.
-            # Averaging keeps the pretrained single-interface score scale while
-            # allowing both binding sites to constrain the linker conformation.
+            # The experts provide two interface-local opinions; TriBrain makes
+            # the single executable decision for every rotatable bond.
             if scores_1['tor_score'].numel() and scores_2['tor_score'].numel():
-                torsion_score = 0.5 * (
-                    scores_1['tor_score'] + scores_2['tor_score']
+                torsion_score, torsion_weight, torsion_residual = (
+                    self.tribrain.torsion_coordinator(
+                        tri_out['h_cond'],
+                        scores_1['tor_score'],
+                        scores_2['tor_score'],
+                    )
                 )
             elif scores_1['tor_score'].numel():
                 torsion_score = scores_1['tor_score']
+                torsion_weight = torch.ones_like(torsion_score)
+                torsion_residual = torch.zeros_like(torsion_score)
             else:
                 torsion_score = scores_2['tor_score']
+                torsion_weight = torch.zeros_like(torsion_score)
+                torsion_residual = torch.zeros_like(torsion_score)
             all_torsion_scores.append(torsion_score)
+            all_torsion_weights.append(torsion_weight)
+            all_torsion_residuals.append(torsion_residual)
             all_confidence.append(tri_out['confidence'])
             all_state.append(tri_out['state'])
 
@@ -366,6 +378,10 @@ class TriCoopDiff(nn.Module):
                 'poi_ligand': expert_scores['sub2'],
             },
             'torsion_score': torch.cat(all_torsion_scores, dim=0),
+            'torsion_coordination': {
+                'e3l_weight': torch.cat(all_torsion_weights, dim=0),
+                'residual': torch.cat(all_torsion_residuals, dim=0),
+            },
             'confidence': torch.cat(all_confidence, dim=0),
             'state': torch.cat(all_state, dim=0),
         }

@@ -74,6 +74,23 @@ def test_film_zero_init():
     print("  [OK] FiLM zero-init transparent")
 
 
+def test_torsion_coordinator_zero_init_and_per_bond_control():
+    """Shared torsion starts neutral but can make independent bond decisions."""
+    from tricoopdiff.tribrain import TorsionCoordinator
+
+    coordinator = TorsionCoordinator(context_dim=8, hidden_dim=4)
+    context = torch.randn(2, 8)
+    score_e3l = torch.tensor([[1.0, 4.0], [-2.0, 6.0]])
+    score_pol = torch.tensor([[3.0, -2.0], [4.0, 2.0]])
+    score, weight, residual = coordinator(context, score_e3l, score_pol)
+
+    assert torch.allclose(weight, torch.full_like(weight, 0.5))
+    assert torch.allclose(residual, torch.zeros_like(residual))
+    assert torch.allclose(score, 0.5 * (score_e3l + score_pol))
+    assert score.shape == score_e3l.shape
+    print("  [OK] Torsion coordinator neutral initialization")
+
+
 def test_diffusion_schedules():
     """Diffusion schedules produce valid noise levels."""
     from tricoopdiff.diffusion import InterfaceDiffusion, so3_score_norm
@@ -266,6 +283,7 @@ if __name__ == "__main__":
 
     test_tribrain_build()
     test_film_zero_init()
+    test_torsion_coordinator_zero_init_and_per_bond_control()
     test_diffusion_schedules()
     test_graph_construction()
     test_initializer_body_frame()

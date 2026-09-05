@@ -34,10 +34,10 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=336):
     """Reject incomplete or legacy checkpoints before expensive inference."""
     if not isinstance(payload, dict):
         raise ValueError("checkpoint must contain a mapping")
-    if payload.get("checkpoint_version") != 4:
-        raise ValueError("interface-coordinate evaluation requires checkpoint_version=4")
-    if payload.get("architecture") != "interface_coordinate_v1":
-        raise ValueError("checkpoint architecture is not interface_coordinate_v1")
+    if payload.get("checkpoint_version") != 5:
+        raise ValueError("joint-interface evaluation requires checkpoint_version=5")
+    if payload.get("architecture") != "joint_interface_v2":
+        raise ValueError("checkpoint architecture is not joint_interface_v2")
     activation_clamp = payload.get("runtime_config", {}).get("activation_clamp")
     if not isinstance(activation_clamp, (int, float)) or activation_clamp <= 0:
         raise ValueError("checkpoint has no valid runtime activation_clamp")

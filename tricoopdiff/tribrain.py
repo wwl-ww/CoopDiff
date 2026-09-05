@@ -376,6 +376,72 @@ class StateHead(nn.Module):
         return self.net(x)
 
 
+class TorsionCoordinator(nn.Module):
+    """Resolve two interface opinions into one score per rotatable bond.
+
+    A PROTAC has one shared set of torsional degrees of freedom.  The two
+    DiffDock experts therefore provide evidence, not independently executable
+    torsion actions.  This head sees both per-bond scores together with the
+    ternary context and predicts a per-bond mixture weight and residual.
+
+    The final projection is zero-initialized, so an untrained coordinator starts
+    at the neutral expert mean while remaining fully learnable.
+    """
+
+    def __init__(self, context_dim: int = 128, hidden_dim: int = 64):
+        super().__init__()
+        # Per-bond inputs are: sub1, sub2, their difference, and their product.
+        self.net = nn.Sequential(
+            nn.Linear(context_dim + 4, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        score_e3l: torch.Tensor,
+        score_pol: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return coordinated score, E3-side weight, and learned residual."""
+        if score_e3l.shape != score_pol.shape:
+            raise ValueError(
+                "torsion experts must describe the same rotatable bonds: "
+                f"{tuple(score_e3l.shape)} != {tuple(score_pol.shape)}"
+            )
+        if score_e3l.ndim != 2:
+            raise ValueError(
+                f"torsion scores must have shape [B,K], got {score_e3l.shape}"
+            )
+        if context.shape[0] != score_e3l.shape[0]:
+            raise ValueError("torsion context and scores have different batches")
+
+        n_torsions = score_e3l.shape[1]
+        context_per_bond = context.unsqueeze(1).expand(-1, n_torsions, -1)
+        bond_evidence = torch.stack(
+            (
+                score_e3l,
+                score_pol,
+                score_e3l - score_pol,
+                score_e3l * score_pol,
+            ),
+            dim=-1,
+        )
+        coordination = self.net(
+            torch.cat((context_per_bond, bond_evidence), dim=-1)
+        )
+        weight_e3l = torch.sigmoid(coordination[..., 0])
+        residual = coordination[..., 1]
+        score = (
+            weight_e3l * score_e3l
+            + (1.0 - weight_e3l) * score_pol
+            + residual
+        )
+        return score, weight_e3l, residual
+
+
 # ---------------------------------------------------------------------------
 # Full TriBrain
 # ---------------------------------------------------------------------------
@@ -447,6 +513,9 @@ class TriBrain(nn.Module):
         # equivariant and are therefore supplied by the DiffDock experts.
         self.judge_head = JudgeHead(hidden_dim=node_dim)         # ~16k
         self.state_head = StateHead(hidden_dim=node_dim)         # ~16k
+        self.torsion_coordinator = TorsionCoordinator(
+            context_dim=node_dim,
+        )
 
         # FiLM: shared MLP → per-layer heads (12 heads = 6 layers × 2 subgraphs)
         self.film_shared = nn.Sequential(

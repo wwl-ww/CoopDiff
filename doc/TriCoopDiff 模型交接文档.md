@@ -12,7 +12,7 @@ E3 是固定全局参考系。动态状态为：
 |---|---|---|
 | `T_E3L` | Ligand 相对 E3 的刚体 | `sub1` DiffDock |
 | `T_POL` | Ligand 相对 POI 的刚体 | `sub2` DiffDock |
-| `chi` | Ligand torsion | 两 expert proposal 均值 |
+| `chi` | Ligand torsion | TriBrain 逐键协调两 expert evidence |
 
 全局坐标由 `T_L = T_E3L`、`T_POI = T_L · inverse(T_POL)` 唯一确定。任何坐标更新后都必须同步刷新 POI-local frame、receptor crop 和 cross-edge。
 
@@ -20,9 +20,9 @@ E3 是固定全局参考系。动态状态为：
 
 两个分支使用同一个预训练 DiffDock 基座，但 LoRA 和 FiLM 参数互相独立：
 
-- `sub1` 在标准 E3–Ligand 二体图上运行，直接更新 Ligand rigid pose；
-- `sub2` 在标准 POI–Ligand local frame 图上运行，保持 Ligand fixed，通过 proposal 的精确逆刚体变换更新 POI；
-- torsion 是 Ligand 的共享内部自由度，取两分支 proposal 的算术均值并只应用一次。
+- 两个分支在同一个旧 Ligand 上分别生成 `L1`、`L2` rigid proposal；
+- Ligand 采用 `L1`，POI 接收把 `L2` 对齐到 `L1` 的同一个精确刚体变换；
+- torsion 是共享内部自由度，由 TriBrain 逐键预测两侧权重与 residual，并只应用一次。
 
 禁止恢复以下旧逻辑：
 
@@ -36,9 +36,10 @@ E3 是固定全局参考系。动态状态为：
 TriBrain 读取三元上下文并输出：
 
 1. `sub1`、`sub2` 各层独立的 FiLM scale/shift；
-2. scalar auxiliary heads，例如功能或置信度预测。
+2. 逐键 torsion coordinator；
+3. scalar auxiliary heads，例如功能或置信度预测。
 
-TriBrain 不输出坐标 score、merge gate 或 SE(3) residual。坐标动力学完全由两个 DiffDock proposal 与显式刚体组合定义，避免让轻量网络重新学习二体 docking。
+TriBrain 不输出 rigid score、merge gate 或 SE(3) residual。刚体动力学完全由两个 DiffDock proposal 与显式群组合定义；TriBrain 只裁决物理上共享的 torsion。
 
 ## 训练
 
@@ -50,24 +51,24 @@ TriBrain 不输出坐标 score、merge gate 或 SE(3) residual。坐标动力学
 
 一个反向步的固定顺序是：
 
-1. 用 `sub1` 更新 `T_E3L` 和 Ligand；
-2. 重建 `sub2` 输入；
-3. 用 `sub2` 更新 `T_POL`，由 `T_POI = T_L · inverse(T_POL)` 移动 POI；
-4. 应用一次平均 torsion；
+1. 在同一个旧 Ligand 上同时得到 `sub1` 的 `L1` 与 `sub2` 的 `L2`；
+2. Ligand 采用 `L1`，把 `L2 → L1` 的刚体变换同步施加给 POI；
+3. 应用一次 TriBrain 协调后的共享 torsion；
+4. 更新 POI local frame；
 5. 重建并验证全部 frame 与图。
 
 初始化模式只提供起始界面 proposal。它不得引入第三套坐标语义，也不得以 near-native pose 掩盖全局装配能力。
 
 ## Checkpoint 与恢复
 
-当前架构标识为 `interface_coordinate_v1`，checkpoint version 为 4。加载时必须同时验证 version、architecture、LoRA 配置和模型 shape。version 3 使用旧动力学和旧参数语义，必须硬拒绝；不支持 legacy mode、自动迁移或用 v3 继续微调。
+当前架构标识为 `joint_interface_v2`，checkpoint version 为 5。加载时必须同时验证 version、architecture、LoRA 配置和模型 shape。version 4 及更早版本缺少当前刚体组合或 torsion coordinator，必须硬拒绝。
 
 ## 最小验收
 
 - 两个 branch 的 native/inline parity 与 finite 检查；
 - 相对/全局 frame round trip 和 SE(3) 等变测试；
-- `sub1` 只移动 Ligand、`sub2` 只移动 POI 的行为测试；
-- 两 expert torsion 均值且每步只应用一次；
+- 同源双 proposal 与 `L2 → L1` 跨界面距离不变量测试；
+- TriBrain torsion coordinator 零初始化、逐键输出及单次应用测试；
 - forward-only、单 optimizer step、训练/验证 smoke 全 finite；
 - v3 和错误 architecture checkpoint 均被明确拒绝。
 

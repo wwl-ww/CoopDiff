@@ -337,8 +337,8 @@ class TriCoopDiffTrainer:
         """
         from .lora import expert_lora_state_dict
         torch.save({
-            'checkpoint_version': 4,
-            'architecture': 'interface_coordinate_v1',
+            'checkpoint_version': 5,
+            'architecture': 'joint_interface_v2',
             'runtime_config': {
                 'activation_clamp': self.activation_clamp,
             },
@@ -361,12 +361,12 @@ class TriCoopDiffTrainer:
         (weights + global step only).
         """
         ckpt = torch.load(path, map_location=self.device)
-        if ckpt.get('checkpoint_version') != 4:
+        if ckpt.get('checkpoint_version') != 5:
             raise ValueError(
-                "interface-coordinate training requires checkpoint_version=4"
+                "joint-interface training requires checkpoint_version=5"
             )
-        if ckpt.get('architecture') != 'interface_coordinate_v1':
-            raise ValueError("checkpoint architecture is not interface_coordinate_v1")
+        if ckpt.get('architecture') != 'joint_interface_v2':
+            raise ValueError("checkpoint architecture is not joint_interface_v2")
         saved_clamp = ckpt.get('runtime_config', {}).get('activation_clamp')
         if saved_clamp != self.activation_clamp:
             raise ValueError(

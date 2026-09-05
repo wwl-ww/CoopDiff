@@ -60,7 +60,7 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument(
         "--nan-clamp", type=float, default=100.0,
-        help="Per-layer expert activation clamp recorded in v4 checkpoints",
+        help="Per-layer expert activation clamp recorded in v5 checkpoints",
     )
     p.add_argument("--lora_rank", type=int, default=0,
                    help="Rank of independent sub1/sub2 expert adapters; 0 disables LoRA")
