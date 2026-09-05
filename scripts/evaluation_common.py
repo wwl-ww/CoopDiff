@@ -55,6 +55,9 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=336):
     )
     if not isinstance(lora_warmup_steps, int) or lora_warmup_steps < 0:
         raise ValueError("checkpoint has no valid lora_warmup_steps")
+    optimizer_groups = payload.get("runtime_config", {}).get("optimizer_groups")
+    if not isinstance(optimizer_groups, dict) or not optimizer_groups:
+        raise ValueError("checkpoint has no optimizer-group training config")
     if not payload.get("trifuse_state_dict"):
         raise ValueError("checkpoint has no TriFuse weights")
     lora = payload.get("expert_lora_state_dict")

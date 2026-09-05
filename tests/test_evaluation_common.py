@@ -35,6 +35,7 @@ def test_checkpoint_preflight_rejects_missing_lora():
             "activation_clamp": 100.0,
             "torsion_expert_aux_weight": 0.25,
             "lora_warmup_steps": 100,
+            "optimizer_groups": {"trifuse": {"lr": 1e-4}},
         },
         "trifuse_state_dict": {"x": 1},
     }
@@ -69,6 +70,7 @@ def test_checkpoint_preflight_accepts_complete_payload():
             "activation_clamp": 100.0,
             "torsion_expert_aux_weight": 0.25,
             "lora_warmup_steps": 100,
+            "optimizer_groups": {"trifuse": {"lr": 1e-4}},
         },
         "trifuse_state_dict": {"x": 1},
         "expert_lora_state_dict": {str(i): i for i in range(336)},

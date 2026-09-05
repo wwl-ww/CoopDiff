@@ -91,6 +91,13 @@ class TriCoopDiffTrainer:
         self._lora_params = lora_groups['early'] + lora_groups['late']
         self._set_lora_trainable(False)
         self.optimizer = AdamW(parameter_groups, weight_decay=weight_decay)
+        self.optimizer_config = {
+            group['name']: {
+                'lr': float(group['lr']),
+                'weight_decay': float(group['weight_decay']),
+            }
+            for group in self.optimizer.param_groups
+        }
         self.scheduler = ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-7,
         )
@@ -388,6 +395,7 @@ class TriCoopDiffTrainer:
                 'activation_clamp': self.activation_clamp,
                 'torsion_expert_aux_weight': self.torsion_expert_aux_weight,
                 'lora_warmup_steps': self.lora_warmup_steps,
+                'optimizer_groups': self.optimizer_config,
             },
             'global_step': self.global_step,
             'trifuse_state_dict': self.model.trifuse.state_dict(),
@@ -447,6 +455,14 @@ class TriCoopDiffTrainer:
             raise ValueError(
                 f"checkpoint lora_warmup_steps={saved_warmup!r} does not "
                 f"match runtime value={self.lora_warmup_steps!r}"
+            )
+        saved_optimizer_config = ckpt.get('runtime_config', {}).get(
+            'optimizer_groups'
+        )
+        if saved_optimizer_config != self.optimizer_config:
+            raise ValueError(
+                f"checkpoint optimizer groups={saved_optimizer_config!r} do not "
+                f"match runtime groups={self.optimizer_config!r}"
             )
         self.model.trifuse.load_state_dict(ckpt['trifuse_state_dict'])
         if ckpt.get('expert_lora_state_dict'):
