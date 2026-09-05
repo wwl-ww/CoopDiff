@@ -11,6 +11,7 @@
 | [训练入口 SLURM 与 Phase1 smoke 交接文档.md](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md) | 环境预检、SLURM、缓存和训练入口 | 提交训练前 |
 | [DiffDock 审计文档.md](DiffDock%20审计文档.md) | 冻结二体专家的结构和扩散实现 | 修改 expert 集成时 |
 | [公式推导参考.md](公式推导参考.md) | SO(3)、DSM、Tweedie 和物理项推导 | 核对数学约定时 |
+| [DeepTernary 数据与评估协议.md](DeepTernary%20数据与评估协议.md) | 统一训练池、cluster 抽样及 PROTAC/MGD 正式评估口径 | 生成索引、训练或汇报 benchmark 前 |
 
 ## 当前权威结论
 
@@ -18,7 +19,7 @@
 - 与 DeepTernary 横向比较时，主指标必须调用其完整原子 `DockQ/dockq_util.py::cal_dockq`；Cα 或接触恢复近似值只能作为诊断指标。
 - 零 FiLM 时，合并采用 `s_q = s_q1 + g(s_q2-s_q1)` 且 `g=0`，应退化为 E3-L expert。
 - `coupled5a` 将 POI 与 PROTAC 放在共同口袋附近；该模式在无 `NAN_CLAMP` 时通过 sub1/sub2 native-inline parity。`native` 保留用于复现 DiffDock 二体先验。
-- Phase 1 使用官方 DeepTernary MGD cluster representatives 训练，并保持 train/validation/test 三个索引互不重叠。
+- 当前 Phase 1 工程训练使用 MGD representatives；正式 benchmark 模型改用 PROTAC/MGD 官方训练 members 的清洁交集与动态 cluster 抽样，详见数据协议。
 
 ## 维护规则
 
