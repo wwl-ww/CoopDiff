@@ -178,6 +178,14 @@ def swap_protein_reference(e3_data, poi_data, ligand_data):
     )
 
 
+def seed_training(seed, device):
+    """Seed training RNGs independently of cache/featurization side effects."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+
 def main():
     args = parse_args()
     if args.nan_clamp <= 0:
@@ -185,10 +193,7 @@ def main():
     os.environ["NAN_CLAMP"] = str(args.nan_clamp)
     device = torch.device(args.device)
 
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(args.seed)
+    seed_training(args.seed, device)
 
     # SO(3)/torus cache lookup resolves relative to CWD; chdir to project root.
     os.chdir(_PROJECT_ROOT)
@@ -222,6 +227,10 @@ def main():
         score_model_args, str(device), cache_dir=args.cache_dir,
     )
     print(f"  receptor_feat_dim={input_dim} (from {first['case']})")
+    # A cold ESM/graph cache can consume framework RNG state while a warm cache
+    # does not. Reset here so model initialization and epoch sampling depend
+    # only on --seed, never on whether the first feature was already cached.
+    seed_training(args.seed, device)
 
     # ----------------------------------------------------------------
     # 1. Build model
