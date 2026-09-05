@@ -178,6 +178,136 @@ def scatter_max_per_batch(feat, batch, n_batch):
     return torch.stack(outputs, dim=0)
 
 
+class TernaryGeometryEncoder(nn.Module):
+    """Encode typed molecular features and invariant three-body geometry."""
+
+    PAIRS = ((0, 2), (1, 2), (0, 1))  # E3-L, POI-L, E3-POI
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128,
+                 n_rbf: int = 16, max_distance: float = 40.0):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.n_rbf = n_rbf
+        self.max_distance = float(max_distance)
+        self.feature_proj = nn.Linear(input_dim, hidden_dim)
+        self.type_embedding = nn.Embedding(3, hidden_dim)
+        self.component_queries = nn.Parameter(torch.randn(3, hidden_dim) * 0.02)
+        self.register_buffer(
+            "rbf_centers", torch.linspace(0.0, max_distance, n_rbf),
+        )
+        self.rbf_width = max_distance / max(n_rbf - 1, 1)
+
+        # Per pair: RBF histogram + min/mean/std + contacts at 4/8/12 A.
+        # Per component: radius of gyration + log node count.
+        geometry_dim = len(self.PAIRS) * (n_rbf + 6) + 3 * 2
+        self.geometry_net = nn.Sequential(
+            nn.Linear(geometry_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.fusion = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 4),
+            nn.Linear(hidden_dim * 4, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+
+    def _pair_descriptor(self, coords_a: torch.Tensor,
+                         coords_b: torch.Tensor) -> torch.Tensor:
+        distances = torch.cdist(coords_a, coords_b).reshape(-1)
+        offsets = distances[:, None] - self.rbf_centers[None, :]
+        rbf = torch.exp(-0.5 * (offsets / self.rbf_width) ** 2).mean(dim=0)
+        scale = self.max_distance
+        statistics = torch.stack((
+            distances.min() / scale,
+            distances.mean() / scale,
+            distances.std(unbiased=False) / scale,
+            (distances < 4.0).to(distances.dtype).mean(),
+            (distances < 8.0).to(distances.dtype).mean(),
+            (distances < 12.0).to(distances.dtype).mean(),
+        ))
+        return torch.cat((rbf, statistics), dim=0)
+
+    def forward(self, node_features: torch.Tensor, node_coords: torch.Tensor,
+                node_types: torch.Tensor, batch: torch.Tensor = None) -> torch.Tensor:
+        if batch is None:
+            batch = torch.zeros(
+                node_features.shape[0], dtype=torch.long,
+                device=node_features.device,
+            )
+        node_types = node_types.to(device=node_features.device)
+        node_coords = node_coords.to(device=node_features.device)
+        features = self.feature_proj(node_features) + self.type_embedding(node_types)
+
+        outputs = []
+        n_batch = int(batch.max().item()) + 1
+        for batch_index in range(n_batch):
+            batch_mask = batch == batch_index
+            component_tokens = []
+            component_coords = []
+            component_descriptors = []
+            for component_type in range(3):
+                mask = batch_mask & (node_types == component_type)
+                if not bool(mask.any()):
+                    raise ValueError(
+                        f"batch {batch_index} has no nodes of type {component_type}"
+                    )
+                component_features = features[mask]
+                coords = node_coords[mask]
+                attention = torch.softmax(
+                    component_features @ self.component_queries[component_type],
+                    dim=0,
+                )
+                token = (
+                    (component_features * attention[:, None]).sum(dim=0)
+                    + component_features.mean(dim=0)
+                    + component_features.max(dim=0).values
+                ) / 3.0
+                component_tokens.append(token)
+                component_coords.append(coords)
+                centered = coords - coords.mean(dim=0, keepdim=True)
+                radius = torch.sqrt(centered.square().sum(dim=-1).mean())
+                component_descriptors.extend((
+                    radius / self.max_distance,
+                    torch.log1p(coords.new_tensor(float(coords.shape[0]))) / 10.0,
+                ))
+
+            pair_descriptors = [
+                self._pair_descriptor(component_coords[a], component_coords[b])
+                for a, b in self.PAIRS
+            ]
+            geometry = torch.cat((
+                *pair_descriptors, torch.stack(component_descriptors),
+            ))
+            geometry_token = self.geometry_net(geometry)
+            outputs.append(self.fusion(torch.cat((
+                *component_tokens, geometry_token,
+            ))))
+        return torch.stack(outputs, dim=0)
+
+
+class ContextProcessor(nn.Module):
+    """Residual scalar processor for the invariant ternary context token."""
+
+    def __init__(self, hidden_dim: int, num_layers: int, dropout: float):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim * 2),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim * 2, hidden_dim),
+            )
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, token: torch.Tensor) -> dict:
+        for layer in self.layers:
+            token = token + layer(token)
+        return {"combined": token}
+
+
 # ---------------------------------------------------------------------------
 # Equivariant Transformer
 # ---------------------------------------------------------------------------
@@ -390,7 +520,8 @@ class TorsionCoordinator(nn.Module):
 
     def __init__(self, context_dim: int = 128, hidden_dim: int = 64):
         super().__init__()
-        # Per-bond inputs are: sub1, sub2, their difference, and their product.
+        # Per-bond evidence is bounded before entering the MLP. This prevents
+        # large but finite expert scores from overflowing in a raw product.
         self.net = nn.Sequential(
             nn.Linear(context_dim + 4, hidden_dim),
             nn.SiLU(),
@@ -420,12 +551,14 @@ class TorsionCoordinator(nn.Module):
 
         n_torsions = score_e3l.shape[1]
         context_per_bond = context.unsqueeze(1).expand(-1, n_torsions, -1)
+        bounded_e3l = torch.tanh(score_e3l)
+        bounded_pol = torch.tanh(score_pol)
         bond_evidence = torch.stack(
             (
-                score_e3l,
-                score_pol,
-                score_e3l - score_pol,
-                score_e3l * score_pol,
+                bounded_e3l,
+                bounded_pol,
+                bounded_e3l - bounded_pol,
+                bounded_e3l * bounded_pol,
             ),
             dim=-1,
         )
@@ -433,7 +566,7 @@ class TorsionCoordinator(nn.Module):
             torch.cat((context_per_bond, bond_evidence), dim=-1)
         )
         weight_e3l = torch.sigmoid(coordination[..., 0])
-        residual = coordination[..., 1]
+        residual = 10.0 * torch.tanh(coordination[..., 1])
         score = (
             weight_e3l * score_e3l
             + (1.0 - weight_e3l) * score_pol
@@ -495,16 +628,14 @@ class TriBrain(nn.Module):
         self.num_conv_layers = num_conv_layers_per_expert
         self.film_dim = film_dim
 
-        # Multi-scale pooling: ~66k params
-        self.pooling = MultiScalePooling(
-            node_dim=node_dim, token_dim=node_dim, input_dim=input_dim
+        self.pooling = TernaryGeometryEncoder(
+            input_dim=input_dim, hidden_dim=node_dim,
         )
 
-        # Equivariant transformer: ~1.1M params
-        self.transformer = EquivariantTransformer(
-            node_dim=node_dim,
-            ns=ns,
-            nv=nv,
+        # The context is invariant, so process it with scalar residual blocks.
+        # Spatial vector predictions remain the responsibility of DiffDock.
+        self.transformer = ContextProcessor(
+            hidden_dim=node_dim,
             num_layers=num_transformer_layers,
             dropout=dropout,
         )

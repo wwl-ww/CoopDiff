@@ -57,6 +57,51 @@ def test_tribrain_build():
     print("  [OK] TriBrain build")
 
 
+def test_tribrain_reads_geometry_and_preserves_rigid_invariance():
+    """Context changes with interfaces, not with a common rigid transform."""
+    from tricoopdiff.diffusion import so3_exp
+    from tricoopdiff.tribrain import TriBrain
+
+    torch.manual_seed(3)
+    tribrain = TriBrain(
+        node_dim=32, input_dim=16, ns=8, nv=2,
+        num_transformer_layers=1,
+        num_conv_layers_per_expert=2,
+        film_dim=4,
+        dropout=0.0,
+    ).eval()
+    features = torch.randn(15, 16)
+    coords = torch.randn(15, 3)
+    node_types = torch.tensor([0] * 5 + [1] * 6 + [2] * 4)
+    time = torch.tensor([0.4])
+
+    base = tribrain(
+        features, coords, node_types, t_e3l=time, t_pol=time,
+    )['h_cond']
+    changed_coords = coords.clone()
+    changed_coords[node_types == 1] += torch.tensor([12.0, 0.0, 0.0])
+    changed = tribrain(
+        features, changed_coords, node_types, t_e3l=time, t_pol=time,
+    )['h_cond']
+    assert not torch.allclose(base, changed, atol=1e-5)
+
+    rotation = so3_exp(torch.tensor([[0.4, -0.2, 0.3]]))[0]
+    transformed = coords @ rotation.T + torch.tensor([8.0, -4.0, 2.0])
+    rigid = tribrain(
+        features, transformed, node_types, t_e3l=time, t_pol=time,
+    )['h_cond']
+    assert torch.allclose(base, rigid, atol=2e-5), (base - rigid).abs().max()
+
+    swapped_types = node_types.clone()
+    swapped_types[node_types == 0] = 1
+    swapped_types[node_types == 1] = 0
+    swapped = tribrain(
+        features, coords, swapped_types, t_e3l=time, t_pol=time,
+    )['h_cond']
+    assert not torch.allclose(base, swapped, atol=1e-5)
+    print("  [OK] TriBrain geometry sensitivity and rigid invariance")
+
+
 def test_film_zero_init():
     """FiLM is transparent at initialization (adaLN-Zero)."""
     from tricoopdiff.tribrain import FiLMHead
@@ -102,6 +147,19 @@ def test_torsion_coordinator_rejects_flat_native_shape():
         assert "[B,K]" in str(error)
     else:
         raise AssertionError("flat native torsion score must be normalized first")
+
+
+def test_torsion_coordinator_does_not_overflow_finite_evidence():
+    """Finite expert scores must not overflow inside feature construction."""
+    from tricoopdiff.tribrain import TorsionCoordinator
+
+    coordinator = TorsionCoordinator(context_dim=8, hidden_dim=4).eval()
+    context = torch.zeros(1, 8)
+    score = torch.full((1, 3), 1e30)
+    coordinated, weight, residual = coordinator(context, score, score)
+    assert torch.isfinite(coordinated).all()
+    assert torch.isfinite(weight).all()
+    assert torch.isfinite(residual).all()
 
 
 def test_diffusion_schedules():
@@ -295,9 +353,11 @@ if __name__ == "__main__":
     print("=== TriCoopDiff Smoke Tests ===\n")
 
     test_tribrain_build()
+    test_tribrain_reads_geometry_and_preserves_rigid_invariance()
     test_film_zero_init()
     test_torsion_coordinator_zero_init_and_per_bond_control()
     test_torsion_coordinator_rejects_flat_native_shape()
+    test_torsion_coordinator_does_not_overflow_finite_evidence()
     test_diffusion_schedules()
     test_graph_construction()
     test_initializer_body_frame()

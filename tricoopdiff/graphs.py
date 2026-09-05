@@ -190,9 +190,9 @@ def build_tribrain_graph(
 
     # Node type encoding: 0=E3, 1=POI, 2=PROTAC
     node_types = torch.cat([
-        torch.zeros(n_e3, dtype=torch.long),
-        torch.ones(n_poi, dtype=torch.long),
-        2 * torch.ones(n_lig, dtype=torch.long),
+        torch.zeros(n_e3, dtype=torch.long, device=node_coords.device),
+        torch.ones(n_poi, dtype=torch.long, device=node_coords.device),
+        2 * torch.ones(n_lig, dtype=torch.long, device=node_coords.device),
     ], dim=0)
 
     return {
