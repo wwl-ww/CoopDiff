@@ -16,27 +16,54 @@ def _triangle(center):
     ).unsqueeze(0) + torch.tensor(center).view(1, 1, 3)
 
 
-def test_interface_reaction_keeps_ligand_fixed():
+def test_interface_composition_preserves_poi_side_relative_geometry():
     diffusion = InterfaceDiffusion(
         temp_sampling_tr=1.0,
         temp_sampling_rot=1.0,
     )
     ligand = _triangle([2.0, -1.0, 0.5])
     poi = _triangle([-3.0, 4.0, 1.0])
+    target_ligand = _triangle([7.0, 2.0, -3.0])
+    tr_score = torch.tensor([[0.2, -0.3, 0.1]])
+    rot_score = torch.tensor([[0.0, 0.0, 0.4]])
+    time = torch.tensor([0.3])
+    dt = torch.tensor([0.05])
+
+    poi_side_proposal, _ = diffusion.reverse_step_protac(
+        ligand,
+        tr_score=tr_score,
+        rot_score=rot_score,
+        tor_score=torch.empty(1, 0),
+        t_tr=time,
+        t_rot=time,
+        t_tor=time,
+        dt_tr=dt,
+        dt_rot=dt,
+        dt_tor=dt,
+        add_noise=False,
+    )
     updated_poi = diffusion.reverse_step_poi_ligand_interface(
         poi,
-        ligand,
-        tr_score=torch.tensor([[0.2, -0.3, 0.1]]),
-        rot_score=torch.tensor([[0.0, 0.0, 0.4]]),
-        t_tr=torch.tensor([0.3]),
-        t_rot=torch.tensor([0.3]),
-        dt_tr=torch.tensor([0.05]),
-        dt_rot=torch.tensor([0.05]),
+        source_ligand_pos=ligand,
+        target_ligand_pos=target_ligand,
+        tr_score=tr_score,
+        rot_score=rot_score,
+        t_tr=time,
+        t_rot=time,
+        dt_tr=dt,
+        dt_rot=dt,
         add_noise=False,
     )
     assert updated_poi.shape == poi.shape
     assert torch.isfinite(updated_poi).all()
     assert torch.equal(ligand, _triangle([2.0, -1.0, 0.5]))
+    # Applying one rigid transform to POI and the sub2 proposal preserves all
+    # cross-interface distances when that proposal lands on the sub1 target.
+    assert torch.allclose(
+        torch.cdist(updated_poi, target_ligand),
+        torch.cdist(poi, poi_side_proposal),
+        atol=1e-5,
+    )
 
 
 def test_interface_pair_noise_reconstructs_finite_frames():
@@ -61,6 +88,6 @@ def test_interface_pair_noise_reconstructs_finite_frames():
 
 
 if __name__ == "__main__":
-    test_interface_reaction_keeps_ligand_fixed()
+    test_interface_composition_preserves_poi_side_relative_geometry()
     test_interface_pair_noise_reconstructs_finite_frames()
     print("Interface-coordinate tests passed")

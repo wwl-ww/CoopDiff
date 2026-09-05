@@ -454,7 +454,8 @@ class InterfaceDiffusion(nn.Module):
     def reverse_step_poi_ligand_interface(
         self,
         poi_pos: torch.Tensor,
-        ligand_pos: torch.Tensor,
+        source_ligand_pos: torch.Tensor,
+        target_ligand_pos: torch.Tensor,
         tr_score: torch.Tensor,
         rot_score: torch.Tensor,
         t_tr: torch.Tensor,
@@ -464,17 +465,19 @@ class InterfaceDiffusion(nn.Module):
         add_noise: bool = True,
         return_rotation: bool = False,
     ):
-        """Denoise POI--Ligand pose while keeping the Ligand pose fixed.
+        """Compose the POI--Ligand proposal with the E3--Ligand proposal.
 
         The POI--Ligand expert predicts the rigid update that DiffDock would
-        apply to Ligand with POI fixed.  This method constructs that proposal
-        with the native DiffDock reverse step, then applies its exact inverse
-        rigid transform to POI.  The resulting relative pose is identical, but
-        the E3--Ligand pose established by the first expert is not disturbed.
+        apply to ``source_ligand_pos`` with POI fixed.  Both interface experts
+        must start from that same old Ligand pose.  This method constructs the
+        POI-side proposal, aligns it to the independently constructed E3-side
+        ``target_ligand_pos``, and applies the same rigid transform to POI.
+        Thus the final Ligand is the E3-side proposal while the POI--Ligand
+        relative pose exactly preserves the POI-side proposal.
         """
         empty_torsion = tr_score.new_zeros((tr_score.shape[0], 0))
         proposed_ligand, _ = self.reverse_step_protac(
-            ligand_pos,
+            source_ligand_pos,
             tr_score,
             rot_score,
             empty_torsion,
@@ -486,15 +489,19 @@ class InterfaceDiffusion(nn.Module):
             dt_tr,
             add_noise=add_noise,
         )
-        inverse_rotation, inverse_translation = (
-            rigid_transform_Kabsch_3D_torch_batch(proposed_ligand, ligand_pos)
+        proposal_to_target_rotation, proposal_to_target_translation = (
+            rigid_transform_Kabsch_3D_torch_batch(
+                proposed_ligand, target_ligand_pos,
+            )
         )
         updated_poi = (
-            torch.bmm(poi_pos, inverse_rotation.transpose(-1, -2))
-            + inverse_translation.transpose(-1, -2)
+            torch.bmm(
+                poi_pos, proposal_to_target_rotation.transpose(-1, -2),
+            )
+            + proposal_to_target_translation.transpose(-1, -2)
         )
         if return_rotation:
-            return updated_poi, inverse_rotation
+            return updated_poi, proposal_to_target_rotation
         return updated_poi
 
     # ------------------------------------------------------------------

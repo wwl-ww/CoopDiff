@@ -283,10 +283,35 @@ def sample_single(
 
         add_noise = i < steps - 1  # no stochastic noise on the final step
 
+        old_ligand_pos = ligand_pos
         rigid_ligand_pos, rigid_target_pos = diffusion.reverse_step_protac(
             ligand_pos, s_q["tr"], s_q["rot"], s_q["tor"],
             t_tr, t_rot, t_tor, dt_tr, dt_rot, dt_tor, add_noise=add_noise,
         )
+
+        # Both experts scored the same old ternary state. Construct both rigid
+        # proposals from that state before changing any coordinates. Aligning
+        # the POI-side proposal to the E3-side proposal produces one consistent
+        # ternary pose: E3 stays fixed, Ligand follows sub1, and POI carries the
+        # exact transform required to preserve sub2's proposed interface.
+        if not freeze_poi:
+            poi_pos, rot_matrix = diffusion.reverse_step_poi_ligand_interface(
+                poi_pos,
+                source_ligand_pos=old_ligand_pos,
+                target_ligand_pos=rigid_ligand_pos,
+                tr_score=s_pol["tr"],
+                rot_score=s_pol["rot"],
+                t_tr=t_tr,
+                t_rot=t_rot,
+                dt_tr=dt_tr,
+                dt_rot=dt_rot,
+                add_noise=add_noise,
+                return_rotation=True,
+            )
+            # The interface composition applies ``old @ rot_matrix.T``;
+            # compose the tracked global-to-body map in the same order.
+            r_e3_to_poi = rot_matrix @ r_e3_to_poi
+
         ligand_pos = rigid_ligand_pos
 
         # Torsion reverse (PROTAC rotatable bonds) — only when the conformer has
@@ -302,16 +327,6 @@ def sample_single(
                 ligand_data["mask_rotate"], add_noise=add_noise,
                 rigid_target_pos=rigid_target_pos,
             )
-
-        if not freeze_poi:
-            poi_pos, rot_matrix = diffusion.reverse_step_poi_ligand_interface(
-                poi_pos, ligand_pos, s_pol["tr"], s_pol["rot"],
-                t_tr, t_rot, dt_tr, dt_rot,
-                add_noise=add_noise, return_rotation=True,
-            )
-            # The inverse interface update applies ``old @ rot_matrix.T``;
-            # compose the tracked global-to-body map in the same order.
-            r_e3_to_poi = rot_matrix @ r_e3_to_poi
 
         if return_trace:
             lig_com = ligand_pos.mean(dim=1)[0]
