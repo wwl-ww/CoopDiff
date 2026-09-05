@@ -78,7 +78,7 @@ class FrozenDiffDock(nn.Module):
         ``requires_grad=False`` prevents parameter updates but does not disable
         dropout or other training-mode behavior. Parent ``model.train()`` calls
         recurse into children, so override it here to keep the pretrained expert
-        deterministic while still allowing TriBrain to train.
+        deterministic while still allowing TriFuse to train.
         """
         super().train(False)
         self.model.eval()

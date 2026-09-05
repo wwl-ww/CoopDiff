@@ -8,14 +8,14 @@ PROTAC (E3-L) pose against the native structure embedded in the featurized data.
 Pipeline:
   1. Featurize the E3-L and POI-L subgraphs (``featurize_common``, on-the-fly
      ESM2-650M embeddings).
-  2. Build the frozen DiffDock-L expert + TriBrain + TriCoopDiff +
+  2. Build the frozen DiffDock-L expert + TriFuse + TriCoopDiff +
      InterfaceDiffusion + TernaryInitializer.
-  3. Optionally load a trained TriBrain checkpoint (``--tribrain-ckpt``).
+  3. Optionally load a trained TriFuse checkpoint (``--trifuse-ckpt``).
   4. ``evaluate_model``: run ``--n-walkers`` reverse-diffusion trajectories and
      report PROTAC RMSD / pocket distance / clash rate + ensemble diversity.
 
-The zero-FiLM baseline (no ``--tribrain-ckpt``) is the Go/No-Go reference:
-TriBrain starts at FiLM-zero-init, so the sampled ensemble should reproduce the
+The zero-FiLM baseline (no ``--trifuse-ckpt``) is the Go/No-Go reference:
+TriFuse starts at FiLM-zero-init, so the sampled ensemble should reproduce the
 native DiffDock-L two-body PROTAC distribution and its RMSD.
 
 Output: a JSON report printed to stdout and dumped to ``--out``.
@@ -55,7 +55,7 @@ from evaluation_common import (
 )
 
 from tricoopdiff.expert_factory import build_diffdock_expert
-from tricoopdiff.tribrain import TriBrain
+from tricoopdiff.trifuse import TriFuse
 from tricoopdiff.model import TriCoopDiff
 from tricoopdiff.diffusion import InterfaceDiffusion, TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
@@ -76,8 +76,8 @@ def build_parser():
     p.add_argument("--ckpt", default="best_ema_inference_epoch_model.pt")
     p.add_argument("--case", default="5T35_D_A_759",
                    help="Ternary complex case name (directory under --protac-dir)")
-    p.add_argument("--tribrain-ckpt", default=None,
-                   help="Version-6 geometric joint-interface checkpoint")
+    p.add_argument("--trifuse-ckpt", default=None,
+                   help="Version-7 TriFuse checkpoint")
     p.add_argument(
         "--nan-clamp", type=float, default=100.0,
         help="Activation clamp for an explicit zero-init baseline",
@@ -121,11 +121,11 @@ def main():
     args = build_parser().parse_args()
     if args.nan_clamp <= 0:
         raise SystemExit("FATAL: --nan-clamp must be positive")
-    if args.tribrain_ckpt is None:
+    if args.trifuse_ckpt is None:
         os.environ["NAN_CLAMP"] = str(args.nan_clamp)
 
-    if args.tribrain_ckpt is None and not args.allow_zero_init:
-        print("FATAL: --tribrain-ckpt is required; use --allow-zero-init only "
+    if args.trifuse_ckpt is None and not args.allow_zero_init:
+        print("FATAL: --trifuse-ckpt is required; use --allow-zero-init only "
               "for an explicit baseline", flush=True)
         sys.exit(2)
 
@@ -174,13 +174,13 @@ def main():
     print(f"TriCoopDiff MVP evaluation — case {args.case}", flush=True)
     print(f"  device={device}  model-dir={args.model_dir}", flush=True)
     print(f"  n_walkers={args.n_walkers}  steps={args.steps}", flush=True)
-    print(f"  tribrain_ckpt={args.tribrain_ckpt or '(zero-init baseline)'}", flush=True)
+    print(f"  trifuse_ckpt={args.trifuse_ckpt or '(zero-init baseline)'}", flush=True)
     print(f"  activation_clamp={os.environ.get('NAN_CLAMP', 'from checkpoint')}", flush=True)
     print("=" * 72, flush=True)
 
     # Production single-case and indexed evaluation intentionally share one
     # runtime. Keep the code below only for the explicit zero-init diagnostic.
-    if args.tribrain_ckpt is not None:
+    if args.trifuse_ckpt is not None:
         from evaluation_runner import EvaluationRunner, write_report_atomic
 
         native_pdb = case_dir / "gt_complex.pdb"
@@ -188,7 +188,7 @@ def main():
             native_pdb = case_dir / "complex.pdb"
         try:
             runner = EvaluationRunner(
-                _PROJECT_ROOT, checkpoint=args.tribrain_ckpt,
+                _PROJECT_ROOT, checkpoint=args.trifuse_ckpt,
                 device=args.device, model_dir=args.model_dir,
                 expert_checkpoint=args.ckpt,
             )
@@ -219,10 +219,10 @@ def main():
           f"num_conv_layers={score_model_args.num_conv_layers}", flush=True)
 
     trained_ckpt = None
-    if args.tribrain_ckpt is not None:
-        ckpt_path = _PROJECT_ROOT / args.tribrain_ckpt
+    if args.trifuse_ckpt is not None:
+        ckpt_path = _PROJECT_ROOT / args.trifuse_ckpt
         if not ckpt_path.exists():
-            print(f"FATAL: --tribrain-ckpt not found: {ckpt_path}", flush=True)
+            print(f"FATAL: --trifuse-ckpt not found: {ckpt_path}", flush=True)
             sys.exit(1)
         trained_ckpt = torch.load(ckpt_path, map_location=device)
         try:
@@ -267,8 +267,8 @@ def main():
     print(f"[data] receptor feat dim={d_rec}  PROTAC atoms={n_lig}  "
           f"rotatable bonds={n_rot}", flush=True)
 
-    # --- Build TriBrain + TriCoopDiff + diffusion + initializer --------------
-    tribrain = TriBrain(
+    # --- Build TriFuse + TriCoopDiff + diffusion + initializer --------------
+    trifuse = TriFuse(
         node_dim=128,
         input_dim=d_rec,
         num_conv_layers_per_expert=num_conv_layers,
@@ -276,27 +276,27 @@ def main():
     )
     model = TriCoopDiff(
         frozen_expert=expert,
-        tribrain=tribrain,
+        trifuse=trifuse,
         num_conv_layers=num_conv_layers,
         use_film=True,
     ).to(device)
     diffusion = InterfaceDiffusion()
     initializer = TernaryInitializer()
-    n_params = sum(p.numel() for p in tribrain.parameters())
-    print(f"[model] TriBrain trainable params = {n_params:,}", flush=True)
+    n_params = sum(p.numel() for p in trifuse.parameters())
+    print(f"[model] TriFuse trainable params = {n_params:,}", flush=True)
 
-    # --- Optional: load a trained TriBrain checkpoint ------------------------
-    if args.tribrain_ckpt is not None:
-        if "tribrain_state_dict" in trained_ckpt:
-            model.tribrain.load_state_dict(trained_ckpt["tribrain_state_dict"])
+    # --- Optional: load a trained TriFuse checkpoint ------------------------
+    if args.trifuse_ckpt is not None:
+        if "trifuse_state_dict" in trained_ckpt:
+            model.trifuse.load_state_dict(trained_ckpt["trifuse_state_dict"])
             if trained_ckpt.get("expert_lora_state_dict"):
                 from tricoopdiff.lora import load_expert_lora_state_dict
                 load_expert_lora_state_dict(
                     model.expert, trained_ckpt["expert_lora_state_dict"],
                 )
         else:
-            model.tribrain.load_state_dict(trained_ckpt)
-        print(f"[model] loaded TriBrain weights from {ckpt_path}", flush=True)
+            model.trifuse.load_state_dict(trained_ckpt)
+        print(f"[model] loaded TriFuse weights from {ckpt_path}", flush=True)
 
     # --- Evaluate ------------------------------------------------------------
     print("[eval] sampling ensemble...", flush=True)
@@ -333,7 +333,7 @@ def main():
         "freeze_poi": args.freeze_poi,
         "init_mode": args.init_mode,
         "t_anchor": args.t_anchor if args.t_anchor is not None else (0.7 if args.init_mode == "anchor_local" else 1.0),
-        "tribrain_checkpoint": args.tribrain_ckpt,
+        "trifuse_checkpoint": args.trifuse_ckpt,
         "activation_clamp": args.nan_clamp,
         "expert_model_dir": args.model_dir,
         "expert_checkpoint": args.ckpt,

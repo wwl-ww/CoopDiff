@@ -12,18 +12,18 @@ import torch
 import numpy as np
 
 
-def test_tribrain_build():
-    """TriBrain builds with correct output shapes."""
-    from tricoopdiff.tribrain import TriBrain
+def test_trifuse_build():
+    """TriFuse builds with correct output shapes."""
+    from tricoopdiff.trifuse import TriFuse
 
-    tribrain = TriBrain(
+    trifuse = TriFuse(
         node_dim=128, ns=32, nv=4,
         num_transformer_layers=3,
         num_conv_layers_per_expert=6,
     )
 
     # Dummy ternary graph: 100 E3 residues + 150 POI residues + 80 PROTAC atoms
-    # TriBrain.forward expects UNBATCHED [N, ...] inputs (batch index derived
+    # TriFuse.forward expects UNBATCHED [N, ...] inputs (batch index derived
     # internally); the leading dim here was a stray batch of 1 that broke
     # per-batch softmax (result[mask] of shape [1] vs value [N]).
     N = 330
@@ -35,7 +35,7 @@ def test_tribrain_build():
         2 * torch.ones(80, dtype=torch.long),
     ])
 
-    out = tribrain(node_features, node_coords, node_types)
+    out = trifuse(node_features, node_coords, node_types)
 
     assert out['confidence'].shape == (1, 1)
     assert out['state'].shape == (1, 2)
@@ -43,27 +43,27 @@ def test_tribrain_build():
     for gamma, beta in out['film_params']:
         # FiLMHead outputs [B, film_dim] per (gamma, beta); film_dim defaults to
         # 48 (the expert's scalar channel count), not node_dim=128.
-        assert gamma.shape == (1, tribrain.film_dim)
-        assert beta.shape == (1, tribrain.film_dim)
+        assert gamma.shape == (1, trifuse.film_dim)
+        assert beta.shape == (1, trifuse.film_dim)
 
     # Count parameters
-    n_params = sum(p.numel() for p in tribrain.parameters())
-    print(f"  TriBrain params: {n_params:,}")
-    # Small MVP config (ns=32, nv=4, 3 transformer layers — the TriBrain defaults
+    n_params = sum(p.numel() for p in trifuse.parameters())
+    print(f"  TriFuse params: {n_params:,}")
+    # Small MVP config (ns=32, nv=4, 3 transformer layers — the TriFuse defaults
     # used by the smoke test) is ~340k params. (The ~2.2M figure in early docs
     # assumed ns=48, nv=10.) Sanity: non-trivial but not bloated.
-    assert 200_000 < n_params < 1_000_000, f"Unexpected TriBrain params: {n_params:,}"
+    assert 200_000 < n_params < 1_000_000, f"Unexpected TriFuse params: {n_params:,}"
 
-    print("  [OK] TriBrain build")
+    print("  [OK] TriFuse build")
 
 
-def test_tribrain_reads_geometry_and_preserves_rigid_invariance():
+def test_trifuse_reads_geometry_and_preserves_rigid_invariance():
     """Context changes with interfaces, not with a common rigid transform."""
     from tricoopdiff.diffusion import so3_exp
-    from tricoopdiff.tribrain import TriBrain
+    from tricoopdiff.trifuse import TriFuse
 
     torch.manual_seed(3)
-    tribrain = TriBrain(
+    trifuse = TriFuse(
         node_dim=32, input_dim=16, ns=8, nv=2,
         num_transformer_layers=1,
         num_conv_layers_per_expert=2,
@@ -75,19 +75,19 @@ def test_tribrain_reads_geometry_and_preserves_rigid_invariance():
     node_types = torch.tensor([0] * 5 + [1] * 6 + [2] * 4)
     time = torch.tensor([0.4])
 
-    base = tribrain(
+    base = trifuse(
         features, coords, node_types, t_e3l=time, t_pol=time,
     )['h_cond']
     changed_coords = coords.clone()
     changed_coords[node_types == 1] += torch.tensor([12.0, 0.0, 0.0])
-    changed = tribrain(
+    changed = trifuse(
         features, changed_coords, node_types, t_e3l=time, t_pol=time,
     )['h_cond']
     assert not torch.allclose(base, changed, atol=1e-5)
 
     rotation = so3_exp(torch.tensor([[0.4, -0.2, 0.3]]))[0]
     transformed = coords @ rotation.T + torch.tensor([8.0, -4.0, 2.0])
-    rigid = tribrain(
+    rigid = trifuse(
         features, transformed, node_types, t_e3l=time, t_pol=time,
     )['h_cond']
     assert torch.allclose(base, rigid, atol=2e-5), (base - rigid).abs().max()
@@ -95,16 +95,16 @@ def test_tribrain_reads_geometry_and_preserves_rigid_invariance():
     swapped_types = node_types.clone()
     swapped_types[node_types == 0] = 1
     swapped_types[node_types == 1] = 0
-    swapped = tribrain(
+    swapped = trifuse(
         features, coords, swapped_types, t_e3l=time, t_pol=time,
     )['h_cond']
     assert not torch.allclose(base, swapped, atol=1e-5)
-    print("  [OK] TriBrain geometry sensitivity and rigid invariance")
+    print("  [OK] TriFuse geometry sensitivity and rigid invariance")
 
 
 def test_film_zero_init():
     """FiLM is transparent at initialization (adaLN-Zero)."""
-    from tricoopdiff.tribrain import FiLMHead
+    from tricoopdiff.trifuse import FiLMHead
 
     head = FiLMHead(hidden_dim=64)
     h = torch.randn(2, 64)
@@ -121,7 +121,7 @@ def test_film_zero_init():
 
 def test_torsion_coordinator_zero_init_and_per_bond_control():
     """Shared torsion starts neutral but can make independent bond decisions."""
-    from tricoopdiff.tribrain import TorsionCoordinator
+    from tricoopdiff.trifuse import TorsionCoordinator
 
     coordinator = TorsionCoordinator(context_dim=8, hidden_dim=4)
     context = torch.randn(2, 8)
@@ -138,7 +138,7 @@ def test_torsion_coordinator_zero_init_and_per_bond_control():
 
 def test_torsion_coordinator_rejects_flat_native_shape():
     """The coordinator boundary requires an explicit batch dimension."""
-    from tricoopdiff.tribrain import TorsionCoordinator
+    from tricoopdiff.trifuse import TorsionCoordinator
 
     coordinator = TorsionCoordinator(context_dim=8, hidden_dim=4)
     try:
@@ -151,7 +151,7 @@ def test_torsion_coordinator_rejects_flat_native_shape():
 
 def test_torsion_coordinator_does_not_overflow_finite_evidence():
     """Finite expert scores must not overflow inside feature construction."""
-    from tricoopdiff.tribrain import TorsionCoordinator
+    from tricoopdiff.trifuse import TorsionCoordinator
 
     coordinator = TorsionCoordinator(context_dim=8, hidden_dim=4).eval()
     context = torch.zeros(1, 8)
@@ -187,7 +187,7 @@ def test_graph_construction():
     """Subgraph construction produces valid HeteroData."""
     from tricoopdiff.graphs import (
         build_subgraph_e3l, build_subgraph_pol,
-        build_tribrain_graph, transform_ligand_to_poi_frame,
+        build_trifuse_graph, transform_ligand_to_poi_frame,
     )
 
     N_e3, N_poi, N_lig = 100, 150, 80
@@ -227,7 +227,7 @@ def test_graph_construction():
     assert torch.allclose(after, before @ rotation, atol=1e-6)
 
     # Ternary graph
-    tri = build_tribrain_graph(e3_coords, e3_feat, poi_coords, poi_feat, lig_coords, lig_feat)
+    tri = build_trifuse_graph(e3_coords, e3_feat, poi_coords, poi_feat, lig_coords, lig_feat)
     assert tri['node_coords'].shape == (N_e3 + N_poi + N_lig, 3)
     assert tri['n_e3'] == N_e3
     assert tri['n_poi'] == N_poi
@@ -352,8 +352,8 @@ def test_deepternary_dockq_alignment():
 if __name__ == "__main__":
     print("=== TriCoopDiff Smoke Tests ===\n")
 
-    test_tribrain_build()
-    test_tribrain_reads_geometry_and_preserves_rigid_invariance()
+    test_trifuse_build()
+    test_trifuse_reads_geometry_and_preserves_rigid_invariance()
     test_film_zero_init()
     test_torsion_coordinator_zero_init_and_per_bond_control()
     test_torsion_coordinator_rejects_flat_native_shape()

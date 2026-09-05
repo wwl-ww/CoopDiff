@@ -1,9 +1,9 @@
 """
-TriCoopDiff: Top-level model orchestrating two-body experts and TriBrain.
+TriCoopDiff: Top-level model orchestrating two-body experts and TriFuse.
 
 The forward pass at each diffusion step:
 1. Build two disconnected subgraphs (E3-L, POI-L) + full ternary graph
-2. TriBrain processes the ternary graph → branch-specific FiLM params
+2. TriFuse processes the ternary graph → branch-specific FiLM params
 3. Two-body experts run forward with per-layer FiLM modulation
 4. Return both interface score fields without merging their rigid coordinates
 5. The sampler updates E3--Ligand directly and applies the inverse POI--Ligand
@@ -16,12 +16,12 @@ import torch.nn as nn
 from .graphs import (
     build_subgraph_e3l,
     build_subgraph_pol,
-    build_tribrain_graph,
+    build_trifuse_graph,
     crop_receptor_to_ligand,
     transform_ligand_to_poi_frame,
 )
 from .expert import FrozenDiffDock
-from .tribrain import TriBrain
+from .trifuse import TriFuse
 from .film import apply_film
 
 
@@ -31,7 +31,7 @@ class TriCoopDiff(nn.Module):
 
     Components:
     - Two frozen DiffDock experts (shared weights, two subgraphs)
-    - One trainable TriBrain (~2.2M params)
+    - One trainable TriFuse (~2.2M params)
     - Multi-rate diffusion process
     - Explicit E3--Ligand and POI--Ligand interface score fields
     """
@@ -39,20 +39,20 @@ class TriCoopDiff(nn.Module):
     def __init__(
         self,
         frozen_expert: FrozenDiffDock,
-        tribrain: TriBrain,
+        trifuse: TriFuse,
         num_conv_layers: int = 11,
         use_film: bool = True,
     ):
         """
         Args:
             frozen_expert: FrozenDiffDock wrapping DiffDock CGModel
-            tribrain: TriBrain coordination network
+            trifuse: TriFuse coordination network
             num_conv_layers: number of conv layers in the expert (11 for DiffDock-L)
             use_film: if False, skip FiLM modulation (L0 ablation)
         """
         super().__init__()
         self.expert = frozen_expert
-        self.tribrain = tribrain
+        self.trifuse = trifuse
         self.num_conv_layers = num_conv_layers
         self.use_film = use_film
 
@@ -95,7 +95,7 @@ class TriCoopDiff(nn.Module):
         Returns:
             dict with:
               'interface_scores': raw E3--Ligand and mapped POI--Ligand scores
-              'torsion_score': TriBrain-coordinated shared Ligand torsion score
+              'torsion_score': TriFuse-coordinated shared Ligand torsion score
               'confidence': [B,1] clash confidence
               'state': [B,2] thermodynamic state predictions
         """
@@ -211,8 +211,8 @@ class TriCoopDiff(nn.Module):
                 lig_mask_rotate=ligand_data.get('mask_rotate'),
             )
 
-            # Build ternary graph for TriBrain
-            tri_graph = build_tribrain_graph(
+            # Build ternary graph for TriFuse
+            tri_graph = build_trifuse_graph(
                 e3_coords=e3_data['coords'][b],
                 e3_features=e3_data['features'][b],
                 poi_coords=poi_data['coords'][b],
@@ -221,11 +221,11 @@ class TriCoopDiff(nn.Module):
                 ligand_features=ligand_data['features'][b],
             )
 
-            # TriBrain forward (node features are 2D [N, D]; no batch dim).
-            # TriBrain receives both interface clocks and builds branch-specific
+            # TriFuse forward (node features are 2D [N, D]; no batch dim).
+            # TriFuse receives both interface clocks and builds branch-specific
             # FiLM conditions. The experts are never conditioned with a clock
             # belonging to a different relative pose.
-            tri_out = self.tribrain(
+            tri_out = self.trifuse(
                 node_features=tri_graph['node_features'],
                 node_coords=tri_graph['node_coords'],
                 node_types=tri_graph['node_types'],
@@ -345,11 +345,11 @@ class TriCoopDiff(nn.Module):
                 self._last_step0_probe['scores_sub2_mapped'] = _score_debug(scores_2)
 
             # Torsion is the only coordinate shared by both interface states.
-            # The experts provide two interface-local opinions; TriBrain makes
+            # The experts provide two interface-local opinions; TriFuse makes
             # the single executable decision for every rotatable bond.
             if scores_1['tor_score'].numel() and scores_2['tor_score'].numel():
                 torsion_score, torsion_weight, torsion_residual = (
-                    self.tribrain.torsion_coordinator(
+                    self.trifuse.torsion_coordinator(
                         tri_out['h_cond'],
                         scores_1['tor_score'],
                         scores_2['tor_score'],
@@ -727,7 +727,7 @@ def _set_time_embeddings(data, t, model):
         }
 
 
-def zero_film_verification(expert, data, tribrain, tri_graph, t=None, atol=1e-5):
+def zero_film_verification(expert, data, trifuse, tri_graph, t=None, atol=1e-5):
     """
     Verify that zero-initialized FiLM is transparent: the expert output under
     zero FiLM (gamma=beta=0 from the zero-initialized FiLMHead) must equal the
@@ -736,8 +736,8 @@ def zero_film_verification(expert, data, tribrain, tri_graph, t=None, atol=1e-5)
     Args:
         expert: FrozenDiffDock wrapping the CGModel
         data: HeteroData subgraph (single protein + PROTAC), already on device
-        tribrain: TriBrain (zero-initialized FiLM heads)
-        tri_graph: dict from build_tribrain_graph (node_coords/features/types)
+        trifuse: TriFuse (zero-initialized FiLM heads)
+        tri_graph: dict from build_trifuse_graph (node_coords/features/types)
         t: [1] diffusion time tensor (defaults to 0.5)
         atol: absolute tolerance for torch.allclose
 
@@ -760,7 +760,7 @@ def zero_film_verification(expert, data, tribrain, tri_graph, t=None, atol=1e-5)
 
     # --- FiLM forward with (guaranteed-zero) FiLM params ---
     with torch.no_grad():
-        tri_out = tribrain(
+        tri_out = trifuse(
             node_features=tri_graph['node_features'],
             node_coords=tri_graph['node_coords'],
             node_types=tri_graph['node_types'],

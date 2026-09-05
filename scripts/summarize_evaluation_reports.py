@@ -50,7 +50,7 @@ def load_row(path):
     ensemble = report.get("ensemble", {})
     conformational = ensemble.get("conformational_analysis", {})
     config = report.get("run_config", {})
-    checkpoint = config.get("tribrain_checkpoint")
+    checkpoint = config.get("trifuse_checkpoint")
     mode = "trained" if checkpoint else "zero_film"
     if config.get("freeze_poi"):
         mode += "_freeze_poi"

@@ -1,5 +1,5 @@
 """
-FiLM (Feature-wise Linear Modulation) for injecting TriBrain coordination
+FiLM (Feature-wise Linear Modulation) for injecting TriFuse coordination
 signals into the frozen two-body expert.
 
 Follows the DiT adaLN-Zero paradigm: each FiLM head is zero-initialized so that
@@ -8,7 +8,7 @@ to native DiffDock).
 
 NOTE: only ``apply_film`` from this module is used by the production path
 (model.py:_expert_forward_with_film). The actual FiLM (γ, β) heads live in
-``tribrain.py:FiLMHead``. The former standalone ``FiLMSharedMLP`` /
+``trifuse.py:FiLMHead``. The former standalone ``FiLMSharedMLP`` /
 ``FiLMLayerHead`` classes here were dead code and have been removed.
 """
 

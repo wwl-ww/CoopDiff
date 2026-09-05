@@ -2,14 +2,14 @@
 Training pipeline for interface-coordinate TriCoopDiff.
 
 Gradient flow (the two-body experts are frozen, requires_grad=False everywhere,
-so every gradient reaches TriBrain through branch-specific FiLM parameters):
-  L_E3L → E3--Ligand expert → branch FiLM → TriBrain
-  L_POL → POI--Ligand expert → branch FiLM → TriBrain
+so every gradient reaches TriFuse through branch-specific FiLM parameters):
+  L_E3L → E3--Ligand expert → branch FiLM → TriFuse
+  L_POL → POI--Ligand expert → branch FiLM → TriFuse
   L_tor → shared linker torsion score → both expert adapters
 
 Two training phases:
   Phase 1: Train FiLM heads and expert adapters (freeze judge/state heads)
-  Phase 2: Unfreeze all TriBrain heads
+  Phase 2: Unfreeze all TriFuse heads
 
 Current implementation uses B=1 sequential optimization; batched variable-size
 graphs and LoRA are not implemented yet.
@@ -60,11 +60,11 @@ class TriCoopDiffTrainer:
             raise ValueError("torsion_expert_aux_weight must be non-negative")
         self.torsion_expert_aux_weight = float(torsion_expert_aux_weight)
 
-        # Only TriBrain is trainable; experts are frozen
+        # Only TriFuse is trainable; experts are frozen
         parameter_groups = [{
-            'params': list(model.tribrain.parameters()),
+            'params': list(model.trifuse.parameters()),
             'lr': lr,
-            'name': 'tribrain',
+            'name': 'trifuse',
         }]
         from .lora import expert_lora_parameter_groups
         lora_groups = expert_lora_parameter_groups(
@@ -332,35 +332,35 @@ class TriCoopDiffTrainer:
         Switch training phase.
 
         Phase 1: Train FiLM heads and expert adapters (freeze judge/state)
-        Phase 2: Unfreeze all TriBrain heads
+        Phase 2: Unfreeze all TriFuse heads
         """
         if phase == 1:
             # Freeze judge and state heads
-            for param in self.model.tribrain.judge_head.parameters():
+            for param in self.model.trifuse.judge_head.parameters():
                 param.requires_grad = False
-            for param in self.model.tribrain.state_head.parameters():
+            for param in self.model.trifuse.state_head.parameters():
                 param.requires_grad = False
         elif phase == 2:
-            # Unfreeze everything in TriBrain
-            for param in self.model.tribrain.parameters():
+            # Unfreeze everything in TriFuse
+            for param in self.model.trifuse.parameters():
                 param.requires_grad = True
 
     def save_checkpoint(self, path: str):
         """Save model checkpoint.
 
-        Stores TriBrain and adapter-only expert state. The frozen expert base is
+        Stores TriFuse and adapter-only expert state. The frozen expert base is
         omitted to avoid duplicating the pretrained checkpoint.
         """
         from .lora import expert_lora_state_dict
         torch.save({
-            'checkpoint_version': 6,
-            'architecture': 'geometric_joint_interface_v3',
+            'checkpoint_version': 7,
+            'architecture': 'trifuse_v4',
             'runtime_config': {
                 'activation_clamp': self.activation_clamp,
                 'torsion_expert_aux_weight': self.torsion_expert_aux_weight,
             },
             'global_step': self.global_step,
-            'tribrain_state_dict': self.model.tribrain.state_dict(),
+            'trifuse_state_dict': self.model.trifuse.state_dict(),
             'expert_lora_state_dict': expert_lora_state_dict(self.model.expert),
             'expert_lora_config': getattr(
                 self.model.expert, 'lora_config', None,
@@ -373,18 +373,18 @@ class TriCoopDiffTrainer:
     def load_checkpoint(self, path: str):
         """Load model checkpoint (for fine-tuning / resume).
 
-        Restores TriBrain weights plus optimizer/scheduler state when present.
+        Restores TriFuse weights plus optimizer/scheduler state when present.
         Older checkpoints without optimizer/scheduler keys are handled gracefully
         (weights + global step only).
         """
         ckpt = torch.load(path, map_location=self.device)
-        if ckpt.get('checkpoint_version') != 6:
+        if ckpt.get('checkpoint_version') != 7:
             raise ValueError(
-                "geometric joint-interface training requires checkpoint_version=6"
+                "TriFuse training requires checkpoint_version=7"
             )
-        if ckpt.get('architecture') != 'geometric_joint_interface_v3':
+        if ckpt.get('architecture') != 'trifuse_v4':
             raise ValueError(
-                "checkpoint architecture is not geometric_joint_interface_v3"
+                "checkpoint architecture is not trifuse_v4"
             )
         saved_clamp = ckpt.get('runtime_config', {}).get('activation_clamp')
         if saved_clamp != self.activation_clamp:
@@ -400,7 +400,7 @@ class TriCoopDiffTrainer:
                 f"checkpoint torsion_expert_aux_weight={saved_aux_weight!r} "
                 f"does not match runtime value={self.torsion_expert_aux_weight!r}"
             )
-        self.model.tribrain.load_state_dict(ckpt['tribrain_state_dict'])
+        self.model.trifuse.load_state_dict(ckpt['trifuse_state_dict'])
         if ckpt.get('expert_lora_state_dict'):
             from .lora import load_expert_lora_state_dict
             load_expert_lora_state_dict(

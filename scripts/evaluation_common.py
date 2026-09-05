@@ -34,13 +34,13 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=336):
     """Reject incomplete or legacy checkpoints before expensive inference."""
     if not isinstance(payload, dict):
         raise ValueError("checkpoint must contain a mapping")
-    if payload.get("checkpoint_version") != 6:
+    if payload.get("checkpoint_version") != 7:
         raise ValueError(
-            "geometric joint-interface evaluation requires checkpoint_version=6"
+            "TriFuse evaluation requires checkpoint_version=7"
         )
-    if payload.get("architecture") != "geometric_joint_interface_v3":
+    if payload.get("architecture") != "trifuse_v4":
         raise ValueError(
-            "checkpoint architecture is not geometric_joint_interface_v3"
+            "checkpoint architecture is not trifuse_v4"
         )
     activation_clamp = payload.get("runtime_config", {}).get("activation_clamp")
     if not isinstance(activation_clamp, (int, float)) or activation_clamp <= 0:
@@ -50,8 +50,8 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=336):
     )
     if not isinstance(torsion_aux_weight, (int, float)) or torsion_aux_weight < 0:
         raise ValueError("checkpoint has no valid torsion_expert_aux_weight")
-    if not payload.get("tribrain_state_dict"):
-        raise ValueError("checkpoint has no TriBrain weights")
+    if not payload.get("trifuse_state_dict"):
+        raise ValueError("checkpoint has no TriFuse weights")
     lora = payload.get("expert_lora_state_dict")
     if not lora:
         raise ValueError("checkpoint has no expert LoRA weights")
@@ -78,7 +78,7 @@ def completed_report(path, case, checkpoint, expected_config=None,
     ensemble = report.get("ensemble", {})
     core_matches = bool(
         report.get("case") == case
-        and config.get("tribrain_checkpoint") == checkpoint
+        and config.get("trifuse_checkpoint") == checkpoint
         and ensemble.get("n_valid_walkers", 0) > 0
     )
     exact_dockq_matches = (

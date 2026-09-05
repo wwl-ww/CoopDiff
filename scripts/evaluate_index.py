@@ -23,7 +23,7 @@ def select_entries(index_path, start=0, limit=None):
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--index", default="data/ternary_test.json")
-    parser.add_argument("--tribrain-ckpt", required=True)
+    parser.add_argument("--trifuse-ckpt", required=True)
     parser.add_argument("--out-dir", default="results/deepternary_test")
     parser.add_argument("--native-root", default="data/TernaryDB_release/pdbs")
     parser.add_argument("--cache-dir", default="results/featurize_cache_deepternary")
@@ -43,7 +43,7 @@ def main():
 
     args = build_parser().parse_args()
     index = Path(args.index).resolve()
-    checkpoint_path = Path(args.tribrain_ckpt)
+    checkpoint_path = Path(args.trifuse_ckpt)
     if not checkpoint_path.is_absolute():
         checkpoint_path = _PROJECT_ROOT / checkpoint_path
     checkpoint = str(checkpoint_path.resolve())

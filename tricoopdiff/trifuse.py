@@ -1,6 +1,6 @@
-"""Geometry-aware coordinator for the two equivariant DiffDock experts.
+"""Geometry-aware interface controller for two equivariant DiffDock experts.
 
-TriBrain encodes typed E3, POI, and Ligand component tokens together with
+TriFuse encodes typed E3, POI, and Ligand component tokens with
 SE(3)-invariant cross-component distance statistics. It conditions independent
 expert FiLM paths and resolves their shared per-bond torsion decisions.
 """
@@ -570,17 +570,17 @@ class TorsionCoordinator(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Full TriBrain
+# Full interface controller
 # ---------------------------------------------------------------------------
 
-class TriBrain(nn.Module):
+class TriFuse(nn.Module):
     """
-    TriBrain: the coordination brain of TriCoopDiff.
+    Geometry-aware controller coordinating both docking interfaces.
 
     Takes the full ternary graph → pools to tokens → equivariant transformer →
     produces branch-specific FiLM modulation parameters, clash confidence,
     and state predictions. Rigid interface scores come exclusively from the
-    two equivariant DiffDock experts; TriBrain no longer predicts an unrelated
+    two equivariant DiffDock experts; TriFuse no longer predicts an unrelated
     Cartesian POI score.
 
     Expert LoRA adapters are trainable alongside this coordinator.

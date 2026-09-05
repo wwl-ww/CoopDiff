@@ -29,13 +29,13 @@ def test_index_entry_and_paths(tmp_path):
 
 def test_checkpoint_preflight_rejects_missing_lora():
     payload = {
-        "checkpoint_version": 6,
-        "architecture": "geometric_joint_interface_v3",
+        "checkpoint_version": 7,
+        "architecture": "trifuse_v4",
         "runtime_config": {
             "activation_clamp": 100.0,
             "torsion_expert_aux_weight": 0.25,
         },
-        "tribrain_state_dict": {"x": 1},
+        "trifuse_state_dict": {"x": 1},
     }
     try:
         evaluation_common.validate_checkpoint_payload(payload)
@@ -48,27 +48,27 @@ def test_checkpoint_preflight_rejects_missing_lora():
 def test_checkpoint_preflight_rejects_legacy_architecture():
     payload = {
         "checkpoint_version": 3,
-        "tribrain_state_dict": {"x": 1},
+        "trifuse_state_dict": {"x": 1},
         "expert_lora_state_dict": {str(i): i for i in range(336)},
         "expert_lora_config": {"rank": 4},
     }
     try:
         evaluation_common.validate_checkpoint_payload(payload)
     except ValueError as error:
-        assert "checkpoint_version=6" in str(error)
+        assert "checkpoint_version=7" in str(error)
     else:
         raise AssertionError("legacy architecture checkpoint must be rejected")
 
 
 def test_checkpoint_preflight_accepts_complete_payload():
     payload = {
-        "checkpoint_version": 6,
-        "architecture": "geometric_joint_interface_v3",
+        "checkpoint_version": 7,
+        "architecture": "trifuse_v4",
         "runtime_config": {
             "activation_clamp": 100.0,
             "torsion_expert_aux_weight": 0.25,
         },
-        "tribrain_state_dict": {"x": 1},
+        "trifuse_state_dict": {"x": 1},
         "expert_lora_state_dict": {str(i): i for i in range(336)},
         "expert_lora_config": {"rank": 4},
     }
@@ -77,9 +77,9 @@ def test_checkpoint_preflight_accepts_complete_payload():
 
 def test_checkpoint_preflight_rejects_missing_runtime_config():
     payload = {
-        "checkpoint_version": 6,
-        "architecture": "geometric_joint_interface_v3",
-        "tribrain_state_dict": {"x": 1},
+        "checkpoint_version": 7,
+        "architecture": "trifuse_v4",
+        "trifuse_state_dict": {"x": 1},
         "expert_lora_state_dict": {str(i): i for i in range(336)},
         "expert_lora_config": {"rank": 4},
     }
@@ -95,7 +95,7 @@ def test_completed_report_requires_matching_checkpoint(tmp_path):
     path = tmp_path / "report.json"
     path.write_text(json.dumps({
         "case": "demo",
-        "run_config": {"tribrain_checkpoint": "best.pt", "seed": 0},
+        "run_config": {"trifuse_checkpoint": "best.pt", "seed": 0},
         "ensemble": {"n_valid_walkers": 31},
     }), encoding="utf-8")
     assert evaluation_common.completed_report(path, "demo", "best.pt")

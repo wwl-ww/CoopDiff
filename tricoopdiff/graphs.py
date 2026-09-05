@@ -3,7 +3,7 @@ Subgraph construction for TriCoopDiff.
 
 Two physically disconnected subgraphs (E3-L and POI-L) are constructed to match
 DiffDock's pretraining input distribution exactly (zero OOD).
-A third full ternary graph connects all three molecules for TriBrain coordination.
+A third full ternary graph connects all three molecules for TriFuse coordination.
 """
 
 import torch
@@ -134,7 +134,7 @@ def build_subgraph_pol(
     return graph
 
 
-def build_tribrain_graph(
+def build_trifuse_graph(
     e3_coords: torch.Tensor,
     e3_features: torch.Tensor,
     poi_coords: torch.Tensor,
@@ -143,14 +143,14 @@ def build_tribrain_graph(
     ligand_features: torch.Tensor,
 ) -> dict:
     """
-    Build the full ternary graph for TriBrain processing.
+    Build the full ternary graph for TriFuse processing.
 
     Unlike the two DiffDock subgraphs, this structure contains all E3 residues,
-    POI residues, and PROTAC atoms with explicit component labels. TriBrain
+    POI residues, and PROTAC atoms with explicit component labels. TriFuse
     constructs invariant descriptors for all three cross-component pairs from
     these coordinates; no dense edge tensor is materialized here.
 
-    Returns a flat dictionary (not HeteroData) for the custom TriBrain architecture.
+    Returns a flat dictionary (not HeteroData) for the custom TriFuse architecture.
 
     Args:
         e3_coords: [N_e3, 3]

@@ -12,7 +12,7 @@ E3 是固定全局参考系。动态状态为：
 |---|---|---|
 | `T_E3L` | Ligand 相对 E3 的刚体 | `sub1` DiffDock |
 | `T_POL` | Ligand 相对 POI 的刚体 | `sub2` DiffDock |
-| `chi` | Ligand torsion | TriBrain 逐键协调两 expert evidence |
+| `chi` | Ligand torsion | TriFuse 逐键协调两 expert evidence |
 
 全局坐标由 `T_L = T_E3L`、`T_POI = T_L · inverse(T_POL)` 唯一确定。任何坐标更新后都必须同步刷新 POI-local frame、receptor crop 和 cross-edge。
 
@@ -22,18 +22,18 @@ E3 是固定全局参考系。动态状态为：
 
 - 两个分支在同一个旧 Ligand 上分别生成 `L1`、`L2` rigid proposal；
 - Ligand 采用 `L1`，POI 接收把 `L2` 对齐到 `L1` 的同一个精确刚体变换；
-- torsion 是共享内部自由度，由 TriBrain 逐键预测两侧权重与 residual，并只应用一次。
+- torsion 是共享内部自由度，由 TriFuse 逐键预测两侧权重与 residual，并只应用一次。
 
 禁止恢复以下旧逻辑：
 
 - `s1 + g * (s2 - s1)` residual-gated merge；
 - 将两个 expert 的刚体 score 都用于移动 Ligand；
-- 让独立 TriBrain SE(3) head 从头预测 POI movement；
+- 让独立 TriFuse SE(3) head 从头预测 POI movement；
 - 对 rotation vector 简单取负来近似逆刚体更新。
 
-## TriBrain
+## TriFuse
 
-TriBrain 读取三元上下文并输出：
+TriFuse 读取三元上下文并输出：
 
 1. E3、POI、Ligand 分别池化的类型 token；
 2. E3–L、POI–L、E3–POI 的 RBF 距离分布、接触比例和尺度编码；
@@ -41,7 +41,7 @@ TriBrain 读取三元上下文并输出：
 4. 逐键 torsion coordinator；
 5. scalar auxiliary heads，例如功能或置信度预测。
 
-TriBrain 不输出 rigid score、merge gate 或 SE(3) residual。刚体动力学完全由两个 DiffDock proposal 与显式群组合定义；TriBrain 只裁决物理上共享的 torsion。
+TriFuse 不输出 rigid score、merge gate 或 SE(3) residual。刚体动力学完全由两个 DiffDock proposal 与显式群组合定义；TriFuse 只裁决物理上共享的 torsion。
 
 ## 训练
 
@@ -55,7 +55,7 @@ TriBrain 不输出 rigid score、merge gate 或 SE(3) residual。刚体动力学
 
 1. 在同一个旧 Ligand 上同时得到 `sub1` 的 `L1` 与 `sub2` 的 `L2`；
 2. Ligand 采用 `L1`，把 `L2 → L1` 的刚体变换同步施加给 POI；
-3. 应用一次 TriBrain 协调后的共享 torsion；
+3. 应用一次 TriFuse 协调后的共享 torsion；
 4. 更新 POI local frame；
 5. 重建并验证全部 frame 与图。
 
@@ -63,16 +63,16 @@ TriBrain 不输出 rigid score、merge gate 或 SE(3) residual。刚体动力学
 
 ## Checkpoint 与恢复
 
-当前架构标识为 `geometric_joint_interface_v3`，checkpoint version 为 6。加载时必须同时验证 version、architecture、LoRA、activation clamp 和 torsion auxiliary weight。version 5 及更早版本没有当前三体几何 encoder，必须硬拒绝。
+当前架构标识为 `trifuse_v4`，checkpoint version 为 7。加载时必须同时验证 version、architecture、LoRA、activation clamp 和 torsion auxiliary weight。version 6 及更早版本使用不同模块契约，必须硬拒绝。
 
 ## 最小验收
 
 - 两个 branch 的 native/inline parity 与 finite 检查；
 - 相对/全局 frame round trip 和 SE(3) 等变测试；
 - 同源双 proposal 与 `L2 → L1` 跨界面距离不变量测试；
-- TriBrain torsion coordinator 零初始化、逐键输出及单次应用测试；
+- TriFuse torsion coordinator 零初始化、逐键输出及单次应用测试；
 - 三体 context 对界面几何和组分类型敏感，并对共同 SE(3) 变换保持不变；
-- 两侧 expert torsion 均接受辅助监督，正式入口检查全部 TriBrain/LoRA 梯度；
+- 两侧 expert torsion 均接受辅助监督，正式入口检查全部 TriFuse/LoRA 梯度；
 - forward-only、单 optimizer step、训练/验证 smoke 全 finite；
 - v3 和错误 architecture checkpoint 均被明确拒绝。
 
