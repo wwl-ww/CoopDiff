@@ -9,7 +9,7 @@ import yaml
 
 from evaluation_common import validate_checkpoint_payload
 from featurize_common import featurize_complex
-from tricoopdiff.diffusion import MultiRateDiffusion, TernaryInitializer
+from tricoopdiff.diffusion import InterfaceDiffusion, TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
 from tricoopdiff.expert_factory import build_diffdock_expert
 from tricoopdiff.lora import (
@@ -55,7 +55,7 @@ class EvaluationRunner:
         )
         self.model = None
         self.input_dim = None
-        self.diffusion = MultiRateDiffusion()
+        self.diffusion = InterfaceDiffusion()
         self.initializer = TernaryInitializer()
 
     def _ensure_model(self, input_dim):

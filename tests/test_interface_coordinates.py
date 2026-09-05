@@ -7,7 +7,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from tricoopdiff.diffusion import MultiRateDiffusion
+from tricoopdiff.diffusion import InterfaceDiffusion
 
 
 def _triangle(center):
@@ -17,7 +17,7 @@ def _triangle(center):
 
 
 def test_interface_reaction_keeps_ligand_fixed():
-    diffusion = MultiRateDiffusion(
+    diffusion = InterfaceDiffusion(
         temp_sampling_tr=1.0,
         temp_sampling_rot=1.0,
     )
@@ -41,7 +41,7 @@ def test_interface_reaction_keeps_ligand_fixed():
 
 def test_interface_pair_noise_reconstructs_finite_frames():
     torch.manual_seed(0)
-    diffusion = MultiRateDiffusion()
+    diffusion = InterfaceDiffusion()
     ligand = _triangle([1.0, 2.0, 3.0])
     poi = _triangle([8.0, -2.0, 1.0])
     noisy_ligand, noisy_poi, noise, global_to_poi = (

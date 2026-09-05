@@ -18,7 +18,7 @@ does NOT import ``../DiffDock``.
 import numpy as np
 import torch
 
-from .diffusion import MultiRateDiffusion, TernaryInitializer
+from .diffusion import InterfaceDiffusion, TernaryInitializer
 
 
 @torch.no_grad()
@@ -72,7 +72,7 @@ def _nearest_interface_anchor(e3_coords: torch.Tensor, poi_coords: torch.Tensor)
 @torch.no_grad()
 def sample_single(
     model,
-    diffusion: MultiRateDiffusion,
+    diffusion: InterfaceDiffusion,
     initializer: TernaryInitializer,
     e3_data: dict,
     poi_data: dict,
@@ -91,7 +91,7 @@ def sample_single(
 
     Args:
         model: ``TriCoopDiff`` (already on ``device``; set to eval mode here).
-        diffusion: ``MultiRateDiffusion`` (holds sigma schedules + reverse steps).
+        diffusion: ``InterfaceDiffusion`` (holds sigma schedules + reverse steps).
         initializer: ``TernaryInitializer``.
         e3_data/poi_data/ligand_data: B=1 featurized dicts (see featurize_common).
         steps: number of reverse steps (default: diffusion.inference_steps).
@@ -380,7 +380,7 @@ def sample_single(
 
 def sample_ensemble(
     model,
-    diffusion: MultiRateDiffusion,
+    diffusion: InterfaceDiffusion,
     initializer: TernaryInitializer,
     e3_data: dict,
     poi_data: dict,

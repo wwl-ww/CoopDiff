@@ -67,9 +67,8 @@ class MultiScalePooling(nn.Module):
 
     The three pooled [B, token_dim] tokens are SUMMED (not concatenated) into the
     final output. ``node_coords`` is accepted for interface compatibility but is
-    currently UNUSED — coordinate/geometry information is supplied separately by
-    ``SE3GeometryEncoder``. Real distance-tiered pooling would be a future
-    extension and is not implemented here.
+    currently unused. Real distance-tiered pooling is not implemented here;
+    geometric reasoning is delegated to the two equivariant experts.
     """
 
     def __init__(
@@ -183,96 +182,6 @@ def scatter_max_per_batch(feat, batch, n_batch):
 
 
 # ---------------------------------------------------------------------------
-# SE3 Geometry Encoder
-# ---------------------------------------------------------------------------
-
-class SE3GeometryEncoder(nn.Module):
-    """
-    Coordinate-aware set encoder → fixed-size geometry embedding for the SE3 head.
-
-    The SE3 score target (translation + so(3) rotation of POI relative to E3) is a
-    function of the NOISY ternary coordinates, not just the ESM features. The
-    feature-based ``h_cond`` is coordinate-blind (MultiScalePooling and
-    EquivariantTransformer both ignore ``node_coords``), so without this encoder
-    the SE3 head cannot regress the target — loss_se3 plateaus ~1.1 instead of
-    converging to 0.
-
-    Encodes per-node [E3-relative coords, node-type one-hot] through a small MLP,
-    then mean/max pools across nodes → [B, geo_dim]. Subtracting the E3 center
-    makes the encoding translation-invariant and directly exposes the POI's
-    (noisy) pose relative to the fixed E3 frame.
-    """
-
-    def __init__(self, geo_dim: int = 64, hidden: int = 64):
-        super().__init__()
-        self.geo_dim = geo_dim
-        self.node_net = nn.Sequential(
-            nn.Linear(6, hidden), nn.SiLU(), nn.Linear(hidden, hidden),
-        )
-        # +12 = 6-entry covariance (second-moment) vector for each of POI and E3.
-        # These are rotation-sensitive (R·C·Rᵀ in the fixed E3 frame) and recover
-        # the orientation info that symmetric scalar mean/max pooling destroys
-        # (the sole mean/max path capped rotation readout at R²≈0.51).
-        self.combine = nn.Linear(2 * hidden + 12, geo_dim)
-
-    def forward(self, node_coords, node_types, batch=None):
-        if batch is None:
-            batch = torch.zeros(
-                node_coords.shape[0], dtype=torch.long, device=node_coords.device,
-            )
-        n_batch = batch.max().item() + 1
-        node_types = node_types.to(node_coords.device)
-
-        # E3 center per batch (node_type 0). E3 is fixed across the diffusion
-        # trajectory; subtracting it exposes the POI's pose relative to E3.
-        e3_mask = node_types == 0
-        e3_sum = torch.zeros(
-            n_batch, 3, device=node_coords.device, dtype=node_coords.dtype,
-        )
-        e3_cnt = torch.zeros(n_batch, device=node_coords.device, dtype=node_coords.dtype)
-        e3_sum.index_add_(0, batch[e3_mask], node_coords[e3_mask])
-        e3_cnt.index_add_(
-            0, batch[e3_mask],
-            torch.ones(int(e3_mask.sum()), device=node_coords.device, dtype=node_coords.dtype),
-        )
-        e3_center = e3_sum / e3_cnt.clamp(min=1).unsqueeze(-1)  # [B, 3]
-
-        rel = node_coords - e3_center[batch]                 # [N, 3]
-        onehot = F.one_hot(node_types, num_classes=3).to(node_coords.dtype)  # [N, 3]
-        feat = torch.cat([rel, onehot], dim=-1)              # [N, 6]
-
-        h = self.node_net(feat)                              # [N, hidden]
-        mean = scatter_mean(h, batch, dim=0, dim_size=n_batch)   # [B, hidden]
-        mx = scatter_max_per_batch(h, batch, n_batch)            # [B, hidden]
-        cov = self._second_moments(node_coords, node_types, batch, n_batch)  # [B, 12]
-        return self.combine(torch.cat([mean, mx, cov], dim=-1))               # [B, geo_dim]
-
-    def _second_moments(self, node_coords, node_types, batch, n_batch):
-        """Per-cloud covariance (6 unique entries) for POI (type 1) then E3 (type 0).
-
-        Computed about each cloud's own centroid → translation-invariant, and in
-        the fixed E3 frame the POI covariance is R·C·Rᵀ, i.e. directly
-        rotation-sensitive. Concatenated to [B, 12].
-        """
-        entries = []
-        for typ in (1, 0):
-            mask = node_types == typ
-            c = scatter_mean(node_coords[mask], batch[mask], dim=0, dim_size=n_batch)  # [B, 3]
-            rel_t = node_coords[mask] - c[batch[mask]]        # [N_t, 3]
-            outer = rel_t.unsqueeze(-1) * rel_t.unsqueeze(-2) # [N_t, 3, 3]
-            cov = scatter_mean(                               # [B, 3, 3]
-                outer.reshape(rel_t.shape[0], 9),
-                batch[mask], dim=0, dim_size=n_batch,
-            ).reshape(n_batch, 3, 3)
-            cov = (cov + cov.transpose(-1, -2)) / 2
-            entries.append(torch.stack([
-                cov[:, 0, 0], cov[:, 1, 1], cov[:, 2, 2],
-                cov[:, 0, 1], cov[:, 0, 2], cov[:, 1, 2],
-            ], dim=-1))                                       # [B, 6]
-        return torch.cat(entries, dim=-1)                     # [B, 12]
-
-
-# ---------------------------------------------------------------------------
 # Equivariant Transformer
 # ---------------------------------------------------------------------------
 
@@ -287,8 +196,7 @@ class EquivariantTransformer(nn.Module):
     scalar and vector linear projections and a stack of layers (scalar
     self-attention + scalar-gated vector magnitude update). The vector channels
     are updated equivariantly (see ``EquivariantTransformerLayer``), but all
-    geometry enters via ``SE3GeometryEncoder``, which is the coordinate-aware
-    module that compensates for this class's coordinate-blindness.
+    geometry enters through the interface graphs consumed by the experts.
 
     MVP configuration: 3 layers, single-head self-attention over the batch,
     32 scalar channels + 4 vector channels.
@@ -435,30 +343,6 @@ def fourier_time_embedding(t: torch.Tensor, n_freqs: int = 16) -> torch.Tensor:
     return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
 
 
-class SE3ScoreHead(nn.Module):
-    """
-    Predicts the SE(3) score (6D: 3 translation + 3 rotation in so(3))
-    for the E3-POI rigid body transformation.
-
-    The SE(3) score target depends on the diffusion time ``t_se3`` (through the
-    noise schedule σ_tr/σ_rot), so the head is fed ``h_cond`` concatenated with a
-    sinusoidal time embedding: ``in_dim = node_dim + 2·n_freqs``.
-    """
-
-    def __init__(self, hidden_dim: int = 128, in_dim: int = None):
-        super().__init__()
-        in_dim = in_dim if in_dim is not None else hidden_dim
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 6),  # [tx, ty, tz, rx, ry, rz]
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Returns [B, 6] SE(3) score."""
-        return self.net(x)
-
-
 class JudgeHead(nn.Module):
     """Predicts per-atom clash mask and global confidence."""
 
@@ -493,28 +377,6 @@ class StateHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns [B, 2] with [ΔΔG_estimate, productive_probability]."""
         return self.net(x)
-
-
-class MergeGateHead(nn.Module):
-    """
-    Per-score-type residual gate for merging the two subgraph scores.
-
-    Produces ``g`` = [B, 3] (tr / rot / tor) such that the merged PROTAC score is
-    ``s_q = s_q1 + g * (s_q2 - s_q1)``. **Zero-initialized**, so at init ``g=0``
-    → ``s_q = s_q1`` (pure E3-L), restoring the zero-FiLM transparency baseline.
-    ``g`` scales how much of the POI-L two-body force field (``s_q2 - s_q1``) is
-    blended in — starting from none, matching FiLM's adaLN-Zero philosophy.
-    """
-
-    def __init__(self, hidden_dim: int = 128):
-        super().__init__()
-        self.net = nn.Linear(hidden_dim, 3)
-        nn.init.zeros_(self.net.weight)
-        nn.init.zeros_(self.net.bias)
-
-    def forward(self, h_cond: torch.Tensor) -> torch.Tensor:
-        """Returns [B, 3] residual gate (tr, rot, tor); =0 at init."""
-        return self.net(h_cond)
 
 
 # ---------------------------------------------------------------------------
@@ -634,8 +496,7 @@ class TriBrain(nn.Module):
         # 1. Pool the ternary graph to compact tokens
         pooled = self.pooling(node_features, node_coords, node_types, batch)
 
-        # 2. Scalar/vector token processor (pooled token only; geometry enters
-        #    separately via the SE3GeometryEncoder below).
+        # 2. Scalar/vector token processor for global conditioning.
         transformer_out = self.transformer(pooled)
         h_cond = transformer_out['combined']  # [B, node_dim]
 

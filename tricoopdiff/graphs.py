@@ -304,7 +304,7 @@ def crop_receptor_to_ligand(
 
     # Align with native crop_beyond semantics: once the crop is stable, do not
     # over-prune to a single residue if the geometric cutoff happened to miss all
-    # residues at this step. The residual-gated expert already has a native-style
+    # residues at this step. The interface expert already has a native-style
     # fallback for fully empty cross graphs, so the crop should remain a genuine
     # receptor neighborhood whenever internal edges exist.
     if has_rec_graph and cropped_edge_index is not None and cropped_edge_index.shape[1] == 0 and keep_mask.sum() > 1:

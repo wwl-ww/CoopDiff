@@ -9,7 +9,7 @@ Pipeline:
   1. Featurize the E3-L and POI-L subgraphs (``featurize_common``, on-the-fly
      ESM2-650M embeddings).
   2. Build the frozen DiffDock-L expert + TriBrain + TriCoopDiff +
-     MultiRateDiffusion + TernaryInitializer.
+     InterfaceDiffusion + TernaryInitializer.
   3. Optionally load a trained TriBrain checkpoint (``--tribrain-ckpt``).
   4. ``evaluate_model``: run ``--n-walkers`` reverse-diffusion trajectories and
      report PROTAC RMSD / pocket distance / clash rate + ensemble diversity.
@@ -57,7 +57,7 @@ from evaluation_common import (
 from tricoopdiff.expert_factory import build_diffdock_expert
 from tricoopdiff.tribrain import TriBrain
 from tricoopdiff.model import TriCoopDiff
-from tricoopdiff.diffusion import MultiRateDiffusion, TernaryInitializer
+from tricoopdiff.diffusion import InterfaceDiffusion, TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
 
 # DiffDock's SO(3)/torus cache lookup resolves relative to CWD; cache files live
@@ -271,7 +271,7 @@ def main():
         num_conv_layers=num_conv_layers,
         use_film=True,
     ).to(device)
-    diffusion = MultiRateDiffusion()
+    diffusion = InterfaceDiffusion()
     initializer = TernaryInitializer()
     n_params = sum(p.numel() for p in tribrain.parameters())
     print(f"[model] TriBrain trainable params = {n_params:,}", flush=True)

@@ -9,4 +9,4 @@ from . import diffdock_compat  # noqa: F401
 
 from .model import TriCoopDiff
 from .graphs import build_subgraph_e3l, build_subgraph_pol, build_tribrain_graph
-from .diffusion import MultiRateDiffusion
+from .diffusion import InterfaceDiffusion

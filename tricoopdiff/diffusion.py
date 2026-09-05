@@ -1,18 +1,13 @@
 """
 Diffusion process for TriCoopDiff.
 
-PROTAC (translation, rotation, torsion) and the E3-POI rigid body (SE3: 3
-translation + 3 rotation) each follow an exponential σ(t) noise schedule, but
-with DIFFERENT σ bounds — faster noise decay for the PROTAC DOFs, slower for the
-SE3 rigid body. All schedules are FULL-RANGE: noise is sampled at the raw σ(t)
-for every t ∈ [0, 1], with no λ_q / λ_SE3 cutoff masking. (The earlier
-threshold-based λ multi-rate masking was removed in the debug-se3-loss work so
-that the forward noise process, the reverse denoising steps, and the DSM
-training target all use the same full σ schedule — the forward/reverse
-asymmetry that masking introduced left the low-t regime untrained at inference.)
+The E3--Ligand and POI--Ligand relative poses both use the native DiffDock
+translation, rotation and torsion schedules. Each interface receives an
+independent noise draw at the same diffusion time, and one globally consistent
+ternary pose is reconstructed from those two relative states.
 
-Reference frame: E3 fixed at origin. POI moves relative to E3. PROTAC is
-globally defined in the E3 reference frame.
+Reference frame: E3 is fixed. The first expert moves Ligand relative to E3; the
+second expert moves POI by the exact inverse of its proposed Ligand update.
 
 The diffusion parameter t is a noise schedule variable, NOT physical time.
 """
@@ -25,15 +20,15 @@ from scipy.spatial.transform import Rotation as R
 from .diffdock.utils.geometry import rigid_transform_Kabsch_3D_torch_batch
 
 
-class MultiRateDiffusion(nn.Module):
+class InterfaceDiffusion(nn.Module):
     """
-    Multi-rate diffusion with separate schedules for PROTAC and E3-POI degrees of freedom.
+    Native DiffDock diffusion applied to two relative interface poses.
 
     Diffusion variables:
     - PROTAC translation t_q: 3D (relative to E3)
     - PROTAC rotation R_q: 3D in so(3)
     - PROTAC torsion angles χ: K (K = number of rotatable bonds)
-    - E3-POI rigid body SE3: 6D (3 translation + 3 rotation in so(3))
+    - POI-Ligand relative translation/rotation: second independent rigid pose
     """
 
     def __init__(
@@ -59,20 +54,6 @@ class MultiRateDiffusion(nn.Module):
         temp_sigma_data_tr: float = 0.93,
         temp_sigma_data_rot: float = 0.75,
         temp_sigma_data_tor: float = 0.69,
-        # SE3 noise parameters (E3-POI rigid body)
-        se3_tr_sigma_min: float = 0.5,
-        se3_tr_sigma_max: float = 20.0,
-        se3_rot_sigma_min: float = 0.05,
-        se3_rot_sigma_max: float = 1.0,
-        # DEPRECATED multi-rate thresholds. The λ_q/λ_SE3 cutoff masking was
-        # removed from the forward/reverse path in the debug-se3-loss work
-        # (add_noise_* / reverse_step_* now use the full σ schedule for all t).
-        # Retained only so legacy diagnostic scripts and tests can still
-        # reference/override them (scripts/diagnose_loss_se3.py,
-        # scripts/verify_se3_sigma_consistency.py,
-        # tests/test_model_build.py). Production code never consults them.
-        lambda_q_threshold: float = 0.7,   # deprecated PROTAC noise cutoff
-        lambda_se3_threshold: float = 0.5,  # deprecated SE3 noise cutoff (slower)
         # Schedule
         inference_steps: int = 20,
     ):
@@ -84,18 +65,6 @@ class MultiRateDiffusion(nn.Module):
         self.rot_sigma_max = rot_sigma_max
         self.tor_sigma_min = tor_sigma_min
         self.tor_sigma_max = tor_sigma_max
-
-        # SE3 noise bounds
-        self.se3_tr_sigma_min = se3_tr_sigma_min
-        self.se3_tr_sigma_max = se3_tr_sigma_max
-        self.se3_rot_sigma_min = se3_rot_sigma_min
-        self.se3_rot_sigma_max = se3_rot_sigma_max
-
-        # Deprecated multi-rate thresholds — see the constructor note above.
-        # Kept as attributes for backward compatibility with legacy diagnostic
-        # scripts; the production noise/reverse paths no longer consult them.
-        self.lambda_q_threshold = lambda_q_threshold
-        self.lambda_se3_threshold = lambda_se3_threshold
 
         self.inference_steps = inference_steps
 
@@ -127,41 +96,6 @@ class MultiRateDiffusion(nn.Module):
         rot_sigma = self.sigma_schedule(t_rot, self.rot_sigma_min, self.rot_sigma_max)
         tor_sigma = self.sigma_schedule(t_tor, self.tor_sigma_min, self.tor_sigma_max)
         return tr_sigma, rot_sigma, tor_sigma
-
-    def se3_t_to_sigma(self, t_se3_tr, t_se3_rot):
-        """Convert diffusion times to noise levels for SE3 DOFs."""
-        tr_sigma = self.sigma_schedule(t_se3_tr, self.se3_tr_sigma_min, self.se3_tr_sigma_max)
-        rot_sigma = self.sigma_schedule(t_se3_rot, self.se3_rot_sigma_min, self.se3_rot_sigma_max)
-        return tr_sigma, rot_sigma
-
-    # ------------------------------------------------------------------
-    # Deprecated: multi-rate λ masking (removed from the production path)
-    # ------------------------------------------------------------------
-
-    def get_lambda_q(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        DEPRECATED. PROTAC noise multiplier λ_q(t).
-
-        λ_q(t) = 1 for t > threshold, 0 for t <= threshold. This stepwise,
-        non-differentiable mask was removed from the production forward/reverse
-        path in the debug-se3-loss work: ``add_noise_protac`` and
-        ``reverse_step_protac`` now use the full σ schedule for all t. Retained
-        only for legacy diagnostic scripts/tests (e.g. scripts/diagnose_loss_se3.py,
-        tests/test_model_build.py); production code must not call it.
-        """
-        return (t > self.lambda_q_threshold).float()
-
-    def get_lambda_se3(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        DEPRECATED. SE3 noise multiplier λ_SE3(t).
-
-        λ_SE3(t) = 1 for t > threshold, 0 for t <= threshold. Removed from the
-        production path (``add_noise_se3`` / ``reverse_step_se3`` now use the full
-        σ schedule). Retained only for legacy diagnostic scripts/tests (e.g.
-        scripts/verify_se3_sigma_consistency.py); production
-        code must not call it.
-        """
-        return (t > self.lambda_se3_threshold).float()
 
     # ------------------------------------------------------------------
     # Forward diffusion (adding noise to clean data)
@@ -221,46 +155,6 @@ class MultiRateDiffusion(nn.Module):
         # the ligand away from its pocket — exploding the tr-score target mismatch.)
         lig_center = ligand_pos.mean(dim=1, keepdim=True)
         noisy_pos = torch.bmm(ligand_pos - lig_center, rot_update.transpose(-1, -2)) + tr_update.unsqueeze(1) + lig_center
-
-        return noisy_pos, tr_update, rot_update, rot_omega
-
-    def add_noise_se3(
-        self,
-        poi_pos: torch.Tensor,
-        t_se3_tr: torch.Tensor,
-        t_se3_rot: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Add Gaussian noise to E3-POI rigid body transformation.
-
-        The SE3 forward process is FULL-RANGE: noise is sampled at the raw
-        σ(t) level for all t ∈ [0, 1], with NO λ_SE3 cutoff. This keeps the
-        forward process consistent with ``reverse_step_se3`` (which denoises at
-        the full σ schedule, never applying λ) and with the DSM training target.
-        The previous λ cutoff made the SE3 head train only on t ∈ (0.5, 1] while
-        inference queried t ∈ [0.05, 1.0], so the low-t regime was untrained.
-
-        Args:
-            poi_pos: [B, N_poi, 3] clean POI positions (relative to E3 origin)
-            t_se3_tr, t_se3_rot: [B] diffusion times for SE3 DOFs
-        Returns:
-            noisy_pos, tr_update [B, 3], rot_update [B, 3, 3],
-            rot_omega [B, 3] (so(3) rotation vector for score target)
-        """
-        B = poi_pos.shape[0]
-        device = poi_pos.device
-
-        tr_sigma, rot_sigma = self.se3_t_to_sigma(t_se3_tr, t_se3_rot)
-
-        tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1)
-        rot_update, rot_omega = sample_so3_noise(B, rot_sigma, device)
-
-        # Apply to POI center of mass
-        poi_center = poi_pos.mean(dim=1, keepdim=True)
-        poi_centered = poi_pos - poi_center
-        noisy_center = poi_center + tr_update.unsqueeze(1)
-        noisy_centered = torch.bmm(poi_centered, rot_update)
-        noisy_pos = noisy_center + noisy_centered
 
         return noisy_pos, tr_update, rot_update, rot_omega
 
@@ -603,59 +497,6 @@ class MultiRateDiffusion(nn.Module):
             return updated_poi, inverse_rotation
         return updated_poi
 
-    def reverse_step_se3(
-        self,
-        poi_pos: torch.Tensor,
-        se3_score: torch.Tensor,
-        t_se3_tr: torch.Tensor,
-        t_se3_rot: torch.Tensor,
-        dt_se3_tr: torch.Tensor,
-        dt_se3_rot: torch.Tensor,
-        add_noise: bool = True,
-        return_rotation: bool = False,
-    ):
-        """
-        Single reverse SDE step for E3-POI rigid body DOFs.
-
-        se3_score: [B, 6] = [tr_score(3), rot_score(3)]
-
-        Returns:
-            [B, N_poi, 3] updated POI positions. If ``return_rotation`` is True,
-            returns ``(poi_pos, rot_matrix)`` where ``rot_matrix`` [B,3,3] is the
-            rotation applied this step (for cumulative SE3 tracking).
-        """
-        B = poi_pos.shape[0]
-        device = poi_pos.device
-
-        tr_score = se3_score[:, :3]
-        rot_score = se3_score[:, 3:]
-
-        tr_sigma, rot_sigma = self.se3_t_to_sigma(t_se3_tr, t_se3_rot)
-        tr_g = tr_sigma * np.sqrt(2 * np.log(self.se3_tr_sigma_max / self.se3_tr_sigma_min))
-        rot_g = rot_sigma * np.sqrt(2 * np.log(self.se3_rot_sigma_max / self.se3_rot_sigma_min))
-
-        tr_perturb = tr_g**2 * dt_se3_tr.unsqueeze(-1) * tr_score
-        if add_noise:
-            tr_z = torch.randn(B, 3, device=device)
-            tr_perturb = tr_perturb + tr_g * torch.sqrt(dt_se3_tr).unsqueeze(-1) * tr_z
-
-        rot_perturb = rot_score * dt_se3_rot.unsqueeze(-1) * rot_g**2
-        if add_noise:
-            rot_z = torch.randn(B, 3, device=device)
-            rot_perturb = rot_perturb + rot_g * torch.sqrt(dt_se3_rot).unsqueeze(-1) * rot_z
-
-        # Apply to POI using the same row-vector rigid-body convention as the
-        # ligand update. The sampler tracks the inverse/body-frame map as
-        # ``rot_matrix @ previous_inverse``.
-        poi_center = poi_pos.mean(dim=1, keepdim=True)
-        poi_centered = poi_pos - poi_center
-        rot_matrix = so3_exp(rot_perturb)
-        poi_pos = torch.bmm(poi_centered, rot_matrix.transpose(-1, -2)) + tr_perturb.unsqueeze(1) + poi_center
-
-        if return_rotation:
-            return poi_pos, rot_matrix
-        return poi_pos
-
     # ------------------------------------------------------------------
     # Inference schedules
     # ------------------------------------------------------------------
@@ -664,15 +505,13 @@ class MultiRateDiffusion(nn.Module):
         """
         Returns time discretization for reverse diffusion.
 
-        PROTAC DOFs: linear schedule from t=1 to t=0 (full-range, no λ_q cutoff)
-        SE3 DOFs: linear schedule from t=1 to t=0 (full-range, no λ_SE3 cutoff)
+        Both interface processes use the same linear clock from ``t_start`` to
+        zero; their stochastic noise draws remain independent.
 
         Returns dict with:
             'tr_schedule': [steps+1] PROTAC translation times
             'rot_schedule': [steps+1] PROTAC rotation times
             'tor_schedule': [steps+1] PROTAC torsion times
-            'se3_tr_schedule': [steps+1] SE3 translation times
-            'se3_rot_schedule': [steps+1] SE3 rotation times
         """
         if steps is None:
             steps = self.inference_steps
@@ -683,8 +522,6 @@ class MultiRateDiffusion(nn.Module):
             'tr_schedule': schedule.copy(),
             'rot_schedule': schedule.copy(),
             'tor_schedule': schedule.copy(),
-            'se3_tr_schedule': schedule.copy(),
-            'se3_rot_schedule': schedule.copy(),
         }
 
 
@@ -896,26 +733,6 @@ class TernaryInitializer:
 # SO(3) utilities
 # ------------------------------------------------------------------
 
-def sample_so3_noise(
-    batch_size: int, sigma: torch.Tensor, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Sample noise on SO(3) manifold using the isotropic Gaussian distribution
-    in the Lie algebra so(3).
-
-    Args:
-        batch_size: number of samples
-        sigma: [B] noise level per sample
-        device: torch device
-    Returns:
-        (rotation_matrices [B, 3, 3], omega [B, 3])
-        omega is the so(3) rotation vector (pre-exp) needed for score targets.
-    """
-    B = batch_size
-    omega = torch.randn(B, 3, device=device) * sigma.unsqueeze(-1)
-    return so3_exp(omega), omega
-
-
 def sample_so3_noise_wrapped(
     batch_size: int, sigma: torch.Tensor, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -926,11 +743,8 @@ def sample_so3_noise_wrapped(
     CDF in [0, π], returning the wrapped so(3) vector ω and its rotation matrix.
     This is the convention the frozen expert and `so3_score_vec` assume.
 
-    Contrast with `sample_so3_noise` (R³ Gaussian ω ~ N(0, σ²I)): that sampler is
-    only valid for the Euclidean DSM target (-ω/σ²) used by the SE3 head. For the
-    PROTAC rotation the target/expert use the wrapped IGSO(3) score, and an R³
-    sampler emits ‖ω‖ > π for σ > 1.0, where `so3_score_vec` extrapolates past
-    the valid [0, π] table — a systematic bias of up to ~64% at σ = 1.55.
+    The wrapped IGSO(3) distribution is required by both interface experts;
+    an unwrapped R³ Gaussian emits ‖ω‖ > π for σ > 1.0, outside the score table.
 
     Args:
         batch_size: number of samples

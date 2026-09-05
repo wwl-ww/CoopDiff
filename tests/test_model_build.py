@@ -76,21 +76,15 @@ def test_film_zero_init():
 
 def test_diffusion_schedules():
     """Diffusion schedules produce valid noise levels."""
-    from tricoopdiff.diffusion import MultiRateDiffusion, so3_score_norm
+    from tricoopdiff.diffusion import InterfaceDiffusion, so3_score_norm
 
-    diffusion = MultiRateDiffusion(inference_steps=20)
+    diffusion = InterfaceDiffusion(inference_steps=20)
 
     # Test sigma schedule
     t = torch.tensor([0.0, 0.5, 1.0])
     tr, rot, tor = diffusion.t_to_sigma(t, t, t)
     assert tr[0] < tr[1] < tr[2], "Sigma should increase with t"
     assert abs(tr[0].item() - 0.1) < 0.05, f"Sigma at t=0 should be ~0.1, got {tr[0].item()}"
-
-    # Test lambda masks
-    t_high = torch.tensor([0.8])
-    t_low = torch.tensor([0.3])
-    assert diffusion.get_lambda_q(t_high).item() == 1.0
-    assert diffusion.get_lambda_q(t_low).item() == 0.0
 
     # Test SO(3) score norm
     sigma = torch.tensor([0.5, 1.0])

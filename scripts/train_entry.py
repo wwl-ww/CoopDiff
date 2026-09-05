@@ -299,7 +299,7 @@ def build_trainer(args, device, input_dim=None):
     from tricoopdiff import TriCoopDiff
     from tricoopdiff.tribrain import TriBrain
     from tricoopdiff.expert_factory import build_diffdock_expert
-    from tricoopdiff.diffusion import MultiRateDiffusion
+    from tricoopdiff.diffusion import InterfaceDiffusion
     from tricoopdiff.train import TriCoopDiffTrainer
 
     # Build frozen DiffDock-L expert from pretrained weights (self-contained
@@ -346,7 +346,7 @@ def build_trainer(args, device, input_dim=None):
     model = TriCoopDiff(frozen_expert, tribrain, num_conv_layers=num_conv_layers)
 
     # Build diffusion
-    diffusion = MultiRateDiffusion(inference_steps=20)
+    diffusion = InterfaceDiffusion(inference_steps=20)
 
     # Build trainer
     trainer = TriCoopDiffTrainer(
@@ -442,7 +442,7 @@ class TernaryDataLoader:
     Each entry is featurized on the fly via ``featurize_complex`` (with an
     on-disk cache so subsequent epochs skip ESM2). The loader yields a **B=1**
     batch dict whose keys match ``TriCoopDiffTrainer.compute_loss``::
-        {'e3_data': ..., 'poi_data': ..., 'ligand_data': ..., 't_se3_data': None}
+        {'e3_data': ..., 'poi_data': ..., 'ligand_data': ...}
 
     By default featurization failures abort training. Silently changing the
     effective dataset would make validation/checkpoint selection misleading.
@@ -485,7 +485,6 @@ class TernaryDataLoader:
             'e3_data': e3_data,
             'poi_data': poi_data,
             'ligand_data': ligand_data,
-            't_se3_data': None,
         }
 
 

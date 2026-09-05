@@ -220,11 +220,9 @@ class TriCoopDiff(nn.Module):
             )
 
             # TriBrain forward (node features are 2D [N, D]; no batch dim).
-            # Use the same PROTAC diffusion clock `t` that conditions the frozen
-            # DiffDock expert so the FiLM / merge-gate path stays transparent under
-            # zero-init. Passing `t_se3` here would make FiLM params drift with the
-            # POI SE3 schedule even when the expert is evaluating the ligand branch
-            # at a different noise level, breaking the native zero-FiLM parity path.
+            # TriBrain receives both interface clocks and builds branch-specific
+            # FiLM conditions. The experts are never conditioned with a clock
+            # belonging to a different relative pose.
             tri_out = self.tribrain(
                 node_features=tri_graph['node_features'],
                 node_coords=tri_graph['node_coords'],
@@ -318,8 +316,8 @@ class TriCoopDiff(nn.Module):
 
             # Preserve both expert fields after mapping them into the common E3
             # frame.  Downstream joint coordination must be able to distinguish
-            # the two interface constraints; exposing only their legacy merge
-            # made the POI--Ligand evidence unavailable to the sampler and loss.
+            # the two interface constraints. Both remain available to the
+            # sampler and loss in a common E3 frame.
             for score_name, output_name in (
                 ('tr_score', 'tr'),
                 ('rot_score', 'rot'),
