@@ -143,6 +143,21 @@ def count_pdb_heavy_atoms(path):
     return count
 
 
+def validate_ligand_graph(path):
+    """Apply the RDKit graph requirements used by DiffDock featurization."""
+    from rdkit import Chem
+
+    molecule = Chem.MolFromPDBFile(str(path), sanitize=True, removeHs=True)
+    if molecule is None:
+        raise RuntimeError('RDKit failed to parse or sanitize ligand')
+    if molecule.GetNumConformers() != 1:
+        raise RuntimeError(
+            f'ligand has {molecule.GetNumConformers()} conformers; expected one'
+        )
+    if molecule.GetNumBonds() == 0:
+        raise RuntimeError('ligand graph contains no inferred bonds')
+
+
 def export_case(case, pdb_root, output_root):
     """Split one normalized ``gt_complex.pdb`` into two proteins and a ligand."""
     from Bio.PDB import PDBIO, PDBParser, Select
@@ -192,6 +207,7 @@ def export_case(case, pdb_root, output_root):
         if atom_counts[key] == 0:
             raise RuntimeError(f'{case}: exported {key} contains no atoms')
     atom_counts['ligand_heavy'] = count_pdb_heavy_atoms(paths['ligand'])
+    validate_ligand_graph(paths['ligand'])
     return {
         'case': case,
         'protein1': _portable(paths['protein1']),

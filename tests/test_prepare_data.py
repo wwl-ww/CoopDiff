@@ -49,6 +49,20 @@ def test_deepternary_heavy_atom_count_excludes_hydrogen(tmp_path):
     assert make_deepternary_index.count_pdb_heavy_atoms(pdb) == 2
 
 
+def test_ligand_graph_gate_rejects_bondless_input(tmp_path):
+    pdb = tmp_path / 'ligand.pdb'
+    pdb.write_text(
+        'HETATM    1 ZN   ZN  A   1       0.000   0.000   0.000  1.00  0.00          ZN  \n',
+        encoding='utf-8',
+    )
+    try:
+        make_deepternary_index.validate_ligand_graph(pdb)
+    except RuntimeError as error:
+        assert 'no inferred bonds' in str(error)
+    else:
+        raise AssertionError('bondless ligand must be rejected before training')
+
+
 def test_joint_cluster_intersection_merges_relations_and_excludes_pdbs():
     protac = [
         {'representative': ['a_A_B_X'], 'items': ['a_A_B_X', 'b_A_B_X']},
