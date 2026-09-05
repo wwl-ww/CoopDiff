@@ -49,6 +49,7 @@ class TriCoopDiffTrainer:
         lora_early_layers: int = 4,
         activation_clamp: float = 100.0,
         torsion_expert_aux_weight: float = 0.25,
+        lora_warmup_steps: int = 100,
     ):
         self.model = model.to(device)
         self.diffusion = diffusion
@@ -59,6 +60,9 @@ class TriCoopDiffTrainer:
         if torsion_expert_aux_weight < 0:
             raise ValueError("torsion_expert_aux_weight must be non-negative")
         self.torsion_expert_aux_weight = float(torsion_expert_aux_weight)
+        if lora_warmup_steps < 0:
+            raise ValueError("lora_warmup_steps must be non-negative")
+        self.lora_warmup_steps = int(lora_warmup_steps)
 
         # Only TriFuse is trainable; experts are frozen
         parameter_groups = [{
@@ -82,12 +86,18 @@ class TriCoopDiffTrainer:
                 'lr': lora_lr,
                 'name': 'expert_lora_late',
             })
+        self._lora_params = lora_groups['early'] + lora_groups['late']
+        self._set_lora_trainable(False)
         self.optimizer = AdamW(parameter_groups, weight_decay=weight_decay)
         self.scheduler = ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-7,
         )
 
         self.global_step = 0
+
+    def _set_lora_trainable(self, trainable: bool):
+        for parameter in self._lora_params:
+            parameter.requires_grad = bool(trainable)
 
     def compute_loss(
         self,
@@ -268,6 +278,7 @@ class TriCoopDiffTrainer:
 
     def train_step(self, **batch) -> dict:
         """Forward + backward + optimizer step."""
+        self._set_lora_trainable(self.global_step >= self.lora_warmup_steps)
         self.model.train()  # dropout / attention dropout active during training
         self.optimizer.zero_grad()
         loss_dict = self.compute_loss(**batch)
@@ -363,11 +374,12 @@ class TriCoopDiffTrainer:
         """
         from .lora import expert_lora_state_dict
         torch.save({
-            'checkpoint_version': 13,
-            'architecture': 'trifuse_v10',
+            'checkpoint_version': 14,
+            'architecture': 'trifuse_v11',
             'runtime_config': {
                 'activation_clamp': self.activation_clamp,
                 'torsion_expert_aux_weight': self.torsion_expert_aux_weight,
+                'lora_warmup_steps': self.lora_warmup_steps,
             },
             'global_step': self.global_step,
             'trifuse_state_dict': self.model.trifuse.state_dict(),
@@ -388,13 +400,13 @@ class TriCoopDiffTrainer:
         (weights + global step only).
         """
         ckpt = torch.load(path, map_location=self.device)
-        if ckpt.get('checkpoint_version') != 13:
+        if ckpt.get('checkpoint_version') != 14:
             raise ValueError(
-                "TriFuse training requires checkpoint_version=13"
+                "TriFuse training requires checkpoint_version=14"
             )
-        if ckpt.get('architecture') != 'trifuse_v10':
+        if ckpt.get('architecture') != 'trifuse_v11':
             raise ValueError(
-                "checkpoint architecture is not trifuse_v10"
+                "checkpoint architecture is not trifuse_v11"
             )
         saved_clamp = ckpt.get('runtime_config', {}).get('activation_clamp')
         if saved_clamp != self.activation_clamp:
@@ -410,6 +422,12 @@ class TriCoopDiffTrainer:
                 f"checkpoint torsion_expert_aux_weight={saved_aux_weight!r} "
                 f"does not match runtime value={self.torsion_expert_aux_weight!r}"
             )
+        saved_warmup = ckpt.get('runtime_config', {}).get('lora_warmup_steps')
+        if saved_warmup != self.lora_warmup_steps:
+            raise ValueError(
+                f"checkpoint lora_warmup_steps={saved_warmup!r} does not "
+                f"match runtime value={self.lora_warmup_steps!r}"
+            )
         self.model.trifuse.load_state_dict(ckpt['trifuse_state_dict'])
         if ckpt.get('expert_lora_state_dict'):
             from .lora import load_expert_lora_state_dict
@@ -417,6 +435,7 @@ class TriCoopDiffTrainer:
                 self.model.expert, ckpt['expert_lora_state_dict'],
             )
         self.global_step = ckpt.get('global_step', 0)
+        self._set_lora_trainable(self.global_step >= self.lora_warmup_steps)
         if 'optimizer_state_dict' in ckpt:
             self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         if (

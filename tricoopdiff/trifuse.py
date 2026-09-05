@@ -773,6 +773,25 @@ class StateHead(nn.Module):
         return self.net(x)
 
 
+class ScoreControlHead(nn.Module):
+    """Predict bounded equivariant-safe gains for the five executable scores."""
+
+    def __init__(self, hidden_dim: int = 128, max_delta: float = 0.25):
+        super().__init__()
+        self.max_delta = float(max_delta)
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 5),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, context: torch.Tensor) -> torch.Tensor:
+        return 1.0 + self.max_delta * torch.tanh(self.net(context))
+
+
 class TorsionCoordinator(nn.Module):
     """Resolve two interface opinions into one score per rotatable bond.
 
@@ -928,6 +947,7 @@ class TriFuse(nn.Module):
         # equivariant and are therefore supplied by the DiffDock experts.
         self.judge_head = JudgeHead(hidden_dim=node_dim)         # ~16k
         self.state_head = StateHead(hidden_dim=node_dim)         # ~16k
+        self.score_control_head = ScoreControlHead(hidden_dim=node_dim)
         self.torsion_coordinator = TorsionCoordinator(
             context_dim=node_dim,
         )
@@ -1026,6 +1046,7 @@ class TriFuse(nn.Module):
         # 3. Auxiliary scalar heads.
         confidence = self.judge_head(h_cond)      # [B, 1]
         state = self.state_head(h_cond)           # [B, 2]
+        score_gains = self.score_control_head(h_state)
 
         # 4. Each expert is conditioned by its own interface clock. Reusing one
         # embedding here would recreate the train/inference mismatch that the
@@ -1061,6 +1082,7 @@ class TriFuse(nn.Module):
         return {
             'confidence': confidence,
             'state': state,
+            'score_gains': score_gains,
             'film_params': film_params,  # list of (gamma, beta), len=num_conv_layers*2
             'h_cond': h_cond,
             'h_e3l': h_e3l,

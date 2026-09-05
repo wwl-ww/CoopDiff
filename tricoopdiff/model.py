@@ -119,6 +119,7 @@ class TriCoopDiff(nn.Module):
         all_torsion_residuals = []
         all_confidence = []
         all_state = []
+        all_score_gains = []
 
         for b in range(B):
             # Compute E3↔POI relative transform. `r_e3_to_poi` maps E3-frame
@@ -331,6 +332,14 @@ class TriCoopDiff(nn.Module):
             scores_2['tr_score'] = scores_2['tr_score'] @ r_poi_to_e3
             scores_2['rot_score'] = scores_2['rot_score'] @ r_poi_to_e3
 
+            # TriFuse may calibrate magnitudes but never invent a Cartesian
+            # direction. Identity-zero-init gains preserve native parity.
+            gains = tri_out['score_gains']
+            scores_1['tr_score'] = scores_1['tr_score'] * gains[:, 0:1]
+            scores_1['rot_score'] = scores_1['rot_score'] * gains[:, 1:2]
+            scores_2['tr_score'] = scores_2['tr_score'] * gains[:, 2:3]
+            scores_2['rot_score'] = scores_2['rot_score'] * gains[:, 3:4]
+
             # Native DiffDock drops the batch dimension from torsion scores for
             # a single graph. Restore the model-level [B,K] contract before
             # coordination and aggregation. Besides serving the coordinator,
@@ -389,6 +398,7 @@ class TriCoopDiff(nn.Module):
             all_torsion_residuals.append(torsion_residual)
             all_confidence.append(tri_out['confidence'])
             all_state.append(tri_out['state'])
+            all_score_gains.append(gains)
 
         # Stack batch results. Each v[b] carries a leading batch dim of 1
         # (e.g. tr/rot are [1,3], tor is [1,K]), so torch.cat along dim 0
@@ -407,13 +417,17 @@ class TriCoopDiff(nn.Module):
                 'e3_ligand': expert_scores['sub1'],
                 'poi_ligand': expert_scores['sub2'],
             },
-            'torsion_score': torch.cat(all_torsion_scores, dim=0),
+            'torsion_score': (
+                torch.cat(all_torsion_scores, dim=0)
+                * torch.cat(all_score_gains, dim=0)[:, 4:5]
+            ),
             'torsion_coordination': {
                 'e3l_weight': torch.cat(all_torsion_weights, dim=0),
                 'residual': torch.cat(all_torsion_residuals, dim=0),
             },
             'confidence': torch.cat(all_confidence, dim=0),
             'state': torch.cat(all_state, dim=0),
+            'score_gains': torch.cat(all_score_gains, dim=0),
             'expert_telemetry': {
                 'e3_ligand': torch.cat(all_expert_telemetry['sub1'], dim=0),
                 'poi_ligand': torch.cat(all_expert_telemetry['sub2'], dim=0),

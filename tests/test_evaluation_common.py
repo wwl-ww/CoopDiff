@@ -29,11 +29,12 @@ def test_index_entry_and_paths(tmp_path):
 
 def test_checkpoint_preflight_rejects_missing_lora():
     payload = {
-        "checkpoint_version": 13,
-        "architecture": "trifuse_v10",
+        "checkpoint_version": 14,
+        "architecture": "trifuse_v11",
         "runtime_config": {
             "activation_clamp": 100.0,
             "torsion_expert_aux_weight": 0.25,
+            "lora_warmup_steps": 100,
         },
         "trifuse_state_dict": {"x": 1},
     }
@@ -55,18 +56,19 @@ def test_checkpoint_preflight_rejects_legacy_architecture():
     try:
         evaluation_common.validate_checkpoint_payload(payload)
     except ValueError as error:
-        assert "checkpoint_version=13" in str(error)
+        assert "checkpoint_version=14" in str(error)
     else:
         raise AssertionError("legacy architecture checkpoint must be rejected")
 
 
 def test_checkpoint_preflight_accepts_complete_payload():
     payload = {
-        "checkpoint_version": 13,
-        "architecture": "trifuse_v10",
+        "checkpoint_version": 14,
+        "architecture": "trifuse_v11",
         "runtime_config": {
             "activation_clamp": 100.0,
             "torsion_expert_aux_weight": 0.25,
+            "lora_warmup_steps": 100,
         },
         "trifuse_state_dict": {"x": 1},
         "expert_lora_state_dict": {str(i): i for i in range(336)},
@@ -77,8 +79,8 @@ def test_checkpoint_preflight_accepts_complete_payload():
 
 def test_checkpoint_preflight_rejects_missing_runtime_config():
     payload = {
-        "checkpoint_version": 13,
-        "architecture": "trifuse_v10",
+        "checkpoint_version": 14,
+        "architecture": "trifuse_v11",
         "trifuse_state_dict": {"x": 1},
         "expert_lora_state_dict": {str(i): i for i in range(336)},
         "expert_lora_config": {"rank": 4},

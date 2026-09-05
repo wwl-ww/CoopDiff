@@ -63,7 +63,7 @@ TriFuse 不输出 rigid score、merge gate 或 SE(3) residual。刚体动力学�
 
 ## Checkpoint 与恢复
 
-当前架构标识为 `trifuse_v10`，checkpoint version 为 13。每个 expert layer 对每个 ligand atom 生成独立的 scalar FiLM；vector irreps 不被直接调制，最终 FiLM 投影保持 zero-init。逐层 invariant telemetry 只进入后验 torsion 协调，不形成循环或重复 forward。旧权重不兼容。
+当前架构标识为 `trifuse_v11`，checkpoint version 为 14。除逐原子 scalar FiLM 外，TriFuse 以恒等初始化的有界标量分别校准五类可执行 score；LoRA 在显式 warmup 后才启用，避免适配器抢先吞掉几何任务。旧权重不兼容。
 
 ## 最小验收
 

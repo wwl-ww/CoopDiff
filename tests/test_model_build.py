@@ -39,6 +39,8 @@ def test_trifuse_build():
 
     assert out['confidence'].shape == (1, 1)
     assert out['state'].shape == (1, 2)
+    assert out['score_gains'].shape == (1, 5)
+    assert torch.allclose(out['score_gains'], torch.ones_like(out['score_gains']))
     assert out['h_e3l'].shape == (1, trifuse.node_dim)
     assert out['h_pol'].shape == (1, trifuse.node_dim)
     assert not torch.allclose(out['h_e3l'], out['h_pol'])
@@ -204,6 +206,19 @@ def test_trifuse_atom_film_can_select_ligand_regions():
     assert gamma.shape == (4, 8)
     assert not torch.allclose(gamma[0], gamma[1])
     print("  [OK] FiLM can select individual ligand atoms")
+
+
+def test_score_control_is_identity_bounded_and_trainable():
+    """Score calibration starts exact identity and cannot reverse direction."""
+    from tricoopdiff.trifuse import ScoreControlHead
+
+    head = ScoreControlHead(hidden_dim=16, max_delta=0.25)
+    context = torch.randn(3, 16)
+    assert torch.equal(head(context), torch.ones(3, 5))
+    torch.nn.init.normal_(head.net[-1].weight)
+    gains = head(context)
+    assert bool(((gains >= 0.75) & (gains <= 1.25)).all())
+    print("  [OK] Score controls are identity-initialized and bounded")
 
 
 def test_torsion_coordinator_zero_init_and_per_bond_control():
@@ -493,6 +508,7 @@ if __name__ == "__main__":
     test_trifuse_reads_sigma_and_solver_state()
     test_film_zero_init()
     test_trifuse_atom_film_can_select_ligand_regions()
+    test_score_control_is_identity_bounded_and_trainable()
     test_torsion_coordinator_zero_init_and_per_bond_control()
     test_torsion_coordinator_rejects_flat_native_shape()
     test_torsion_coordinator_does_not_overflow_finite_evidence()

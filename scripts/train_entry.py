@@ -60,7 +60,7 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument(
         "--nan-clamp", type=float, default=100.0,
-        help="Per-layer expert activation clamp recorded in v13 checkpoints",
+        help="Per-layer expert activation clamp recorded in v14 checkpoints",
     )
     p.add_argument(
         "--torsion-expert-aux-weight", type=float, default=0.25,
@@ -75,6 +75,10 @@ def parse_args():
     p.add_argument("--lora_early_alpha", type=float, default=4.0)
     p.add_argument("--lora_lr", type=float, default=1e-5)
     p.add_argument("--lora_early_lr", type=float, default=5e-6)
+    p.add_argument(
+        "--lora-warmup-steps", type=int, default=100,
+        help="Train TriFuse alone before enabling expert LoRA adapters",
+    )
 
     # Phase
     p.add_argument("--phase", type=int, default=1, choices=[1, 2],
@@ -373,6 +377,7 @@ def build_trainer(args, device, input_dim=None):
         lora_early_layers=getattr(args, 'lora_early_layers', 4),
         activation_clamp=args.nan_clamp,
         torsion_expert_aux_weight=args.torsion_expert_aux_weight,
+        lora_warmup_steps=args.lora_warmup_steps,
         device=device,
     )
 
