@@ -134,9 +134,10 @@ class TriCoopDiffTrainer:
         device = self.device
 
         # Both relative interface variables share a clock but receive
-        # independent noise draws. This matches inference while ensuring each
-        # frozen expert sees the native DiffDock forward marginal it was trained
-        # on. ``t_pol_override`` is available as the explicit POI--Ligand clock
+        # independent noise draws. Only the clock and assembly convention match
+        # inference: the native DSM terminal distribution is NOT the SDPI prior.
+        # See scripts/audit_initialization_consistency.py. ``t_pol_override``
+        # is available as the explicit POI--Ligand clock
         # for diagnostics; production training uses the shared clock.
         t = (t_override.to(device=device, dtype=torch.float32)
              if t_override is not None else torch.rand(B, device=device))
