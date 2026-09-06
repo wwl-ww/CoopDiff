@@ -139,7 +139,7 @@ $$
 
 ## 6. 双 expert 的逐步联合更新
 
-DiffDock 的 `tr/rot` 输出是切空间 score，不是可以直接取负或平均的最终 pose。每一步必须先使用各自的 σ、dt、SDE/ODE 漂移和随机项，从同一旧状态生成两个有限刚体 proposal：`D_A` 与 `D_B`。
+DiffDock 的原始 `tr/rot` 输出不是最终 pose。生产流程按 §8 转为速度参数化，使用 dt 从同一旧状态生成两个有限刚体 proposal：`D_A` 与 `D_B`，不添加随机 SDE 项。
 
 若选择统一 ligand 刚体更新 C，则全局组合为：
 
@@ -186,97 +186,95 @@ $$
 
 `initial_noise_std_proportion` 必须为上述固定正值；负值或任何请求固定绝对尺度的配置必须直接报错。文档、CLI、缓存签名和结果 JSON 均使用 `sdpi` 表示这一唯一语义，禁止同名模式随配置切换分布。
 
-## 8. 训练—推理一致性
+## 8. 训练—推理契约：SDPI Flow v1
 
-建议将扩散状态显式定义为：
+生产训练与采样改为条件流匹配，`generative_process=sdpi_flow_v1`。
+`t=0` 是原始晶体，`t=1` 是 SDPI 的可动自由度先验。**不投影晶体真值，
+不新增内部几何自由度**。ETKDG 与晶体的刚性片段内部几何差异仍是明确的
+近似，不能宣称全坐标终端分布完全相同。
 
-$$
-X_A=\operatorname{pose}(L\mid A),\quad
-X_B=\operatorname{pose}(L\mid B),\quad
-\theta=\text{shared torsion}(L).
-$$
+### 8.1 路径与端点
 
-训练从真实三元结构出发，对 `X_A`、`X_B` 施加独立刚体噪声，但共享时间条件和唯一 torsion 噪声。当前 `add_noise_interface_pair()` 与推理 initializer 共用 `assemble_interface_pair()`，用已知变换解析重建三元坐标。
+令原始配体中心为 c₀，两侧受体中心为 cᵢ、SDPI 尺度为 sᵢ。
+独立采样 zᵢ ~ N(0,I)、Rᵢ,₁ ~ Haar(SO(3))，并对每个共享 torsion
+采样 aⱼ ~ Uniform(-π,π)。置：
 
-训练 forward marginal、DiffDock 的经验终端初始化和带二元候选的局部 proposal 是三种不同对象：
+- mᵢ(t) = (1-t)c₀ + t(cᵢ+sᵢzᵢ)；
+- Rᵢ(t) = Exp(t Log(Rᵢ,₁))，使用主值 Log（π 切割处为零测集）；
+- C(t) = 对原始配体应用 t·a 的完整 torsion 旋转，再将中心移回 c₀。
 
-- 当前广域 `sdpi` prior：仅从 `t_start=1` 开始；
-- 未来二元 pose 周围的局部 proposal：需使用相同 forward kernel，并从匹配的 `t_anchor<1` 开始；当前没有该入口；
-- 组件级 bounded 5 Å 分布不等于训练的 `t=1`，旧实现已删除。
+Lᵢ(t) = (C(t)-c₀) Rᵢ(t)ᵀ + mᵢ(t)。
+两侧通过 `assemble_interface_pair` 解析装配；E3 固定，完整配体只有一份。
+t=0 精确返回晶体；t=1 的中心为受体自适应 Gaussian、姿态为 Haar、
+可旋转角为 uniform。Haar/圆周 uniform 的平移不变性消除了原生位姿和
+初始 torsion 对这些终端变量分布的影响。不可旋转的内部几何不在此结论内。
 
-训练和推理必须共用 `compose/decompose`、frame 和 torsion 映射实现。
+### 8.2 速度目标与对齐修正
 
-### 8.1 当前并未实现终端分布一致性
+平移目标为 cᵢ+sᵢzᵢ-c₀，torsion 目标为 a。
+采样器每次 torsion 后做相对上一步的 Kabsch 对齐，因而会移除刚体自旋；
+训练必须把这部分自旋补入两侧 angular velocity，不能仅监督 Log(Rᵢ,₁)。
 
-`sdpi_v1` 与 native DSM **只对齐了状态、时间和装配约定**，不能因为调用
-同一装配函数就宣称生成过程一致。需要同时处理以下问题：
+对当前中心化形状 x，先按 directed bond axis 解析计算 torsion 的原子速度 w，
+减去其均值，再计算：
 
-1. 平移：给定原生样本，训练终端配体中心服从
-   `N(c_native, 19² I)`；推理服从 `N(c_receptor, sigma_init² I)`。
-   仅把训练的 19 换成 `sigma_init` 仍保留中心差异。
-2. 旋转和 torsion：有限时间的热核不等于精确均匀先验。对 wrapped normal
-   torsion，条件一阶圆周矩的模为 `exp(-sigma²/2)`；当前终端约为
-   `0.007228`，而 uniform 为 0。这个条件差异不能直接当成数据边缘分布差异。
-3. 配体几何：训练保留晶体构象的键长、键角和刚性片段几何；推理保留
-   新 ETKDG 构象的相应量。刚体＋合法 torsion 更新不能改变这些不变量。
-   调整噪声或增加步数不能消除此类不可达性。
-4. 前向核改变时，DSM target、score normalization、反向系数和时间条件
-   必须一起推导；经验 temperature sampling 也不能自动视为新过程的精确反演。
-   新目标不能默认兼容旧 checkpoint。
+- J = Σ (||xₙ||² I - xₙ xₙᵀ)；
+- ω_shape = J⁺ Σ (xₙ × wₙ)；
+- ωᵢ = Log(Rᵢ,₁) + Rᵢ(t) ω_shape。
 
-### 8.2 可复现数学审计
+POI-side 目标再映射到当前 E3/global frame。
+这是一阶最小二乘刚体自旋分解；原子坐标有限差分用于独立测试，不参与生成
+训练目标。路径直接使用光滑 bond rotations，禁止逐状态拟合回 native，
+以免长链折叠构象的全局 Kabsch chart 引入奇异速度。
 
-从仓库根目录运行（无需模型或 GPU）：
+### 8.3 损失、预条件与反向积分
 
-```bash
-python tests/test_initialization_audit.py
-python scripts/audit_initialization_consistency.py \
-  --case-dirs DeepTernary/output/protac22/5T35_D_A_759 \
-              DeepTernary/output/protac22/6BN7_B_C_RN3 \
-              DeepTernary/output/protac22/7JTO_L_B_VKA \
-  --seeds 0 7 42 --out results/sdpi_consistency_audit.json
-```
+用按受体 sᵢ 和 π 归一化的速度 MSE，监督两个界面和唯一共享 torsion，
+保留两侧 torsion 辅助监督。固定条件下的平方损失最优解为
+v(x,t)=E[dXₜ/dt | Xₜ=x,t,条件]。
+对任意光滑测试函数 f，
+dE[f(Xₜ)]/dt = E[∇f(Xₜ)·v(Xₜ,t)]，因此该速度场满足路径边缘分布的
+连续性方程。这是流匹配的数学依据，不保证有限网络或有限训练达到最优解。
 
-脚本记录输入 SHA256、完整初始化 provenance、两侧条件 Gaussian KL 和
-不变原子对的距离误差。这里
+DiffDock 的旧 sigma/score_norm 仅保留为预训练骨干的时间特征与输出预条件：
+normalized translation = -sigma_tr × raw_tr；
+normalized rotation = -raw_rot / score_norm_rot；
+normalized torsion = -raw_tor / sqrt(E[score_tor²])。
+这些不是“旧 score 自动等于新速度”的恒等式，TriFuse/LoRA 必须重新训练。
 
-$$
-D_{KL}(q_T(\cdot\mid x_0)\Vert p_{init})=
-\frac12\left[3\left(\frac{s^2}{r^2}-1-2\log\frac{s}{r}\right)
-+\frac{\|c_{native}-c_{receptor}\|^2}{r^2}\right].
-$$
+生产采样使用确定性的反向 Lie–Euler 积分：
+中心减去 dt·v_tr，旋转左乘 Exp(-dt·ω)，torsion 更新为 -dt·v_tor，
+并使用同源双 proposal 解析更新 POI/body frame。
+不再使用经验温度、随机 SDE 增量或旧 DSM target。
+`freeze_poi` 仅是改变生成过程的诊断，不属于完整双界面契约。
 
-这是**逐样本条件 KL**，不是数据边缘 `q_T` 的 KL，不能把它解释为后者的
-下界。几何检查包含删除可旋转键后各刚性片段内的全部原子对，以及所有
-1–2、1–3 原子对。对任意不变原子对距离差 `d`，任意合法 torsion 和刚体
-拟合后的 indexed-atom RMSD 均满足 `RMSD >= |d| / sqrt(2N)`，由三角不等式
-及 Cauchy–Schwarz 不等式直接得到。零误差只是必要条件，不证明完整可达性；
-该界不包含原子对称置换，也不是 DockQ 界。
+checkpoint 必须为 version 17、architecture=trifuse_v13、
+generative_process=sdpi_flow_v1。旧 version 16 不允许静默恢复。
+初始化本身仍是 sdpi_v1；评估报告和续跑签名另记生成过程版本。
 
-2026-09-06，float64 输入、当前 vendored torsion 实现、seeds 0/7/42：
+### 8.4 验证与边界
 
-| case | E3 / POI 条件平移 KL（nat） | 最大不变距离差范围（Å） | RMSD 保守下界范围（Å） |
-|---|---:|---:|---:|
-| 5T35_D_A_759 | 1.3061 / 2.1766 | 0.3492–0.4828 | 0.0297–0.0411 |
-| 6BN7_B_C_RN3 | 0.9692 / 1.5198 | 0.3766–0.3980 | 0.0338–0.0357 |
-| 7JTO_L_B_VKA | 1.6032 / 1.0636 | 0.6148–0.7423 | 0.0469–0.0566 |
+运行 `python tests/test_sdpi_flow.py`，检查晶体/先验端点、完整坐标切向量、
+步长收敛、全局等变性、反向 oracle、速度归一化和训练梯度。
 
-9/9 初始化均存在超过 `1e-5 Å` 容差的不变量差异。这证明当前采样自由度
-无法精确重建这些 indexed 晶体坐标，**不证明这是低 DockQ 的主要原因**；
-上面的 RMSD 下界很小，不能夸大为严重精度损失。
+真实案例脚本 `scripts/validate_sdpi_flow.py` 接受 `--case-dirs`、
+`--seeds`、`--out`；可另加 `--gpu-smoke-dir`（必须为不存在的目录）。
+GPU smoke 检查真实 optimizer step、LoRA warmup、参数更新、保存恢复及20步采样。
+benchmark smoke 产物只作诊断，不能作为正式训练起点或精度报告。
 
-### 8.3 后续修改必须先明确训练目标
+首轮 5T35_D_A_759、6BN7_B_C_RN3、7JTO_L_B_VKA 各3个seed的几何门禁通过；
+3次 GPU 更新、checkpoint 恢复和3个case各20步采样通过。
+这不证明 DockQ 提升，更不证明流匹配优于经过充分训练的 DSM 基线。
 
-尚未替换当前生产 forward/loss/sampler；审计通过表示诊断实现正确，
-不是训练—推理一致性通过。两条路线不能静默混为一谈：
+2026-09-07 收尾全套回归为77项通过；真实几何复查9组通过，
+半步完整坐标误差最大约9.01e-7 Å（dt=5e-5，仅作局部切向量门禁）。
+GPU首轮报告为 `results/sdpi_flow_validation_v1.json`；最终复跑使用
+`results/sdpi_flow_validation_final.json`。诊断 checkpoint 均与正式训练隔离。
 
-- 保留刚体＋torsion：从与推理同分布、独立于 native 的参考构象出发，
-  将原生目标显式投影到该可达空间，记录投影误差并继续用原始结构评估。
-  再为这个目标推导以实际 SDPI 为起点的生成过程与监督目标。
-- 保留原始晶体坐标目标：扩展配体内部几何自由度，重新处理化学约束、
-  模型输出与动力学。不能只把原有 torsion head 换个名字。
-
-前者改变训练目标，后者改变状态空间；在决定前不得声称已经实现严格对齐。
+旧 native DSM 的不匹配诊断保留在 `scripts/audit_initialization_consistency.py`；
+该脚本固定审计旧过程，不是新 flow 的通过/失败门禁。其不可变几何诊断仍适用：
+3个case、9次初始化的不变距离差为0.35–0.74 Å，保守 indexed-atom RMSD
+下界约0.03–0.06 Å；这是下界，不是误差上界或 DockQ 界。
 
 ## 9. 碰撞、口袋和 MGD 边界
 
@@ -286,7 +284,7 @@ $$
 
 ## 10. 已实现与后续工作
 
-已实现完整 ligand 共享构象、单次 torsion、双侧受体自适应尺度、解析装配，以及 sampler/CLI/trace/缓存/续跑签名接入。固定尺度与旧局部路径已删除；模型架构和训练目标不变。
+已实现完整 ligand 共享构象、单次 torsion、双侧受体自适应尺度、解析装配，以及 sampler/CLI/trace/缓存/续跑签名接入。固定尺度与旧局部路径已删除；当前训练目标与采样改为 §8 的 SDPI Flow，模型骨干架构保持不变。
 
 后续实验是：同 seed、同构象配置下比较独立 DiffDock A/B、双 expert＋固定 torsion 平均、训练后 TriFuse。当前 zero-init smoke 只验证有限采样，不替代三组精度对照。
 

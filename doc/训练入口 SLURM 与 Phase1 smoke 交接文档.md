@@ -20,7 +20,7 @@ sacct -j <job_id> --format=JobID,State,ExitCode,Elapsed,NodeList
 - 检查 CUDA、DeepTernary 数据索引、expert 参数/权重及缓存可写性；
 - Hugging Face 使用本地缓存并设置 offline 模式，作业不得静默下载模型。
 
-特征缓存当前为 version 5，包含初始化所需的索引化 RDKit 化学图。旧缓存不能直接用于 `sdpi` 推理，需要通过正式特征化入口重建；模型权重格式仍为 version 16。
+特征缓存当前为 version 5，包含初始化所需的索引化 RDKit 化学图。旧缓存不能直接用于 `sdpi` 推理，需要通过正式特征化入口重建；模型权重格式仍为 version 17。
 
 ## Phase 1 门禁
 
@@ -44,7 +44,7 @@ sacct -j <job_id> --format=JobID,State,ExitCode,Elapsed,NodeList
 sbatch scripts/train_deepternary_phase1.slurm
 ```
 
-Smoke 验收至少检查：退出码 0；两个界面的 loss、总 loss和全部 TriFuse/LoRA/bridge 梯度有限；训练和验证均有有效 batch；FiLM/LoRA/torsion coordinator 参数发生更新；每 epoch checkpoint 可读；验证阶段保持 eval mode。日志应分别打印 E3–Ligand 与 POI–Ligand 的 translation、rotation、branch torsion 和 joint torsion loss。产出的 checkpoint 必须是 version 16 且标记 `architecture=trifuse_v13`；旧版本应明确失败。
+Smoke 验收至少检查：退出码 0；两个界面的 loss、总 loss和全部 TriFuse/LoRA/bridge 梯度有限；训练和验证均有有效 batch；FiLM/LoRA/torsion coordinator 参数发生更新；每 epoch checkpoint 可读；验证阶段保持 eval mode。日志应分别打印 E3–Ligand 与 POI–Ligand 的 translation、rotation、branch torsion 和 joint torsion loss。产出的 checkpoint 必须是 version 17 且标记 `architecture=trifuse_v13`、`generative_process=sdpi_flow_v1`；旧版本应明确失败。
 
 ## 产物管理
 
