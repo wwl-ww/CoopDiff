@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-eval "$(/data/home/scwb792/run/miniconda3/bin/conda shell.bash hook)"
+source /data/home/scwb792/run/miniconda3/etc/profile.d/conda.sh
 conda activate tricoopdiff
 
 PROJECT_ROOT="/data/run01/scwb792/mwj/CoopDiff"
