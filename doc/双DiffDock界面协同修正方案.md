@@ -12,12 +12,12 @@ TriCoopDiff 以 E3 为固定全局参考系，扩散状态不是“全局 Ligand
 
 ## 一步更新
 
-每个反向扩散步按以下顺序执行：
+每个反向流积分步按以下顺序执行：
 
-1. 两个 expert 在同一个旧 Ligand 状态上预测 score。
+1. 两个 expert 在同一个旧 Ligand 状态上预测原始输出，再按 SDPIFlow 的预条件转换为速度。
 2. 从该旧状态分别生成 E3–Ligand proposal `L1` 和 POI–Ligand proposal `L2`。
 3. Ligand 采用 `L1`；求 `L2 → L1` 的精确刚体变换，并把同一变换施加给旧 POI。
-4. TriFuse 按可旋转键融合两侧 torsion score，并将唯一的共享 torsion 更新应用一次。
+4. TriFuse 按可旋转键融合两侧 torsion score，并将唯一的共享 torsion 速度更新应用一次。
 5. 同步重建 POI local frame、receptor crop、cross-edge 和两个 expert 图。
 
 旋转必须使用 SO(3)/SE(3) 群组合；禁止把 rotation vector 简单取负来近似逆变换。架构中不存在 residual-gated merge，也不存在独立预测 POI 运动的 TriFuse SE(3) head。
@@ -36,7 +36,7 @@ TriFuse 不合并 rigid score、不输出 Ligand/POI SE(3) residual，也不替�
 
 ## 训练与推理对齐
 
-训练分别对 `T_E3L` 和 `T_POL` 使用 native DiffDock forward noise。加噪后的两个相对刚体通过精确 SE(3) 组合重建唯一且一致的全局 Ligand/POI 坐标，然后构建两个二体图。每个 expert 接收自己界面的真实时间和噪声目标，禁止独立扰动全局 POI 后让 `sub2` 复用 `sub1` 的时间条件。
+训练使用 SDPI 条件流路径：晶体为 t=0，双 Haar/受体自适应 Gaussian/共享 uniform torsion 为 t=1；通过精确 SE(3) 组合重建全局坐标。监督两个界面速度与共享 torsion 速度，包含对齐自旋修正。两个界面必须使用同一时间。旧 DiffDock sigma 只用于骨干预条件，不再代表训练噪声方差，详见[初始化规范 §8](初始化方案_gpt6.md)。
 
 推理同样维护这两个界面状态。唯一初始化 `sdpi` 使用共享完整构象与两侧尺寸自适应先验，见[初始化规范](初始化方案_gpt6.md)。
 
@@ -44,11 +44,11 @@ TriFuse 不合并 rigid score、不输出 Ligand/POI SE(3) residual，也不替�
 
 新架构 checkpoint 必须同时满足：
 
-- `checkpoint_version == 16`；
+- `checkpoint_version == 17`；
 - `architecture == "trifuse_v13"`；
 - 包含与当前 branch-specific FiLM/LoRA 配置匹配的状态。
 
-加载器只接受 version 16 和匹配的架构/运行配置；不提供静默迁移路径。旧 checkpoint 只能留作历史结果，不据此推断其已完成当前训练。
+加载器只接受 version 17 和匹配的架构/运行配置；不提供静默迁移路径。旧 checkpoint 只能留作历史结果，不据此推断其已完成当前训练。
 
 Expert 每层卷积采用显式 activation clamp，默认值为 100，实际值写入 checkpoint 的 `runtime_config`。评估必须恢复训练值；该策略不能替代正确的界面坐标与输入分布。
 
@@ -60,4 +60,4 @@ Expert 每层卷积采用显式 activation clamp，默认值为 100，实际值�
 - `L2 → L1` 变换前后 POI–Ligand 跨界面距离保持不变；
 - 两分支输出有限，TriFuse 协调后的 torsion 只应用一次；
 - forward-only、optimizer step 和 smoke training 全程 finite；
-- v15 及更早 checkpoint 被明确拒绝，v16 架构标识不匹配时立即失败。
+- v16 及更早 checkpoint 被明确拒绝，v17 还必须匹配 generative_process=sdpi_flow_v1。

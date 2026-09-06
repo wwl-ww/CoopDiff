@@ -25,7 +25,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from .model import TriCoopDiff
-from .diffusion import InterfaceDiffusion
+from .sdpi_flow import SDPIFlow, CHECKPOINT_VERSION, FLOW_VERSION
 
 
 class NonFiniteTrainingError(FloatingPointError):
@@ -36,13 +36,13 @@ class TriCoopDiffTrainer:
     """
     Trainer for TriCoopDiff model.
 
-    Handles interface score matching and gradient isolation of frozen experts.
+    Handles conditional velocity matching and gradient isolation of frozen experts.
     """
 
     def __init__(
         self,
         model: TriCoopDiff,
-        diffusion: InterfaceDiffusion,
+        diffusion: SDPIFlow,
         lr: float = 1e-4,
         weight_decay: float = 1e-4,
         device: str = 'cuda',
@@ -53,6 +53,8 @@ class TriCoopDiffTrainer:
         torsion_expert_aux_weight: float = 0.25,
         lora_warmup_steps: int = 100,
     ):
+        if not isinstance(diffusion, SDPIFlow):
+            raise ValueError('training requires SDPIFlow, not the legacy DSM process')
         self.model = model.to(device)
         self.diffusion = diffusion
         self.device = device
@@ -111,181 +113,69 @@ class TriCoopDiffTrainer:
             parameter.requires_grad = bool(trainable)
 
     def compute_loss(
-        self,
-        e3_data: dict,
-        poi_data: dict,
-        ligand_data: dict,
-        case: str = "unknown",
-        t_override: Optional[torch.Tensor] = None,
+        self, e3_data: dict, poi_data: dict, ligand_data: dict,
+        case: str = "unknown", t_override: Optional[torch.Tensor] = None,
         t_pol_override: Optional[torch.Tensor] = None,
     ) -> dict:
-        """
-        Compute forward pass + losses without backward.
-        Shared by train_step and validate_step.
-
-        Returns:
-            dict of loss values and intermediate tensors
-        """
-        # NOTE: this method intentionally does NOT set self.model.train()/eval().
-        # The caller owns the mode: train_step() sets train(), validate_step()
-        # sets eval(). Setting train() here would clobber the eval() mode that
-        # validate_step() establishes, keeping dropout active during validation.
-        B = e3_data['coords'].shape[0]
+        """Conditional velocity matching; t=0 crystal, t=1 SDPI movable DOFs."""
+        if e3_data['coords'].shape[0] != 1:
+            raise ValueError("SDPI flow training requires B=1")
         device = self.device
-
-        # Both relative interface variables share a clock but receive
-        # independent noise draws. This matches inference while ensuring each
-        # frozen expert sees the native DiffDock forward marginal it was trained
-        # on. ``t_pol_override`` is available as the explicit POI--Ligand clock
-        # for diagnostics; production training uses the shared clock.
-        t = (t_override.to(device=device, dtype=torch.float32)
-             if t_override is not None else torch.rand(B, device=device))
-        t_pol = (t_pol_override.to(device=device, dtype=torch.float32)
-                 if t_pol_override is not None else t.clone())
-        if t.ndim == 0:
-            t = t.expand(B)
-        if t_pol.ndim == 0:
-            t_pol = t_pol.expand(B)
-        if t.shape != (B,) or t_pol.shape != (B,):
-            raise ValueError(
-                f"interface time overrides must have shape [{B}], got "
-                f"{tuple(t.shape)} and {tuple(t_pol.shape)}"
-            )
-
-        noisy_ligand, noisy_poi, interface_noise, r_e3_to_poi = (
-            self.diffusion.add_noise_interface_pair(
-                ligand_data['coords'].to(device),
-                poi_data['coords'].to(device),
-                t,
-                t_pol,
-            )
+        e3_data = {**e3_data, 'coords': e3_data['coords'].to(device)}
+        poi_data = {**poi_data, 'coords': poi_data['coords'].to(device)}
+        ligand_data = {**ligand_data, 'coords': ligand_data['coords'].to(device)}
+        t = (torch.rand(1, device=device) if t_override is None
+             else torch.as_tensor(t_override, device=device, dtype=torch.float32).reshape(-1))
+        if t.shape != (1,) or not torch.isfinite(t).all() or not bool(((t >= 0) & (t <= 1)).all()):
+            raise ValueError("flow time must be one finite value in [0, 1]")
+        if t_pol_override is not None:
+            other = torch.as_tensor(t_pol_override, device=device, dtype=t.dtype).reshape(-1)
+            if other.shape != t.shape or not torch.equal(t, other):
+                raise ValueError("SDPI flow requires one shared interface clock")
+        coupling = self.diffusion.sample_coupling(
+            e3_data['coords'], poi_data['coords'], ligand_data,
+            no_torsion=bool(getattr(self.model.expert.model, 'no_torsion', False)),
         )
-        # Add torsion noise (rotatable-bond angles) — the PROTAC-specific DOF
-        tor_update = None
-        if ligand_data.get('edge_mask') is not None and ligand_data.get('mask_rotate') is not None:
-            noisy_ligand, tor_update = self.diffusion.add_torsion_noise(
-                noisy_ligand, t,
-                ligand_data['edge_index'], ligand_data['edge_mask'], ligand_data['mask_rotate'],
-            )
-        # Prepare noisy batch
-        noisy_e3_data = {**e3_data, 'coords': e3_data['coords'].to(device)}
-        noisy_poi_data = {**poi_data, 'coords': noisy_poi}
-        noisy_ligand_data = {**ligand_data, 'coords': noisy_ligand}
-
-        tr_sigma, rot_sigma, tor_sigma = self.diffusion.t_to_sigma(t, t, t)
-        pol_tr_sigma, pol_rot_sigma, _ = self.diffusion.t_to_sigma(
-            t_pol, t_pol, t_pol,
-        )
-        nominal_dt = t.new_full((B, 3), 1.0 / self.diffusion.inference_steps)
-        diffusion_state = torch.cat((
-            torch.log(torch.stack((
-                tr_sigma, rot_sigma, tor_sigma, pol_tr_sigma, pol_rot_sigma,
-            ), dim=-1).clamp_min(1e-8)),
-            nominal_dt,
-            (0.5 * (t + t_pol)).unsqueeze(-1),
-        ), dim=-1)
-
+        ligand, poi, body, targets = self.diffusion.path(ligand_data, poi_data['coords'], coupling, t)
+        dt = t.new_full((1,), 1 / self.diffusion.inference_steps)
+        conditioning = self.diffusion.conditioning(t, dt, e3_data['coords'], poi_data['coords'])
+        tr_condition, _, _ = self.diffusion.t_to_sigma(t, t, t)
+        crop = (tr_condition * 3 + 20
+                if bool(getattr(self.model.expert.model, 'dynamic_max_cross', False)) else None)
         output = self.model(
-            noisy_e3_data,
-            noisy_poi_data,
-            noisy_ligand_data,
-            t_e3l=t,
-            t_pol=t_pol,
-            r_e3_to_poi=r_e3_to_poi,
-            diffusion_state=diffusion_state,
+            e3_data, {**poi_data, 'coords': poi}, {**ligand_data, 'coords': ligand},
+            t_e3l=t, t_pol=t, r_e3_to_poi=body,
+            diffusion_state=conditioning, receptor_crop_cutoff=crop,
         )
-
-        nonfinite_components = []
-        for branch, scores in output['interface_scores'].items():
-            for name, score in scores.items():
-                if score is not None and score.numel() > 0 and not torch.isfinite(score).all():
-                    nonfinite_components.append(f"{branch}.{name}")
-        if not torch.isfinite(output['torsion_score']).all():
-            nonfinite_components.append('torsion_score')
-        if nonfinite_components:
-            raise NonFiniteTrainingError(
-                f"case={case}: non-finite model scores: {','.join(nonfinite_components)}"
-            )
-
-        # Score matching loss — matches DiffDock paper §4
-        # Translation: weighted by σ² (R³ Euclidean DSM)
-        # Rotation: normalized by SO(3) score_norm
-        # Torsion: normalized by torus score_norm
-        from .diffusion import so3_score_norm
-
-        e3l = output['interface_scores']['e3_ligand']
-        pol = output['interface_scores']['poi_ligand']
-
-        target_e3l_tr = (
-            -interface_noise['e3_ligand']['tr'] / tr_sigma.unsqueeze(-1) ** 2
-        )
-        target_e3l_rot = self._compute_rot_score_target(
-            interface_noise['e3_ligand']['rot_omega'], rot_sigma,
-        )
-        loss_e3l_tr = (
-            (e3l['tr'] - target_e3l_tr) ** 2 * tr_sigma.unsqueeze(-1) ** 2
-        ).mean()
-        loss_e3l_rot = (
-            (e3l['rot'] - target_e3l_rot) ** 2
-            / so3_score_norm(rot_sigma).unsqueeze(-1) ** 2
-        ).mean()
-
-        target_pol_tr_local = (
-            -interface_noise['poi_ligand']['tr_local']
-            / pol_tr_sigma.unsqueeze(-1) ** 2
-        )
-        target_pol_rot_local = self._compute_rot_score_target(
-            interface_noise['poi_ligand']['rot_omega_local'], pol_rot_sigma,
-        )
-        local_to_e3 = r_e3_to_poi.transpose(-1, -2)
-        target_pol_tr = target_pol_tr_local @ local_to_e3
-        target_pol_rot = target_pol_rot_local @ local_to_e3
-        loss_pol_tr = (
-            (pol['tr'] - target_pol_tr) ** 2
-            * pol_tr_sigma.unsqueeze(-1) ** 2
-        ).mean()
-        loss_pol_rot = (
-            (pol['rot'] - target_pol_rot) ** 2
-            / so3_score_norm(pol_rot_sigma).unsqueeze(-1) ** 2
-        ).mean()
-
-        if tor_update is not None and output['torsion_score'].numel() > 0:
-            tor_score_target = self._compute_tor_score_target(tor_update, tor_sigma)
-            tor_norm = self._compute_tor_score_norm(tor_sigma)  # E[score²], like so3
-            loss_score_tor = (
-                (output['torsion_score'] - tor_score_target) ** 2 / tor_norm
-            ).mean()
-            loss_e3l_tor = (
-                (e3l['tor'] - tor_score_target) ** 2 / tor_norm
-            ).mean()
-            loss_pol_tor = (
-                (pol['tor'] - tor_score_target) ** 2 / tor_norm
-            ).mean()
-        else:
-            loss_score_tor = torch.tensor(0.0, device=device)
-            loss_e3l_tor = torch.tensor(0.0, device=device)
-            loss_pol_tor = torch.tensor(0.0, device=device)
-
-        loss_score = (
-            loss_e3l_tr + loss_e3l_rot
-            + loss_pol_tr + loss_pol_rot
-            + loss_score_tor
-            + self.torsion_expert_aux_weight
-            * 0.5 * (loss_e3l_tor + loss_pol_tor)
-        )
-        loss_total = loss_score
-
-        return {
-            'loss_total': loss_total,
-            'loss_score': loss_score.item(),
-            'loss_e3l_tr': loss_e3l_tr.item(),
-            'loss_e3l_rot': loss_e3l_rot.item(),
-            'loss_pol_tr': loss_pol_tr.item(),
-            'loss_pol_rot': loss_pol_rot.item(),
-            'loss_score_tor': loss_score_tor.item(),
-            'loss_e3l_tor': loss_e3l_tor.item(),
-            'loss_pol_tor': loss_pol_tor.item(),
-        }
+        predictions = self.diffusion.normalized_predictions(output, t)
+        scales = self.diffusion.scales(e3_data['coords'], poi_data['coords'])
+        losses = {}
+        for index, (branch, prefix) in enumerate((('e3_ligand', 'e3l'), ('poi_ligand', 'pol'))):
+            for component, scale in (('tr', scales[index]), ('rot', np.pi)):
+                predicted = predictions[branch][component]
+                target = targets[branch][component] / scale
+                if predicted.shape != target.shape:
+                    raise ValueError(f"{branch}.{component} shape mismatch: {predicted.shape} vs {target.shape}")
+                losses[f'loss_{prefix}_{component}'] = (predicted - target).square().mean()
+        tor_target = targets['torsion'] / np.pi
+        if bool(getattr(self.model.expert.model, 'no_torsion', False)):
+            tor_target = tor_target[:, :0]
+        for name, predicted in (
+            ('loss_score_tor', predictions['torsion']),
+            ('loss_e3l_tor', predictions['e3_ligand']['tor']),
+            ('loss_pol_tor', predictions['poi_ligand']['tor']),
+        ):
+            if predicted.shape != tor_target.shape:
+                raise ValueError(f"{name} shape mismatch: {predicted.shape} vs {tor_target.shape}")
+            losses[name] = ((predicted - tor_target).square().mean()
+                            if predicted.numel() else t.new_zeros(()))
+        if any(not torch.isfinite(value) for value in losses.values()):
+            raise NonFiniteTrainingError(f"case={case}: non-finite SDPI velocity loss")
+        total = (losses['loss_e3l_tr'] + losses['loss_e3l_rot']
+                 + losses['loss_pol_tr'] + losses['loss_pol_rot'] + losses['loss_score_tor']
+                 + self.torsion_expert_aux_weight * 0.5 * (losses['loss_e3l_tor'] + losses['loss_pol_tor']))
+        return {'loss_total': total, 'loss_score': total.item(),
+                **{name: value.item() for name, value in losses.items()}}
 
     def train_step(self, **batch) -> dict:
         """Forward + backward + optimizer step."""
@@ -321,39 +211,6 @@ class TriCoopDiffTrainer:
         loss_dict = self.compute_loss(**batch)
         return {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
 
-    def _compute_rot_score_target(self, rot_omega, rot_sigma):
-        """Compute SO(3) score target from the sampled so(3) rotation vector.
-
-        Matches DiffDock `so3.score_vec(vec=omega, eps=sigma)`: the score of the
-        isotropic-Gaussian-on-SO(3) density evaluated at the sampled rotation
-        vector `omega`, returned in the same [B, 3] shape as the model's rot score.
-        """
-        from .diffusion import so3_score_vec
-        return so3_score_vec(rot_sigma, rot_omega)
-
-    def _compute_tor_score_target(self, tor_update, tor_sigma):
-        """Torus (SO(2)) score target from the sampled torsion-angle noise.
-
-        Matches DiffDock ``torus.score(torsion_updates, tor_sigma)``: the score of
-        the wrapped-Gaussian-on-SO(2) density evaluated at each sampled rotation
-        angle, returned in the same [B, n_rot] shape as the model's tor score.
-        """
-        from .diffdock.utils import torus
-        B = tor_update.shape[0]
-        targets = []
-        for b in range(B):
-            tgt = torus.score(
-                tor_update[b].detach().cpu().numpy(),
-                tor_sigma[b].detach().cpu().item(),
-            )
-            targets.append(torch.from_numpy(np.asarray(tgt, dtype=np.float32)).to(self.device))
-        return torch.stack(targets, dim=0)
-
-    def _compute_tor_score_norm(self, tor_sigma):
-        """Torus score norm E[score²] for torsion-loss normalization (DiffDock)."""
-        from .diffdock.utils import torus
-        norm = torus.score_norm(tor_sigma.detach().cpu().numpy())
-        return torch.from_numpy(np.asarray(norm, dtype=np.float32)).to(self.device).unsqueeze(-1)
 
     def scheduler_step(self, validation_loss: float):
         """Update the plateau scheduler from the completed validation pass."""
@@ -392,7 +249,8 @@ class TriCoopDiffTrainer:
                 f"checkpoint contract requires 336 LoRA tensors, got {len(lora_state)}"
             )
         payload = {
-            'checkpoint_version': 16,
+            'checkpoint_version': CHECKPOINT_VERSION,
+            'generative_process': FLOW_VERSION,
             'architecture': 'trifuse_v13',
             'runtime_config': {
                 'activation_clamp': self.activation_clamp,
@@ -426,10 +284,12 @@ class TriCoopDiffTrainer:
         (weights + global step only).
         """
         ckpt = torch.load(path, map_location=self.device)
-        if ckpt.get('checkpoint_version') != 16:
+        if ckpt.get('checkpoint_version') != CHECKPOINT_VERSION:
             raise ValueError(
-                "TriFuse training requires checkpoint_version=16"
+                "TriFuse flow training requires checkpoint_version=17"
             )
+        if ckpt.get('generative_process') != FLOW_VERSION:
+            raise ValueError('checkpoint generative process is not sdpi_flow_v1')
         if ckpt.get('architecture') != 'trifuse_v13':
             raise ValueError(
                 "checkpoint architecture is not trifuse_v13"

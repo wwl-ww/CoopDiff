@@ -6,7 +6,7 @@ flowchart TB
         E3["E3 蛋白<br/>残基特征 + 坐标"]
         POI["POI 蛋白<br/>残基特征 + 坐标"]
         LIG["PROTAC<br/>原子特征 + 共价键 + 坐标"]
-        TIME["扩散状态<br/>t · sigma · dt · progress"]
+        TIME["流时间与预条件状态<br/>t · sigma · dt · progress"]
     end
 
     subgraph TRIFUSE["TriFuse 协调网络"]
@@ -68,13 +68,13 @@ flowchart TB
     TOR --> TUPDATE
     E3FIX --> LUPDATE
     LUPDATE --> TUPDATE
-    TUPDATE --> OUTPUT["新的三元复合物状态<br/>进入下一扩散步"]
+    TUPDATE --> OUTPUT["新的三元复合物状态<br/>进入下一流积分步"]
     PUPDATE --> OUTPUT
 ```
 
 ## 模块职责
 
-- **TriFuse** 读取完整三元几何、Ligand 化学结构和扩散状态，产生两条专家路径各自的逐原子 FiLM。
+- **TriFuse** 读取完整三元几何、Ligand 化学结构和流时间与预条件状态，产生两条专家路径各自的逐原子 FiLM。
 - **sub1 DiffDock** 预测 E3–PROTAC 界面的平移、旋转和 torsion score。
 - **sub2 DiffDock** 在 POI 局部参考系中预测 POI–PROTAC 界面，再将向量 score 映射回 E3 全局参考系。
 - **Expert Bridge** 每层仅交换两路 Ligand 的标量表示，禁止跨参考系直接交换向量表示。

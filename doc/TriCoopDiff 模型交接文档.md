@@ -45,9 +45,9 @@ TriFuse 不自行输出笛卡尔 rigid score、merge gate 或 SE(3) residual。�
 
 ## 训练
 
-从真实三元坐标提取 `T_E3L,0` 与 `T_POL,0`。分别使用 native DiffDock forward process 对两个界面加平移、旋转噪声，并对共享 torsion 加噪；随后从噪声界面状态重建一致的全局坐标和二体图。
+从真实三元坐标构造通向 SDPI 终端的双界面条件流路径；随后解析重建一致的全局坐标和二体图。当前训练是 SDPI velocity matching，不是 native DiffDock DSM。
 
-每个 expert 必须接收与自身界面噪声一致的时间、sigma 和 target。不得独立扰动全局 POI，再把该相对噪声错误地标记为 Ligand 时间。训练损失直接监督两个界面 proposal，辅助 scalar loss 不得改变坐标 target。
+两侧共享流时间；sigma/score_norm 仅作为预训练输出的预条件。速度 target 包含 torsion 对齐所移除的自旋，采样反向 Lie–Euler 积分，不再叠加经验温度随机项。原始晶体目标不投影，详见[初始化规范 §8](初始化方案_gpt6.md)。
 
 ## 采样
 
@@ -63,7 +63,7 @@ TriFuse 不自行输出笛卡尔 rigid score、merge gate 或 SE(3) residual。�
 
 ## Checkpoint 与恢复
 
-当前架构标识为 `trifuse_v13`，checkpoint version 为 16。两个专家按层同步运行：每层各执行一次卷积，再按 canonical ligand atom ID 交换 scalar irreps，生成有界、zero-init 的下一次调制。bridge 不交换不同 frame 的 vector irreps，不增加卷积调用数。旧权重不兼容。
+当前架构标识为 `trifuse_v13`，checkpoint version 为 17（generative_process=sdpi_flow_v1）。两个专家按层同步运行：每层各执行一次卷积，再按 canonical ligand atom ID 交换 scalar irreps，生成有界、zero-init 的下一次调制。bridge 不交换不同 frame 的 vector irreps，不增加卷积调用数。旧权重不兼容。
 
 ## 最小验收
 
@@ -74,6 +74,6 @@ TriFuse 不自行输出笛卡尔 rigid score、merge gate 或 SE(3) residual。�
 - 三体 context 对界面几何和组分类型敏感，并对共同 SE(3) 变换保持不变；
 - 两侧 expert torsion 均接受辅助监督，正式入口检查全部 TriFuse/LoRA 梯度；
 - forward-only、单 optimizer step、训练/验证 smoke 全 finite；
-- 非 version 16、错误 architecture 或不完整运行配置的 checkpoint 均被明确拒绝。
+- 非 version 17、错误 architecture 或不完整运行配置的 checkpoint 均被明确拒绝。
 
 详细坐标公式见 [公式推导参考.md](公式推导参考.md)，实现原则见 [双DiffDock界面协同修正方案.md](双DiffDock界面协同修正方案.md)。

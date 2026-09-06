@@ -28,9 +28,12 @@
 - 推理唯一支持 `sdpi`：从完整化学图生成一次构象并采样一次 torsion，分别使用两侧受体 RMS radius 计算平移尺度，再精确逆装配；旧 `native`、`coupled5a`、`anchor_local` 和固定 Å 初始化均已删除。
 - 两个 rigid proposal 从同一个旧 Ligand 生成；Ligand 采用 `sub1` proposal，POI 接收将 `sub2` proposal 对齐到 `sub1` proposal 的精确刚体变换。
 - TriFuse 使用组分类型、三组跨分子距离分布和接触统计，负责 branch-specific FiLM 与逐键 torsion 协调；它不输出刚体 merge gate 或独立 SE(3) score。
-- 训练分别对两个界面应用 native DiffDock forward noise，再重建唯一一致的全局坐标。
-- 新 checkpoint 必须是 version 16 且 `architecture=trifuse_v13`；旧版本必须拒绝。
-- version 16 记录 activation clamp、torsion expert 辅助损失与 LoRA warmup；训练与评估必须恢复一致配置。
+- 生产训练使用 `SDPIFlow` 条件速度匹配，采样反向积分同一速度场；不再使用
+  native DSM target 或经验温度 SDE。可动自由度终端与 SDPI 对齐，内部几何差异
+  仍是已知近似；原始晶体监督不投影。数学契约见[初始化规范 §8](初始化方案_gpt6.md)。
+- 新 checkpoint 必须是 version 17、`architecture=trifuse_v13`、
+  `generative_process=sdpi_flow_v1`；旧版本必须拒绝，不能直接拿旧 DSM 权重做 flow 推理。
+- version 17 记录 activation clamp、torsion 辅助损失与 LoRA warmup；训练与评估必须恢复一致配置。
 - 当前只定义 Phase 1；`judge_head/state_head` 缺少监督标签，因此保持冻结，不能用无损失的“Phase 2”假装完成微调。
 - Phase 1 使用 PROTAC/Molecular Glue 官方训练成员的去 benchmark 同 PDB
   交集（7,198 cases、653 merged clusters），并按 cluster 留出内部 validation。

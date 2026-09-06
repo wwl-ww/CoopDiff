@@ -35,10 +35,12 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=336):
     """Reject incomplete or legacy checkpoints before expensive inference."""
     if not isinstance(payload, dict):
         raise ValueError("checkpoint must contain a mapping")
-    if payload.get("checkpoint_version") != 16:
+    if payload.get("checkpoint_version") != 17:
         raise ValueError(
-            "TriFuse evaluation requires checkpoint_version=16"
+            "TriFuse evaluation requires checkpoint_version=17"
         )
+    if payload.get('generative_process') != 'sdpi_flow_v1':
+        raise ValueError('checkpoint generative process is not sdpi_flow_v1')
     if payload.get("architecture") != "trifuse_v13":
         raise ValueError(
             "checkpoint architecture is not trifuse_v13"

@@ -42,16 +42,16 @@ the exact rigid transform that maps the POI-L proposal onto that ligand pose.
 ## Frames and training contract
 
 E3 defines the global frame. The POI-L graph is rebuilt in the current POI body
-frame, and its vector scores are rotated back before use. Training applies two
-native DiffDock forward marginals at one shared diffusion clock, then reconstructs
-one consistent ternary pose. Phase 1 optimizes both interface score losses, joint
+frame, and its vector outputs are rotated back before use. Training uses SDPI
+conditional flow paths at one shared clock and reconstructs one consistent ternary
+pose. Phase 1 optimizes both interface velocity losses, joint
 and auxiliary torsion losses, TriFuse, and—after warmup—branch-specific LoRA.
 Judge/state heads remain frozen because no labels or losses currently exist.
 
 ## Known limitations
 
-- Only `sdpi` is implemented. Its receptor-adaptive terminal prior is not
-  claimed to equal the training forward marginal exactly. Binary pocket/warhead
+- Only `sdpi` is implemented. Flow endpoints match its movable-DOF prior;
+  ETKDG/crystal internal-geometry mismatch remains an explicit approximation. Binary pocket/warhead
   priors and local refinement are not implemented; see [initialization](初始化方案_gpt6.md).
 - Protein context uses residue-level coordinates; side-chain orientation and
   explicit backbone frames are not represented inside TriFuse.

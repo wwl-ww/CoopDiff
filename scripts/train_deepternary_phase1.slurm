@@ -44,6 +44,7 @@ python -c "import runpy; tests=runpy.run_path('tests/test_torsion_utils.py'); te
 python tests/test_model_build.py
 python tests/test_lora.py
 python tests/test_training_contract.py
+python tests/test_sdpi_flow.py
 
 python scripts/make_deepternary_index.py \
     --min-ligand-heavy-atoms 1

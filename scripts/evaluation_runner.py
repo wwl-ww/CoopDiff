@@ -12,7 +12,8 @@ from evaluation_common import (
     evaluation_input_signature, sha256_file, validate_checkpoint_payload,
 )
 from featurize_common import featurize_complex
-from tricoopdiff.diffusion import InterfaceDiffusion, TernaryInitializer
+from tricoopdiff.sdpi_flow import SDPIFlow
+from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
 from tricoopdiff.expert_factory import build_diffdock_expert
 from tricoopdiff.lora import (
@@ -64,7 +65,7 @@ class EvaluationRunner:
         )
         self.model = None
         self.input_dim = None
-        self.diffusion = InterfaceDiffusion()
+        self.diffusion = SDPIFlow()
         self.initializer = TernaryInitializer(
             no_torsion=getattr(self.score_model_args, "no_torsion", False),
         )
@@ -131,6 +132,7 @@ class EvaluationRunner:
             "freeze_poi": freeze_poi,
             "init_mode": init_mode,
             "initialization_version": "sdpi_v1",
+            "generative_process": "sdpi_flow_v1",
             "t_anchor": (t_anchor if t_anchor is not None else
                          1.0),
             "trifuse_checkpoint": str(self.checkpoint_path.resolve()),
