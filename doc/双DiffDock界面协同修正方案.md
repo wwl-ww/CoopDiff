@@ -24,10 +24,11 @@ TriCoopDiff 以 E3 为固定全局参考系，扩散状态不是“全局 Ligand
 
 ## TriFuse 职责
 
-TriFuse 输出三类信息：
+TriFuse 输出以下信息：
 
 - E3、POI、Ligand 类型感知 token，以及 E3–L、POI–L、E3–POI 距离/接触编码；
 - 两个 expert 各层独立的 FiLM 参数；
+- 两侧 translation/rotation score 的有界幅度校准；
 - 基于两侧 per-bond score 和三体 context 的 torsion 权重与 residual；
 - 不改变坐标动力学的 scalar auxiliary heads。
 
@@ -37,19 +38,19 @@ TriFuse 不合并 rigid score、不输出 Ligand/POI SE(3) residual，也不替�
 
 训练分别对 `T_E3L` 和 `T_POL` 使用 native DiffDock forward noise。加噪后的两个相对刚体通过精确 SE(3) 组合重建唯一且一致的全局 Ligand/POI 坐标，然后构建两个二体图。每个 expert 接收自己界面的真实时间和噪声目标，禁止独立扰动全局 POI 后让 `sub2` 复用 `sub1` 的时间条件。
 
-推理同样维护这两个界面状态。初始化策略只能决定两个界面 proposal 的起点，不能改变状态定义或绕过精确坐标重建。
+推理同样维护这两个界面状态。唯一初始化 `dual_native` 使用共享完整构象与两侧尺寸自适应先验，见[初始化规范](初始化方案_gpt6.md)。
 
 ## Checkpoint 边界
 
 新架构 checkpoint 必须同时满足：
 
-- `checkpoint_version == 7`；
+- `checkpoint_version == 16`；
 - `architecture == "trifuse_v13"`；
 - 包含与当前 branch-specific FiLM/LoRA 配置匹配的状态。
 
-加载器必须拒绝 version 15 及更早 checkpoint；不提供静默迁移路径。旧 checkpoint 缺少同步 dual-stream layerwise bridge，只能留作历史结果。
+加载器只接受 version 16 和匹配的架构/运行配置；不提供静默迁移路径。旧 checkpoint 只能留作历史结果，不据此推断其已完成当前训练。
 
-Expert 每层卷积采用固定 activation clamp 100，并将该值写入 checkpoint 的 `runtime_config`。这是冻结 DiffDock/LoRA 路径的显式数值策略；它不能替代界面坐标加噪，也不得在训练与评估之间改变。
+Expert 每层卷积采用显式 activation clamp，默认值为 100，实际值写入 checkpoint 的 `runtime_config`。评估必须恢复训练值；该策略不能替代正确的界面坐标与输入分布。
 
 ## 验收门禁
 

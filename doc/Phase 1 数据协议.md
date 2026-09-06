@@ -25,13 +25,15 @@ representative，保证 checkpoint 选择可复现。
 
 正式 benchmark 不参与 `t_anchor`、epoch 或 checkpoint 选择。
 
-## 正式评估
+## 正式评估目标（与当前工程诊断区分）
 
 - PROTAC：官方 22 cases，unbound 输入，每个 case 40 seeds。
 - Molecular Glue：官方 94 cases，bound 输入，每个 case 1 seed。
 
-PROTAC 的主结果按预测置信度选择 top-1；oracle best DockQ 只能作为单独的上限
-指标。旧的 23-case bound、70-case 或 791-case representative 结果仅作工程诊断。
+PROTAC 的主结果应按经验证的预测置信度选择 top-1；当前代码尚无经过监督的
+ranking head，评估报告的 best 是按真实结构指标挑选的 oracle-best，不能称作
+model-ranked top-1。旧的 23-case bound、70-case 或 791-case representative
+结果以及当前晶体拆分输入的初始化 smoke 仅作工程诊断。
 
 ## 可复现性门禁
 

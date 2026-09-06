@@ -85,4 +85,4 @@ flowchart TB
 
 两个专家始终读取同一个更新前状态。Ligand 执行 sub1 的刚体 proposal；随后计算一个精确刚体变换，将 sub2 的 Ligand proposal 对齐到 sub1 proposal，并将同一变换施加到 POI。最后执行 TriFuse 协调后的 PROTAC torsion 更新。E3 在整个采样过程中保持固定。
 
-该组合保证一次更新后同时保留 E3–Ligand 与 POI–Ligand 两个界面的约束，避免先移动 Ligand 后继续使用旧 sub2 状态。
+该组合在 torsion 更新前精确保留两侧刚体 proposal 的 receptor–ligand 距离；随后共享 torsion 会同时改变两侧局部几何，不能把该保证延伸到完整一步之后。初始化及其精确装配见 [初始化方案_gpt6.md](初始化方案_gpt6.md)。
