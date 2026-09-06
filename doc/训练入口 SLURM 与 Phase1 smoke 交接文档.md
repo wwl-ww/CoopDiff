@@ -2,7 +2,7 @@
 
 ## 调度原则
 
-小型诊断应写成可复现 Python 脚本，提交 Git 后交由同学运行。训练、完整 GPU parity 和大规模评估才使用 SLURM。有效 GPU 分区包括 `gpu_a800`、`gpu_h100`、`gpu_h200`；提交前用真实调度器检查，不依赖静态 `sinfo` 包装输出。
+诊断写成可复现 Python 脚本并提交 Git。集群 GPU 任务通过 SLURM 申请资源，不在登录节点运行；本地有独立 GPU 时可运行小型 smoke。仓库 wrapper 使用 `gpu_a800` 等站点配置，分区和资源是否可用须在提交时向实际调度器查询，不能由本文保证。
 
 ```bash
 sbatch scripts/train_deepternary_phase1.slurm
@@ -12,13 +12,15 @@ sacct -j <job_id> --format=JobID,State,ExitCode,Elapsed,NodeList
 
 ## 环境与缓存
 
-统一激活 `/data/home/scwb792/run/miniconda3` 下的 `tricoopdiff` 环境。旧 smoke 曾同时暴露两个环境问题：缺少 Pillow 导致 ESM case 被跳过；Triton 编译缓存写入 home 时触发 `Errno 122: Disk quota exceeded`。当前 smoke 脚本应保持以下约束：
+集群 wrapper 当前示例使用 `/data/home/scwb792/run/miniconda3` 下的 `tricoopdiff` 环境；迁移站点时同时修改项目与环境路径。环境预检应满足：
 
 - 导入 `PIL`、PyTorch 和 `transformers.models.esm.modeling_esm` 做预检；
 - 从 conda site-packages 收集 NVIDIA library 目录加入 `LD_LIBRARY_PATH`；
 - 将 `TRITON_CACHE_DIR`、`TORCHINDUCTOR_CACHE_DIR` 和 `TMPDIR` 指向项目盘；
 - 检查 CUDA、DeepTernary 数据索引、expert 参数/权重及缓存可写性；
 - Hugging Face 使用本地缓存并设置 offline 模式，作业不得静默下载模型。
+
+特征缓存当前为 version 5，包含初始化所需的索引化 RDKit 化学图。旧缓存不能直接用于 `sdpi` 推理，需要通过正式特征化入口重建；模型权重格式仍为 version 16。
 
 ## Phase 1 门禁
 

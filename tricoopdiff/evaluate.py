@@ -581,9 +581,10 @@ def evaluate_model(
     debug_trace: bool = False,
     debug_seed: int = 0,
     freeze_poi: bool = False,
-    init_mode: str = "coupled5a",
+    init_mode: str = "sdpi",
     t_anchor: float = None,
     deepternary_dockq_paths: Optional[Dict[str, str]] = None,
+    seed: int = 0,
 ) -> dict:
     """
     Sample a conformational ensemble and score structure quality vs the native
@@ -626,6 +627,7 @@ def evaluate_model(
     ensemble = sample_ensemble(
         model, diffusion, initializer, e3_data, poi_data, ligand_data,
         steps=steps, device=device, n_walkers=n_walkers,
+        seeds=range(seed, seed + n_walkers),
         freeze_poi=freeze_poi,
         init_mode=init_mode,
         t_anchor=t_anchor,
@@ -838,6 +840,7 @@ def evaluate_model(
         )
 
     report = {
+        'initialization': [r['initialization'] for r in ensemble],
         'structure': structure,
         'ensemble': ensemble_metrics,
         # Functional ranking (α, Top-20% hit rate, AUROC) requires predicted

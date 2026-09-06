@@ -1,6 +1,49 @@
-# 双 DiffDock＋联合 TriFuse 三元复合物初始化方案
+# SDPI：共享配体双位姿初始化
 
-> 设计规格草案。本文定义共享完整配体、双二元相对状态和统一三元坐标更新；其中实验结论仍需通过本文门禁验证。
+SDPI 全称为 **Shared-Ligand Dual-Pose Initialization**。两侧共享一份完整配体内部构象，分别采样配体相对 E3、POI 的二元刚体位姿，再精确装配为一个三元初态。代码和 CLI 使用 `sdpi`，结果版本为 `sdpi_v1`；本次命名不改变采样分布或模型架构。
+
+历史验证产物仍保留当时的 `dual_native` 文件名与记录，以下链接用于追溯原始实验。新运行只接受 `sdpi`；旧名称不是兼容别名，旧结果也不会被当成 `sdpi_v1` 续跑结果。
+
+> 当前 `sdpi_v1` 初始化规范及验收边界。初始化几何已验证；完整模型精度、MGD benchmark 和二元强先验仍需独立实验。
+
+### 当前落地范围（2026-09-06）
+
+`tricoopdiff/initialization.py` 实现唯一 `sdpi_v1`。从保持 atom index 的完整 RDKit 图生成 ETKDGv3 构象，固定 `useRandomCoords=True` 以支持长链 PROTAC；每个 walker 只采样一次完整 torsion。A/B 各用自身 Cα RMS radius，记录实际旋转、平移和中心，通过 `rigid.py` 的解析逆变换装配。训练的界面 forward noise 也使用同一组合函数。两个 expert 继续读取同一完整图，TriFuse 架构和训练目标没有变更。
+
+按本次替换要求，旧 `native`、球壳、固定 Å 高斯、`coupled5a` 和 `anchor_local` 的实现及 CLI 入口全部删除；`t_anchor != 1`、非指定比例及旧固定尺度参数会报错。本文后续描述的局部 proposal 和 sidecar 是未来方案，不代表当前支持。当前不做外部 atom map、对称性匹配或 Kabsch 初始化，因此不存在退化 anchor fallback。
+
+特征缓存版本升至 5，保存保持原子顺序的 RDKit 分子；旧缓存需重新特征化。结果 JSON 的 `initialization` 保存每个 walker 的尺度、变换、torsion 顺序、库版本、设备、种子和专家来源。模型 checkpoint 格式不变；评估续跑签名必须匹配 `init_mode=sdpi` 与 `initialization_version=sdpi_v1`。
+
+Indexed 评估续跑还比对输入/参考结构、TriFuse 权重、专家权重及配置的内容指纹，防止同路径文件被替换后误用旧结果。缺少指纹、不完整 walker 数或非有限 full DockQ 的报告不会跳过重跑。采样拒绝非正整数步数、空 ensemble 和非布尔 torsion mask。
+
+可复现实例命令（仓库根目录运行，模型资产必须已缓存）：
+
+```bash
+python tests/test_initialization.py
+python scripts/validate_initialization.py --case-dirs DeepTernary/output/protac22/5T35_D_A_759 DeepTernary/output/protac22/6BN7_B_C_RN3 DeepTernary/output/protac22/7JTO_L_B_VKA --official-sampling ../DiffDock/utils/sampling.py --out results/sdpi_geometry_examples.json
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python scripts/evaluate_entry.py --case 5T35_D_A_759 --allow-zero-init --n-walkers 1 --steps 20 --cache-dir results/featurize_cache_sdpi_v5 --out results/sdpi_5T35_etkdg_random_1x20.json
+```
+
+`--official-sampling` 仅用于对照本地官方源码的刚体初始化核，不构成完整 DiffDock/训练后 TriFuse 精度对照。`--allow-zero-init` 明确表示未训练 TriFuse；初始化几何门禁、有限采样与最终 docking 精度必须分别报告。
+
+### 本次验证结果
+
+代码实现提交为 `fc385c5`、`49ea618`，验证脚本提交为 `329e1ae`。本地 RTX 4060 GPU，PyTorch 2.6.0+cu124，offline 模式，冻结专家加 zero-init TriFuse，activation clamp 为 100；没有使用训练后 TriFuse checkpoint。
+
+| 验证 | 结果 | 产物 |
+|---|---|---|
+| 3 个真实 PROTAC × seeds 0/7/42，CPU float64 几何 | 全通过；最大距离/参考系误差 2.6×10⁻¹² Å | [geometry](../results/dual_native_geometry_examples.json) |
+| 官方 DiffDock 刚体核，16 seeds，CPU float32 | 全通过；最大坐标差异 3.9×10⁻⁶ Å | 同上，`official_rigid_parity` |
+| 5T35_D_A_759，1 walker × 20 steps | 1/1 有效；full DockQ 0.0166；trace 20 steps 全 finite | [1×20](../results/dual_native_5T35_etkdg_random_1x20.json) |
+| 6BN7_B_C_RN3，1 walker × 20 steps | 1/1 有效；full DockQ 0.00846 | [6BN7](../results/dual_native_6BN7_1x20.json) |
+| 7JTO_L_B_VKA，1 walker × 20 steps | 1/1 有效；full DockQ 不可用 | [7JTO](../results/dual_native_7JTO_1x20.json) |
+| 5T35_D_A_759，32 walkers × 20 steps，seeds 0–31 | 32/32 有效，无 NaN；mean DockQ 0.0607，oracle-best 0.2293 | [32×20](../results/dual_native_5T35_etkdg_random_32x20.json) |
+
+初始化、界面坐标、训练契约、数据处理和评估辅助逻辑共 26 项函数检查通过；`tests/test_model_build.py` 亦全部通过。当前环境未安装 pytest，带 `tmp_path` 的函数通过 Python 临时目录直接调用，未跳过其测试体。
+
+7JTO 的完整 DockQ 失败源于全原子刚体拟合中 Cα 数量不匹配（148 对 154），见对应日志；不能把其近似界面指标冒充完整 DockQ。未运行 MGD benchmark、训练后 TriFuse 精度对照或完整 Phase 1 training smoke，也没有启用碰撞筛选。上述结果只支持初始化几何与有限采样结论。
+
+合并前复核：全库 65 项函数测试通过（包含新增续跑/非法输入回归）；SDPI 命名下再次运行 5T35 的 1 walker × 20 steps，1/1 有效，full DockQ 0.0168，见 [复核报告](../results/sdpi_review_5T35_1x20.json)。此处与历史测试数量分开记录，不把小幅 GPU 数值差异解释为精度提升。
 
 ## 1. 目标与原则
 
@@ -16,7 +59,9 @@
 
 这里的“保留二元先验”只表示各侧装配前后的局部相对几何不变，不自动保证三元碰撞、蛋白间界面或最终精度。
 
-## 2. PROTAC 与 MGD 的输入区别
+## 2. 当前输入与尚未接入的端点条件
+
+当前 MGD/PROTAC 都用完整 L 的原子身份和完整构象作为共同参照，不读取 `lig1_mask/lig2_mask` 或二元 pose。下表中的端点/口袋条件属于未来 `binary_prior` 扩展，不是当前初始化选项。
 
 | 项目 | PROTAC：结合头已知 | MGD：结合区域未知或不可划分 |
 | --- | --- | --- |
@@ -27,7 +72,7 @@
 | B 侧对齐参照 | `lig2_mask` 对应的结合头 b | 完整 L |
 | 额外条件 | 两端原子身份、二元 pose、口袋和局部 frame | 可用口袋/界面候选；默认无端点划分 |
 
-`lig1_mask/lig2_mask` 用于初始化对齐、界面读出和 TriFuse 条件，不改变冻结 DiffDock 的配体图。若未来研究片段 expert，必须单独处理封端、原子特征、片段 torsion 到完整 L 的映射并重新验证；它不属于本方案第一版。
+未来 `lig1_mask/lig2_mask` 可用于初始化对齐、界面读出和 TriFuse 条件，但不能改变冻结 DiffDock 的完整配体图。片段 expert 需要单独处理封端、原子特征和 torsion 映射，当前不支持。
 
 ## 3. 模块职责
 
@@ -49,7 +94,7 @@
 3. 保留原子顺序、可旋转键顺序、旋转侧 mask 和立体化学。
 4. 复制该内部构象作为两侧局部初始化的共同输入；局部副本只允许有不同的整体刚体位姿。
 
-MGD 两侧使用完整 L 作为对齐参照。PROTAC 可用两端 mask 或二元 warhead pose 确定局部 frame，但 expert 仍读取完整 L。
+当前两类任务均使用完整 L；端点 mask 或二元 warhead pose 确定局部 frame 的方法尚未接入。
 
 ### 4.2 分别采样两个二元位姿
 
@@ -114,7 +159,7 @@ $$
 
 ## 7. 唯一允许的广域平移先验
 
-`dual_native` 必须采用 DiffDock 默认推理 YAML 的受体尺寸自适应高斯，不提供固定标准差的兼容分支。对每侧居中后的受体坐标 `p_j`，定义：
+`sdpi` 必须采用 DiffDock 默认推理 YAML 的受体尺寸自适应高斯，不提供固定标准差的兼容分支。对每侧居中后的受体坐标 `p_j`，定义：
 
 $$
 s_{rec}=\sqrt{\frac{1}{N}\sum_j\lVert p_j\rVert^2},\qquad
@@ -139,7 +184,7 @@ $$
 - receptor 尺寸、计算得到的 `sigma_init` 以及 receptor/pocket center 的定义；
 - NumPy、SciPy、PyTorch 与 Python RNG seed。
 
-`initial_noise_std_proportion` 必须为上述固定正值；负值或任何请求固定绝对尺度的配置必须直接报错。文档、CLI、缓存签名和结果 JSON 均使用 `dual_native` 表示这一唯一语义，禁止同名模式随配置切换分布。
+`initial_noise_std_proportion` 必须为上述固定正值；负值或任何请求固定绝对尺度的配置必须直接报错。文档、CLI、缓存签名和结果 JSON 均使用 `sdpi` 表示这一唯一语义，禁止同名模式随配置切换分布。
 
 ## 8. 训练—推理一致性
 
@@ -151,13 +196,13 @@ X_B=\operatorname{pose}(L\mid B),\quad
 \theta=\text{shared torsion}(L).
 $$
 
-训练从真实三元结构出发，对 `X_A`、`X_B` 施加独立刚体噪声，但共享时间条件和唯一 torsion 噪声，再通过与推理相同的组合函数重建三元坐标。当前 `add_noise_interface_pair()` 已接近这一表示；主要缺口是推理 initializer 仍分别摆放 ligand 与 POI。
+训练从真实三元结构出发，对 `X_A`、`X_B` 施加独立刚体噪声，但共享时间条件和唯一 torsion 噪声。当前 `add_noise_interface_pair()` 与推理 initializer 共用 `assemble_interface_pair()`，用已知变换解析重建三元坐标。
 
 训练 forward marginal、DiffDock 的经验终端初始化和带二元候选的局部 proposal 是三种不同对象：
 
-- 广域 native prior：从 `t_start=1` 开始；
-- 二元 pose 周围的局部 proposal：用相同 forward kernel 扰动，并从匹配的 `t_anchor<1` 开始；
-- bounded 5 Å 初始化：只能作为明确的 fallback/消融，不能假装等于训练的 `t=1`。
+- 当前广域 `sdpi` prior：仅从 `t_start=1` 开始；
+- 未来二元 pose 周围的局部 proposal：需使用相同 forward kernel，并从匹配的 `t_anchor<1` 开始；当前没有该入口；
+- 组件级 bounded 5 Å 分布不等于训练的 `t=1`，旧实现已删除。
 
 训练和推理必须共用 `compose/decompose`、frame 和 torsion 映射实现。
 
@@ -167,15 +212,13 @@ $$
 
 初始蛋白碰撞可以作为未筛选 baseline 被记录，但不能称为可用生产先验。碰撞拒绝、口袋约束或界面筛选都会改变联合分布，应作为显式模式，在训练和评估中分别报告，禁止静默启用。
 
-## 10. 最小落地顺序
+## 10. 已实现与后续工作
 
-1. 新增 full-ligand `dual_native` 联合 initializer，只采样一次 torsion；两侧分别计算受体尺寸自适应平移尺度。
-2. 接入 sampler、CLI 和 trace，并从 CLI 与实现中删除固定绝对尺度的旧 `native` 初始化路径；暂不修改模型、训练目标或旧 checkpoint。
-3. `coupled5a`、`anchor_local` 若仍用于诊断，必须保持不同名称；它们不能被 `dual_native` 静默调用或作为失败 fallback。
-4. 运行两次独立 DiffDock 与“双 expert＋固定 torsion 平均”的配对实验。
-5. 再加入版本化 `binary_prior` sidecar：端点 mask、二元 pose、口袋、frame、置信度和来源 SHA256。
-6. 先让先验只进入 TriFuse；关闭先验时必须严格复现旧架构输出。
-7. 只有片段 expert 被单独训练和验证后，才研究以 warhead 片段替代完整配体输入。
+已实现完整 ligand 共享构象、单次 torsion、双侧受体自适应尺度、解析装配，以及 sampler/CLI/trace/缓存/续跑签名接入。固定尺度与旧局部路径已删除；模型架构和训练目标不变。
+
+后续实验是：同 seed、同构象配置下比较独立 DiffDock A/B、双 expert＋固定 torsion 平均、训练后 TriFuse。当前 zero-init smoke 只验证有限采样，不替代三组精度对照。
+
+版本化 `binary_prior` sidecar 和 prior adapter 见[单独设计](双二元强先验接入方案.md)，尚未实现。只有片段 expert 被单独训练和验证后，才研究以 warhead 片段替代完整配体输入。
 
 ## 11. 验收门禁
 
@@ -184,7 +227,7 @@ $$
 1. 随机 SE(3) 下验证逆变换 roundtrip、`RᵀR=I`、`det(R)>0`。
 2. 装配前后两侧 receptor–ligand 全部 `cdist` 保持，误差不超过 `1e-5`。
 3. 验证两侧共享同一内部构象、canonical torsion 映射和方向翻转。
-4. 对称、少于三个非共线锚点或无效 atom map 必须硬失败。
+4. 当前直接保存变换并保持原子索引；非法 atom/torsion map 必须失败。未来若增加外部匹配/Kabsch，歧义对称匹配与少于三个非共线锚点必须拒绝，不能伪造唯一解。
 5. 分别验证 A、B 的 `sigma_init` 与受体 RMS radius 公式一致；负比例和固定尺度参数必须硬失败。
 6. 关闭新先验时的模型输出不得变化。
 
@@ -201,6 +244,5 @@ $$
 - [DiffDock 官方仓库](https://github.com/gcorso/DiffDock)：模型与版本说明。
 - [DiffDock 初始化及采样实现](https://github.com/gcorso/DiffDock/blob/main/utils/sampling.py)：随机 torsion、旋转、平移和反向采样。
 - [DiffDock 默认推理配置](https://github.com/gcorso/DiffDock/blob/main/default_inference_args.yaml)：尺寸自适应初始化等运行参数。
-- [TriGlue](https://arxiv.org/abs/2607.22143)：MGD 的界面估计和三元联合建模动机；不是本初始化方案的实验验证。
 
-正式实验必须固定代码 commit、权重、配置、数据版本、原子映射和随机种子。本文的共享参照装配、联合更新和 TriFuse 分工仍需通过上述门禁后才能升级为默认方法。
+正式实验必须固定代码 commit、权重、配置、数据版本、原子映射和随机种子。`sdpi` 已是唯一默认实现，但默认启用不等于通过全部精度、碰撞或训练后模型验收。

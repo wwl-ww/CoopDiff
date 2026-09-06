@@ -119,3 +119,56 @@ def test_completed_report_requires_matching_checkpoint(tmp_path):
     assert evaluation_common.completed_report(
         path, "demo", "best.pt", require_exact_dockq=True,
     )
+
+
+def test_resume_fingerprints_detect_same_path_replacement(tmp_path):
+    source = tmp_path / 'ligand.sdf'
+    source.write_text('original chemical graph')
+    checkpoint = tmp_path / 'best.pt'
+    checkpoint.write_bytes(b'original weights')
+    paths = {'ligand': source}
+    signature = evaluation_common.evaluation_input_signature(paths)
+    digest = evaluation_common.sha256_file(checkpoint)
+    config = {'input_signature': signature, 'checkpoint_sha256': digest}
+    report = tmp_path / 'report.json'
+    report.write_text(json.dumps({
+        'case': 'demo',
+        'run_config': {'trifuse_checkpoint': str(checkpoint), **config},
+        'ensemble': {'n_valid_walkers': 1},
+    }))
+    assert evaluation_common.completed_report(report, 'demo', str(checkpoint), config)
+    source.write_text('replacement chemical graph')
+    changed_input = evaluation_common.evaluation_input_signature(paths)
+    assert changed_input != signature
+    assert not evaluation_common.completed_report(
+        report, 'demo', str(checkpoint), {**config, 'input_signature': changed_input},
+    )
+    checkpoint.write_bytes(b'replacement weights')
+    assert not evaluation_common.completed_report(
+        report, 'demo', str(checkpoint),
+        {**config, 'checkpoint_sha256': evaluation_common.sha256_file(checkpoint)},
+    )
+    native = tmp_path / 'native.pdb'
+    native.write_text('reference')
+    assert evaluation_common.evaluation_input_signature(paths, native) != changed_input
+
+
+def test_resume_rejects_nonfinite_metric_and_incomplete_ensemble(tmp_path):
+    path = tmp_path / 'report.json'
+    report = {
+        'case': 'demo',
+        'run_config': {'trifuse_checkpoint': 'best.pt', 'n_walkers': 32},
+        'ensemble': {'n_walkers': 1, 'n_valid_walkers': 1},
+        'structure': {'dockq_best': 0.1},
+    }
+    path.write_text(json.dumps(report))
+    assert not evaluation_common.completed_report(
+        path, 'demo', 'best.pt', {'n_walkers': 32}, require_exact_dockq=True,
+    )
+    report['ensemble']['n_walkers'] = 32
+    for invalid in (None, float('nan'), float('inf')):
+        report['structure']['dockq_best'] = invalid
+        path.write_text(json.dumps(report))
+        assert not evaluation_common.completed_report(
+            path, 'demo', 'best.pt', {'n_walkers': 32}, require_exact_dockq=True,
+        )

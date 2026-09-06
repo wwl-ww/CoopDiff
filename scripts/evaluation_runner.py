@@ -8,7 +8,9 @@ from pathlib import Path
 import torch
 import yaml
 
-from evaluation_common import validate_checkpoint_payload
+from evaluation_common import (
+    evaluation_input_signature, sha256_file, validate_checkpoint_payload,
+)
 from featurize_common import featurize_complex
 from tricoopdiff.diffusion import InterfaceDiffusion, TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
@@ -35,6 +37,7 @@ class EvaluationRunner:
         self.checkpoint_path = Path(checkpoint)
         if not self.checkpoint_path.is_absolute():
             self.checkpoint_path = self.root / self.checkpoint_path
+        self.checkpoint_sha256 = sha256_file(self.checkpoint_path)
         self.checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
         validate_checkpoint_payload(self.checkpoint)
         self.activation_clamp = float(
@@ -47,6 +50,7 @@ class EvaluationRunner:
             self.model_dir = self.root / self.model_dir
         with (self.model_dir / "model_parameters.yml").open() as handle:
             self.score_model_args = Namespace(**yaml.full_load(handle))
+        self.expert_config_sha256 = sha256_file(self.model_dir / "model_parameters.yml")
         self.expert = build_diffdock_expert(
             model_dir=str(self.model_dir), device=str(self.device),
             ckpt=expert_checkpoint,
@@ -61,7 +65,9 @@ class EvaluationRunner:
         self.model = None
         self.input_dim = None
         self.diffusion = InterfaceDiffusion()
-        self.initializer = TernaryInitializer()
+        self.initializer = TernaryInitializer(
+            no_torsion=getattr(self.score_model_args, "no_torsion", False),
+        )
 
     def _ensure_model(self, input_dim):
         if self.model is not None:
@@ -88,7 +94,7 @@ class EvaluationRunner:
 
     def evaluate_case(self, case, paths, cache_dir, native_complex_pdb=None,
                       n_walkers=32, steps=20, seed=0,
-                      init_mode="coupled5a", t_anchor=None, freeze_poi=False,
+                      init_mode="sdpi", t_anchor=None, freeze_poi=False,
                       debug_trace=False, debug_seed=0):
         """Featurize and evaluate one case with the resident model."""
         torch.manual_seed(seed)
@@ -104,6 +110,7 @@ class EvaluationRunner:
             self.model, e3_data, poi_data, ligand_data, self.diffusion,
             initializer=self.initializer, device=str(self.device),
             n_walkers=n_walkers, steps=steps,
+            seed=seed,
             native_complex_pdb=(str(native_complex_pdb)
                                 if native_complex_pdb else None),
             freeze_poi=freeze_poi, init_mode=init_mode, t_anchor=t_anchor,
@@ -123,9 +130,14 @@ class EvaluationRunner:
                       else self.diffusion.inference_steps),
             "freeze_poi": freeze_poi,
             "init_mode": init_mode,
+            "initialization_version": "sdpi_v1",
             "t_anchor": (t_anchor if t_anchor is not None else
-                         (0.7 if init_mode == "anchor_local" else 1.0)),
+                         1.0),
             "trifuse_checkpoint": str(self.checkpoint_path.resolve()),
+            "checkpoint_sha256": self.checkpoint_sha256,
+            "expert_checkpoint_sha256": self.expert.provenance["score_checkpoint_sha256"],
+            "expert_config_sha256": self.expert_config_sha256,
+            "input_signature": evaluation_input_signature(paths, native_complex_pdb),
             "activation_clamp": self.activation_clamp,
             "expert_model_dir": str(self.model_dir),
             "dockq_implementation": (

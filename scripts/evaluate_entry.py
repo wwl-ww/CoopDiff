@@ -110,10 +110,10 @@ def build_parser():
         action="store_true",
         help="Keep the POI fixed and disable SE3 reverse updates for strict E3-L parity evaluation.",
     )
-    p.add_argument("--init-mode", choices=["native", "coupled5a", "anchor_local"], default="coupled5a",
-                   help="Ternary initialization prior (default: stable 0-5 A coupled prior)")
-    p.add_argument("--t-anchor", type=float, default=None,
-                   help="Starting diffusion time for anchor_local (default: 0.7)")
+    p.add_argument("--init-mode", choices=["sdpi"], default="sdpi",
+                   help="Shared full-ligand dual binary receptor-size-adaptive prior")
+    p.add_argument("--t-anchor", type=float, choices=[1.0], default=None,
+                   help="sdpi starts at t=1; other values are rejected")
     return p
 
 
@@ -281,7 +281,9 @@ def main():
         use_film=True,
     ).to(device)
     diffusion = InterfaceDiffusion()
-    initializer = TernaryInitializer()
+    initializer = TernaryInitializer(
+        no_torsion=getattr(score_model_args, "no_torsion", False),
+    )
     n_params = sum(p.numel() for p in trifuse.parameters())
     print(f"[model] TriFuse trainable params = {n_params:,}", flush=True)
 
@@ -313,6 +315,7 @@ def main():
         model, e3_data, poi_data, ligand_data, diffusion,
         initializer=initializer, device=device,
         n_walkers=args.n_walkers, steps=args.steps,
+        seed=args.seed,
         native_complex_pdb=native_complex_pdb,
         debug_trace=args.debug_trace, debug_seed=args.debug_seed,
         freeze_poi=args.freeze_poi,
@@ -332,7 +335,8 @@ def main():
         "steps": args.steps if args.steps is not None else diffusion.inference_steps,
         "freeze_poi": args.freeze_poi,
         "init_mode": args.init_mode,
-        "t_anchor": args.t_anchor if args.t_anchor is not None else (0.7 if args.init_mode == "anchor_local" else 1.0),
+        "initialization_version": "sdpi_v1",
+        "t_anchor": args.t_anchor if args.t_anchor is not None else 1.0,
         "trifuse_checkpoint": args.trifuse_ckpt,
         "activation_clamp": args.nan_clamp,
         "expert_model_dir": args.model_dir,

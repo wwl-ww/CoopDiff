@@ -5,7 +5,9 @@ import argparse
 import json
 from pathlib import Path
 
-from evaluation_common import completed_report, resolve_entry_paths, sha256_file
+from evaluation_common import (
+    completed_report, evaluation_input_signature, resolve_entry_paths, sha256_file,
+)
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -56,6 +58,8 @@ def main():
         "checkpoint": checkpoint,
         "checkpoint_sha256": sha256_file(checkpoint),
         "cases": [entry["case"] for entry in entries],
+        "init_mode": "sdpi",
+        "initialization_version": "sdpi_v1",
         "seed": args.seed,
         "n_walkers": args.n_walkers,
         "steps": args.steps,
@@ -71,23 +75,32 @@ def main():
     for position, entry in enumerate(entries, start=1):
         case = entry["case"]
         report_path = output / f"{case}.json"
-        expected_config = {
-            "seed": args.seed,
-            "n_walkers": args.n_walkers,
-            "steps": args.steps,
-        }
-        if not args.no_resume and completed_report(
-                report_path, case, checkpoint, expected_config,
-                require_exact_dockq=True):
-            print(f"[{position}/{len(entries)}] SKIP completed {case}", flush=True)
-            continue
-        print(f"[{position}/{len(entries)}] RUN {case}", flush=True)
         try:
             paths = resolve_entry_paths(entry, _PROJECT_ROOT)
             native = _PROJECT_ROOT / args.native_root / case / "gt_complex.pdb"
+            native = native if native.is_file() else None
+            expected_config = {
+                "init_mode": "sdpi",
+                "initialization_version": "sdpi_v1",
+                "seed": args.seed,
+                "n_walkers": args.n_walkers,
+                "steps": args.steps,
+                "checkpoint_sha256": runner.checkpoint_sha256,
+                "expert_checkpoint_sha256": runner.expert.provenance["score_checkpoint_sha256"],
+                "expert_config_sha256": runner.expert_config_sha256,
+                "input_signature": evaluation_input_signature(paths, native),
+                "freeze_poi": False,
+                "t_anchor": 1.0,
+            }
+            if not args.no_resume and completed_report(
+                    report_path, case, checkpoint, expected_config,
+                    require_exact_dockq=True):
+                print(f"[{position}/{len(entries)}] SKIP completed {case}", flush=True)
+                continue
+            print(f"[{position}/{len(entries)}] RUN {case}", flush=True)
             report = runner.evaluate_case(
                 case, paths, cache_dir=_PROJECT_ROOT / args.cache_dir,
-                native_complex_pdb=native if native.is_file() else None,
+                native_complex_pdb=native,
                 n_walkers=args.n_walkers, steps=args.steps, seed=args.seed,
             )
             write_report_atomic(report, report_path)

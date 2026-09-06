@@ -46,7 +46,7 @@ os.chdir(_PROJECT_ROOT)
 # Featurization cache schema version. Bump whenever the geometry/frame handling
 # of the produced data changes, so stale on-disk caches (written before the
 # shared-reference-frame fix) are invalidated instead of silently reused.
-_FEATURIZE_CACHE_VERSION = 4
+_FEATURIZE_CACHE_VERSION = 5
 
 
 def _featurize_signature(protein1, protein2, ligand_path, score_model_args):
@@ -217,7 +217,15 @@ def extract_ligand(batch_graph, device):
     mask_rotate = batch_graph['ligand'].mask_rotate
     if isinstance(mask_rotate, (list, tuple)):
         mask_rotate = mask_rotate[0]
+    from rdkit import Chem
+
+    mol = batch_graph.mol[0] if isinstance(batch_graph.mol, (list, tuple)) else batch_graph.mol
+    if mol.GetNumAtoms() != batch_graph['ligand'].pos.shape[0]:
+        mol = Chem.RemoveHs(mol)
+    if mol.GetNumAtoms() != batch_graph['ligand'].pos.shape[0]:
+        raise ValueError("RDKit atom order/count does not match ligand graph")
     return {
+        'mol': mol.ToBinary(),
         'coords': batch_graph['ligand'].pos.unsqueeze(0).to(device),
         'features': batch_graph['ligand'].x.unsqueeze(0).to(device),
         'edge_index': batch_graph['ligand', 'ligand'].edge_index.to(device),

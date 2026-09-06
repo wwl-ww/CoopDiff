@@ -50,15 +50,6 @@ def _sanitize_score(score):
     return score, had_nonfinite
 
 
-def _nearest_interface_anchor(e3_coords: torch.Tensor, poi_coords: torch.Tensor) -> torch.Tensor:
-    """Return the midpoint of the closest E3/POI residue pair."""
-    distances = torch.cdist(e3_coords, poi_coords)
-    flat_index = torch.argmin(distances)
-    e3_index = flat_index // poi_coords.shape[0]
-    poi_index = flat_index % poi_coords.shape[0]
-    return (e3_coords[e3_index] + poi_coords[poi_index]) / 2
-
-
 @torch.no_grad()
 def sample_single(
     model,
@@ -73,7 +64,7 @@ def sample_single(
     return_trajectory: bool = False,
     return_trace: bool = False,
     freeze_poi: bool = False,
-    init_mode: str = "coupled5a",
+    init_mode: str = "sdpi",
     t_anchor: float = None,
 ) -> dict:
     """
@@ -93,9 +84,8 @@ def sample_single(
             disable the SE3 reverse updates. This defines the strict zero-FiLM
             E3-L parity baseline: the sampler reduces to native-style DiffDock on
             the PROTAC branch instead of running an extra ternary POI dynamics.
-        init_mode: ``native``, ``coupled5a`` or ``anchor_local`` initialization prior.
-        t_anchor: starting diffusion time. ``anchor_local`` defaults to 0.7;
-            other modes default to 1.0.
+        init_mode: only ``sdpi`` is supported.
+        t_anchor: must be 1.0 for the broad sdpi prior.
 
     Returns:
         dict with 'ligand_coords' [N_lig, 3], 'poi_coords' [N_poi, 3] (CPU numpy),
@@ -109,65 +99,38 @@ def sample_single(
 
     if steps is None:
         steps = diffusion.inference_steps
+    if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
+        raise ValueError("steps must be a positive integer")
 
     # Clean templates (drop the B=1 dim).
     ligand_template = ligand_data["coords"][0].detach()  # [N_lig, 3]
     poi_template = poi_data["coords"][0].detach()        # [N_poi, 3]
     e3_coords = e3_data["coords"][0].detach()            # [N_e3, 3]
 
-    # E3 center = receptor COM. Native randomize_position uses receptor.pos.mean(0).
-    e3_center = e3_coords.mean(dim=0, keepdim=True)            # [1, 3]
+    e3_center = e3_coords.mean(dim=0, keepdim=True)
+    if init_mode != "sdpi":
+        raise ValueError(f"removed initialization mode: {init_mode}; use sdpi")
     if t_anchor is None:
-        t_anchor = 0.7 if init_mode == "anchor_local" else 1.0
-    if not 0.0 < t_anchor <= 1.0:
-        raise ValueError(f"t_anchor must be in (0, 1], got {t_anchor}")
-    anchor_center = _nearest_interface_anchor(e3_coords, poi_template)
-
-    # Initialize at t=1 (fully noised). Passing the receptor COM + torsion metadata
-    # + tr_sigma_max makes initialize_protac replicate native randomize_position
-    # (uniform torsions, rotate about ligand COM, translate to receptor COM,
-    # Gaussian N(0, tr_sigma_max^2)) — sampling-fidelity hypothesis #3.
-    ligand_pos = initializer.initialize_protac(
-        e3_center, ligand_template,
-        lig_edge_index=ligand_data.get("edge_index"),
-        lig_edge_mask=ligand_data.get("edge_mask"),
-        lig_mask_rotate=ligand_data.get("mask_rotate"),
-        tr_sigma_max=diffusion.tr_sigma_max,
-        init_mode=init_mode,
-        anchor_center=anchor_center.unsqueeze(0),
-    )  # [1, N_lig, 3]
-    poi_pos, rot_init = initializer.initialize_poi(
-        e3_center, poi_template, return_rotation=True, init_mode=init_mode,
+        t_anchor = 1.0
+    if t_anchor != 1.0:
+        raise ValueError("sdpi requires t_anchor=1")
+    ligand_pos, poi_pos, r_e3_to_poi, initialization = initializer.initialize(
+        e3_coords, poi_template, ligand_data, seed=seed,
     )
-
     if not torch.isfinite(ligand_pos).all() or not torch.isfinite(poi_pos).all():
-        raise FloatingPointError(
-            f"non-finite {init_mode} initialization for ligand or POI"
-        )
-    if init_mode in {"coupled5a", "anchor_local"}:
-        ligand_dist = torch.linalg.vector_norm(
-            ligand_pos.mean(dim=1) - (
-                e3_center if init_mode == "coupled5a" else anchor_center.unsqueeze(0)
-            ), dim=-1
-        )
-        poi_reference = e3_center if init_mode == "coupled5a" else poi_template.mean(dim=0, keepdim=True)
-        poi_dist = torch.linalg.vector_norm(poi_pos.mean(dim=1) - poi_reference, dim=-1)
-        max_radius = initializer.coupled_radius + 1e-4
-        if bool((ligand_dist > max_radius).any()) or bool((poi_dist > max_radius).any()):
-            raise ValueError(
-                f"{init_mode} initialization escaped its 0-5 A local radius: "
-                f"ligand={ligand_dist.tolist()}, poi={poi_dist.tolist()}"
-            )
-
+        raise FloatingPointError("non-finite sdpi initialization")
     if freeze_poi:
         poi_pos = poi_data["coords"].clone().detach()
         r_e3_to_poi = torch.eye(3, device=device, dtype=poi_pos.dtype).unsqueeze(0)
-    else:
-        # initialize_poi applies ``template_centered @ rot_init.T``. Therefore
-        # ``rot_init`` itself is the inverse/body-frame map that converts E3-frame
-        # row vectors into the current POI frame. Track that inverse directly;
-        # transposing it again would apply the forward rotation twice.
-        r_e3_to_poi = rot_init  # [1, 3, 3]
+    initialization["freeze_poi"] = bool(freeze_poi)
+    initialization["expert"] = getattr(model.expert, "provenance", {})
+    ca_distances = torch.cdist(e3_coords, poi_pos[0])
+    initialization["initial_geometry"] = {
+        "minimum_protein_ca_distance": float(ca_distances.min()),
+        "protein_ca_pairs_below_3A": int((ca_distances < 3.0).sum()),
+        "minimum_e3_ca_ligand_distance": float(torch.cdist(e3_coords, ligand_pos[0]).min()),
+        "minimum_poi_ca_ligand_distance": float(torch.cdist(poi_pos[0], ligand_pos[0]).min()),
+    }
 
     schedule = diffusion.get_inference_schedule(steps, t_start=t_anchor)
     trajectory = [] if return_trajectory else None
@@ -190,7 +153,7 @@ def sample_single(
         if ligand_data.get("edge_mask") is not None else 0,
         "init_mode": init_mode,
         "t_anchor": float(t_anchor),
-        "interface_anchor": anchor_center.detach().cpu().numpy().tolist(),
+        "initialization": initialization,
     }
     if return_trace:
         trace.append(init_record)
@@ -392,6 +355,7 @@ def sample_single(
     result = {
         "ligand_coords": ligand_pos[0].detach().cpu().numpy(),
         "poi_coords": poi_pos[0].detach().cpu().numpy(),
+        "initialization": initialization,
         "valid": not nonfinite_score_steps,
         "nonfinite_score_steps": nonfinite_score_steps,
         "termination_reason": (
@@ -417,7 +381,7 @@ def sample_ensemble(
     n_walkers: int = 32,
     seeds=None,
     freeze_poi: bool = False,
-    init_mode: str = "coupled5a",
+    init_mode: str = "sdpi",
     t_anchor: float = None,
 ) -> list:
     """
@@ -435,9 +399,12 @@ def sample_ensemble(
         seeds = list(range(n_walkers))
     else:
         n_walkers = len(seeds)
+    if n_walkers < 1:
+        raise ValueError("at least one walker is required")
 
     results = []
     for i in range(n_walkers):
+        print(f"[sample] walker {i + 1}/{n_walkers}, seed={seeds[i]}", flush=True)
         results.append(
             sample_single(
                 model, diffusion, initializer, e3_data, poi_data, ligand_data,

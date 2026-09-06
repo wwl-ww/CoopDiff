@@ -41,7 +41,7 @@ TriFuse 读取三元上下文并输出：
 4. 逐键 torsion coordinator；
 5. scalar auxiliary heads，例如功能或置信度预测。
 
-TriFuse 不输出 rigid score、merge gate 或 SE(3) residual。刚体动力学完全由两个 DiffDock proposal 与显式群组合定义；TriFuse 只裁决物理上共享的 torsion。
+TriFuse 不自行输出笛卡尔 rigid score、merge gate 或 SE(3) residual。它通过 FiLM/bridge 和有界 score gain 校准专家建议，并裁决共享 torsion；刚体方向仍来自两个 DiffDock，坐标由显式群组合定义。功能/置信度 heads 当前无监督且冻结，不能用于可靠排序。
 
 ## 训练
 
@@ -59,7 +59,7 @@ TriFuse 不输出 rigid score、merge gate 或 SE(3) residual。刚体动力学�
 4. 更新 POI local frame；
 5. 重建并验证全部 frame 与图。
 
-初始化模式只提供起始界面 proposal。它不得引入第三套坐标语义，也不得以 near-native pose 掩盖全局装配能力。
+初始化唯一支持 [`sdpi`](初始化方案_gpt6.md)。完整 ligand 从化学图重新生成共享构象，A/B 独立采样尺寸自适应刚体先验后精确装配。旧组件级和局部初始化已删除，当前不支持二元端点 sidecar。
 
 ## Checkpoint 与恢复
 
@@ -74,6 +74,6 @@ TriFuse 不输出 rigid score、merge gate 或 SE(3) residual。刚体动力学�
 - 三体 context 对界面几何和组分类型敏感，并对共同 SE(3) 变换保持不变；
 - 两侧 expert torsion 均接受辅助监督，正式入口检查全部 TriFuse/LoRA 梯度；
 - forward-only、单 optimizer step、训练/验证 smoke 全 finite；
-- v3 和错误 architecture checkpoint 均被明确拒绝。
+- 非 version 16、错误 architecture 或不完整运行配置的 checkpoint 均被明确拒绝。
 
 详细坐标公式见 [公式推导参考.md](公式推导参考.md)，实现原则见 [双DiffDock界面协同修正方案.md](双DiffDock界面协同修正方案.md)。
