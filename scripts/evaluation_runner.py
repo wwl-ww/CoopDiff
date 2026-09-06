@@ -8,7 +8,9 @@ from pathlib import Path
 import torch
 import yaml
 
-from evaluation_common import validate_checkpoint_payload
+from evaluation_common import (
+    evaluation_input_signature, sha256_file, validate_checkpoint_payload,
+)
 from featurize_common import featurize_complex
 from tricoopdiff.diffusion import InterfaceDiffusion, TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
@@ -35,6 +37,7 @@ class EvaluationRunner:
         self.checkpoint_path = Path(checkpoint)
         if not self.checkpoint_path.is_absolute():
             self.checkpoint_path = self.root / self.checkpoint_path
+        self.checkpoint_sha256 = sha256_file(self.checkpoint_path)
         self.checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
         validate_checkpoint_payload(self.checkpoint)
         self.activation_clamp = float(
@@ -47,6 +50,7 @@ class EvaluationRunner:
             self.model_dir = self.root / self.model_dir
         with (self.model_dir / "model_parameters.yml").open() as handle:
             self.score_model_args = Namespace(**yaml.full_load(handle))
+        self.expert_config_sha256 = sha256_file(self.model_dir / "model_parameters.yml")
         self.expert = build_diffdock_expert(
             model_dir=str(self.model_dir), device=str(self.device),
             ckpt=expert_checkpoint,
@@ -130,6 +134,10 @@ class EvaluationRunner:
             "t_anchor": (t_anchor if t_anchor is not None else
                          1.0),
             "trifuse_checkpoint": str(self.checkpoint_path.resolve()),
+            "checkpoint_sha256": self.checkpoint_sha256,
+            "expert_checkpoint_sha256": self.expert.provenance["score_checkpoint_sha256"],
+            "expert_config_sha256": self.expert_config_sha256,
+            "input_signature": evaluation_input_signature(paths, native_complex_pdb),
             "activation_clamp": self.activation_clamp,
             "expert_model_dir": str(self.model_dir),
             "dockq_implementation": (

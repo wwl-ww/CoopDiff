@@ -67,7 +67,9 @@ def validate_ligand_graph(mol, edge_index, edge_mask, mask_rotate):
         if len(mask_rotate) != 1:
             raise ValueError("expected one full-ligand torsion map")
         mask_rotate = mask_rotate[0]
-    masks = torch.as_tensor(mask_rotate, dtype=torch.bool).cpu()
+    masks = torch.as_tensor(mask_rotate).cpu()
+    if masks.dtype != torch.bool:
+        raise ValueError("torsion mask_rotate must be boolean")
     bonds = edges.T[selected]
     if masks.shape != (len(bonds), n):
         raise ValueError("torsion mask shape/order does not match canonical bonds")

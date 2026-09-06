@@ -99,6 +99,8 @@ def sample_single(
 
     if steps is None:
         steps = diffusion.inference_steps
+    if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
+        raise ValueError("steps must be a positive integer")
 
     # Clean templates (drop the B=1 dim).
     ligand_template = ligand_data["coords"][0].detach()  # [N_lig, 3]
@@ -397,6 +399,8 @@ def sample_ensemble(
         seeds = list(range(n_walkers))
     else:
         n_walkers = len(seeds)
+    if n_walkers < 1:
+        raise ValueError("at least one walker is required")
 
     results = []
     for i in range(n_walkers):

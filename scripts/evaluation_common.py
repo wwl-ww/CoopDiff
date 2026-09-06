@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 from pathlib import Path
 
 
@@ -89,11 +90,17 @@ def completed_report(path, case, checkpoint, expected_config=None,
         and config.get("trifuse_checkpoint") == checkpoint
         and ensemble.get("n_valid_walkers", 0) > 0
     )
+    dockq = report.get("structure", {}).get("dockq_best")
     exact_dockq_matches = (
         not require_exact_dockq
-        or report.get("structure", {}).get("dockq_best") is not None
+        or (isinstance(dockq, (int, float)) and math.isfinite(dockq))
     )
-    return core_matches and exact_dockq_matches and all(
+    expected_walkers = (expected_config or {}).get("n_walkers")
+    walker_count_matches = (
+        expected_walkers is None
+        or ensemble.get("n_walkers") == expected_walkers
+    )
+    return core_matches and exact_dockq_matches and walker_count_matches and all(
         config.get(key) == value for key, value in (expected_config or {}).items()
     )
 
@@ -105,3 +112,14 @@ def sha256_file(path, chunk_size=1024 * 1024):
         for chunk in iter(lambda: handle.read(chunk_size), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def evaluation_input_signature(paths, native_complex_pdb=None):
+    """Fingerprint actual case inputs, including the reference used for metrics."""
+    sources = {**paths, "native_complex_pdb": native_complex_pdb}
+    payload = {
+        key: ({"path": str(Path(path).resolve()), "sha256": sha256_file(path)}
+              if path is not None else None)
+        for key, path in sources.items()
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()

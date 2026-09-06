@@ -14,6 +14,8 @@ SDPI 全称为 **Shared-Ligand Dual-Pose Initialization**。两侧共享一份�
 
 特征缓存版本升至 5，保存保持原子顺序的 RDKit 分子；旧缓存需重新特征化。结果 JSON 的 `initialization` 保存每个 walker 的尺度、变换、torsion 顺序、库版本、设备、种子和专家来源。模型 checkpoint 格式不变；评估续跑签名必须匹配 `init_mode=sdpi` 与 `initialization_version=sdpi_v1`。
 
+Indexed 评估续跑还比对输入/参考结构、TriFuse 权重、专家权重及配置的内容指纹，防止同路径文件被替换后误用旧结果。缺少指纹、不完整 walker 数或非有限 full DockQ 的报告不会跳过重跑。采样拒绝非正整数步数、空 ensemble 和非布尔 torsion mask。
+
 可复现实例命令（仓库根目录运行，模型资产必须已缓存）：
 
 ```bash
@@ -40,6 +42,8 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python scripts/evaluate_entry.py --case 
 初始化、界面坐标、训练契约、数据处理和评估辅助逻辑共 26 项函数检查通过；`tests/test_model_build.py` 亦全部通过。当前环境未安装 pytest，带 `tmp_path` 的函数通过 Python 临时目录直接调用，未跳过其测试体。
 
 7JTO 的完整 DockQ 失败源于全原子刚体拟合中 Cα 数量不匹配（148 对 154），见对应日志；不能把其近似界面指标冒充完整 DockQ。未运行 MGD benchmark、训练后 TriFuse 精度对照或完整 Phase 1 training smoke，也没有启用碰撞筛选。上述结果只支持初始化几何与有限采样结论。
+
+合并前复核：全库 65 项函数测试通过（包含新增续跑/非法输入回归）；SDPI 命名下再次运行 5T35 的 1 walker × 20 steps，1/1 有效，full DockQ 0.0168，见 [复核报告](../results/sdpi_review_5T35_1x20.json)。此处与历史测试数量分开记录，不把小幅 GPU 数值差异解释为精度提升。
 
 ## 1. 目标与原则
 

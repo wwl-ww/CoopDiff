@@ -110,6 +110,7 @@ def test_bad_atom_and_torsion_maps_fail():
     bonds = data['edge_index'].clone()
     bonds[0, 0] = 999
     for edges, masks in ((bonds, data['mask_rotate']),
+                         (data['edge_index'], data['mask_rotate'].astype(float)),
                          (data['edge_index'].flip(0), data['mask_rotate']),
                          (data['edge_index'], ~data['mask_rotate'])):
         try:
@@ -144,7 +145,8 @@ def test_sampler_rejects_removed_modes_and_mismatched_clock():
     model = SimpleNamespace(eval=lambda: None)
     data = {'coords': torch.ones(1, 4, 3)}
     for kwargs in ({'init_mode': 'dual_native'}, {'init_mode': 'native'}, {'init_mode': 'coupled5a'},
-                   {'init_mode': 'anchor_local'}, {'t_anchor': 0.7}):
+                   {'init_mode': 'anchor_local'}, {'t_anchor': 0.7},
+                   {'steps': 0}, {'steps': -1}, {'steps': 1.5}):
         try:
             sample_single(model, InterfaceDiffusion(), TernaryInitializer(),
                           data, data, data, device='cpu', **kwargs)
@@ -152,6 +154,18 @@ def test_sampler_rejects_removed_modes_and_mismatched_clock():
             pass
         else:
             raise AssertionError(f"removed or mismatched prior accepted: {kwargs}")
+
+
+def test_sampler_rejects_empty_ensemble():
+    from tricoopdiff.sampler import sample_ensemble
+
+    for kwargs in ({'n_walkers': 0}, {'seeds': []}):
+        try:
+            sample_ensemble(None, None, None, {}, {}, {}, **kwargs)
+        except ValueError as error:
+            assert 'walker' in str(error)
+        else:
+            raise AssertionError('empty ensemble must not be reported as completed')
 
 
 if __name__ == '__main__':
