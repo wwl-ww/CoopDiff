@@ -86,6 +86,8 @@ def test_joint_initialization_is_shared_and_reproducible():
     again = init.initialize(a, b, data, seed=12)
     assert torch.equal(l, again[0]) and torch.equal(p, again[1])
     assert meta == again[3]
+    assert meta['init_mode'] == 'sdpi'
+    assert meta['version'] == 'sdpi_v1'
     # Native coordinates must not enter inference internal geometry.
     changed = {**data, "coords": torch.randn_like(data["coords"]) * 1000}
     assert torch.equal(l, init.initialize(a, b, changed, seed=12)[0])
@@ -141,7 +143,7 @@ def test_sampler_rejects_removed_modes_and_mismatched_clock():
 
     model = SimpleNamespace(eval=lambda: None)
     data = {'coords': torch.ones(1, 4, 3)}
-    for kwargs in ({'init_mode': 'native'}, {'init_mode': 'coupled5a'},
+    for kwargs in ({'init_mode': 'dual_native'}, {'init_mode': 'native'}, {'init_mode': 'coupled5a'},
                    {'init_mode': 'anchor_local'}, {'t_anchor': 0.7}):
         try:
             sample_single(model, InterfaceDiffusion(), TernaryInitializer(),

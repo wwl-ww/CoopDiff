@@ -1,4 +1,4 @@
-"""Shared full-ligand, receptor-size-adaptive dual binary initialization."""
+"""SDPI: Shared-Ligand Dual-Pose Initialization with receptor-adaptive priors."""
 
 import platform
 import random
@@ -12,7 +12,7 @@ from .rigid import apply_rigid, assemble_interface_pair
 
 
 INITIAL_NOISE_STD_PROPORTION = 1.4601642460337794
-INITIALIZATION_VERSION = "dual_native_v1"
+INITIALIZATION_VERSION = "sdpi_v1"
 
 
 def receptor_prior(coords):
@@ -48,7 +48,7 @@ def validate_ligand_graph(mol, edge_index, edge_mask, mask_rotate):
     from rdkit import Chem
 
     if mol is None or len(Chem.GetMolFrags(mol)) != 1:
-        raise ValueError("dual_native requires one connected complete RDKit molecule")
+        raise ValueError("sdpi requires one connected complete RDKit molecule")
     n = mol.GetNumAtoms()
     edges = torch.as_tensor(edge_index).detach().cpu()
     selected = torch.as_tensor(edge_mask).detach().cpu()
@@ -94,12 +94,12 @@ def validate_ligand_graph(mol, edge_index, edge_mask, mask_rotate):
 
 
 class TernaryInitializer:
-    """Only dual_native is supported; old shell/fixed-Å/local priors are removed."""
+    """Only sdpi is supported; old shell/fixed-Å/local priors are removed."""
 
     def __init__(self, initial_noise_std_proportion=INITIAL_NOISE_STD_PROPORTION,
                  no_torsion=False):
         if initial_noise_std_proportion != INITIAL_NOISE_STD_PROPORTION:
-            raise ValueError("dual_native requires the fixed positive DiffDock proportion")
+            raise ValueError("sdpi requires the fixed positive DiffDock proportion")
         self.no_torsion = bool(no_torsion)
 
     def initialize(self, e3_coords, poi_coords, ligand_data, seed=None):
@@ -156,7 +156,7 @@ class TernaryInitializer:
         ligand = apply_rigid(shared, ra, ta)
         poi, body_rotation = assemble_interface_pair(poi_coords, ra, ta, rb, tb)
         metadata = {
-            "init_mode": "dual_native", "version": INITIALIZATION_VERSION,
+            "init_mode": "sdpi", "version": INITIALIZATION_VERSION,
             "initial_noise_std_proportion": INITIAL_NOISE_STD_PROPORTION,
             "no_torsion": self.no_torsion, "pocket_knowledge": False,
             "choose_residue": False, "collision_filter": False,

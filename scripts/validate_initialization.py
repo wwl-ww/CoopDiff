@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Validate dual_native on real input molecules without ESM or model downloads."""
+"""Validate sdpi on real input molecules without ESM or model downloads."""
 
 import argparse
 import ast
@@ -126,7 +126,7 @@ def main():
     parser.add_argument('--official-sampling', type=Path)
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
-    report = {'init_mode': 'dual_native', 'passed': True,
+    report = {'init_mode': 'sdpi', 'passed': True,
               'cases': [validate_case(path, args.seeds) for path in args.case_dirs]}
     if args.official_sampling:
         report['official_rigid_parity'] = official_parity(args.official_sampling)

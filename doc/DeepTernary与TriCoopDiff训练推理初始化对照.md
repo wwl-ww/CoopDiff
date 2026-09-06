@@ -1,6 +1,6 @@
 # DeepTernary 与 TriCoopDiff 训练/推理初始化对照
 
-审计对象为本仓库当前代码和本地 DeepTernary 源码。TriCoopDiff 的初始化实现以 [dual_native 规范](初始化方案_gpt6.md) 为准；旧组件球壳与 5 Å 初始化操作说明已移除。
+审计对象为本仓库当前代码和本地 DeepTernary 源码。TriCoopDiff 的初始化实现以 [sdpi 规范](初始化方案_gpt6.md) 为准；旧组件球壳与 5 Å 初始化操作说明已移除。
 
 ## 对照口径
 
@@ -8,9 +8,9 @@
 |---|---|---|---|
 | DeepTernary MGD | 固定 P1，Ligand/P2 组件级随机旋转和平移 | 历史 `predict_cpu.py` 做组件随机化；`predict.py` 的 bound 路径保留输入 P2 布局 | 两入口的约束不同，不能混报 |
 | DeepTernary PROTAC | 组件随机化并带已知口袋信息 | 端点和二元口袋约束下的组件随机化 | warhead 原子、两端二元构象、两侧口袋 |
-| TriCoopDiff MGD/PROTAC | 真实三元结构上的双界面 forward noise，加一次共享 torsion noise | 唯一 `dual_native`，完整 ligand 共享构象、两侧尺寸自适应 prior、精确装配，从 t=1 开始 | 当前未接入 warhead/口袋 sidecar |
+| TriCoopDiff MGD/PROTAC | 真实三元结构上的双界面 forward noise，加一次共享 torsion noise | 唯一 `sdpi`，完整 ligand 共享构象、两侧尺寸自适应 prior、精确装配，从 t=1 开始 | 当前未接入 warhead/口袋 sidecar |
 
-`dual_native` 保留两侧局部初始化的所有相对距离，并与训练共用刚体组合函数。这不意味着其经验终端分布严格等于训练的 t=1 forward marginal，也不意味着已经获得 DeepTernary 的二元端点先验。
+`sdpi` 保留两侧局部初始化的所有相对距离，并与训练共用刚体组合函数。这不意味着其经验终端分布严格等于训练的 t=1 forward marginal，也不意味着已经获得 DeepTernary 的二元端点先验。
 
 ## DeepTernary 的共同训练初始化
 

@@ -59,7 +59,7 @@ TriFuse 不自行输出笛卡尔 rigid score、merge gate 或 SE(3) residual。�
 4. 更新 POI local frame；
 5. 重建并验证全部 frame 与图。
 
-初始化唯一支持 [`dual_native`](初始化方案_gpt6.md)。完整 ligand 从化学图重新生成共享构象，A/B 独立采样尺寸自适应刚体先验后精确装配。旧组件级和局部初始化已删除，当前不支持二元端点 sidecar。
+初始化唯一支持 [`sdpi`](初始化方案_gpt6.md)。完整 ligand 从化学图重新生成共享构象，A/B 独立采样尺寸自适应刚体先验后精确装配。旧组件级和局部初始化已删除，当前不支持二元端点 sidecar。
 
 ## Checkpoint 与恢复
 

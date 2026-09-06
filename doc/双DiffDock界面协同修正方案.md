@@ -38,7 +38,7 @@ TriFuse 不合并 rigid score、不输出 Ligand/POI SE(3) residual，也不替�
 
 训练分别对 `T_E3L` 和 `T_POL` 使用 native DiffDock forward noise。加噪后的两个相对刚体通过精确 SE(3) 组合重建唯一且一致的全局 Ligand/POI 坐标，然后构建两个二体图。每个 expert 接收自己界面的真实时间和噪声目标，禁止独立扰动全局 POI 后让 `sub2` 复用 `sub1` 的时间条件。
 
-推理同样维护这两个界面状态。唯一初始化 `dual_native` 使用共享完整构象与两侧尺寸自适应先验，见[初始化规范](初始化方案_gpt6.md)。
+推理同样维护这两个界面状态。唯一初始化 `sdpi` 使用共享完整构象与两侧尺寸自适应先验，见[初始化规范](初始化方案_gpt6.md)。
 
 ## Checkpoint 边界
 

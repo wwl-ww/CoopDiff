@@ -110,10 +110,10 @@ def build_parser():
         action="store_true",
         help="Keep the POI fixed and disable SE3 reverse updates for strict E3-L parity evaluation.",
     )
-    p.add_argument("--init-mode", choices=["dual_native"], default="dual_native",
+    p.add_argument("--init-mode", choices=["sdpi"], default="sdpi",
                    help="Shared full-ligand dual binary receptor-size-adaptive prior")
     p.add_argument("--t-anchor", type=float, choices=[1.0], default=None,
-                   help="dual_native starts at t=1; other values are rejected")
+                   help="sdpi starts at t=1; other values are rejected")
     return p
 
 
@@ -335,7 +335,7 @@ def main():
         "steps": args.steps if args.steps is not None else diffusion.inference_steps,
         "freeze_poi": args.freeze_poi,
         "init_mode": args.init_mode,
-        "initialization_version": "dual_native_v1",
+        "initialization_version": "sdpi_v1",
         "t_anchor": args.t_anchor if args.t_anchor is not None else 1.0,
         "trifuse_checkpoint": args.trifuse_ckpt,
         "activation_clamp": args.nan_clamp,

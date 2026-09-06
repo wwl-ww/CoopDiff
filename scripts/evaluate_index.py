@@ -56,8 +56,8 @@ def main():
         "checkpoint": checkpoint,
         "checkpoint_sha256": sha256_file(checkpoint),
         "cases": [entry["case"] for entry in entries],
-        "init_mode": "dual_native",
-        "initialization_version": "dual_native_v1",
+        "init_mode": "sdpi",
+        "initialization_version": "sdpi_v1",
         "seed": args.seed,
         "n_walkers": args.n_walkers,
         "steps": args.steps,
@@ -74,8 +74,8 @@ def main():
         case = entry["case"]
         report_path = output / f"{case}.json"
         expected_config = {
-            "init_mode": "dual_native",
-            "initialization_version": "dual_native_v1",
+            "init_mode": "sdpi",
+            "initialization_version": "sdpi_v1",
             "seed": args.seed,
             "n_walkers": args.n_walkers,
             "steps": args.steps,

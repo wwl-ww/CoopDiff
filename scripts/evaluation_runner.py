@@ -90,7 +90,7 @@ class EvaluationRunner:
 
     def evaluate_case(self, case, paths, cache_dir, native_complex_pdb=None,
                       n_walkers=32, steps=20, seed=0,
-                      init_mode="dual_native", t_anchor=None, freeze_poi=False,
+                      init_mode="sdpi", t_anchor=None, freeze_poi=False,
                       debug_trace=False, debug_seed=0):
         """Featurize and evaluate one case with the resident model."""
         torch.manual_seed(seed)
@@ -126,7 +126,7 @@ class EvaluationRunner:
                       else self.diffusion.inference_steps),
             "freeze_poi": freeze_poi,
             "init_mode": init_mode,
-            "initialization_version": "dual_native_v1",
+            "initialization_version": "sdpi_v1",
             "t_anchor": (t_anchor if t_anchor is not None else
                          1.0),
             "trifuse_checkpoint": str(self.checkpoint_path.resolve()),

@@ -33,7 +33,7 @@
 
 [diffusion.py](../tricoopdiff/diffusion.py) 使用指数 σ schedule、IGSO(3) 旋转噪声和 torsion 查表归一化。反向采样默认 20 步，末步不加随机噪声；温度修正由 `InterfaceDiffusion` 的参数定义。
 
-`tr_sigma_max=19` 是扩散 schedule 上限，不能用作当前初始化标准差。唯一初始化 `dual_native` 对两侧分别使用：
+`tr_sigma_max=19` 是扩散 schedule 上限，不能用作当前初始化标准差。唯一初始化 `sdpi` 对两侧分别使用：
 
 `sigma_init = receptor_rms_radius × 1.4601642460337794 / 1.73`
 

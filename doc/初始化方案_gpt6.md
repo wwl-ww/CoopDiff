@@ -1,21 +1,25 @@
-# 双 DiffDock＋联合 TriFuse 三元复合物初始化方案
+# SDPI：共享配体双位姿初始化
 
-> 当前 `dual_native_v1` 初始化规范及验收边界。初始化几何已验证；完整模型精度、MGD benchmark 和二元强先验仍需独立实验。
+SDPI 全称为 **Shared-Ligand Dual-Pose Initialization**。两侧共享一份完整配体内部构象，分别采样配体相对 E3、POI 的二元刚体位姿，再精确装配为一个三元初态。代码和 CLI 使用 `sdpi`，结果版本为 `sdpi_v1`；本次命名不改变采样分布或模型架构。
+
+历史验证产物仍保留当时的 `dual_native` 文件名与记录，以下链接用于追溯原始实验。新运行只接受 `sdpi`；旧名称不是兼容别名，旧结果也不会被当成 `sdpi_v1` 续跑结果。
+
+> 当前 `sdpi_v1` 初始化规范及验收边界。初始化几何已验证；完整模型精度、MGD benchmark 和二元强先验仍需独立实验。
 
 ### 当前落地范围（2026-09-06）
 
-`tricoopdiff/initialization.py` 实现唯一 `dual_native_v1`。从保持 atom index 的完整 RDKit 图生成 ETKDGv3 构象，固定 `useRandomCoords=True` 以支持长链 PROTAC；每个 walker 只采样一次完整 torsion。A/B 各用自身 Cα RMS radius，记录实际旋转、平移和中心，通过 `rigid.py` 的解析逆变换装配。训练的界面 forward noise 也使用同一组合函数。两个 expert 继续读取同一完整图，TriFuse 架构和训练目标没有变更。
+`tricoopdiff/initialization.py` 实现唯一 `sdpi_v1`。从保持 atom index 的完整 RDKit 图生成 ETKDGv3 构象，固定 `useRandomCoords=True` 以支持长链 PROTAC；每个 walker 只采样一次完整 torsion。A/B 各用自身 Cα RMS radius，记录实际旋转、平移和中心，通过 `rigid.py` 的解析逆变换装配。训练的界面 forward noise 也使用同一组合函数。两个 expert 继续读取同一完整图，TriFuse 架构和训练目标没有变更。
 
 按本次替换要求，旧 `native`、球壳、固定 Å 高斯、`coupled5a` 和 `anchor_local` 的实现及 CLI 入口全部删除；`t_anchor != 1`、非指定比例及旧固定尺度参数会报错。本文后续描述的局部 proposal 和 sidecar 是未来方案，不代表当前支持。当前不做外部 atom map、对称性匹配或 Kabsch 初始化，因此不存在退化 anchor fallback。
 
-特征缓存版本升至 5，保存保持原子顺序的 RDKit 分子；旧缓存需重新特征化。结果 JSON 的 `initialization` 保存每个 walker 的尺度、变换、torsion 顺序、库版本、设备、种子和专家来源。模型 checkpoint 格式不变；评估续跑签名必须匹配 `init_mode=dual_native` 与 `initialization_version=dual_native_v1`。
+特征缓存版本升至 5，保存保持原子顺序的 RDKit 分子；旧缓存需重新特征化。结果 JSON 的 `initialization` 保存每个 walker 的尺度、变换、torsion 顺序、库版本、设备、种子和专家来源。模型 checkpoint 格式不变；评估续跑签名必须匹配 `init_mode=sdpi` 与 `initialization_version=sdpi_v1`。
 
 可复现实例命令（仓库根目录运行，模型资产必须已缓存）：
 
 ```bash
 python tests/test_initialization.py
-python scripts/validate_initialization.py --case-dirs DeepTernary/output/protac22/5T35_D_A_759 DeepTernary/output/protac22/6BN7_B_C_RN3 DeepTernary/output/protac22/7JTO_L_B_VKA --official-sampling ../DiffDock/utils/sampling.py --out results/dual_native_geometry_examples.json
-HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python scripts/evaluate_entry.py --case 5T35_D_A_759 --allow-zero-init --n-walkers 1 --steps 20 --cache-dir results/featurize_cache_dual_native_v5 --out results/dual_native_5T35_etkdg_random_1x20.json
+python scripts/validate_initialization.py --case-dirs DeepTernary/output/protac22/5T35_D_A_759 DeepTernary/output/protac22/6BN7_B_C_RN3 DeepTernary/output/protac22/7JTO_L_B_VKA --official-sampling ../DiffDock/utils/sampling.py --out results/sdpi_geometry_examples.json
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python scripts/evaluate_entry.py --case 5T35_D_A_759 --allow-zero-init --n-walkers 1 --steps 20 --cache-dir results/featurize_cache_sdpi_v5 --out results/sdpi_5T35_etkdg_random_1x20.json
 ```
 
 `--official-sampling` 仅用于对照本地官方源码的刚体初始化核，不构成完整 DiffDock/训练后 TriFuse 精度对照。`--allow-zero-init` 明确表示未训练 TriFuse；初始化几何门禁、有限采样与最终 docking 精度必须分别报告。
@@ -151,7 +155,7 @@ $$
 
 ## 7. 唯一允许的广域平移先验
 
-`dual_native` 必须采用 DiffDock 默认推理 YAML 的受体尺寸自适应高斯，不提供固定标准差的兼容分支。对每侧居中后的受体坐标 `p_j`，定义：
+`sdpi` 必须采用 DiffDock 默认推理 YAML 的受体尺寸自适应高斯，不提供固定标准差的兼容分支。对每侧居中后的受体坐标 `p_j`，定义：
 
 $$
 s_{rec}=\sqrt{\frac{1}{N}\sum_j\lVert p_j\rVert^2},\qquad
@@ -176,7 +180,7 @@ $$
 - receptor 尺寸、计算得到的 `sigma_init` 以及 receptor/pocket center 的定义；
 - NumPy、SciPy、PyTorch 与 Python RNG seed。
 
-`initial_noise_std_proportion` 必须为上述固定正值；负值或任何请求固定绝对尺度的配置必须直接报错。文档、CLI、缓存签名和结果 JSON 均使用 `dual_native` 表示这一唯一语义，禁止同名模式随配置切换分布。
+`initial_noise_std_proportion` 必须为上述固定正值；负值或任何请求固定绝对尺度的配置必须直接报错。文档、CLI、缓存签名和结果 JSON 均使用 `sdpi` 表示这一唯一语义，禁止同名模式随配置切换分布。
 
 ## 8. 训练—推理一致性
 
@@ -192,7 +196,7 @@ $$
 
 训练 forward marginal、DiffDock 的经验终端初始化和带二元候选的局部 proposal 是三种不同对象：
 
-- 当前广域 `dual_native` prior：仅从 `t_start=1` 开始；
+- 当前广域 `sdpi` prior：仅从 `t_start=1` 开始；
 - 未来二元 pose 周围的局部 proposal：需使用相同 forward kernel，并从匹配的 `t_anchor<1` 开始；当前没有该入口；
 - 组件级 bounded 5 Å 分布不等于训练的 `t=1`，旧实现已删除。
 
@@ -237,4 +241,4 @@ $$
 - [DiffDock 初始化及采样实现](https://github.com/gcorso/DiffDock/blob/main/utils/sampling.py)：随机 torsion、旋转、平移和反向采样。
 - [DiffDock 默认推理配置](https://github.com/gcorso/DiffDock/blob/main/default_inference_args.yaml)：尺寸自适应初始化等运行参数。
 
-正式实验必须固定代码 commit、权重、配置、数据版本、原子映射和随机种子。`dual_native` 已是唯一默认实现，但默认启用不等于通过全部精度、碰撞或训练后模型验收。
+正式实验必须固定代码 commit、权重、配置、数据版本、原子映射和随机种子。`sdpi` 已是唯一默认实现，但默认启用不等于通过全部精度、碰撞或训练后模型验收。

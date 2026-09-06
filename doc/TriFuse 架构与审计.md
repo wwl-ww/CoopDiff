@@ -50,7 +50,7 @@ Judge/state heads remain frozen because no labels or losses currently exist.
 
 ## Known limitations
 
-- Only `dual_native` is implemented. Its receptor-adaptive terminal prior is not
+- Only `sdpi` is implemented. Its receptor-adaptive terminal prior is not
   claimed to equal the training forward marginal exactly. Binary pocket/warhead
   priors and local refinement are not implemented; see [initialization](初始化方案_gpt6.md).
 - Protein context uses residue-level coordinates; side-chain orientation and

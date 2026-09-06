@@ -64,7 +64,7 @@ def sample_single(
     return_trajectory: bool = False,
     return_trace: bool = False,
     freeze_poi: bool = False,
-    init_mode: str = "dual_native",
+    init_mode: str = "sdpi",
     t_anchor: float = None,
 ) -> dict:
     """
@@ -84,8 +84,8 @@ def sample_single(
             disable the SE3 reverse updates. This defines the strict zero-FiLM
             E3-L parity baseline: the sampler reduces to native-style DiffDock on
             the PROTAC branch instead of running an extra ternary POI dynamics.
-        init_mode: only ``dual_native`` is supported.
-        t_anchor: must be 1.0 for the broad dual_native prior.
+        init_mode: only ``sdpi`` is supported.
+        t_anchor: must be 1.0 for the broad sdpi prior.
 
     Returns:
         dict with 'ligand_coords' [N_lig, 3], 'poi_coords' [N_poi, 3] (CPU numpy),
@@ -106,17 +106,17 @@ def sample_single(
     e3_coords = e3_data["coords"][0].detach()            # [N_e3, 3]
 
     e3_center = e3_coords.mean(dim=0, keepdim=True)
-    if init_mode != "dual_native":
-        raise ValueError(f"removed initialization mode: {init_mode}; use dual_native")
+    if init_mode != "sdpi":
+        raise ValueError(f"removed initialization mode: {init_mode}; use sdpi")
     if t_anchor is None:
         t_anchor = 1.0
     if t_anchor != 1.0:
-        raise ValueError("dual_native requires t_anchor=1")
+        raise ValueError("sdpi requires t_anchor=1")
     ligand_pos, poi_pos, r_e3_to_poi, initialization = initializer.initialize(
         e3_coords, poi_template, ligand_data, seed=seed,
     )
     if not torch.isfinite(ligand_pos).all() or not torch.isfinite(poi_pos).all():
-        raise FloatingPointError("non-finite dual_native initialization")
+        raise FloatingPointError("non-finite sdpi initialization")
     if freeze_poi:
         poi_pos = poi_data["coords"].clone().detach()
         r_e3_to_poi = torch.eye(3, device=device, dtype=poi_pos.dtype).unsqueeze(0)
@@ -379,7 +379,7 @@ def sample_ensemble(
     n_walkers: int = 32,
     seeds=None,
     freeze_poi: bool = False,
-    init_mode: str = "dual_native",
+    init_mode: str = "sdpi",
     t_anchor: float = None,
 ) -> list:
     """

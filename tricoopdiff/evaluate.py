@@ -581,7 +581,7 @@ def evaluate_model(
     debug_trace: bool = False,
     debug_seed: int = 0,
     freeze_poi: bool = False,
-    init_mode: str = "dual_native",
+    init_mode: str = "sdpi",
     t_anchor: float = None,
     deepternary_dockq_paths: Optional[Dict[str, str]] = None,
     seed: int = 0,

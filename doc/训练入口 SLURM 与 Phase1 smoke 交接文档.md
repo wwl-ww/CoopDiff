@@ -20,7 +20,7 @@ sacct -j <job_id> --format=JobID,State,ExitCode,Elapsed,NodeList
 - 检查 CUDA、DeepTernary 数据索引、expert 参数/权重及缓存可写性；
 - Hugging Face 使用本地缓存并设置 offline 模式，作业不得静默下载模型。
 
-特征缓存当前为 version 5，包含初始化所需的索引化 RDKit 化学图。旧缓存不能直接用于 `dual_native` 推理，需要通过正式特征化入口重建；模型权重格式仍为 version 16。
+特征缓存当前为 version 5，包含初始化所需的索引化 RDKit 化学图。旧缓存不能直接用于 `sdpi` 推理，需要通过正式特征化入口重建；模型权重格式仍为 version 16。
 
 ## Phase 1 门禁
 
