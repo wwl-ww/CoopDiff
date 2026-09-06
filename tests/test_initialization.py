@@ -2,6 +2,8 @@
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -106,6 +108,7 @@ def test_bad_atom_and_torsion_maps_fail():
     bonds = data['edge_index'].clone()
     bonds[0, 0] = 999
     for edges, masks in ((bonds, data['mask_rotate']),
+                         (data['edge_index'].flip(0), data['mask_rotate']),
                          (data['edge_index'], ~data['mask_rotate'])):
         try:
             validate_ligand_graph(mol, edges, data['edge_mask'], masks)
@@ -113,6 +116,40 @@ def test_bad_atom_and_torsion_maps_fail():
             pass
         else:
             raise AssertionError("invalid atom/directed torsion mapping accepted")
+
+
+def test_torsion_is_applied_once_and_no_torsion_is_explicit():
+    from tricoopdiff.diffdock.utils.torsion import modify_conformer_torsion_angles
+
+    data = ligand_input()
+    receptor = torch.tensor([[0., 0., 0.], [2., 0., 0.], [0., 3., 0.]])
+    target = 'tricoopdiff.diffdock.utils.torsion.modify_conformer_torsion_angles'
+    for disabled in (False, True):
+        with patch(target, wraps=modify_conformer_torsion_angles) as torsion:
+            *_, metadata = TernaryInitializer(no_torsion=disabled).initialize(
+                receptor, receptor * 2, data, seed=5,
+            )
+        assert torsion.call_count == (0 if disabled else 1)
+        assert metadata['no_torsion'] == disabled
+        if disabled:
+            assert not any(metadata['torsion_updates'])
+
+
+def test_sampler_rejects_removed_modes_and_mismatched_clock():
+    from tricoopdiff.diffusion import InterfaceDiffusion
+    from tricoopdiff.sampler import sample_single
+
+    model = SimpleNamespace(eval=lambda: None)
+    data = {'coords': torch.ones(1, 4, 3)}
+    for kwargs in ({'init_mode': 'native'}, {'init_mode': 'coupled5a'},
+                   {'init_mode': 'anchor_local'}, {'t_anchor': 0.7}):
+        try:
+            sample_single(model, InterfaceDiffusion(), TernaryInitializer(),
+                          data, data, data, device='cpu', **kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"removed or mismatched prior accepted: {kwargs}")
 
 
 if __name__ == '__main__':
