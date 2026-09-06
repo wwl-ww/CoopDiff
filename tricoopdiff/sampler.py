@@ -1,7 +1,7 @@
 """
 Reverse-diffusion sampling for TriCoopDiff.
 
-Composes the existing reverse SDE primitives in ``diffusion.py`` into a full
+Composes the deterministic reverse flow in ``sdpi_flow.py`` into a full
 t=1→0 denoising loop that produces a predicted PROTAC pose (E3 reference frame)
 and a predicted E3-POI pose.
 
@@ -18,7 +18,8 @@ does NOT import ``../DiffDock``.
 import numpy as np
 import torch
 
-from .diffusion import InterfaceDiffusion, TernaryInitializer
+from .initialization import TernaryInitializer
+from .sdpi_flow import SDPIFlow, FLOW_VERSION
 
 
 @torch.no_grad()
@@ -26,7 +27,7 @@ def _tensor_summary(tensor: torch.Tensor) -> dict:
     """Compact numeric summary for per-step parity diagnostics."""
     t = tensor.detach().float()
     return {
-        "mean": float(t.mean().item()),
+        "mean": float(t.mean().item()) if t.numel() else 0.0,
         "std": float(t.std(unbiased=False).item()) if t.numel() > 1 else 0.0,
         "norm": float(torch.linalg.vector_norm(t).item()),
         "max_abs": float(t.abs().max().item()) if t.numel() > 0 else 0.0,
@@ -53,7 +54,7 @@ def _sanitize_score(score):
 @torch.no_grad()
 def sample_single(
     model,
-    diffusion: InterfaceDiffusion,
+    diffusion: SDPIFlow,
     initializer: TernaryInitializer,
     e3_data: dict,
     poi_data: dict,
@@ -68,11 +69,11 @@ def sample_single(
     t_anchor: float = None,
 ) -> dict:
     """
-    Run one reverse-diffusion trajectory (single walker) from t=1 to t=0.
+    Run one reverse-flow trajectory (single walker) from t=1 to t=0.
 
     Args:
         model: ``TriCoopDiff`` (already on ``device``; set to eval mode here).
-        diffusion: ``InterfaceDiffusion`` (holds sigma schedules + reverse steps).
+        diffusion: ``SDPIFlow`` (velocity preconditioning + reverse integration).
         initializer: ``TernaryInitializer``.
         e3_data/poi_data/ligand_data: B=1 featurized dicts (see featurize_common).
         steps: number of reverse steps (default: diffusion.inference_steps).
@@ -114,6 +115,10 @@ def sample_single(
         t_anchor = 1.0
     if t_anchor != 1.0:
         raise ValueError("sdpi requires t_anchor=1")
+    if not isinstance(diffusion, SDPIFlow):
+        raise ValueError('sampling requires SDPIFlow, not the legacy DSM process')
+    if initializer.no_torsion != bool(getattr(model.expert.model, 'no_torsion', False)):
+        raise ValueError('initializer and model no_torsion must match')
     ligand_pos, poi_pos, r_e3_to_poi, initialization = initializer.initialize(
         e3_coords, poi_template, ligand_data, seed=seed,
     )
@@ -123,6 +128,7 @@ def sample_single(
         poi_pos = poi_data["coords"].clone().detach()
         r_e3_to_poi = torch.eye(3, device=device, dtype=poi_pos.dtype).unsqueeze(0)
     initialization["freeze_poi"] = bool(freeze_poi)
+    initialization['generative_process'] = FLOW_VERSION
     initialization["expert"] = getattr(model.expert, "provenance", {})
     ca_distances = torch.cdist(e3_coords, poi_pos[0])
     initialization["initial_geometry"] = {
@@ -187,13 +193,7 @@ def sample_single(
         pol_tr_sigma, pol_rot_sigma, _ = diffusion.t_to_sigma(
             t_tr, t_rot, t_tor,
         )
-        diffusion_state = torch.cat((
-            torch.log(torch.stack((
-                tr_sigma, rot_sigma, tor_sigma, pol_tr_sigma, pol_rot_sigma,
-            ), dim=-1).clamp_min(1e-8)),
-            torch.stack((dt_tr, dt_rot, dt_tor), dim=-1),
-            t_tr.unsqueeze(-1),
-        ), dim=-1)
+        diffusion_state = diffusion.conditioning(t_tr, dt_tr, e3_data['coords'], poi_data['coords'])
 
         if bool(getattr(model.expert.model, "dynamic_max_cross", False)):
             receptor_crop_cutoff = tr_sigma * 3 + 20
@@ -219,13 +219,15 @@ def sample_single(
             setattr(model, '_debug_step0_probe', False)
         else:
             step0_probe = None
-        interface_scores = out["interface_scores"]
+        predicted = diffusion.normalized_predictions(out, t_tr)
+        velocities = diffusion.velocities(predicted, e3_data['coords'], poi_data['coords'])
+        interface_scores = velocities
         s_q = {}
         sanitized_components = []
         for name, value in (
             ("tr", interface_scores["e3_ligand"]["tr"]),
             ("rot", interface_scores["e3_ligand"]["rot"]),
-            ("tor", out["torsion_score"]),
+            ("tor", velocities['torsion']),
         ):
             s_q[name], had_nonfinite = _sanitize_score(value)
             if had_nonfinite:
@@ -253,52 +255,12 @@ def sample_single(
                 })
             break
 
-        add_noise = i < steps - 1  # no stochastic noise on the final step
-
-        old_ligand_pos = ligand_pos
-        rigid_ligand_pos, rigid_target_pos = diffusion.reverse_step_protac(
-            ligand_pos, s_q["tr"], s_q["rot"], s_q["tor"],
-            t_tr, t_rot, t_tor, dt_tr, dt_rot, dt_tor, add_noise=add_noise,
+        add_noise = False  # deterministic reverse flow, not temperature SDE
+        ligand_pos, poi_pos, r_e3_to_poi = diffusion.step(
+            ligand_pos, poi_pos, r_e3_to_poi,
+            {'e3_ligand': s_q, 'poi_ligand': s_pol, 'torsion': s_q['tor']},
+            dt_tr, ligand_data, freeze_poi=freeze_poi,
         )
-
-        # Both experts scored the same old ternary state. Construct both rigid
-        # proposals from that state before changing any coordinates. Aligning
-        # the POI-side proposal to the E3-side proposal produces one consistent
-        # ternary pose: E3 stays fixed, Ligand follows sub1, and POI carries the
-        # exact transform required to preserve sub2's proposed interface.
-        if not freeze_poi:
-            poi_pos, rot_matrix = diffusion.reverse_step_poi_ligand_interface(
-                poi_pos,
-                source_ligand_pos=old_ligand_pos,
-                target_ligand_pos=rigid_ligand_pos,
-                tr_score=s_pol["tr"],
-                rot_score=s_pol["rot"],
-                t_tr=t_tr,
-                t_rot=t_rot,
-                dt_tr=dt_tr,
-                dt_rot=dt_rot,
-                add_noise=add_noise,
-                return_rotation=True,
-            )
-            # The interface composition applies ``old @ rot_matrix.T``;
-            # compose the tracked global-to-body map in the same order.
-            r_e3_to_poi = rot_matrix @ r_e3_to_poi
-
-        ligand_pos = rigid_ligand_pos
-
-        # Torsion reverse (PROTAC rotatable bonds) — only when the conformer has
-        # rotatable bonds (edge_mask/mask_rotate present and tor score non-empty).
-        if (
-            ligand_data.get("edge_mask") is not None
-            and ligand_data.get("mask_rotate") is not None
-            and s_q["tor"].numel() > 0
-        ):
-            ligand_pos = diffusion.reverse_step_torsion(
-                ligand_pos, s_q["tor"], t_tor, dt_tor,
-                ligand_data["edge_index"], ligand_data["edge_mask"],
-                ligand_data["mask_rotate"], add_noise=add_noise,
-                rigid_target_pos=rigid_target_pos,
-            )
 
         if return_trace:
             lig_com = ligand_pos.mean(dim=1)[0]
@@ -332,6 +294,8 @@ def sample_single(
                 "poi_com": poi_com.detach().cpu().numpy().tolist(),
                 "ligand_pocket_dist": float(torch.linalg.vector_norm(lig_com - e3_center[0]).item()),
                 "poi_e3_dist": float(torch.linalg.vector_norm(poi_com - e3_center[0]).item()),
+                # Flow records use physical velocity units, not DSM scores.
+                "prediction_units": "angstrom/time, radians/time",
                 # Keep the historical key for report compatibility; the value
                 # is the determinant of the inverse/body-frame rotation.
                 "r_cum_det": float(torch.det(r_e3_to_poi[0]).item()),
@@ -371,7 +335,7 @@ def sample_single(
 
 def sample_ensemble(
     model,
-    diffusion: InterfaceDiffusion,
+    diffusion: SDPIFlow,
     initializer: TernaryInitializer,
     e3_data: dict,
     poi_data: dict,
@@ -385,7 +349,7 @@ def sample_ensemble(
     t_anchor: float = None,
 ) -> list:
     """
-    Run ``n_walkers`` independent reverse-diffusion trajectories.
+    Run ``n_walkers`` independent reverse-flow trajectories.
 
     Args:
         (same as ``sample_single`` for model/data/diffusion/initializer)

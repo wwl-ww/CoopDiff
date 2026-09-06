@@ -2,7 +2,7 @@
 TriCoopDiff training entry point.
 
 Supervised training:
-  Phase 1: Interface score matching (TriFuse control + expert LoRA).
+  Phase 1: SDPI conditional velocity matching (TriFuse + expert LoRA).
   Auxiliary confidence/state training is intentionally unavailable until the
   dataset and loss expose explicit labels.
 
@@ -75,13 +75,13 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument(
         "--nan-clamp", type=float, default=100.0,
-        help="Per-layer expert activation clamp recorded in v16 checkpoints",
+        help="Per-layer expert activation clamp recorded in v17 flow checkpoints",
     )
     p.add_argument(
         "--torsion-expert-aux-weight", type=float, default=0.25,
         help="Weight for per-expert torsion losses in addition to joint torsion",
     )
-    p.add_argument("--lora_rank", type=int, default=0,
+    p.add_argument("--lora_rank", type=int, default=4,
                    help="Rank of independent sub1/sub2 expert adapters; 0 disables LoRA")
     p.add_argument("--lora_alpha", type=float, default=8.0)
     p.add_argument("--lora_start_layer", type=int, default=0)
@@ -97,7 +97,7 @@ def parse_args():
 
     # Phase
     p.add_argument("--phase", type=int, default=1, choices=[1],
-                   help="interface score matching (the only defined phase)")
+                   help="SDPI velocity matching (the only defined phase)")
     p.add_argument("--resume", default=None, help="Resume from checkpoint")
 
     # Model config
@@ -188,6 +188,7 @@ def seed_training(seed, device):
 
 def main():
     args = parse_args()
+    args.generative_process = 'sdpi_flow_v1'
     if args.nan_clamp <= 0:
         raise SystemExit("FATAL: --nan-clamp must be positive")
     os.environ["NAN_CLAMP"] = str(args.nan_clamp)
@@ -360,10 +361,12 @@ def main():
 
 def build_trainer(args, device, input_dim=None):
     """Build model, diffusion, and trainer."""
+    if args.lora_rank <= 0 or args.lora_start_layer != 0:
+        raise ValueError('version-17 flow training requires LoRA from layer 0')
     from tricoopdiff import TriCoopDiff
     from tricoopdiff.trifuse import TriFuse
     from tricoopdiff.expert_factory import build_diffdock_expert
-    from tricoopdiff.diffusion import InterfaceDiffusion
+    from tricoopdiff.sdpi_flow import SDPIFlow
     from tricoopdiff.train import TriCoopDiffTrainer
 
     # Build frozen DiffDock-L expert from pretrained weights (self-contained
@@ -410,7 +413,7 @@ def build_trainer(args, device, input_dim=None):
     model = TriCoopDiff(frozen_expert, trifuse, num_conv_layers=num_conv_layers)
 
     # Build diffusion
-    diffusion = InterfaceDiffusion(inference_steps=20)
+    diffusion = SDPIFlow(inference_steps=20)
 
     # Build trainer
     trainer = TriCoopDiffTrainer(

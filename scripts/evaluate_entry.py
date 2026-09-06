@@ -9,9 +9,9 @@ Pipeline:
   1. Featurize the E3-L and POI-L subgraphs (``featurize_common``, on-the-fly
      ESM2-650M embeddings).
   2. Build the frozen DiffDock-L expert + TriFuse + TriCoopDiff +
-     InterfaceDiffusion + TernaryInitializer.
+     SDPIFlow + TernaryInitializer.
   3. Optionally load a trained TriFuse checkpoint (``--trifuse-ckpt``).
-  4. ``evaluate_model``: run ``--n-walkers`` reverse-diffusion trajectories and
+  4. ``evaluate_model``: run ``--n-walkers`` reverse-flow trajectories and
      report PROTAC RMSD / pocket distance / clash rate + ensemble diversity.
 
 The zero-FiLM baseline (no ``--trifuse-ckpt``) is the Go/No-Go reference:
@@ -57,7 +57,8 @@ from evaluation_common import (
 from tricoopdiff.expert_factory import build_diffdock_expert
 from tricoopdiff.trifuse import TriFuse
 from tricoopdiff.model import TriCoopDiff
-from tricoopdiff.diffusion import InterfaceDiffusion, TernaryInitializer
+from tricoopdiff.sdpi_flow import SDPIFlow
+from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
 
 # DiffDock's SO(3)/torus cache lookup resolves relative to CWD; cache files live
@@ -77,7 +78,7 @@ def build_parser():
     p.add_argument("--case", default="5T35_D_A_759",
                    help="Ternary complex case name (directory under --protac-dir)")
     p.add_argument("--trifuse-ckpt", default=None,
-                   help="Version-16 TriFuse checkpoint")
+                   help="Version-17 SDPI flow checkpoint")
     p.add_argument(
         "--nan-clamp", type=float, default=100.0,
         help="Activation clamp for an explicit zero-init baseline",
@@ -93,7 +94,7 @@ def build_parser():
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--n-walkers", type=int, default=32,
-                   help="Number of independent reverse-diffusion trajectories")
+                   help="Number of independent reverse-flow trajectories")
     p.add_argument("--steps", type=int, default=None,
                    help="Reverse-diffusion steps (default: diffusion.inference_steps)")
     p.add_argument("--cache-dir", default="results/featurize_cache",
@@ -280,7 +281,7 @@ def main():
         num_conv_layers=num_conv_layers,
         use_film=True,
     ).to(device)
-    diffusion = InterfaceDiffusion()
+    diffusion = SDPIFlow()
     initializer = TernaryInitializer(
         no_torsion=getattr(score_model_args, "no_torsion", False),
     )
@@ -336,6 +337,7 @@ def main():
         "freeze_poi": args.freeze_poi,
         "init_mode": args.init_mode,
         "initialization_version": "sdpi_v1",
+        "generative_process": "sdpi_flow_v1",
         "t_anchor": args.t_anchor if args.t_anchor is not None else 1.0,
         "trifuse_checkpoint": args.trifuse_ckpt,
         "activation_clamp": args.nan_clamp,

@@ -60,6 +60,7 @@ def main():
         "cases": [entry["case"] for entry in entries],
         "init_mode": "sdpi",
         "initialization_version": "sdpi_v1",
+        "generative_process": "sdpi_flow_v1",
         "seed": args.seed,
         "n_walkers": args.n_walkers,
         "steps": args.steps,
@@ -82,6 +83,7 @@ def main():
             expected_config = {
                 "init_mode": "sdpi",
                 "initialization_version": "sdpi_v1",
+                "generative_process": "sdpi_flow_v1",
                 "seed": args.seed,
                 "n_walkers": args.n_walkers,
                 "steps": args.steps,
