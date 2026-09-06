@@ -206,6 +206,78 @@ $$
 
 训练和推理必须共用 `compose/decompose`、frame 和 torsion 映射实现。
 
+### 8.1 当前并未实现终端分布一致性
+
+`sdpi_v1` 与 native DSM **只对齐了状态、时间和装配约定**，不能因为调用
+同一装配函数就宣称生成过程一致。需要同时处理以下问题：
+
+1. 平移：给定原生样本，训练终端配体中心服从
+   `N(c_native, 19² I)`；推理服从 `N(c_receptor, sigma_init² I)`。
+   仅把训练的 19 换成 `sigma_init` 仍保留中心差异。
+2. 旋转和 torsion：有限时间的热核不等于精确均匀先验。对 wrapped normal
+   torsion，条件一阶圆周矩的模为 `exp(-sigma²/2)`；当前终端约为
+   `0.007228`，而 uniform 为 0。这个条件差异不能直接当成数据边缘分布差异。
+3. 配体几何：训练保留晶体构象的键长、键角和刚性片段几何；推理保留
+   新 ETKDG 构象的相应量。刚体＋合法 torsion 更新不能改变这些不变量。
+   调整噪声或增加步数不能消除此类不可达性。
+4. 前向核改变时，DSM target、score normalization、反向系数和时间条件
+   必须一起推导；经验 temperature sampling 也不能自动视为新过程的精确反演。
+   新目标不能默认兼容旧 checkpoint。
+
+### 8.2 可复现数学审计
+
+从仓库根目录运行（无需模型或 GPU）：
+
+```bash
+python tests/test_initialization_audit.py
+python scripts/audit_initialization_consistency.py \
+  --case-dirs DeepTernary/output/protac22/5T35_D_A_759 \
+              DeepTernary/output/protac22/6BN7_B_C_RN3 \
+              DeepTernary/output/protac22/7JTO_L_B_VKA \
+  --seeds 0 7 42 --out results/sdpi_consistency_audit.json
+```
+
+脚本记录输入 SHA256、完整初始化 provenance、两侧条件 Gaussian KL 和
+不变原子对的距离误差。这里
+
+$$
+D_{KL}(q_T(\cdot\mid x_0)\Vert p_{init})=
+\frac12\left[3\left(\frac{s^2}{r^2}-1-2\log\frac{s}{r}\right)
++\frac{\|c_{native}-c_{receptor}\|^2}{r^2}\right].
+$$
+
+这是**逐样本条件 KL**，不是数据边缘 `q_T` 的 KL，不能把它解释为后者的
+下界。几何检查包含删除可旋转键后各刚性片段内的全部原子对，以及所有
+1–2、1–3 原子对。对任意不变原子对距离差 `d`，任意合法 torsion 和刚体
+拟合后的 indexed-atom RMSD 均满足 `RMSD >= |d| / sqrt(2N)`，由三角不等式
+及 Cauchy–Schwarz 不等式直接得到。零误差只是必要条件，不证明完整可达性；
+该界不包含原子对称置换，也不是 DockQ 界。
+
+2026-09-06，float64 输入、当前 vendored torsion 实现、seeds 0/7/42：
+
+| case | E3 / POI 条件平移 KL（nat） | 最大不变距离差范围（Å） | RMSD 保守下界范围（Å） |
+|---|---:|---:|---:|
+| 5T35_D_A_759 | 1.3061 / 2.1766 | 0.3492–0.4828 | 0.0297–0.0411 |
+| 6BN7_B_C_RN3 | 0.9692 / 1.5198 | 0.3766–0.3980 | 0.0338–0.0357 |
+| 7JTO_L_B_VKA | 1.6032 / 1.0636 | 0.6148–0.7423 | 0.0469–0.0566 |
+
+9/9 初始化均存在超过 `1e-5 Å` 容差的不变量差异。这证明当前采样自由度
+无法精确重建这些 indexed 晶体坐标，**不证明这是低 DockQ 的主要原因**；
+上面的 RMSD 下界很小，不能夸大为严重精度损失。
+
+### 8.3 后续修改必须先明确训练目标
+
+尚未替换当前生产 forward/loss/sampler；审计通过表示诊断实现正确，
+不是训练—推理一致性通过。两条路线不能静默混为一谈：
+
+- 保留刚体＋torsion：从与推理同分布、独立于 native 的参考构象出发，
+  将原生目标显式投影到该可达空间，记录投影误差并继续用原始结构评估。
+  再为这个目标推导以实际 SDPI 为起点的生成过程与监督目标。
+- 保留原始晶体坐标目标：扩展配体内部几何自由度，重新处理化学约束、
+  模型输出与动力学。不能只把原有 torsion head 换个名字。
+
+前者改变训练目标，后者改变状态空间；在决定前不得声称已经实现严格对齐。
+
 ## 9. 碰撞、口袋和 MGD 边界
 
 两侧独立二元初始化不保证合理的蛋白质—蛋白质界面，尤其 MGD 可能依赖由另一颗蛋白和配体共同形成的协同界面。两个 DiffDock 仅提供局部先验；TriFuse 必须观察 A–B、A–L、B–L 三类关系。

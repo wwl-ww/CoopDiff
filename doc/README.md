@@ -29,6 +29,9 @@
 - 两个 rigid proposal 从同一个旧 Ligand 生成；Ligand 采用 `sub1` proposal，POI 接收将 `sub2` proposal 对齐到 `sub1` proposal 的精确刚体变换。
 - TriFuse 使用组分类型、三组跨分子距离分布和接触统计，负责 branch-specific FiLM 与逐键 torsion 协调；它不输出刚体 merge gate 或独立 SE(3) score。
 - 训练分别对两个界面应用 native DiffDock forward noise，再重建唯一一致的全局坐标。
+- 该训练终端与 `sdpi_v1` **不是同一分布**；平移中心/尺度、有限角噪声和
+  配体不可变内部几何均需处理。数学审计与真实样例见
+  [初始化规范 §8](初始化方案_gpt6.md#8-训练推理一致性)，不能把装配一致当作分布一致。
 - 新 checkpoint 必须是 version 16 且 `architecture=trifuse_v13`；旧版本必须拒绝。
 - version 16 记录 activation clamp、torsion expert 辅助损失与 LoRA warmup；训练与评估必须恢复一致配置。
 - 当前只定义 Phase 1；`judge_head/state_head` 缺少监督标签，因此保持冻结，不能用无损失的“Phase 2”假装完成微调。
