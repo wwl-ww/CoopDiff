@@ -14,6 +14,7 @@ Usage:
 
 from pathlib import Path
 from functools import partial
+import hashlib
 
 import torch
 import yaml
@@ -85,7 +86,15 @@ def build_diffdock_expert(
     cg_model = cg_model.to(device)
     cg_model.eval()
 
-    return FrozenDiffDock(cg_model, num_conv_layers=num_conv_layers)
+    expert = FrozenDiffDock(cg_model, num_conv_layers=num_conv_layers)
+    expert.provenance = {
+        "diffdock_commit": "47eb91a",
+        "diffdock_source": "vendored with repository stability patches",
+        "score_checkpoint": str(ckpt_path.resolve()),
+        "score_checkpoint_sha256": hashlib.sha256(ckpt_path.read_bytes()).hexdigest(),
+        "no_torsion": bool(getattr(args, "no_torsion", False)),
+    }
+    return expert
 
 
 __all__ = ["build_diffdock_expert"]

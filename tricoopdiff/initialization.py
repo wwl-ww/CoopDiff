@@ -1,8 +1,10 @@
 """Shared full-ligand, receptor-size-adaptive dual binary initialization."""
 
+import platform
 import random
 
 import numpy as np
+import scipy
 import torch
 from scipy.spatial.transform import Rotation
 
@@ -26,6 +28,21 @@ def receptor_prior(coords):
     return center, radius, radius * INITIAL_NOISE_STD_PROPORTION / 1.73
 
 
+def sample_binary_pose(shared, receptor):
+    """Sample and retain one Haar rotation and receptor-adaptive translation."""
+    center, radius, sigma = receptor_prior(receptor)
+    rotation = torch.as_tensor(Rotation.random().as_matrix(),
+                               device=shared.device, dtype=shared.dtype)
+    delta = torch.randn(3, device=shared.device, dtype=shared.dtype) * sigma
+    translation = center + delta - rotation @ shared.mean(0)
+    return rotation, translation, {
+        "receptor_center": center.tolist(), "rms_radius": radius.item(),
+        "sigma_init": sigma.item(), "rotation": rotation.tolist(),
+        "delta": delta.tolist(), "translation": translation.tolist(),
+        "center_definition": "all_receptor_ca_mean",
+    }
+
+
 def validate_ligand_graph(mol, edge_index, edge_mask, mask_rotate):
     """Require exact indexed full-molecule bonds and directed torsion masks."""
     from rdkit import Chem
@@ -35,7 +52,8 @@ def validate_ligand_graph(mol, edge_index, edge_mask, mask_rotate):
     n = mol.GetNumAtoms()
     edges = torch.as_tensor(edge_index).detach().cpu()
     selected = torch.as_tensor(edge_mask).detach().cpu()
-    if edges.ndim != 2 or edges.shape[0] != 2 or selected.dtype != torch.bool:
+    if (edges.ndim != 2 or edges.shape[0] != 2 or selected.dtype != torch.bool
+            or edges.dtype not in (torch.int32, torch.int64)):
         raise ValueError("invalid ligand edge_index or edge_mask")
     if selected.shape != (edges.shape[1],) or edges.numel() == 0:
         raise ValueError("invalid full-ligand bond map")
@@ -43,7 +61,7 @@ def validate_ligand_graph(mol, edge_index, edge_mask, mask_rotate):
         raise ValueError("ligand atom map out of range")
     expected = {(b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in mol.GetBonds()}
     expected |= {(v, u) for u, v in expected.copy()}
-    if set(map(tuple, edges.T.tolist())) != expected:
+    if set(map(tuple, edges.T.tolist())) != expected or edges.shape[1] != len(expected):
         raise ValueError("ligand graph does not match indexed chemical graph")
     if isinstance(mask_rotate, (list, tuple)):
         if len(mask_rotate) != 1:
@@ -94,10 +112,11 @@ class TernaryInitializer:
         from rdkit.Chem import AllChem
         from .diffdock.utils.torsion import modify_conformer_torsion_angles
 
-        if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
+        if seed is None:
+            seed = random.SystemRandom().randrange(2**32)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
         mol = ligand_data.get("mol")
         if isinstance(mol, bytes):
             mol = Chem.Mol(mol)
@@ -105,12 +124,17 @@ class TernaryInitializer:
             mol, ligand_data["edge_index"], ligand_data["edge_mask"],
             ligand_data["mask_rotate"],
         )
+        for field in ("coords", "features"):
+            if field in ligand_data and ligand_data[field].shape[-2] != mol.GetNumAtoms():
+                raise ValueError(f"full-ligand atom count disagrees with {field}")
         mol = Chem.Mol(mol)
         mol.RemoveAllConformers()
         conformer_seed = int(np.random.randint(0, 2**31 - 1))
         embedded = Chem.AddHs(mol)
         params = AllChem.ETKDGv3()
         params.randomSeed = conformer_seed
+        # A fixed policy for flexible PROTACs, not a native-conformer fallback.
+        params.useRandomCoords = True
         if AllChem.EmbedMolecule(embedded, params) != 0:
             raise ValueError("full-ligand ETKDG embedding failed; no native-pose fallback")
         # AddHs appends atoms; retain the original graph's exact atom order.
@@ -124,21 +148,10 @@ class TernaryInitializer:
             shared = modify_conformer_torsion_angles(
                 shared.cpu(), bonds, masks, torsions, as_numpy=False,
             ).to(device=e3_coords.device, dtype=e3_coords.dtype)
-        ligand_center = shared.mean(0)
         transforms, sides = [], {}
         for name, receptor in (("e3", e3_coords), ("poi", poi_coords)):
-            center, radius, sigma = receptor_prior(receptor)
-            rotation = torch.as_tensor(Rotation.random().as_matrix(),
-                                       device=shared.device, dtype=shared.dtype)
-            delta = torch.randn(3, device=shared.device, dtype=shared.dtype) * sigma
-            translation = center + delta - rotation @ ligand_center
+            rotation, translation, sides[name] = sample_binary_pose(shared, receptor)
             transforms.append((rotation, translation))
-            sides[name] = {
-                "receptor_center": center.tolist(), "rms_radius": radius.item(),
-                "sigma_init": sigma.item(), "rotation": rotation.tolist(),
-                "delta": delta.tolist(), "translation": translation.tolist(),
-                "center_definition": "all_receptor_ca_mean",
-            }
         (ra, ta), (rb, tb) = transforms
         ligand = apply_rigid(shared, ra, ta)
         poi, body_rotation = assemble_interface_pair(poi_coords, ra, ta, rb, tb)
@@ -151,5 +164,11 @@ class TernaryInitializer:
                               rdkit=conformer_seed),
             "torsion_updates": torsions.tolist(),
             "torsion_bonds": bonds.tolist(), "sides": sides,
+            "conformer": {"method": "ETKDGv3", "useRandomCoords": True,
+                          "enforceChirality": True},
+            "software": {"python": platform.python_version(), "numpy": np.__version__,
+                         "scipy": scipy.__version__, "pytorch": torch.__version__,
+                         "rdkit": Chem.rdBase.rdkitVersion},
+            "device": str(shared.device), "dtype": str(shared.dtype),
         }
         return ligand.unsqueeze(0), poi.unsqueeze(0), body_rotation.unsqueeze(0), metadata

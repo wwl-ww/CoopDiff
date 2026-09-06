@@ -52,7 +52,7 @@ def report_gate(path, key, validator=None):
 
 
 def validate_parity_report(report):
-    if report.get("init_mode") not in {"coupled5a", "anchor_local"}:
+    if report.get("init_mode") not in {"dual_native"}:
         return "parity report used an unsupported ternary initialization mode"
     if str(report.get("nan_clamp")).lower() != "none":
         return "parity report was not generated with nan_clamp=none"
@@ -60,7 +60,7 @@ def validate_parity_report(report):
 
 
 def validate_frame_report(report):
-    if report.get("init_mode") not in {"coupled5a", "anchor_local"}:
+    if report.get("init_mode") not in {"dual_native"}:
         return "frame report used an unsupported ternary initialization mode"
     checks = report.get("checks", {})
     if checks.get("poi_body_frame") is not True:

@@ -61,7 +61,9 @@ class EvaluationRunner:
         self.model = None
         self.input_dim = None
         self.diffusion = InterfaceDiffusion()
-        self.initializer = TernaryInitializer()
+        self.initializer = TernaryInitializer(
+            no_torsion=getattr(self.score_model_args, "no_torsion", False),
+        )
 
     def _ensure_model(self, input_dim):
         if self.model is not None:
@@ -88,7 +90,7 @@ class EvaluationRunner:
 
     def evaluate_case(self, case, paths, cache_dir, native_complex_pdb=None,
                       n_walkers=32, steps=20, seed=0,
-                      init_mode="coupled5a", t_anchor=None, freeze_poi=False,
+                      init_mode="dual_native", t_anchor=None, freeze_poi=False,
                       debug_trace=False, debug_seed=0):
         """Featurize and evaluate one case with the resident model."""
         torch.manual_seed(seed)
@@ -104,6 +106,7 @@ class EvaluationRunner:
             self.model, e3_data, poi_data, ligand_data, self.diffusion,
             initializer=self.initializer, device=str(self.device),
             n_walkers=n_walkers, steps=steps,
+            seed=seed,
             native_complex_pdb=(str(native_complex_pdb)
                                 if native_complex_pdb else None),
             freeze_poi=freeze_poi, init_mode=init_mode, t_anchor=t_anchor,
@@ -123,8 +126,9 @@ class EvaluationRunner:
                       else self.diffusion.inference_steps),
             "freeze_poi": freeze_poi,
             "init_mode": init_mode,
+            "initialization_version": "dual_native_v1",
             "t_anchor": (t_anchor if t_anchor is not None else
-                         (0.7 if init_mode == "anchor_local" else 1.0)),
+                         1.0),
             "trifuse_checkpoint": str(self.checkpoint_path.resolve()),
             "activation_clamp": self.activation_clamp,
             "expert_model_dir": str(self.model_dir),
