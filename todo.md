@@ -336,12 +336,17 @@ POI-L `1.247008/1.247022`；正确条件更好分别为 `12/27`、`11/27`。
 不把“已做噪声诊断”写成“已证明训练到达不可约下限”；生成质量另用 benchmark 检验。
 证据：`results/epoch20_diagnostic_run3/endpoint_target_variance.json`。
 
-### 8. 异常样本与全池数据：失败路径复查完成，全池门禁进行中
+### 8. 异常样本与全池数据：失败路径复查与全池拆分门禁完成
 
 回复：`5Z86` 目标/坐标检查通过，原模型 loss 正常，且固定拟合可显著降低。
 不能将首轮短训练的高梯度当作损坏标签而剔除该 case。
-正在从本地已通过 gzip 完整性检查的压缩包提取官方 7,198-case 联合池，
-按现行 index builder 执行全部结构拆分和连通配体门禁，结果随后补充。
+从已通过 gzip 完整性检查的压缩包提取官方 7,198-case 联合池，无缺失。
+现行 index builder 完整运行通过：训练 6,834 accepted / 110 rejected，
+验证 253 accepted / 1 rejected；111 个拒绝项全部为协议预期的不连通配体，
+无其他 materialization error，合计 7,087 usable cases。
+索引：`/tmp/pymp-f2c2db1a/epoch20_evaluation/indexes/ternary_{train,val}.json`。
+验证 253/253 通过有限坐标与双界面接触审计；训练集同项审计进行中。
+审计显式使用 `--min-ligand-heavy-atoms 1`，不套用旧的 20-heavy-atom 过滤器。
 联合池是 PROTAC/MGD 两训练来源的交集，不能把来源目录直接当作互斥任务标签。
 本轮 loss 统计只覆盖 6 个结构，不声称已完成全池神经网络 loss 归因。
 
@@ -353,3 +358,16 @@ SDPI 初始化、20 步、seed=0 起始，仅物理 GPU 3；先做单例完整�
 权重、索引哈希和逐 case 输出须保留。PROTAC 的 best 只称 oracle-best，
 当前不存在经监督的模型排名 top-1；失败 case、无效 walker 与样本分母必须公开。
 本轮不继续训练剩余 80 epochs，也不使用 benchmark 选择参数或 checkpoint。
+
+评测接口修正：PROTAC unbound 文件的链名/残基编号与 native 不一致。
+严格复用 `DeepTernary/predict_cpu.py::predict_one_unbound` 的重建方式：
+先从 unbound 输入与预测坐标求刚体运动，再将其作用到同目录预对齐的 bound 全原子模板，
+调用 `cal_dockq`。模板仅用于打分，不进入模型特征或初始化；
+通过 `evaluate_index.py --metric-template-root /tmp/coopdiff_protac/output/protac22` 显式开启，
+模板内容纳入 input_signature，run_config 记录 reconstruction 方式。
+PROTAC 不注入 DeepTernary 的双端点二元先验，因此历史 DeepTernary 分数不是同先验对照。
+每条 seed 的指标、计算失败原因和完整原子 DockQ 成功数均保留。
+
+代码提交：`14a0c02`（真实 checkpoint 受控诊断）、`a5ce49d`（官方输入准备与逐 seed 记录）。
+回归：model-build 全部通过；数据/evaluation helper 共 21 项通过；逐 seed 与
+unbound-template 刚体重建测试通过。`.gitignore` 用户原有改动未包含在提交中。

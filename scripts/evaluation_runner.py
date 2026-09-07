@@ -121,6 +121,8 @@ class EvaluationRunner:
                 "protein2_pdb": str(paths["protein2"]),
                 "ligand_pdb": str(paths["ligand"]),
                 "deepternary_root": str(self.root / "DeepTernary"),
+                **{key + '_pdb': str(paths[key]) for key in
+                   ('metric_protein1', 'metric_protein2') if key in paths},
             },
         )
         report["case"] = case
@@ -141,6 +143,10 @@ class EvaluationRunner:
             "expert_config_sha256": self.expert_config_sha256,
             "input_signature": evaluation_input_signature(paths, native_complex_pdb),
             "activation_clamp": self.activation_clamp,
+            "dockq_reconstruction": (
+                "deepternary_bound_template_rigid_motion"
+                if 'metric_protein1' in paths else "input_allatom_rigid_motion"
+            ),
             "expert_model_dir": str(self.model_dir),
             "dockq_implementation": (
                 "DeepTernary/DockQ/dockq_util.py::cal_dockq"

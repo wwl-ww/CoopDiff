@@ -3,6 +3,8 @@
 from contextlib import ExitStack
 from pathlib import Path
 import sys
+import tempfile
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -11,6 +13,7 @@ import numpy as np
 import torch
 
 from tricoopdiff.evaluate import evaluate_model
+from tricoopdiff.deepternary_metrics import compute_fullatom_dockq
 
 
 def test_walker_metrics_preserve_seeds_and_exact_failures():
@@ -40,6 +43,42 @@ def test_walker_metrics_preserve_seeds_and_exact_failures():
     assert report['structure']['dockq_best'] == .5
 
 
+def test_unbound_metric_templates_receive_only_predicted_rigid_motion():
+    def records(coords, chain):
+        return ''.join(
+            f'ATOM  {i:5d}  CA  ALA {chain}{i:4d}    '
+            f'{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C  \n'
+            for i, (x, y, z) in enumerate(coords, 1))
+
+    coords = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]])
+    rotation = np.array([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
+    translation = np.array([3., 4., 5.])
+    template = np.vstack((coords + 10., [[12., 12., 12.]]))
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        for name, points, chain in (
+                ('p1', coords, 'I'), ('p2', coords + 10., 'J'),
+                ('m1', coords, 'A'), ('m2', template, 'B')):
+            (root / f'{name}.pdb').write_text(records(points, chain))
+        (root / 'lig.pdb').write_text(records(coords, 'A').replace('ATOM  ', 'HETATM'))
+
+        def capture(predicted, native):
+            lines = Path(predicted).read_text().splitlines()
+            points = np.array([[float(line[30:38]), float(line[38:46]), float(line[46:54])]
+                               for line in lines if line.startswith('ATOM') and line[21] == 'B'])
+            assert np.allclose(points, template @ rotation + translation, atol=1e-3)
+            assert not any(line[21] in ('I', 'J') for line in lines)
+            return .4, 1., 2., .5
+
+        with patch.dict(sys.modules, {'DockQ.dockq_util': SimpleNamespace(cal_dockq=capture)}):
+            result = compute_fullatom_dockq(
+                coords, (coords + 10.) @ rotation + translation, coords,
+                root / 'p1.pdb', root / 'p2.pdb', root / 'lig.pdb', 'native', root,
+                metric_protein1_pdb=root / 'm1.pdb', metric_protein2_pdb=root / 'm2.pdb')
+        assert result['dockq'] == .5
+
+
 if __name__ == '__main__':
     test_walker_metrics_preserve_seeds_and_exact_failures()
+    test_unbound_metric_templates_receive_only_predicted_rigid_motion()
     print('Evaluation walker provenance test passed')

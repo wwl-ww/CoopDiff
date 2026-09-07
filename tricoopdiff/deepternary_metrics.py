@@ -96,6 +96,8 @@ def compute_fullatom_dockq(
     ligand_pdb,
     native_complex_pdb,
     deepternary_root,
+    metric_protein1_pdb=None,
+    metric_protein2_pdb=None,
 ):
     """Rebuild a predicted ternary PDB and call DeepTernary's ``cal_dockq``."""
     p1_lines, _, _ = _records(protein1_pdb, "ATOM")
@@ -113,6 +115,15 @@ def compute_fullatom_dockq(
     # rigid transform to every protein2 atom before invoking full-atom DockQ.
     poi_r, poi_t = _fit_rigid(p2_ca, pred_poi_ca_pdb)
     pred_p2_atoms = p2_atoms @ poi_r + poi_t
+    if (metric_protein1_pdb is None) != (metric_protein2_pdb is None):
+        raise ValueError('provide both metric protein templates or neither')
+    if metric_protein1_pdb is not None:
+        # DeepTernary predict_one_unbound applies the predicted rigid motion
+        # of the unbound receptor to its prealigned bound all-atom template.
+        # Templates are used for scoring only, never as neural-model inputs.
+        p1_lines, _, _ = _records(metric_protein1_pdb, 'ATOM')
+        p2_lines, p2_indices, p2_atoms = _records(metric_protein2_pdb, 'ATOM')
+        pred_p2_atoms = p2_atoms @ poi_r + poi_t
     p2_pred_lines = _replace_coords(p2_lines, p2_indices, pred_p2_atoms)
     p1_chain = next(line[21] for line in p1_lines if line.startswith("ATOM"))
     lig_pred_lines = _replace_coords(lig_lines, lig_indices, pred_ligand_pdb, chain=p1_chain)

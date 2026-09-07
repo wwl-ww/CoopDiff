@@ -28,6 +28,8 @@ def build_parser():
     parser.add_argument("--trifuse-ckpt", required=True)
     parser.add_argument("--out-dir", default="results/deepternary_test")
     parser.add_argument("--native-root", default="data/TernaryDB_release/pdbs")
+    parser.add_argument("--metric-template-root",
+                        help="Prealigned bound protein1/2 templates for DeepTernary unbound scoring only")
     parser.add_argument("--cache-dir", default="results/featurize_cache_deepternary")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--limit", type=int)
@@ -65,6 +67,7 @@ def main():
         "n_walkers": args.n_walkers,
         "steps": args.steps,
         "native_root": str((_PROJECT_ROOT / args.native_root).resolve()),
+        "metric_template_root": args.metric_template_root,
     }
     (output / "evaluation_manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8",
@@ -78,6 +81,13 @@ def main():
         report_path = output / f"{case}.json"
         try:
             paths = resolve_entry_paths(entry, _PROJECT_ROOT)
+            if args.metric_template_root:
+                template_root = _PROJECT_ROOT / args.metric_template_root / case
+                for name in ('protein1', 'protein2'):
+                    template = template_root / f'{name}.pdb'
+                    if not template.is_file():
+                        raise FileNotFoundError(template)
+                    paths['metric_' + name] = template.resolve()
             native = _PROJECT_ROOT / args.native_root / case / "gt_complex.pdb"
             native = native if native.is_file() else None
             expected_config = {
