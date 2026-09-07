@@ -31,7 +31,15 @@ def resolve_entry_paths(entry, project_root):
     return resolved
 
 
-def validate_checkpoint_payload(payload, expected_lora_tensors=336):
+def validate_checkpoint_payload(payload, expected_lora_tensors=None):
+    """The model-v2 production evaluator accepts only consensus checkpoints."""
+    if not isinstance(payload, dict):
+        raise ValueError('checkpoint must contain a mapping')
+    from tricoopdiff.consensus_train import validate_consensus_checkpoint
+    validate_consensus_checkpoint(payload)
+
+
+def validate_legacy_checkpoint_payload(payload, expected_lora_tensors=336):
     """Reject incomplete or legacy checkpoints before expensive inference."""
     if not isinstance(payload, dict):
         raise ValueError("checkpoint must contain a mapping")

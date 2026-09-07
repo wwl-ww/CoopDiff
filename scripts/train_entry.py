@@ -81,7 +81,9 @@ def parse_args(argv=None):
         "--torsion-expert-aux-weight", type=float, default=0.25,
         help="Weight for per-expert torsion losses in addition to joint torsion",
     )
-    p.add_argument("--lora_rank", type=int, default=4,
+    p.add_argument('--residual-weight', type=float, default=1e-3)
+    p.add_argument('--ema-decay', type=float, default=0.999)
+    p.add_argument("--lora_rank", type=int, default=0,
                    help="Rank of independent sub1/sub2 expert adapters; 0 disables LoRA")
     p.add_argument("--lora_alpha", type=float, default=8.0)
     p.add_argument("--lora_start_layer", type=int, default=0)
@@ -361,13 +363,12 @@ def main():
 
 def build_trainer(args, device, input_dim=None):
     """Build model, diffusion, and trainer."""
-    if args.lora_rank <= 0 or args.lora_start_layer != 0:
-        raise ValueError('version-17 flow training requires LoRA from layer 0')
-    from tricoopdiff import TriCoopDiff
-    from tricoopdiff.trifuse import TriFuse
+    if args.lora_rank != 0:
+        raise ValueError('model-v2 Stage 1 freezes native experts; use --lora_rank 0')
+    from tricoopdiff.consensus import ConsensusCoopDiff as TriCoopDiff, ConsensusFuse as TriFuse
     from tricoopdiff.expert_factory import build_diffdock_expert
     from tricoopdiff.sdpi_flow import SDPIFlow
-    from tricoopdiff.train import TriCoopDiffTrainer
+    from tricoopdiff.consensus_train import ConsensusTrainer as TriCoopDiffTrainer
 
     # Build frozen DiffDock-L expert from pretrained weights (self-contained
     # vendored core — no ../DiffDock dependency). num_conv_layers (11) and the
@@ -427,6 +428,8 @@ def build_trainer(args, device, input_dim=None):
         activation_clamp=args.nan_clamp,
         torsion_expert_aux_weight=args.torsion_expert_aux_weight,
         lora_warmup_steps=args.lora_warmup_steps,
+        residual_weight=args.residual_weight,
+        ema_decay=args.ema_decay,
         device=device,
     )
 

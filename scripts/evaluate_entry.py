@@ -55,8 +55,7 @@ from evaluation_common import (
 )
 
 from tricoopdiff.expert_factory import build_diffdock_expert
-from tricoopdiff.trifuse import TriFuse
-from tricoopdiff.model import TriCoopDiff
+from tricoopdiff.consensus import ConsensusFuse as TriFuse, ConsensusCoopDiff as TriCoopDiff
 from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
@@ -269,17 +268,16 @@ def main():
           f"rotatable bonds={n_rot}", flush=True)
 
     # --- Build TriFuse + TriCoopDiff + diffusion + initializer --------------
-    trifuse = TriFuse(
-        node_dim=128,
-        input_dim=d_rec,
-        num_conv_layers_per_expert=num_conv_layers,
-        film_dim=expert.ns,
-    )
+    fuse_config = (trained_ckpt['model_config'] if trained_ckpt is not None
+                   else dict(node_dim=128, input_dim=d_rec))
+    if fuse_config['input_dim'] != d_rec:
+        raise ValueError('checkpoint input feature dimension mismatch')
+    trifuse = TriFuse(**fuse_config)
     model = TriCoopDiff(
         frozen_expert=expert,
         trifuse=trifuse,
         num_conv_layers=num_conv_layers,
-        use_film=True,
+        use_film=False,
     ).to(device)
     diffusion = SDPIFlow()
     initializer = TernaryInitializer(
@@ -291,7 +289,7 @@ def main():
     # --- Optional: load a trained TriFuse checkpoint ------------------------
     if args.trifuse_ckpt is not None:
         if "trifuse_state_dict" in trained_ckpt:
-            model.trifuse.load_state_dict(trained_ckpt["trifuse_state_dict"])
+            model.trifuse.load_state_dict(trained_ckpt["ema_trifuse_state_dict"])
             if trained_ckpt.get("expert_lora_state_dict"):
                 from tricoopdiff.lora import load_expert_lora_state_dict
                 load_expert_lora_state_dict(

@@ -20,8 +20,7 @@ from tricoopdiff.lora import (
     inject_expert_lora,
     load_expert_lora_state_dict,
 )
-from tricoopdiff.model import TriCoopDiff
-from tricoopdiff.trifuse import TriFuse
+from tricoopdiff.consensus import ConsensusCoopDiff as TriCoopDiff, ConsensusFuse as TriFuse
 from tricoopdiff.reproducibility import configure_inference_reproducibility
 from tricoopdiff.checkpoint_contract import validate_expert_base_identity
 from tricoopdiff.diffdock.utils.torus import (
@@ -74,12 +73,6 @@ class EvaluationRunner:
         self.reproducibility['checkpoint_expert_base_identity'] = (
             validate_expert_base_identity(self.checkpoint, self.expert)
         )
-        inject_expert_lora(
-            self.expert, **self.checkpoint["expert_lora_config"],
-        )
-        load_expert_lora_state_dict(
-            self.expert, self.checkpoint["expert_lora_state_dict"],
-        )
         self.model = None
         self.input_dim = None
         self.diffusion = SDPIFlow()
@@ -95,18 +88,16 @@ class EvaluationRunner:
                     f"to {input_dim}"
                 )
             return
-        trifuse = TriFuse(
-            node_dim=128, input_dim=input_dim,
-            num_conv_layers_per_expert=self.expert.num_conv_layers,
-            film_dim=self.expert.ns,
-        )
+        if self.checkpoint['model_config']['input_dim'] != input_dim:
+            raise ValueError('checkpoint input feature dimension mismatch')
+        trifuse = TriFuse(**self.checkpoint['model_config'])
         self.model = TriCoopDiff(
             frozen_expert=self.expert,
             trifuse=trifuse,
             num_conv_layers=self.expert.num_conv_layers,
-            use_film=True,
+            use_film=False,
         ).to(self.device)
-        self.model.trifuse.load_state_dict(self.checkpoint["trifuse_state_dict"])
+        self.model.trifuse.load_state_dict(self.checkpoint["ema_trifuse_state_dict"])
         self.model.eval()
         self.input_dim = input_dim
 
