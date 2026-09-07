@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from tricoopdiff.train import TriCoopDiffTrainer
 from tricoopdiff.sdpi_flow import SDPIFlow
-from train_entry import swap_protein_reference
+from train_entry import build_trainer, parse_args, swap_protein_reference
 
 
 def _head():
@@ -75,9 +75,41 @@ def test_trainer_owns_recorded_activation_clamp_runtime():
             assert os.environ['NAN_CLAMP'] == '37.0'
 
 
+def test_consensus_builder_passes_only_active_model_dimensions():
+    args = parse_args([
+        '--train_data', 'unused.json', '--val_data', 'unused.json',
+        '--output_dir', 'unused',
+    ])
+    expert = SimpleNamespace(num_conv_layers=11)
+    with patch('tricoopdiff.expert_factory.build_diffdock_expert', return_value=expert), \
+            patch('tricoopdiff.consensus.ConsensusFuse') as fuse, \
+            patch('tricoopdiff.consensus.ConsensusCoopDiff') as model, \
+            patch('tricoopdiff.consensus_train.ConsensusTrainer') as trainer:
+        result, _, trained = build_trainer(args, 'cpu', input_dim=1281)
+        fuse.assert_called_once_with(
+            node_dim=args.node_dim, input_dim=1281,
+            num_transformer_layers=args.num_transformer_layers,
+        )
+        assert result is model.return_value
+        assert trained is trainer.return_value
+
+
+def test_consensus_builder_rejects_lora_before_loading_expert():
+    with patch('tricoopdiff.expert_factory.build_diffdock_expert') as expert:
+        try:
+            build_trainer(SimpleNamespace(lora_rank=4), 'cpu')
+        except ValueError as error:
+            assert 'freezes native experts' in str(error)
+        else:
+            raise AssertionError('v2 must reject expert adapters')
+        expert.assert_not_called()
+
+
 if __name__ == "__main__":
     test_phase1_freezes_unsupervised_heads()
     test_undefined_phase_is_rejected()
     test_protein_role_swap_changes_reference_without_changing_geometry()
     test_trainer_owns_recorded_activation_clamp_runtime()
+    test_consensus_builder_passes_only_active_model_dimensions()
+    test_consensus_builder_rejects_lora_before_loading_expert()
     print("Training-contract tests passed")

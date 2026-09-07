@@ -16,11 +16,7 @@ from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
 from tricoopdiff.expert_factory import build_diffdock_expert
-from tricoopdiff.lora import (
-    inject_expert_lora,
-    load_expert_lora_state_dict,
-)
-from tricoopdiff.consensus import ConsensusCoopDiff as TriCoopDiff, ConsensusFuse as TriFuse
+from tricoopdiff.consensus import ConsensusCoopDiff, ConsensusFuse
 from tricoopdiff.reproducibility import configure_inference_reproducibility
 from tricoopdiff.checkpoint_contract import validate_expert_base_identity
 from tricoopdiff.diffdock.utils.torus import (
@@ -90,8 +86,8 @@ class EvaluationRunner:
             return
         if self.checkpoint['model_config']['input_dim'] != input_dim:
             raise ValueError('checkpoint input feature dimension mismatch')
-        trifuse = TriFuse(**self.checkpoint['model_config'])
-        self.model = TriCoopDiff(
+        trifuse = ConsensusFuse(**self.checkpoint['model_config'])
+        self.model = ConsensusCoopDiff(
             frozen_expert=self.expert,
             trifuse=trifuse,
             num_conv_layers=self.expert.num_conv_layers,

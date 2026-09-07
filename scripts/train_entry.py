@@ -365,10 +365,10 @@ def build_trainer(args, device, input_dim=None):
     """Build model, diffusion, and trainer."""
     if args.lora_rank != 0:
         raise ValueError('model-v2 Stage 1 freezes native experts; use --lora_rank 0')
-    from tricoopdiff.consensus import ConsensusCoopDiff as TriCoopDiff, ConsensusFuse as TriFuse
+    from tricoopdiff.consensus import ConsensusCoopDiff, ConsensusFuse
     from tricoopdiff.expert_factory import build_diffdock_expert
     from tricoopdiff.sdpi_flow import SDPIFlow
-    from tricoopdiff.consensus_train import ConsensusTrainer as TriCoopDiffTrainer
+    from tricoopdiff.consensus_train import ConsensusTrainer
 
     # Build frozen DiffDock-L expert from pretrained weights (self-contained
     # vendored core — no ../DiffDock dependency). num_conv_layers (11) and the
@@ -377,18 +377,6 @@ def build_trainer(args, device, input_dim=None):
         model_dir=args.expert_model_dir,
         device=str(device),
     )
-    if getattr(args, 'lora_rank', 0) > 0:
-        from tricoopdiff.lora import inject_expert_lora
-        count = inject_expert_lora(
-            frozen_expert, rank=args.lora_rank, alpha=args.lora_alpha,
-            start_layer=args.lora_start_layer,
-            early_layers=args.lora_early_layers,
-            early_rank=args.lora_early_rank,
-            early_alpha=args.lora_early_alpha,
-        )
-        print(f"  expert LoRA: {count} linear layers, early rank="
-              f"{args.lora_early_rank}, late rank={args.lora_rank}, "
-              f"start_layer={args.lora_start_layer}")
     num_conv_layers = frozen_expert.num_conv_layers
 
     # input_dim must match the ternary node feature dim, which is the receptor
@@ -398,26 +386,20 @@ def build_trainer(args, device, input_dim=None):
         input_dim = args.node_dim
         print(f"[warn] input_dim not provided; defaulting to node_dim={input_dim}")
 
-    # Build TriFuse (the only trainable module). film_dim MUST equal the expert's
-    # scalar channel count (ns=48 for DiffDock-L) — it is independent of TriFuse's
-    # own internal width (args.ns).
-    trifuse = TriFuse(
+    # Consensus learns after expert inference; no FiLM dimensions are needed.
+    trifuse = ConsensusFuse(
         node_dim=args.node_dim,
         input_dim=input_dim,
-        ns=args.ns,
-        nv=args.nv,
         num_transformer_layers=args.num_transformer_layers,
-        num_conv_layers_per_expert=num_conv_layers,
-        film_dim=frozen_expert.ns,
     )
 
-    model = TriCoopDiff(frozen_expert, trifuse, num_conv_layers=num_conv_layers)
+    model = ConsensusCoopDiff(frozen_expert, trifuse, num_conv_layers=num_conv_layers)
 
     # Build diffusion
     diffusion = SDPIFlow(inference_steps=20)
 
     # Build trainer
-    trainer = TriCoopDiffTrainer(
+    trainer = ConsensusTrainer(
         model=model,
         diffusion=diffusion,
         lr=args.lr,

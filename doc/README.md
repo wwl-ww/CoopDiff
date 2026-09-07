@@ -10,6 +10,25 @@
 独立二元对照的实测结果与 DockQ 小分子指标定义见
 [独立 DiffDock 小分子评估](独立DiffDock小分子评估.md)。
 
+当前 `model-v2` 入口使用冻结专家后的残差共识模型，设计动机见
+[`sug_gpt6.md`](../sug_gpt6.md)。下表中 `trifuse_v13`、FiLM 和旧训练
+交接文档是历史参考，不是 v2 的运行配置；旧 SLURM 的 LoRA 参数仍需迁移。
+
+### 当前代码导航
+
+- `tricoopdiff/consensus.py`：冻结专家调用、门控与残差速度场。
+- `tricoopdiff/geometry_encoders.py`：配体化学特征、逐键上下文和三元几何编码。
+- `tricoopdiff/consensus_layers.py`：token 协商、共享 torsion 与预留输出头。
+- `tricoopdiff/expert_time.py`：独立二元对照与协同模型共用的 DiffDock 时间输入。
+- `tricoopdiff/consensus_train.py`：残差正则、EMA 和 v2 checkpoint；目前复用
+  `train.py` 的训练循环。`model.py`、`trifuse.py` 保留旧 FiLM 模型及兼容导出。
+- `scripts/evaluation_runner.py`：训练权重的统一 EMA 评估；
+  `evaluate_entry.py --allow-zero-init` 仅是未训练共识诊断，不是原生 DiffDock 对照。
+
+公共层拆分不更改 `state_dict` 键或数值计算。回归入口为
+`python tests/test_model_build.py`、`python tests/test_consensus.py` 和
+`python tests/test_module_boundaries.py`；最后一项检查兼容导出及新旧模块隔离。
+
 | 文档 | 用途 | 何时阅读 |
 |---|---|---|
 | [TriCoopDiff 模型架构图.md](TriCoopDiff%20模型架构图.md) | 完整 Mermaid 模型图、模块职责与单步坐标更新 | 快速查看当前整体架构时 |
@@ -30,13 +49,16 @@
 - E3 固定；动态状态是 E3–Ligand 与 POI–Ligand 两个相对刚体界面以及共享 Ligand torsion。
 - 推理唯一支持 `sdpi`：从完整化学图生成一次构象并采样一次 torsion，分别使用两侧受体 RMS radius 计算平移尺度，再精确逆装配；旧 `native`、`coupled5a`、`anchor_local` 和固定 Å 初始化均已删除。
 - 两个 rigid proposal 从同一个旧 Ligand 生成；Ligand 采用 `sub1` proposal，POI 接收将 `sub2` proposal 对齐到 `sub1` proposal 的精确刚体变换。
-- TriFuse 使用组分类型、三组跨分子距离分布和接触统计，负责 branch-specific FiLM 与逐键 torsion 协调；它不输出刚体 merge gate 或独立 SE(3) score。
+- v2 在冻结专家完成推理后生成门控先验与等变残差，协调共享 torsion；
+  不向专家内部注入 FiLM、LoRA 或逐层 bridge。历史 `trifuse_v13` 才使用 FiLM。
 - 生产训练使用 `SDPIFlow` 条件速度匹配，采样反向积分同一速度场；不再使用
   native DSM target 或经验温度 SDE。可动自由度终端与 SDPI 对齐，内部几何差异
   仍是已知近似；原始晶体监督不投影。数学契约见[初始化规范 §8](初始化方案_gpt6.md)。
-- 新 checkpoint 必须是 version 17、`architecture=trifuse_v13`、
-  `generative_process=sdpi_flow_v1`；旧版本必须拒绝，不能直接拿旧 DSM 权重做 flow 推理。
-- version 17 记录 activation clamp、torsion 辅助损失与 LoRA warmup；训练与评估必须恢复一致配置。
+- v2 checkpoint 必须是 version 18、`architecture=residual_consensus_v2`、
+  `generative_process=sdpi_flow_v1`；评估使用 EMA。version 17 仅供旧模型参考，
+  不能作为 v2 续训权重。运行配置记录 activation clamp、残差正则、EMA decay
+  和 torus score norm 版本，并校验冻结专家身份。
+- v2 已有构建、梯度、EMA 恢复及短轨迹检查，尚无充分训练后的质量结论。
 - 当前只定义 Phase 1；`judge_head/state_head` 缺少监督标签，因此保持冻结，不能用无损失的“Phase 2”假装完成微调。
 - Phase 1 使用 PROTAC/Molecular Glue 官方训练成员的去 benchmark 同 PDB
   交集（7,198 cases、653 merged clusters），并按 cluster 留出内部 validation。
