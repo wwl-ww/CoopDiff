@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from tricoopdiff.evaluate import evaluate_model
-from tricoopdiff.deepternary_metrics import compute_fullatom_dockq
+from tricoopdiff.deepternary_metrics import compute_fullatom_dockq, _ligand_records
 
 
 def test_walker_metrics_preserve_seeds_and_exact_failures():
@@ -78,7 +78,23 @@ def test_unbound_metric_templates_receive_only_predicted_rigid_motion():
         assert result['dockq'] == .5
 
 
+def test_sdf_metric_template_preserves_heavy_atom_order():
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    molecule = Chem.AddHs(Chem.MolFromSmiles('CCO'))
+    assert AllChem.EmbedMolecule(molecule, randomSeed=42) == 0
+    expected = molecule.GetConformer().GetPositions()[:3]
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / 'ligand.sdf'
+        Chem.MolToMolFile(molecule, str(path))
+        _, indices, coords = _ligand_records(path)
+    assert len(indices) == 3
+    assert np.allclose(coords, expected, atol=1e-3)
+
+
 if __name__ == '__main__':
     test_walker_metrics_preserve_seeds_and_exact_failures()
     test_unbound_metric_templates_receive_only_predicted_rigid_motion()
+    test_sdf_metric_template_preserves_heavy_atom_order()
     print('Evaluation walker provenance test passed')

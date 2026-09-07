@@ -34,6 +34,9 @@ def _ligand_records(path):
         )
         if molecule is None:
             raise ValueError(f"cannot parse ligand structure: {ligand_path}")
+        # DiffDock predicts heavy-atom coordinates. Some official SDFs carry
+        # explicit H atoms; remove them without reordering the heavy atoms.
+        molecule = Chem.RemoveHs(molecule, sanitize=False)
         lines = Chem.MolToPDBBlock(molecule).splitlines()
         indices = [
             index for index, line in enumerate(lines)

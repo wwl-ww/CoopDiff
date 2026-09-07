@@ -394,3 +394,13 @@ unbound-template 刚体重建测试通过。`.gitignore` 用户原有改动未�
 - 修正批处理状态：完整原子 DockQ 缺失不再写成成功；逐 seed 报告先保存再标记失败。
   新增官方集合汇总器，缺失 case 和失败 seed 计入分母，不能只汇总幸存样本。
   最终汇总尚未完成，当前单例数值不能当作 benchmark 结果。
+- 后续 SDF 预检发现 `6HR2_F_E_FWZ` 含 58 个显式 H、`7KHH_C_D_WEP` 含 4 个。
+  打分 SDF 模板改为去 H 且保留重原子顺序，与 DiffDock 输出一致；新增重原子顺序测试通过。
+  受影响的 shard 1 已恢复运行，跳过已完成的首例；只丢弃当时未完成的第二例轨迹，
+  重用同一 seed 与原权重，不修改输入文件或采样算法。其他分片继续，已完成指标不受影响。
+- 用户查看时的阶段快照：PROTAC 完成 3/22，120/120 seeds 精确打分，
+  mean oracle-best DockQ `0.15659`，ensemble-mean DockQ `0.02760`；
+  MGD 完成 29/94，29/29 seeds 精确打分，mean DockQ `0.02514`。
+  已完成 case 中 DockQ≥0.23 均为 0；未完成 case 不能据此判为失败。
+  快照：`results/epoch20_partial_{protac,mgd}.json`，`complete_all_cases_and_seeds=false`。
+  全部评测仍在后台运行，最终指标待全量汇总。
