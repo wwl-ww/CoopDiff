@@ -646,7 +646,8 @@ def evaluate_model(
     poi_native_contacts = None
     poi_native_com_dist = None
     n_nan = 0
-    for r in ensemble:
+    invalid_seeds = []
+    for walker_index, r in enumerate(ensemble):
         pred = r['ligand_coords']  # [N_lig, 3] numpy
         pred_poi = r['poi_coords']
         if (
@@ -655,8 +656,10 @@ def evaluate_model(
             or not np.isfinite(pred_poi).all()
         ):
             n_nan += 1
+            invalid_seeds.append(seed + walker_index)
             continue
         rec = {
+            'seed': seed + walker_index,
             'pred': pred,
             'pred_poi': pred_poi,
             'protac_rmsd': compute_rmsd(pred, ref_lig, align_first=True),
@@ -678,11 +681,14 @@ def evaluate_model(
                     native_complex_pdb=native_complex_pdb,
                     **deepternary_dockq_paths,
                 )
+                if not all(np.isfinite(exact_m[key]) for key in ('dockq', 'fnat', 'lrms', 'irms')):
+                    raise FloatingPointError('non-finite full-atom DockQ metrics')
                 rec['dockq'] = exact_m['dockq']
                 rec['dockq_fnat'] = exact_m['fnat']
                 rec['dockq_lrms'] = exact_m['lrms']
                 rec['dockq_irms'] = exact_m['irms']
             except Exception as error:
+                rec['exact_dockq_error'] = f'{type(error).__name__}: {error}'
                 print(f"[evaluate] DeepTernary full-atom DockQ failed: {error}")
         e3_m = compute_e3_interface_dockq(e3_ca, pred, ref_lig)
         if e3_m is not None:
@@ -814,6 +820,8 @@ def evaluate_model(
         'n_walkers': len(ensemble),
         'n_valid_walkers': len(walkers),
         'n_nan_walkers': n_nan,
+        'n_exact_dockq_walkers': len(exact_indices),
+        'invalid_seeds': invalid_seeds,
         'selection_metric': selection_metric,
         'protac_rmsd_std': float(protac_rmsds.std()) if len(protac_rmsds) > 1 else 0.0,
     }
@@ -840,6 +848,10 @@ def evaluate_model(
         )
 
     report = {
+        'walkers': [
+            {key: value for key, value in walker.items() if key not in ('pred', 'pred_poi')}
+            for walker in walkers
+        ],
         'initialization': [r['initialization'] for r in ensemble],
         'structure': structure,
         'ensemble': ensemble_metrics,
