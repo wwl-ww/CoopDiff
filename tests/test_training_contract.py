@@ -1,8 +1,10 @@
 """CPU checks for training-stage contracts that must fail explicitly."""
 
 import sys
+import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -10,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from tricoopdiff.train import TriCoopDiffTrainer
+from tricoopdiff.sdpi_flow import SDPIFlow
 from train_entry import swap_protein_reference
 
 
@@ -56,8 +59,25 @@ def test_protein_role_swap_changes_reference_without_changing_geometry():
     )
 
 
+def test_trainer_owns_recorded_activation_clamp_runtime():
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.trifuse = torch.nn.Linear(2, 2)
+            self.expert = torch.nn.Module()
+
+    with patch('tricoopdiff.lora.expert_lora_parameter_groups',
+               return_value={'early': [], 'late': []}):
+        with patch.dict(os.environ, {}, clear=True):
+            trainer = TriCoopDiffTrainer(
+                DummyModel(), SDPIFlow(), device='cpu', activation_clamp=37)
+            assert trainer.activation_clamp == 37
+            assert os.environ['NAN_CLAMP'] == '37.0'
+
+
 if __name__ == "__main__":
     test_phase1_freezes_unsupervised_heads()
     test_undefined_phase_is_rejected()
     test_protein_role_swap_changes_reference_without_changing_geometry()
+    test_trainer_owns_recorded_activation_clamp_runtime()
     print("Training-contract tests passed")

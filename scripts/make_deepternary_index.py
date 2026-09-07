@@ -390,6 +390,7 @@ def main():
         destination = Path(args.index_dir) / f'ternary_{split}.json'
         write_index(destination, entries, rejected, {
             'protocol': 'joint_train_intersection_v1',
+            'split': split,
             'sampling': ('cluster_80pct_any_20pct_representative'
                          if split == 'train' else 'fixed_representative'),
             'requested': len(cases),

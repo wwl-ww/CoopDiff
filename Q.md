@@ -20,12 +20,15 @@
 | --- | --- | --- | --- |
 | Q-001 | P0 | 同 seed 跨进程推理漂移 | 已修复 |
 | Q-002 | P0 | 原训练 torsion 归一化表没有保存 | 已知限制；新 checkpoint 已防护 |
-| Q-003 | P0 | 刚体位置/朝向及双界面装配失败 | 已确认现象；根因待验证 |
+| Q-003 | P0 | 刚体位置/朝向及双界面装配失败 | 已确认：学习速度场不足；继续定位训练原因 |
 | Q-004 | P1 | 积分后半程可能退化 | 已确认现象；根因待验证 |
 | Q-005 | P1 | 配体远离 E3 时局部 cross edges 变稀疏 | 待验证因果关系 |
-| Q-006 | P1 | 专家输出方向接近零引发归一化爆炸 | 本案例不支持 |
+| Q-006 | P1 | 专家输出方向接近零引发归一化爆炸 | 已关闭：本案例假设被否定 |
 | Q-007 | P1 | 新旧数值协议的报告被错误复用 | 已修复防护 |
-| Q-008 | P0 | 坐标变换、速度符号或双界面组合错误 | 待验证；不是已确认缺陷 |
+| Q-008 | P0 | 坐标变换、速度符号或双界面组合错误 | 已关闭：真实路径对照不支持该假设 |
+| Q-009 | P1 | 官方 train/val index 缺失显式 split 标签 | 已修复生成器；旧产物不回写 |
+| Q-010 | P0 | Trainer 的 activation clamp 依赖入口脚本设置隐藏环境变量 | 已修复并复核 |
+| Q-011 | P0 | Adapter checkpoint 未绑定冻结 DiffDock 基座身份 | 已修复；旧 checkpoint 明示不确定 |
 
 ## Q-001：同 seed 跨进程推理漂移
 
@@ -55,6 +58,20 @@
   `results/epoch20_failure_trajectories_v2/`。
 - **下一步：** 固定状态分别检查预测与监督速度的方向、尺度；先验证 Q-008，再比较
   完整模型与条件/专家对照。不能直接通过反转符号或修改损失权重“试出”测试集效果。
+- **方向审计：** 三个显式 validation cases、两条独立路径、`t=0.1/0.5/0.9` 共 18
+  个固定状态中，E3 translation/rotation 与目标同向比例均为 `66.7%`，POI translation
+  为 `88.9%`，但 POI rotation 仅 `55.6%`，torsion 为 `61.1%`。POI rotation 平均
+  cosine 仅 `0.0261`；torsion 仅 `0.1114`。实际局部一步相对零速度的 ligand 改善率
+  `50%`，POI 平均改善为 `-0.00084 Å`。这是学习场质量不足的直接证据。
+- **证据：** `results/epoch20_velocity_direction_audit/summary.json`；固定验证路径，不是
+  benchmark。下一步用完全相同 probes 比较 epoch5 与 epoch20，判断继续训练是在改善还是退化。
+- **epoch 曲线：** 相同 18 probes 的 POI rotation mean cosine 在 epoch
+  `5/10/15/20` 分别为 `0.3317/0.2985/0.1567/0.0261`，持续退化；与此同时 POI
+  translation 为 `0.4788/0.5554/0.5483/0.6055`，明显改善。POI 实际局部一步平均
+  改善为 `-0.0494/-0.0287/-0.0150/-0.0008 Å`，主要由平移进步抵消旋转退化。
+  因此不能用“继续训练会一起变好”关闭本项，需检查多任务梯度/选择指标。
+- **曲线证据：** `results/epoch{5,10,15,20}_velocity_direction_audit/summary.json`；所有
+  checkpoint 使用相同 cases、path seeds、times 和确定性数值协议。
 - **限制：** Cα 接触是几何诊断；unbound POI 朝向误差基于预对齐输入，不是全 native
   残基映射或对称校正指标。上述为选择后的失败分析，不是无偏 benchmark。
 
@@ -93,10 +110,54 @@
   oracle round trip、全局刚体等变与归一化测试；此前通过，不支持直接认定符号错了。
 - **当前阅读结论：** `SDPIFlow.path` 定义 clean→prior 速度，`step` 使用负时间增量；
   POI 使用两个同源刚体 proposal 的精确组合，不应改成简单旋转向量相减。
-- **下一步：** 将这些契约与真实失败案例的固定状态、实际模型调用及 body frame 映射
-  连起来验证。尚未完成新的真实案例方向对照，不宣称本项已排除。
+- **真实案例验证：** 上述 18 个固定 validation 状态中，精确 target 经生产
+  `SDPIFlow.step` 后相对解析 `t-dt` 状态的 Euler 坐标误差约 `1e-5–5e-3 Å`；证明
+  path target、body-frame 映射和 reverse-step 符号在真实分子上相互一致。
+- **结论：** 关闭“采样器符号/组合实现错误”假设。模型预测一步经常不改善，是预测场
+  与已验证 target 不一致，不应通过整体反号或删除 `body.T` 修补。
+
+## Q-009：官方 index 缺失显式 split 标签
+
+- **问题：** 已生成的 `ternary_val.json` 虽由 val 分支产生，却没有
+  `metadata.split`；严格诊断入口无法证明它是 validation，不能仅凭文件名放行。
+- **修复：** `make_deepternary_index.py` 在每个输出中写入 `split=train|val`，新增
+  `test_written_index_preserves_explicit_split_label`。历史 `/tmp` index 保留不回写；
+  当前方向审计使用已有显式 `split=val` 的三案例归档子集。
+- **结论：** 修复未来生成器的数据 provenance；不改变现有训练成员或切分结果。
+
+## Q-010：Trainer 未落实自身记录的 activation clamp
+
+- **问题：** `TriCoopDiffTrainer` 保存并校验 `activation_clamp=100`，但 expert 卷积实际
+  从进程环境变量 `NAN_CLAMP` 读取；构造 Trainer 本身没有设置它。新方向审计作为库调用
+  时没有复制训练入口的隐藏副作用，`1XK4` 固定验证路径出现非有限刚体速度。
+- **修复：** Trainer 初始化在任何 forward 前将已校验的 `self.activation_clamp` 写入
+  expert 当前使用的运行设置。评测 Runner 原本已执行同样配置。
+- **下一步：** 重跑同一验证方向审计；若非有限值消失则关闭本项，否则继续定位具体层。
+- **边界：** `torch.clamp` 不能修复已经产生的 NaN；本修复保证模型契约一致，不把非有限
+  输出替换成伪造数值。
+- **复核：** 完全相同的 18 个方向 probes 全部 finite；`1XK4` 第二条路径不再失败。
+  `tests/test_training_contract.py::test_trainer_owns_recorded_activation_clamp_runtime` 通过。
+- **结论：** 已关闭。所有 Trainer 调用现在都落实 checkpoint 所声明的 clamp；仍保留
+  非有限检测，真正的 NaN 会继续硬失败。
+
+## Q-011：Adapter checkpoint 未绑定冻结 expert 基座
+
+- **问题：** checkpoint 只包含 TriFuse 与 LoRA adapter；原格式没有记录所依赖的冻结
+  DiffDock 权重哈希。错误基座仍可能接受形状相同的 adapter，产生不可解释结果。
+- **修复：** 新 checkpoint 保存稳定身份字段：DiffDock commit、冻结权重 SHA256、
+  `no_torsion`；排除机器相关绝对路径。训练恢复与评测均拒绝已记录的身份不匹配。
+  旧 checkpoint 明确标为 `legacy_unrecorded` 并警告，原 epoch20 文件不修改。
+- **验证：** `tests/test_checkpoint_contract.py` 覆盖稳定字段、旧格式标记和错基座拒绝。
+- **结论：** 关闭未来静默错配风险；无法追溯补齐旧 checkpoint 当时未保存的证据。
 
 ## 更新日志
 
 - 2026-09-07：建立问题账本，收录已确认的复现缺陷、修复证据、质量现象和待验证假设。
   当前没有宣布模型质量恢复，也没有重启大规模任务。
+- 2026-09-07：发现官方 index 生成器遗漏显式 split 标签，登记 Q-009 并修复生成器。
+- 2026-09-07：方向审计暴露 Trainer 的 activation clamp 隐式入口依赖，登记 Q-010 并修复。
+- 2026-09-07：发现 adapter checkpoint 未绑定冻结 expert，登记 Q-011 并加入身份校验。
+- 2026-09-07：完成 18 个真实 validation 路径方向对照，关闭 Q-008/Q-010，将 Q-003
+  收窄为学习速度场不足，并开始 epoch5→20 同路径进展审计。
+- 2026-09-07：补齐 epoch5/10/15/20 同路径曲线；确认 POI translation 学习改善但
+  POI rotation 方向持续退化，下一步转向多任务梯度与 checkpoint 选择审计。

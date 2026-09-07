@@ -23,6 +23,7 @@ from tricoopdiff.lora import (
 from tricoopdiff.model import TriCoopDiff
 from tricoopdiff.trifuse import TriFuse
 from tricoopdiff.reproducibility import configure_inference_reproducibility
+from tricoopdiff.checkpoint_contract import validate_expert_base_identity
 from tricoopdiff.diffdock.utils.torus import (
     SCORE_NORM_VERSION, validate_score_norm_version,
 )
@@ -69,6 +70,9 @@ class EvaluationRunner:
             model_dir=str(self.model_dir), device=str(self.device),
             ckpt=expert_checkpoint,
             num_conv_layers=self.score_model_args.num_conv_layers,
+        )
+        self.reproducibility['checkpoint_expert_base_identity'] = (
+            validate_expert_base_identity(self.checkpoint, self.expert)
         )
         inject_expert_lora(
             self.expert, **self.checkpoint["expert_lora_config"],

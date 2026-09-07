@@ -148,6 +148,15 @@ def test_cluster_split_is_deterministic_and_disjoint():
     )
 
 
+def test_written_index_preserves_explicit_split_label(tmp_path):
+    destination = tmp_path / 'ternary_val.json'
+    make_deepternary_index.write_index(
+        destination, [], [], {'protocol': 'test', 'split': 'val'})
+    import json
+    payload = json.loads(destination.read_text(encoding='utf-8'))
+    assert payload['metadata']['split'] == 'val'
+
+
 def test_repository_joint_pool_contract():
     root = Path(__file__).resolve().parents[1]
     protac_path = root / 'DeepTernary/data/PROTAC/train_clusters_poc6.json'

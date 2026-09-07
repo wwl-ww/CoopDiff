@@ -27,6 +27,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from .model import TriCoopDiff
 from .sdpi_flow import SDPIFlow, CHECKPOINT_VERSION, FLOW_VERSION
 from .diffdock.utils.torus import SCORE_NORM_VERSION, validate_score_norm_version
+from .checkpoint_contract import expert_base_identity, validate_expert_base_identity
 
 
 class NonFiniteTrainingError(FloatingPointError):
@@ -62,6 +63,11 @@ class TriCoopDiffTrainer:
         if activation_clamp <= 0:
             raise ValueError("activation_clamp must be positive")
         self.activation_clamp = float(activation_clamp)
+        # The vendored expert integration currently reads this process-level
+        # setting inside each convolution. Configure it at the owning runtime
+        # boundary so library callers cannot silently run a different model
+        # from the trainer's recorded checkpoint contract.
+        os.environ['NAN_CLAMP'] = str(self.activation_clamp)
         if torsion_expert_aux_weight < 0:
             raise ValueError("torsion_expert_aux_weight must be non-negative")
         self.torsion_expert_aux_weight = float(torsion_expert_aux_weight)
@@ -265,6 +271,7 @@ class TriCoopDiffTrainer:
             'checkpoint_version': CHECKPOINT_VERSION,
             'generative_process': FLOW_VERSION,
             'architecture': 'trifuse_v13',
+            'expert_base_identity': expert_base_identity(self.model.expert),
             'runtime_config': {
                 'torus_score_norm_version': SCORE_NORM_VERSION,
                 'activation_clamp': self.activation_clamp,
@@ -299,6 +306,7 @@ class TriCoopDiffTrainer:
         """
         ckpt = torch.load(path, map_location=self.device)
         validate_score_norm_version(ckpt.get('runtime_config', {}))
+        validate_expert_base_identity(ckpt, self.model.expert)
         if ckpt.get('checkpoint_version') != CHECKPOINT_VERSION:
             raise ValueError(
                 "TriFuse flow training requires checkpoint_version=17"
