@@ -22,6 +22,11 @@ from tricoopdiff.lora import (
 )
 from tricoopdiff.model import TriCoopDiff
 from tricoopdiff.trifuse import TriFuse
+from tricoopdiff.reproducibility import configure_inference_reproducibility
+from tricoopdiff.checkpoint_contract import validate_expert_base_identity
+from tricoopdiff.diffdock.utils.torus import (
+    SCORE_NORM_VERSION, validate_score_norm_version,
+)
 
 
 class EvaluationRunner:
@@ -29,8 +34,14 @@ class EvaluationRunner:
 
     def __init__(self, project_root, checkpoint, device="cuda",
                  model_dir="checkpoints/score_model",
-                 expert_checkpoint="best_ema_inference_epoch_model.pt"):
+                 expert_checkpoint="best_ema_inference_epoch_model.pt",
+                 deepternary_root=None, deterministic=True):
+        self.reproducibility = configure_inference_reproducibility(deterministic)
+        self.reproducibility['torus_score_norm_version'] = SCORE_NORM_VERSION
         self.root = Path(project_root).resolve()
+        self.deepternary_root = (
+            self.root / (deepternary_root or 'DeepTernary')
+        ).resolve()
         self.device = torch.device(device)
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but is unavailable")
@@ -41,6 +52,9 @@ class EvaluationRunner:
         self.checkpoint_sha256 = sha256_file(self.checkpoint_path)
         self.checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
         validate_checkpoint_payload(self.checkpoint)
+        self.reproducibility['checkpoint_torus_score_norm_version'] = (
+            validate_score_norm_version(self.checkpoint['runtime_config'])
+        )
         self.activation_clamp = float(
             self.checkpoint["runtime_config"]["activation_clamp"]
         )
@@ -56,6 +70,9 @@ class EvaluationRunner:
             model_dir=str(self.model_dir), device=str(self.device),
             ckpt=expert_checkpoint,
             num_conv_layers=self.score_model_args.num_conv_layers,
+        )
+        self.reproducibility['checkpoint_expert_base_identity'] = (
+            validate_expert_base_identity(self.checkpoint, self.expert)
         )
         inject_expert_lora(
             self.expert, **self.checkpoint["expert_lora_config"],
@@ -120,11 +137,14 @@ class EvaluationRunner:
                 "protein1_pdb": str(paths["protein1"]),
                 "protein2_pdb": str(paths["protein2"]),
                 "ligand_pdb": str(paths["ligand"]),
-                "deepternary_root": str(self.root / "DeepTernary"),
+                "deepternary_root": str(self.deepternary_root),
+                **{key + '_pdb': str(paths[key]) for key in
+                   ('metric_protein1', 'metric_protein2') if key in paths},
             },
         )
         report["case"] = case
         report["run_config"] = {
+            **self.reproducibility,
             "seed": seed,
             "n_walkers": n_walkers,
             "steps": (steps if steps is not None
@@ -141,7 +161,14 @@ class EvaluationRunner:
             "expert_config_sha256": self.expert_config_sha256,
             "input_signature": evaluation_input_signature(paths, native_complex_pdb),
             "activation_clamp": self.activation_clamp,
+            "dockq_reconstruction": (
+                "deepternary_bound_template_rigid_motion"
+                if 'metric_protein1' in paths else "input_allatom_rigid_motion"
+            ),
             "expert_model_dir": str(self.model_dir),
+            "deepternary_root": str(self.deepternary_root),
+            "dockq_source_sha256": sha256_file(self.deepternary_root / 'DockQ/dockq_util.py'),
+            "dockq_binary_sha256": sha256_file(self.deepternary_root / 'DockQ/fnat'),
             "dockq_implementation": (
                 "DeepTernary/DockQ/dockq_util.py::cal_dockq"
                 if native_complex_pdb else None

@@ -28,6 +28,10 @@ def build_parser():
     parser.add_argument("--trifuse-ckpt", required=True)
     parser.add_argument("--out-dir", default="results/deepternary_test")
     parser.add_argument("--native-root", default="data/TernaryDB_release/pdbs")
+    parser.add_argument("--metric-template-root",
+                        help="Prealigned bound protein1/2 templates for DeepTernary unbound scoring only")
+    parser.add_argument("--deepternary-root", default="DeepTernary",
+                        help="Local DeepTernary installation with executable DockQ/fnat")
     parser.add_argument("--cache-dir", default="results/featurize_cache_deepternary")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--limit", type=int)
@@ -36,6 +40,8 @@ def build_parser():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--allow-nondeterministic", action="store_true",
+                        help="Explicit legacy diagnostic control; never mix with deterministic results")
     return parser
 
 
@@ -65,12 +71,16 @@ def main():
         "n_walkers": args.n_walkers,
         "steps": args.steps,
         "native_root": str((_PROJECT_ROOT / args.native_root).resolve()),
+        "metric_template_root": args.metric_template_root,
+        "deterministic_algorithms": not args.allow_nondeterministic,
     }
     (output / "evaluation_manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8",
     )
     runner = EvaluationRunner(
         _PROJECT_ROOT, checkpoint=checkpoint, device=args.device,
+        deepternary_root=args.deepternary_root,
+        deterministic=not args.allow_nondeterministic,
     )
     failures = []
     for position, entry in enumerate(entries, start=1):
@@ -78,9 +88,17 @@ def main():
         report_path = output / f"{case}.json"
         try:
             paths = resolve_entry_paths(entry, _PROJECT_ROOT)
+            if args.metric_template_root:
+                template_root = _PROJECT_ROOT / args.metric_template_root / case
+                for name in ('protein1', 'protein2'):
+                    template = template_root / f'{name}.pdb'
+                    if not template.is_file():
+                        raise FileNotFoundError(template)
+                    paths['metric_' + name] = template.resolve()
             native = _PROJECT_ROOT / args.native_root / case / "gt_complex.pdb"
             native = native if native.is_file() else None
             expected_config = {
+                **runner.reproducibility,
                 "init_mode": "sdpi",
                 "initialization_version": "sdpi_v1",
                 "generative_process": "sdpi_flow_v1",
@@ -93,6 +111,8 @@ def main():
                 "input_signature": evaluation_input_signature(paths, native),
                 "freeze_poi": False,
                 "t_anchor": 1.0,
+                "dockq_source_sha256": sha256_file(runner.deepternary_root / 'DockQ/dockq_util.py'),
+                "dockq_binary_sha256": sha256_file(runner.deepternary_root / 'DockQ/fnat'),
             }
             if not args.no_resume and completed_report(
                     report_path, case, checkpoint, expected_config,
@@ -106,6 +126,10 @@ def main():
                 n_walkers=args.n_walkers, steps=args.steps, seed=args.seed,
             )
             write_report_atomic(report, report_path)
+            ensemble = report['ensemble']
+            if (ensemble['n_valid_walkers'] == 0
+                    or ensemble['n_exact_dockq_walkers'] != ensemble['n_valid_walkers']):
+                raise RuntimeError('incomplete full-atom DockQ; see saved per-seed report')
         except Exception as error:
             failures.append({
                 "case": case,

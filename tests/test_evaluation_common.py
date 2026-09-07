@@ -122,6 +122,11 @@ def test_completed_report_requires_matching_checkpoint(tmp_path):
     assert evaluation_common.completed_report(
         path, "demo", "best.pt", require_exact_dockq=True,
     )
+    report['ensemble']['n_exact_dockq_walkers'] = 1
+    path.write_text(json.dumps(report), encoding='utf-8')
+    assert not evaluation_common.completed_report(
+        path, 'demo', 'best.pt', require_exact_dockq=True,
+    )
 
 
 def test_resume_fingerprints_detect_same_path_replacement(tmp_path):
@@ -175,3 +180,21 @@ def test_resume_rejects_nonfinite_metric_and_incomplete_ensemble(tmp_path):
         assert not evaluation_common.completed_report(
             path, 'demo', 'best.pt', {'n_walkers': 32}, require_exact_dockq=True,
         )
+
+
+def test_resume_rejects_changed_numerical_policy(tmp_path):
+    path = tmp_path / 'report.json'
+    policy = {'deterministic_algorithms': True,
+              'torus_score_norm_version': 'wrapped_normal_quadrature_v1'}
+    report = {'case': 'demo',
+              'run_config': {'trifuse_checkpoint': 'best.pt', **policy},
+              'ensemble': {'n_valid_walkers': 1}}
+    path.write_text(json.dumps(report))
+    assert evaluation_common.completed_report(path, 'demo', 'best.pt', policy)
+    for key, changed in (('deterministic_algorithms', False),
+                         ('torus_score_norm_version', 'old')):
+        assert not evaluation_common.completed_report(
+            path, 'demo', 'best.pt', {**policy, key: changed})
+    report['run_config'].pop('torus_score_norm_version')
+    path.write_text(json.dumps(report))
+    assert not evaluation_common.completed_report(path, 'demo', 'best.pt', policy)

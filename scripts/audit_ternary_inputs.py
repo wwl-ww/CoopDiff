@@ -38,7 +38,7 @@ def _contact_count(protein, ligand, cutoff=10.0):
     return int(np.count_nonzero(squared_distances <= cutoff ** 2))
 
 
-def audit_entry(entry):
+def audit_entry(entry, min_ligand_heavy_atoms=20):
     """Validate that one ligand is sanitized, bonded, 3D, and finite."""
     ligand_path = _resolve(entry['ligand'])
     molecule = Chem.MolFromPDBFile(str(ligand_path), sanitize=True, removeHs=True)
@@ -51,7 +51,7 @@ def audit_entry(entry):
         raise ValueError(f'invalid coordinate shape: {coordinates.shape}')
     if not np.isfinite(coordinates).all():
         raise FloatingPointError('ligand coordinates are non-finite')
-    if molecule.GetNumAtoms() < 20:
+    if molecule.GetNumAtoms() < min_ligand_heavy_atoms:
         raise ValueError(f'ligand has only {molecule.GetNumAtoms()} heavy atoms')
     if molecule.GetNumBonds() == 0:
         raise ValueError('ligand has no inferred bonds')
@@ -78,7 +78,11 @@ def main():
     parser.add_argument('--index', required=True)
     parser.add_argument('--out', required=True)
     parser.add_argument('--limit', type=int)
+    parser.add_argument('--min-ligand-heavy-atoms', type=int, default=20,
+                        help='Use 1 for the joint-pool contract; 20 is the legacy diagnostic filter')
     args = parser.parse_args()
+    if args.min_ligand_heavy_atoms < 1:
+        parser.error('min-ligand-heavy-atoms must be positive')
 
     payload = json.loads(_resolve(args.index).read_text(encoding='utf-8'))
     entries = payload.get('entries', payload)
@@ -87,7 +91,7 @@ def main():
     records = []
     for entry in entries:
         try:
-            records.append(audit_entry(entry))
+            records.append(audit_entry(entry, args.min_ligand_heavy_atoms))
         except Exception as error:
             records.append({
                 'case': entry['case'],
@@ -96,6 +100,7 @@ def main():
             })
     report = {
         'index': args.index,
+        'min_ligand_heavy_atoms': args.min_ligand_heavy_atoms,
         'requested': len(entries),
         'passed': sum(record['ok'] for record in records),
         'failed': sum(not record['ok'] for record in records),

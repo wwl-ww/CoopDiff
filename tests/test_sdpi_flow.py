@@ -113,6 +113,16 @@ def test_flow_loss_backward_and_shared_clock_guard():
 
     model = Predictor()
     trainer = SimpleNamespace(device='cpu', model=model, diffusion=flow, torsion_expert_aux_weight=.25)
+    coupling = flow.sample_coupling(a, b, data)
+    fixed = dict(t_override=torch.tensor([.5]), coupling_override=coupling)
+    plain = TriCoopDiffTrainer.compute_loss(trainer, {'coords': a}, {'coords': b}, data, **fixed)
+    torch.manual_seed(999)
+    diagnostic = TriCoopDiffTrainer.compute_loss(
+        trainer, {'coords': a}, {'coords': b}, data, diagnostics=True, **fixed)
+    assert torch.equal(plain['loss_total'], diagnostic['loss_total'])
+    assert len(diagnostic['rms']) == 14
+    assert all(np.isfinite(value) for value in diagnostic['rms'].values())
+    assert all(value.requires_grad for value in diagnostic['components'].values())
     for value in (0., .5, 1.):
         losses = TriCoopDiffTrainer.compute_loss(trainer, {'coords': a}, {'coords': b}, data,
                                                 t_override=torch.tensor([value]))

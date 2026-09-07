@@ -43,7 +43,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 from featurize_common import featurize_complex  # noqa: E402
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description="TriCoopDiff training")
 
     # Data
@@ -126,7 +126,7 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0,
                    help="Random seed for model initialization, shuffling, and diffusion noise")
 
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def _load_score_model_args(expert_model_dir):

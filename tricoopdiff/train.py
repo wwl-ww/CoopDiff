@@ -26,6 +26,8 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from .model import TriCoopDiff
 from .sdpi_flow import SDPIFlow, CHECKPOINT_VERSION, FLOW_VERSION
+from .diffdock.utils.torus import SCORE_NORM_VERSION, validate_score_norm_version
+from .checkpoint_contract import expert_base_identity, validate_expert_base_identity
 
 
 class NonFiniteTrainingError(FloatingPointError):
@@ -61,6 +63,11 @@ class TriCoopDiffTrainer:
         if activation_clamp <= 0:
             raise ValueError("activation_clamp must be positive")
         self.activation_clamp = float(activation_clamp)
+        # The vendored expert integration currently reads this process-level
+        # setting inside each convolution. Configure it at the owning runtime
+        # boundary so library callers cannot silently run a different model
+        # from the trainer's recorded checkpoint contract.
+        os.environ['NAN_CLAMP'] = str(self.activation_clamp)
         if torsion_expert_aux_weight < 0:
             raise ValueError("torsion_expert_aux_weight must be non-negative")
         self.torsion_expert_aux_weight = float(torsion_expert_aux_weight)
@@ -116,6 +123,7 @@ class TriCoopDiffTrainer:
         self, e3_data: dict, poi_data: dict, ligand_data: dict,
         case: str = "unknown", t_override: Optional[torch.Tensor] = None,
         t_pol_override: Optional[torch.Tensor] = None,
+        coupling_override=None, diagnostics: bool = False,
     ) -> dict:
         """Conditional velocity matching; t=0 crystal, t=1 SDPI movable DOFs."""
         if e3_data['coords'].shape[0] != 1:
@@ -132,7 +140,7 @@ class TriCoopDiffTrainer:
             other = torch.as_tensor(t_pol_override, device=device, dtype=t.dtype).reshape(-1)
             if other.shape != t.shape or not torch.equal(t, other):
                 raise ValueError("SDPI flow requires one shared interface clock")
-        coupling = self.diffusion.sample_coupling(
+        coupling = coupling_override if coupling_override is not None else self.diffusion.sample_coupling(
             e3_data['coords'], poi_data['coords'], ligand_data,
             no_torsion=bool(getattr(self.model.expert.model, 'no_torsion', False)),
         )
@@ -150,6 +158,13 @@ class TriCoopDiffTrainer:
         predictions = self.diffusion.normalized_predictions(output, t)
         scales = self.diffusion.scales(e3_data['coords'], poi_data['coords'])
         losses = {}
+        rms = {}
+        def record_rms(name, predicted, target):
+            if diagnostics:
+                for label, value in (('prediction', predicted), ('target', target)):
+                    rms[f'{name}_{label}_rms'] = (
+                        value.detach().square().mean().sqrt().item()
+                        if value.numel() else 0.0)
         for index, (branch, prefix) in enumerate((('e3_ligand', 'e3l'), ('poi_ligand', 'pol'))):
             for component, scale in (('tr', scales[index]), ('rot', np.pi)):
                 predicted = predictions[branch][component]
@@ -157,6 +172,7 @@ class TriCoopDiffTrainer:
                 if predicted.shape != target.shape:
                     raise ValueError(f"{branch}.{component} shape mismatch: {predicted.shape} vs {target.shape}")
                 losses[f'loss_{prefix}_{component}'] = (predicted - target).square().mean()
+                record_rms(f'{prefix}_{component}', predicted, target)
         tor_target = targets['torsion'] / np.pi
         if bool(getattr(self.model.expert.model, 'no_torsion', False)):
             tor_target = tor_target[:, :0]
@@ -169,11 +185,14 @@ class TriCoopDiffTrainer:
                 raise ValueError(f"{name} shape mismatch: {predicted.shape} vs {tor_target.shape}")
             losses[name] = ((predicted - tor_target).square().mean()
                             if predicted.numel() else t.new_zeros(()))
+            record_rms(name.removeprefix('loss_'), predicted, tor_target)
         if any(not torch.isfinite(value) for value in losses.values()):
             raise NonFiniteTrainingError(f"case={case}: non-finite SDPI velocity loss")
         total = (losses['loss_e3l_tr'] + losses['loss_e3l_rot']
                  + losses['loss_pol_tr'] + losses['loss_pol_rot'] + losses['loss_score_tor']
                  + self.torsion_expert_aux_weight * 0.5 * (losses['loss_e3l_tor'] + losses['loss_pol_tor']))
+        if diagnostics:
+            return {'loss_total': total, 'components': losses, 'rms': rms}
         return {'loss_total': total, 'loss_score': total.item(),
                 **{name: value.item() for name, value in losses.items()}}
 
@@ -252,7 +271,9 @@ class TriCoopDiffTrainer:
             'checkpoint_version': CHECKPOINT_VERSION,
             'generative_process': FLOW_VERSION,
             'architecture': 'trifuse_v13',
+            'expert_base_identity': expert_base_identity(self.model.expert),
             'runtime_config': {
+                'torus_score_norm_version': SCORE_NORM_VERSION,
                 'activation_clamp': self.activation_clamp,
                 'torsion_expert_aux_weight': self.torsion_expert_aux_weight,
                 'lora_warmup_steps': self.lora_warmup_steps,
@@ -284,6 +305,8 @@ class TriCoopDiffTrainer:
         (weights + global step only).
         """
         ckpt = torch.load(path, map_location=self.device)
+        validate_score_norm_version(ckpt.get('runtime_config', {}))
+        validate_expert_base_identity(ckpt, self.model.expert)
         if ckpt.get('checkpoint_version') != CHECKPOINT_VERSION:
             raise ValueError(
                 "TriFuse flow training requires checkpoint_version=17"
