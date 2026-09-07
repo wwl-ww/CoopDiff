@@ -2,20 +2,21 @@
 
 TriCoopDiff predicts protein–ligand–protein ternary complexes with two frozen
 DiffDock experts, independent LoRA adapters, and a cooperative TriFuse module.
-This document is the handoff entry point for reproducing Phase 1 inference and
-evaluation. Run all commands from the repository root. Do not import PyTorch or
+This branch implements two independent ligand hypotheses, annealed consensus,
+and explicit POI motion. Read [the current model contract](doc/DualConsensus.md)
+before training or evaluation. Run all commands from the repository root. Do not import PyTorch or
 load models on a shared cluster login node; use a GPU compute environment.
 
-## 1. Clone the validated branch
+## 1. Check out the experimental branch
 
 ```bash
-git clone --branch phase1-run https://github.com/wwl-ww/CoopDiff.git
+git clone --branch model-v2-dual-consensus https://github.com/wwl-ww/CoopDiff.git
 cd CoopDiff
 git rev-parse HEAD
 ```
 
-Record the commit together with every result. The current handoff must include
-commit `1c5d230` or a documented descendant.
+Record the commit together with every result. This experimental branch starts
+from master `52d5e5b`; benchmark improvement has not yet been established.
 
 ## 2. Create the software environment
 
@@ -110,20 +111,23 @@ python scripts/check_phase1_readiness.py \
 The index command must report 7,198 cases and 653 merged clusters. See
 [`doc/Phase 1 数据协议.md`](doc/Phase%201%20数据协议.md) for split and leakage rules.
 
-## 6. Install the trained TriCoopDiff checkpoint
+## 6. Train a new dual-consensus checkpoint
 
-The Phase 1 checkpoint is not stored in Git. Obtain `best_model.pt` directly
-from the project owner and keep its supplied SHA256 alongside it:
+Old Phase 1 checkpoints cannot initialize this new architecture. Run the
+small-data gates in [DualConsensus.md](doc/DualConsensus.md), then train with
+`scripts/train_entry.py --dual-stage annealed` and an independent output directory.
+After training, install the best validation checkpoint and record its digest:
 
 ```bash
-mkdir -p checkpoints/phase1_joint
-cp /path/from/handoff/best_model.pt checkpoints/phase1_joint/best_model.pt
-sha256sum checkpoints/phase1_joint/best_model.pt
+mkdir -p checkpoints/dual_consensus
+cp results/dual_consensus_phase1/best_model.pt checkpoints/dual_consensus/best_model.pt
+sha256sum checkpoints/dual_consensus/best_model.pt
 ```
 
 Use the exact advertised digest; a filename alone is not provenance. A valid
-checkpoint has `checkpoint_version=16`, `architecture=trifuse_v13`, 336 LoRA
-tensors, and an `expert_lora_config`. Do not use the old `checkpoints/phase1/`
+checkpoint has `checkpoint_version=18`, `architecture=dual_consensus_v1`, 336 LoRA
+tensors, `generative_process=dual_consensus_flow_v1`, and the full recorded runtime contract.
+Do not use the old `checkpoints/phase1/`
 smoke checkpoints for formal evaluation.
 
 ## 7. First validation gate
@@ -141,7 +145,7 @@ python scripts/evaluate_entry.py \
   --case 5T35_D_A_759 \
   --n-walkers 1 \
   --steps 20 \
-  --trifuse-ckpt checkpoints/phase1_joint/best_model.pt \
+  --trifuse-ckpt checkpoints/dual_consensus/best_model.pt \
   --out results/gate_5T35.json
 ```
 
