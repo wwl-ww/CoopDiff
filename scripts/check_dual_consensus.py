@@ -22,6 +22,8 @@ from train_entry import build_trainer, parse_args, seed_training
 from tricoopdiff.dual_consensus import FLOW_VERSION
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.sampler import sample_single
+from tricoopdiff.reproducibility import configure_inference_reproducibility
+from expert_parity import audit_binary_preservation
 
 
 def main():
@@ -33,12 +35,20 @@ def main():
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--out', required=True)
     parser.add_argument('--expert-model-dir', default='checkpoints/score_model')
+    parser.add_argument('--parity-only', action='store_true', help='Audit fixed forwards without training or sampling')
+    parser.add_argument('--trace-parity-layers', action='store_true', help='Record per-convolution input equality and output errors')
+    parser.add_argument('--nondeterministic-audit', action='store_true', help='Diagnostic negative control; requires --parity-only and is not a passing gate')
     args = parser.parse_args()
     if args.steps < 1 or args.sampling_steps < 1:
         parser.error('steps must be positive')
+    if args.nondeterministic_audit and not args.parity_only:
+        parser.error('--nondeterministic-audit requires --parity-only')
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
     device = torch.device(args.device)
+    # This must precede CUDA seeding, cache transfers and model construction.
+    # Seeds do not control the reduction order of CUDA index_add_/scatter.
+    reproducibility = configure_inference_reproducibility(not args.nondeterministic_audit)
     seed_training(42, device)
     batches = []
     for case in args.cases:
@@ -62,19 +72,18 @@ def main():
     with torch.no_grad():
         batch, coupling = pairs[0]
         state, _ = flow.path(batch['ligand_data'], batch['poi_data']['coords'], coupling, t)
-        def binary_forward(stage):
-            model.dual_stage = stage
-            model.eval()
-            return model(batch['e3_data'], {**batch['poi_data'], 'coords': state['poi']},
-                         {**batch['ligand_data'], 'coords': state['a']}, t_e3l=t,
-                         ligand_b_coords=state['b'], r_e3_to_poi=state['body'])['interface_scores']
-        native = binary_forward('independent')
-        coordinated = binary_forward('annealed')
-        parity = max(float((native[n][k] - coordinated[n][k]).abs().max())
-                     for n in native for k in native[n] if native[n][k].numel())
-        for name in native:
-            for key in native[name]:
-                assert torch.allclose(native[name][key], coordinated[name][key], atol=2e-4, rtol=2e-4), (name, key, parity)
+        parity_report = audit_binary_preservation(model, batch, state, t, args.trace_parity_layers)
+        parity_report['reproducibility'] = reproducibility
+        parity_report['negative_control_only'] = args.nondeterministic_audit
+        (out / 'parity.json').write_text(json.dumps(parity_report, indent=2, allow_nan=False))
+        if not args.nondeterministic_audit:
+            for name in ('native_repeat', 'film_repeat'):
+                assert parity_report['comparisons'][name]['allclose'], f'{name} is not repeatable; see parity.json'
+            assert parity_report['comparisons']['native_vs_film']['allclose'], 'native/FiLM mismatch; see parity.json'
+        parity = parity_report['comparisons']['native_vs_film']['max_abs_error']
+    if args.parity_only:
+        print(f'Parity audit saved: {out / "parity.json"}', flush=True)
+        return
     def measure(batch, coupling):
         model.eval()
         return trainer.compute_loss(**batch, coupling_override=coupling, t_override=t, diagnostics=True)
@@ -83,7 +92,8 @@ def main():
                 'components': {k: float(v.detach()) for k, v in result['components'].items()},
                 'metrics': result['rms']}
     report = {'process': FLOW_VERSION, 'cases': args.cases, 'initial': [], 'steps': [],
-              'diagnostic_only': True, 'time': .1, 'binary_preservation_max_error': parity}
+              'diagnostic_only': True, 'time': .1, 'binary_preservation_max_error': parity,
+              'reproducibility': reproducibility}
     with torch.no_grad():
         for batch, coupling in pairs:
             report['initial'].append(record(measure(batch, coupling)))

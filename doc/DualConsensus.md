@@ -102,3 +102,21 @@ python scripts/check_dual_consensus.py \
 `--cases` 接收多个 case，可运行 N=32/64 固定路径 overfit；需要足够多的有效缓存。
 在集群分配的 GPU 上使用 `scripts/train_dual_consensus_smoke.slurm`；本地工作站可直接运行。
 正式训练前还需完成真实训练集 N=1、N=32/64 overfit，以及两侧局部质量和完整 ternary DockQ 对照。
+
+### 专家保持性检查的数值控制
+
+`scripts/check_dual_consensus.py` 必须在 CUDA 初始化前启用确定性运算，
+并预热原生/FiLM 两条路径，再分别重复前向。固定随机种子不能固定 CUDA reduction 顺序；
+首次 TorchScript 执行与预热后的舍入差异也不应算作路径差异。
+报告在断言前写入 `parity.json`，区分 `native_repeat`、`film_repeat` 和 `native_vs_film`，
+保留原来的 `atol=rtol=2e-4`。`--trace-parity-layers` 可追踪受体/配体 embedding 和各层卷积。
+
+MGD `1KKQ_A_E_471` 的负对照在 `rec_emb_layers.0` 就出现输入指纹完全相同、
+输出不同的现象（约 `2.9e-6`）；原生路径自身重复的最终误差可达 `0.109`。
+启用确定性计算并预热后，同一机器上两种路径的重复检查、两路径比较均逐位相同（最大误差 0）。
+证据分别位于 `results/mgd_parity_warm_negative/parity.json` 和
+`results/mgd_parity_fixed_smoke/parity.json`。这次失败是验证数值控制缺失，
+不是双状态专家输入接错；它也暴露了该样本对早期微小舍入差异的放大效应。
+
+`--parity-only` 只做前向诊断；`--nondeterministic-audit` 必须与它一起使用，
+其结果明确标记为负对照，不作为通过验收的依据。
