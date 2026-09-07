@@ -21,14 +21,15 @@
 | Q-001 | P0 | 同 seed 跨进程推理漂移 | 已修复 |
 | Q-002 | P0 | 原训练 torsion 归一化表没有保存 | 已知限制；新 checkpoint 已防护 |
 | Q-003 | P0 | 刚体位置/朝向及双界面装配失败 | 已确认：学习速度场不足；继续定位训练原因 |
-| Q-004 | P1 | 积分后半程可能退化 | 已确认现象；根因待验证 |
-| Q-005 | P1 | 配体远离 E3 时局部 cross edges 变稀疏 | 待验证因果关系 |
+| Q-004 | P1 | 20-step 积分误差与后半程退化 | 已确认两种误差；数值改进待设计 |
+| Q-005 | P1 | 配体远离 E3 时局部 cross edges 变稀疏 | 已关闭：放大机制，非已证根因 |
 | Q-006 | P1 | 专家输出方向接近零引发归一化爆炸 | 已关闭：本案例假设被否定 |
 | Q-007 | P1 | 新旧数值协议的报告被错误复用 | 已修复防护 |
 | Q-008 | P0 | 坐标变换、速度符号或双界面组合错误 | 已关闭：真实路径对照不支持该假设 |
 | Q-009 | P1 | 官方 train/val index 缺失显式 split 标签 | 已修复生成器；旧产物不回写 |
 | Q-010 | P0 | Trainer 的 activation clamp 依赖入口脚本设置隐藏环境变量 | 已修复并复核 |
 | Q-011 | P0 | Adapter checkpoint 未绑定冻结 DiffDock 基座身份 | 已修复；旧 checkpoint 明示不确定 |
+| Q-012 | P0 | 推理 ETKDG scaffold 不在训练 native-scaffold 端点支持上 | 已确认；训练/状态设计待修 |
 
 ## Q-001：同 seed 跨进程推理漂移
 
@@ -83,6 +84,14 @@
   积分离散误差；旧轨迹数值不能直接当成新协议结果。
 - **结论：** 原四条轨迹即使按真实结构选择最佳中间步也未达 DockQ 0.23，单纯少走几步
   尚无解决质量问题的证据。
+- **oracle 积分审计：** 对真实 `5Z86` 固定路径使用精确 target velocity，Euler
+  `10/20/40/80` 步终点 ligand RMS 为 `0.311/0.143/0.071/0.036 Å`，POI RMS 为
+  `2.382/1.150/0.560/0.276 Å`，呈一阶收敛。证据：
+  `results/oracle_integration_step_audit.json`。因此 20 steps 确有可测离散误差。
+- **预测场对照：** 5T35 seed 0 将模型从 20 改为 40 steps 后 DockQ 从 `0.01351`
+  降至 `0.01277`、ligand RMSD 从 `5.05` 升至 `5.55 Å`。证据：
+  `results/epoch20_steps40_probe/`。当前权重的学习场误差大于积分误差，不能把加步数
+  作为质量修复；且训练只见过 `dt=0.05`，直接改步数会改变模型条件输入。
 
 ## Q-005：远距离回收时 E3 接触信息不足
 
@@ -90,6 +99,11 @@
   POI–ligand 末端仍约 6,300 条；采样的邻域半径本来就随时间缩小。
 - **下一步：** 固定坐标与时间检查 crop、cross-edge 和专家响应，判断是否是失败的原因
   或结果。不得直接扩大半径、改变预训练图契约后混称同模型评测。
+- **时序复核：** 5T35 seed 0 在 `t=1` 时已有 9,798 条 E3 cross edges，模型仍未沿
+  精确方向充分回收；随着 schedule cutoff 缩小、状态没有及时上轨，edges 逐步降至
+  28 条。末端并非零边，且训练和推理都使用同一 native dynamic cutoff。
+- **结论：** 关闭“缺边是起始根因”的假设；它是预测偏离训练路径后的放大机制。
+  在没有重训对照前不擅自扩大 cutoff 或改冻结 expert 的图分布。
 
 ## Q-006：输出头近零方向归一化假设
 
@@ -150,6 +164,25 @@
 - **验证：** `tests/test_checkpoint_contract.py` 覆盖稳定字段、旧格式标记和错基座拒绝。
 - **结论：** 关闭未来静默错配风险；无法追溯补齐旧 checkpoint 当时未保存的证据。
 
+## Q-012：推理与训练的 ligand 内部端点支持
+
+- **问题：** 训练 t=1 从 native ligand scaffold 施加随机 torsion；推理 t=1 则从新生成
+  ETKDG scaffold 施加随机 torsion。刚体和 torsion DOF 一致不代表不可旋转的键角、环系
+  与局部几何一致；这些差异无法由当前 rigid + torsion sampler 消除。
+- **审计方法：** 对显式 validation cases 使用完全相同的 torsion 角和 canonical atom
+  order，刚体 Kabsch 对齐后比较 inference ETKDG 与 training-native 端点的 RMSD、全原子
+  pair-distance RMSE。这样不会把不同随机 torsion 或全局位姿误记为 scaffold mismatch。
+- **首轮审计纠错：** 仅对两种 scaffold 施加相同 torsion *update* 后得到的 `2.62 Å`
+  aligned RMSD 仍混入了不同初始绝对二面角，不能当作不可达残差。审计已改为逐键对齐
+  绝对可旋转二面角，并同时报告 torsion 不可改变的 bond-length/bond-angle 误差。
+- **修正结果：** 三个 validation cases × 5 seeds，在所有可旋转绝对二面角对齐到
+  `3.1e-13°` 以内后，仍有 mean `2.013 Å` Kabsch RMSD、`1.389 Å` pair-distance
+  RMSE；bond-length RMSE `0.109 Å`、bond-angle RMSE `10.81°`。证据：
+  `results/endpoint_support_audit_v2.json`。这部分无法由当前 rigid + torsion 状态消除。
+- **结论：** 已确认训练/推理 endpoint support mismatch，是 Q-003 的一个根因候选。
+  修复必须让训练看到推理 scaffold 并使用可达 clean target，或扩展内部自由度；不能在
+  benchmark 推理时读取 native ligand 作为捷径。旧 epoch20 权重无法通过 sampler 小改补齐。
+
 ## 更新日志
 
 - 2026-09-07：建立问题账本，收录已确认的复现缺陷、修复证据、质量现象和待验证假设。
@@ -161,3 +194,4 @@
   收窄为学习速度场不足，并开始 epoch5→20 同路径进展审计。
 - 2026-09-07：补齐 epoch5/10/15/20 同路径曲线；确认 POI translation 学习改善但
   POI rotation 方向持续退化，下一步转向多任务梯度与 checkpoint 选择审计。
+- 2026-09-07：登记 Q-012，开始定量检查推理 ETKDG 与训练 native-scaffold 端点失配。
