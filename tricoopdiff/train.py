@@ -26,6 +26,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from .model import TriCoopDiff
 from .sdpi_flow import SDPIFlow, CHECKPOINT_VERSION, FLOW_VERSION
+from .diffdock.utils.torus import SCORE_NORM_VERSION, validate_score_norm_version
 
 
 class NonFiniteTrainingError(FloatingPointError):
@@ -265,6 +266,7 @@ class TriCoopDiffTrainer:
             'generative_process': FLOW_VERSION,
             'architecture': 'trifuse_v13',
             'runtime_config': {
+                'torus_score_norm_version': SCORE_NORM_VERSION,
                 'activation_clamp': self.activation_clamp,
                 'torsion_expert_aux_weight': self.torsion_expert_aux_weight,
                 'lora_warmup_steps': self.lora_warmup_steps,
@@ -296,6 +298,7 @@ class TriCoopDiffTrainer:
         (weights + global step only).
         """
         ckpt = torch.load(path, map_location=self.device)
+        validate_score_norm_version(ckpt.get('runtime_config', {}))
         if ckpt.get('checkpoint_version') != CHECKPOINT_VERSION:
             raise ValueError(
                 "TriFuse flow training requires checkpoint_version=17"

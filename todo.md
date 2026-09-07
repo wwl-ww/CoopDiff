@@ -469,3 +469,53 @@ seed 0 必须同时参照上述坐标差异，不能仅凭 DockQ 容差称其精
 当前结论：停止追加大规模评测/训练是合理的；下一步优先在确定性诊断设置下，
 检查固定状态的速度方向和 POI 刚体目标，再做同起点的条件/专家对照。
 本轮没有修改生产 sampler、checkpoint、学习率或启用碰撞过滤，也未证明架构必然不可行。
+
+## 优先排障与修复：跨进程数值一致性
+
+### 1. 复现问题的根因与修复（已验证）
+
+- **问题：** `tricoopdiff/diffdock/utils/torus.py` 原来在模块导入时用未固定 RNG 的
+  `10000 × 5001` 次随机采样估计 torsion score normalization；每个进程的表不同，
+  而且消耗全局 NumPy RNG。初始化坐标一致，并不代表模型使用的归一化常数一致。
+- **修复：** 在现有 wrapped-normal 密度/score 网格上分块确定性积分，替代随机估计；
+  保留 score 定义与表格查找接口，不改 checkpoint 权重或 sampler 步长。
+  版本为 `wrapped_normal_quadrature_v1`，避免约 5000 万次随机采样及其大中间数组。
+- **证据：** 同一个 5T35 seed 0、20 steps、原 epoch20 权重，独立进程 gate 1/2
+  仅开确定性 CUDA 时 DockQ 为 `0.01385652 / 0.01459943`；gate 3/4 再固定 attention、
+  关闭 TF32 后仍为 `0.01376211 / 0.01289350`。加入确定性积分后的 gate 5/6
+  **完整 case JSON 完全相等**，DockQ 均为 `0.013508286730742941`。
+  证据目录：`results/deterministic_production_gate_{1,2,3,4,5,6}/`。
+- **整轨迹复核：** `results/epoch20_fixed_normalization_probe/` 使用修复后的版本，
+  traced + 两次 untraced 的初始/最终坐标差均为 `0`，终值 DockQ 同为上述 gate 5/6
+  数值。末态 ligand–E3 最近 Cα 距离 `17.06 Å`、POI 朝向误差 `178.13°`，
+  仍未形成正确双界面，说明恢复一致性并没有消除几何失败。
+- **结论：** 找到并修复了一个跨进程复现根因；不是模型质量修复，不能把该单 seed
+  当成整体性能提升。旧训练时的随机表没有写进 checkpoint，无法恢复原来的数值轨迹；
+  新旧协议结果必须分开保存，原 benchmark 保留不覆盖。
+
+### 2. 防止复发与错误续跑（已实现、测试通过）
+
+- 默认评测开启严格确定性算法，固定 CUDA/attention 数值后端；
+  `--allow-nondeterministic` 只用于显式诊断对照。
+- 报告与续跑匹配记录数值设置、归一化版本；缺失或不同版本的报告不能直接复用。
+  新训练 checkpoint 保存归一化版本；加载旧 checkpoint 明确警告其表未记录，
+  对已记录但不兼容的版本直接报错。没有覆盖或重新训练原 epoch20 checkpoint。
+- `tests/test_torus_score_norm.py` 检查小 sigma 的解析极限、6 个 sigma 的独立
+  20 万样本 Monte Carlo 参考、分块一致性、导入不消耗 NumPy RNG、版本兼容检查。
+  `tests/test_reproducibility.py` 检查确定性设置与显式对照，并恢复测试前的后端状态。
+- 验证：`python tests/test_model_build.py` 全部通过；7 个定向测试文件共 **26 项通过**
+  （reproducibility、torus、evaluation_common、evaluate_index、training_contract、
+  sdpi_flow、failure_geometry）。当前环境没有 pytest，使用 `runpy` 执行 plain test
+  函数并以临时目录提供 `tmp_path`，没有安装依赖或绕过失败断言。
+
+### 3. 输出头方向归一化假设（本案例未支持，不盲目修改）
+
+对 5T35 seed 0 的 20 步记录 E3/POI translation、rotation 输出头输入范数及增益。
+POI rotation 最小原始范数约 `0.0630`、最大归一化增益约 `2.518`；其他头也没有
+接近零的分母。证据：`results/epoch20_head_direction_probe/5T35_D_A_759_seed0.json`。
+本案例不支持“输出头零方向除法导致爆炸”，因此不添加任意 epsilon 截断。
+该诊断是修复前随机表下的结果；不能推广为所有 cases 均无此问题。
+
+当前重点仍是失败轨迹中的刚体方向与双界面协调；已修复的复现问题让后续固定状态
+对照可解释，但尚未解决 epoch20 checkpoint 的低 DockQ。全量评测/长训练保持停止，
+本轮所有 GPU 推理只使用物理 GPU 3。

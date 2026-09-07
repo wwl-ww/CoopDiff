@@ -1,6 +1,7 @@
 import numpy as np
 import tqdm
 import os
+import warnings
 from pathlib import Path
 
 """
@@ -78,11 +79,54 @@ def sample(sigma):
     return out
 
 
-score_norm_ = score(
-    sample(sigma[None].repeat(10000, 0).flatten()),
-    sigma[None].repeat(10000, 0).flatten()
-).reshape(10000, -1)
-score_norm_ = (score_norm_ ** 2).mean(0)
+SCORE_NORM_VERSION = 'wrapped_normal_quadrature_v1'
+
+
+def validate_score_norm_version(runtime_config):
+    """Reject known normalization mismatches; identify unrecorded legacy tables."""
+    saved = runtime_config.get('torus_score_norm_version')
+    if saved is None:
+        warnings.warn(
+            'Checkpoint has no torus normalization provenance. Its original '
+            'random Monte Carlo table cannot be recovered; using deterministic '
+            'quadrature, not an exact legacy numerical replay.',
+            RuntimeWarning, stacklevel=2,
+        )
+        return 'legacy_unrecorded'
+    if saved != SCORE_NORM_VERSION:
+        raise ValueError(f'checkpoint torus normalization {saved!r} does not match '
+                         f'runtime {SCORE_NORM_VERSION!r}')
+    return saved
+
+
+def deterministic_score_norm(density, scores, positive_grid, chunk_size=128):
+    """Integrate E[score²] on the existing wrapped-normal grid.
+
+    Both density and score² are even, so the factor two on [0, pi] cancels
+    between numerator and normalizer. The missing zero endpoint has score 0.
+    Work in chunks rather than allocating a 10,000-by-5,001 Monte Carlo array.
+    This function never consumes RNG state.
+    """
+    if density.shape != scores.shape or density.shape[1] != len(positive_grid):
+        raise ValueError('density, score, and grid shapes must agree')
+    if chunk_size < 1 or np.any(np.diff(positive_grid) <= 0) or positive_grid[0] <= 0:
+        raise ValueError('positive increasing grid and positive chunk size required')
+    result = np.empty(density.shape[0], dtype=np.float64)
+    for start in range(0, len(result), chunk_size):
+        stop = min(start + chunk_size, len(result))
+        density_chunk = density[start:stop]
+        integrand = scores[start:stop] ** 2 * density_chunk
+        numerator = np.trapz(integrand, positive_grid, axis=1)
+        numerator += .5 * positive_grid[0] * integrand[:, 0]
+        denominator = np.trapz(density_chunk, positive_grid, axis=1)
+        denominator += positive_grid[0] * density_chunk[:, 0]
+        result[start:stop] = numerator / denominator
+    if not np.isfinite(result).all() or np.any(result <= 0):
+        raise FloatingPointError('invalid deterministic torus score normalizer')
+    return result
+
+
+score_norm_ = deterministic_score_norm(p_, score_, x)
 
 
 def score_norm(sigma):

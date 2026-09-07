@@ -59,7 +59,8 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
     data_root = Path(args.data_root)
-    runner = EvaluationRunner(root, args.checkpoint, deepternary_root=args.deepternary_root)
+    runner = EvaluationRunner(root, args.checkpoint, deepternary_root=args.deepternary_root,
+                              deterministic=args.deterministic)
     specifications = [
         ('protac', '5T35_D_A_759', 0, 'fixed first seed'),
         ('protac', '5T35_D_A_759', 18, 'oracle-best of completed 40 seeds'),
@@ -71,6 +72,7 @@ def main():
             parser.error('limit must be positive')
         specifications = specifications[:args.limit]
     summary = {'checkpoint_sha256': runner.checkpoint_sha256,
+               'reproducibility': runner.reproducibility,
                'deterministic_algorithms': args.deterministic,
                'scope': 'selected post-hoc failure analysis, not an unbiased benchmark',
                'notes': 'CA contacts are geometry diagnostics. Unbound POI errors use prealigned input templates.',
@@ -85,6 +87,17 @@ def main():
             runner.score_model_args, 'cuda', cache_dir=str(cache))
         runner._ensure_model(dim)
         initial = []
+        head_probes = {'tr': [], 'rot': []}
+        handles = []
+        for component in head_probes:
+            def record_head(module, inputs, output, component=component):
+                raw = float(inputs[0][0, 0].detach())
+                magnitude = float(output.reshape(-1)[0].detach())
+                head_probes[component].append({
+                    'raw_vector_norm': raw, 'signed_magnitude': magnitude,
+                    'normalization_gain': abs(magnitude) / max(raw, 1e-8),
+                })
+            handles.append(getattr(runner.expert.model, f'{component}_final_layer').register_forward_hook(record_head))
         initialize = runner.initializer.initialize
 
         def capture(*values, **kwargs):
@@ -92,10 +105,14 @@ def main():
             initial.append(tuple(t[0].detach().cpu().numpy().copy() for t in result[:2]))
             return result
 
-        with patch.object(runner.initializer, 'initialize', side_effect=capture):
-            result = sample_single(
-                runner.model, runner.diffusion, runner.initializer, e3, poi, ligand,
-                device='cuda', steps=20, seed=seed, return_trajectory=True, return_trace=True)
+        try:
+            with patch.object(runner.initializer, 'initialize', side_effect=capture):
+                result = sample_single(
+                    runner.model, runner.diffusion, runner.initializer, e3, poi, ligand,
+                    device='cuda', steps=20, seed=seed, return_trajectory=True, return_trace=True)
+        finally:
+            for handle in handles:
+                handle.remove()
         if not result['valid'] or len(result['trajectory']) != 20:
             raise RuntimeError(f'incomplete replay for {case}/{seed}')
         states = initial + result['trajectory']
@@ -141,10 +158,12 @@ def main():
                              'poi_rmsd_to_trace_A': float(np.sqrt(np.mean(np.sum(
                                  (plain['poi_coords']-states[-1][1])**2, axis=-1))))})
         payload = {'case': case, 'group': group, 'seed': seed, 'selection': selection,
+                   'reproducibility': runner.reproducibility,
                    'initialization': result['initialization'], 'trace': result['trace'],
                    'states': rows, 'final_dockq_replay_error': replay_error,
                    'historical_dockq': expected, 'historical_replay_matches_1e3': replay_error <= 1e-3,
                    'untraced_repeats': controls}
+        payload['head_probes'] = head_probes
         destination = out / f'{case}_seed{seed}'
         destination.with_suffix('.json').write_text(json.dumps(payload, indent=2, allow_nan=False))
         np.savez_compressed(destination.with_suffix('.npz'),

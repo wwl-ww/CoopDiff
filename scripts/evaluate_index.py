@@ -40,6 +40,8 @@ def build_parser():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--allow-nondeterministic", action="store_true",
+                        help="Explicit legacy diagnostic control; never mix with deterministic results")
     return parser
 
 
@@ -70,6 +72,7 @@ def main():
         "steps": args.steps,
         "native_root": str((_PROJECT_ROOT / args.native_root).resolve()),
         "metric_template_root": args.metric_template_root,
+        "deterministic_algorithms": not args.allow_nondeterministic,
     }
     (output / "evaluation_manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8",
@@ -77,6 +80,7 @@ def main():
     runner = EvaluationRunner(
         _PROJECT_ROOT, checkpoint=checkpoint, device=args.device,
         deepternary_root=args.deepternary_root,
+        deterministic=not args.allow_nondeterministic,
     )
     failures = []
     for position, entry in enumerate(entries, start=1):
@@ -94,6 +98,7 @@ def main():
             native = _PROJECT_ROOT / args.native_root / case / "gt_complex.pdb"
             native = native if native.is_file() else None
             expected_config = {
+                **runner.reproducibility,
                 "init_mode": "sdpi",
                 "initialization_version": "sdpi_v1",
                 "generative_process": "sdpi_flow_v1",

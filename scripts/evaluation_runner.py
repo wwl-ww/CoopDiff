@@ -22,6 +22,10 @@ from tricoopdiff.lora import (
 )
 from tricoopdiff.model import TriCoopDiff
 from tricoopdiff.trifuse import TriFuse
+from tricoopdiff.reproducibility import configure_inference_reproducibility
+from tricoopdiff.diffdock.utils.torus import (
+    SCORE_NORM_VERSION, validate_score_norm_version,
+)
 
 
 class EvaluationRunner:
@@ -30,7 +34,9 @@ class EvaluationRunner:
     def __init__(self, project_root, checkpoint, device="cuda",
                  model_dir="checkpoints/score_model",
                  expert_checkpoint="best_ema_inference_epoch_model.pt",
-                 deepternary_root=None):
+                 deepternary_root=None, deterministic=True):
+        self.reproducibility = configure_inference_reproducibility(deterministic)
+        self.reproducibility['torus_score_norm_version'] = SCORE_NORM_VERSION
         self.root = Path(project_root).resolve()
         self.deepternary_root = (
             self.root / (deepternary_root or 'DeepTernary')
@@ -45,6 +51,9 @@ class EvaluationRunner:
         self.checkpoint_sha256 = sha256_file(self.checkpoint_path)
         self.checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
         validate_checkpoint_payload(self.checkpoint)
+        self.reproducibility['checkpoint_torus_score_norm_version'] = (
+            validate_score_norm_version(self.checkpoint['runtime_config'])
+        )
         self.activation_clamp = float(
             self.checkpoint["runtime_config"]["activation_clamp"]
         )
@@ -131,6 +140,7 @@ class EvaluationRunner:
         )
         report["case"] = case
         report["run_config"] = {
+            **self.reproducibility,
             "seed": seed,
             "n_walkers": n_walkers,
             "steps": (steps if steps is not None
