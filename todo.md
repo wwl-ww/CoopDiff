@@ -1,3 +1,25 @@
+集群：ssh.cn-zhongwei-1.paracloud.com
+
+在自己的电脑上执行：
+
+  scp scwb792@<集群登录地址>:/data/home/scwb792/run/mwj/CoopDiff/results/
+  tricoopdiff_phase1_joint.tar.gz .
+
+  再下载校验文件：
+
+  scp scwb792@<集群登录地址>:/data/home/scwb792/run/mwj/CoopDiff/results/
+  tricoopdiff_phase1_joint.tar.gz.sha256 .
+
+  进入下载目录后校验：
+
+  sha256sum -c tricoopdiff_phase1_joint.tar.gz.sha256
+
+下载执行回复：目标目录为 `/tmp/pymp-f2c2db1a/checkpoints/phase1_joint/`，空间充足。
+已尝试连接 `scwb792@ssh.cn-zhongwei-1.paracloud.com`，默认 SSH 端口 `22`
+连接超时，尚未进入身份验证；压缩包和校验文件均未下载，SHA256 校验尚未执行。
+结论：当前阻塞在集群连接，不是模型文件或校验失败。
+后续：确认实际 SSH 端口或当前环境可达的登录地址后重试；下载完成后先校验再使用。
+
 # FiLM＋LoRA 条件流排查清单与逐项结论
 
 ## 本轮诊断范围
