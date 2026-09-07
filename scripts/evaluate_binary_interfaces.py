@@ -27,7 +27,7 @@ from tricoopdiff.diffusion import InterfaceDiffusion
 from tricoopdiff.expert_factory import build_diffdock_expert
 from tricoopdiff.graphs import build_subgraph_e3l, crop_receptor_to_ligand
 from tricoopdiff.initialization import sample_binary_pose, validate_ligand_graph
-from tricoopdiff.model import _set_time_embeddings
+from tricoopdiff.expert_time import _set_time_embeddings
 from tricoopdiff.diffdock.utils.torsion import modify_conformer_torsion_angles
 
 

@@ -10,10 +10,10 @@ import torch
 from torch import nn
 
 from .graphs import build_subgraph_e3l, build_trifuse_graph, crop_receptor_to_ligand
-from .model import _set_time_embeddings
+from .expert_time import _set_time_embeddings
 from .sdpi_flow import SDPIFlow
-from .trifuse import (BondContextEncoder, JudgeHead, StateHead,
-                      TernaryGeometryEncoder, TokenNegotiator, TorsionCoordinator)
+from .geometry_encoders import BondContextEncoder, TernaryGeometryEncoder
+from .consensus_layers import JudgeHead, StateHead, TokenNegotiator, TorsionCoordinator
 
 
 ARCHITECTURE = 'residual_consensus_v2'
