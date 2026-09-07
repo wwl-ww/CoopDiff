@@ -144,7 +144,15 @@ def count_pdb_heavy_atoms(path):
 
 
 def validate_ligand_graph(path):
-    """Apply the RDKit graph requirements used by DiffDock featurization."""
+    """Repair plausible missing PDB bonds and enforce one connected ligand.
+
+    PDB files do not require ``CONECT`` records, and RDKit occasionally misses
+    a long but chemically plausible covalent bond when inferring connectivity
+    from coordinates (for example the 1.82-A C--C bond in 2NU7_B_E_COA).
+    Add only the shortest inter-fragment bond that fits a conservative
+    covalent-radius cutoff. True salts or other distant components remain an
+    error instead of being silently joined or discarded.
+    """
     from rdkit import Chem
 
     molecule = Chem.MolFromPDBFile(str(path), sanitize=True, removeHs=True)
@@ -156,6 +164,59 @@ def validate_ligand_graph(path):
         )
     if molecule.GetNumBonds() == 0:
         raise RuntimeError('ligand graph contains no inferred bonds')
+    bridges = []
+    editable = Chem.RWMol(molecule)
+    conformer = molecule.GetConformer()
+    periodic_table = Chem.GetPeriodicTable()
+    while True:
+        fragments = Chem.GetMolFrags(editable)
+        if len(fragments) == 1:
+            break
+        candidates = []
+        for left_index, left in enumerate(fragments):
+            for right in fragments[left_index + 1:]:
+                for atom_i in left:
+                    for atom_j in right:
+                        position_i = conformer.GetAtomPosition(atom_i)
+                        position_j = conformer.GetAtomPosition(atom_j)
+                        distance = position_i.Distance(position_j)
+                        radius = (
+                            periodic_table.GetRcovalent(
+                                molecule.GetAtomWithIdx(atom_i).GetAtomicNum()
+                            )
+                            + periodic_table.GetRcovalent(
+                                molecule.GetAtomWithIdx(atom_j).GetAtomicNum()
+                            )
+                        )
+                        # RDKit's covalent radii are deliberately small
+                        # (C=0.68 A in the deployed version). Allow coordinate
+                        # uncertainty up to 1.4x the summed radii; this admits
+                        # the known 1.82-A C--C miss while remaining well below
+                        # nonbonded C--C contact distances.
+                        if 0.6 * radius <= distance <= 1.4 * radius:
+                            candidates.append((distance, atom_i, atom_j))
+        if not candidates:
+            sizes = sorted((len(fragment) for fragment in fragments), reverse=True)
+            raise RuntimeError(
+                f'ligand has disconnected fragments {sizes} with no plausible '
+                'missing covalent bond'
+            )
+        _, atom_i, atom_j = min(candidates)
+        editable.AddBond(atom_i, atom_j, Chem.BondType.SINGLE)
+        bridges.append((atom_i + 1, atom_j + 1))
+
+    if bridges:
+        lines = Path(path).read_text(encoding='utf-8').splitlines()
+        insertion = next((i for i, line in enumerate(lines)
+                          if line.startswith('END')), len(lines))
+        conect = [f'CONECT{atom_i:5d}{atom_j:5d}' for atom_i, atom_j in bridges]
+        lines[insertion:insertion] = conect
+        temporary = Path(path).with_suffix(Path(path).suffix + '.tmp')
+        temporary.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        temporary.replace(path)
+        molecule = Chem.MolFromPDBFile(str(path), sanitize=True, removeHs=True)
+        if molecule is None or len(Chem.GetMolFrags(molecule)) != 1:
+            raise RuntimeError('ligand connectivity repair did not round-trip')
 
 
 def export_case(case, pdb_root, output_root):

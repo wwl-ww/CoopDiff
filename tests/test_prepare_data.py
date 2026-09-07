@@ -63,6 +63,38 @@ def test_ligand_graph_gate_rejects_bondless_input(tmp_path):
         raise AssertionError('bondless ligand must be rejected before training')
 
 
+def test_ligand_graph_repairs_plausible_missing_pdb_bond(tmp_path):
+    pdb = tmp_path / 'ligand.pdb'
+    pdb.write_text(
+        'HETATM    1  C1  LIG A   1       0.000   0.000   0.000  1.00  0.00           C  \n'
+        'HETATM    2  C2  LIG A   1       1.500   0.000   0.000  1.00  0.00           C  \n'
+        'HETATM    3  C3  LIG A   1       3.320   0.000   0.000  1.00  0.00           C  \n'
+        'HETATM    4  C4  LIG A   1       4.820   0.000   0.000  1.00  0.00           C  \n'
+        'END\n',
+        encoding='utf-8',
+    )
+    make_deepternary_index.validate_ligand_graph(pdb)
+    assert 'CONECT    2    3' in pdb.read_text(encoding='utf-8')
+
+
+def test_ligand_graph_rejects_distant_fragments(tmp_path):
+    pdb = tmp_path / 'ligand.pdb'
+    pdb.write_text(
+        'HETATM    1  C1  LIG A   1       0.000   0.000   0.000  1.00  0.00           C  \n'
+        'HETATM    2  C2  LIG A   1       1.500   0.000   0.000  1.00  0.00           C  \n'
+        'HETATM    3  C3  LIG A   1      10.000   0.000   0.000  1.00  0.00           C  \n'
+        'HETATM    4  C4  LIG A   1      11.500   0.000   0.000  1.00  0.00           C  \n'
+        'END\n',
+        encoding='utf-8',
+    )
+    try:
+        make_deepternary_index.validate_ligand_graph(pdb)
+    except RuntimeError as error:
+        assert 'disconnected fragments' in str(error)
+    else:
+        raise AssertionError('distant ligand fragments must not be joined')
+
+
 def test_joint_cluster_intersection_merges_relations_and_excludes_pdbs():
     protac = [
         {'representative': ['a_A_B_X'], 'items': ['a_A_B_X', 'b_A_B_X']},
