@@ -33,6 +33,21 @@ STAGES = {
                      'failures_counted'),
 }
 
+V2_STAGES = {
+    'regression': ('regression_passed', 'inputs_present', 'split_disjoint'),
+    'smoke': ('expert_unchanged', 'all_trainable_gradients_present',
+              'checkpoint_ema_roundtrip_exact', 'finite_trajectory'),
+    'overfit': ('loss_decreased', 'poi_rotation_learned', 'finite_gradients'),
+    'pilot': ('heldout_validation', 'throughput_measured', 'checkpoint_saved'),
+    'train': ('finite_training', 'checkpoint_saved', 'validation_recorded'),
+    'evaluate_protac': STAGES['evaluate_protac'],
+    'evaluate_mgd': STAGES['evaluate_mgd'],
+}
+
+
+def stage_contract(architecture):
+    return V2_STAGES if architecture == 'residual_consensus_v2' else STAGES
+
 
 def write_json(path, payload):
     temporary = path.with_suffix(path.suffix + '.tmp')
@@ -44,8 +59,9 @@ def validate_plan(plan):
     if not isinstance(plan.get('architecture'), str) or not plan['architecture']:
         raise ValueError('architecture is required')
     stages = plan.get('stages', [])
-    if [s.get('name') for s in stages] != list(STAGES):
-        raise ValueError(f'stages must be ordered exactly as {list(STAGES)}')
+    expected = stage_contract(plan['architecture'])
+    if [s.get('name') for s in stages] != list(expected):
+        raise ValueError(f'stages must be ordered exactly as {list(expected)}')
     missing = []
     total = 0
     for stage in stages:
@@ -83,7 +99,7 @@ def validate_report(path, architecture, stage, run_id, checkpoint):
     if report.get('passed') is not True:
         raise ValueError(f'{stage}: scientific gate failed')
     checks = report.get('checks', {})
-    for name in STAGES[stage]:
+    for name in stage_contract(architecture)[stage]:
         if checks.get(name) is not True:
             raise ValueError(f'{stage}: missing or failed check {name}')
     evidence = report.get('artifacts')
@@ -179,6 +195,8 @@ def run_plan(plan, output, python, require_allocation=True, direct_gpu3=False):
     checkpoint = None
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=visible_gpu, HF_HUB_OFFLINE='1',
                TRANSFORMERS_OFFLINE='1', PYTHONUNBUFFERED='1',
+               HF_HOME='/tmp/pymp-f2c2db1a/results/huggingface',
+               CUBLAS_WORKSPACE_CONFIG=':4096:8',
                TRICOOPDIFF_CACHE_DIR='/tmp/pymp-f2c2db1a/results/runtime_cache/diffdock')
     try:
         for i, stage in enumerate(plan['stages']):
@@ -227,7 +245,7 @@ def run_plan(plan, output, python, require_allocation=True, direct_gpu3=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--plan', type=Path, default=ROOT / 'scripts/overnight_dual.json')
+    parser.add_argument('--plan', type=Path, default=ROOT / 'scripts/overnight_v2.json')
     parser.add_argument('--out', type=Path)
     parser.add_argument('--python', default=sys.executable)
     parser.add_argument('--dry-run', action='store_true')
