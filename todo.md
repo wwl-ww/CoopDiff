@@ -76,7 +76,7 @@ TriFuse/LoRA 开始，以下首轮结果未使用你之前训练得到的 checkp
 
 后续：在之前训练的 checkpoint 上复查，并优先检查第 8 项的退化样本。
 证据：[固定拟合](results/flow_diagnostic_fixed_3EXE_run4/summary.json)、
-[实际坐标检查](results/flow_diagnostic_fixed_3EXE_run4/tangent_audit.json)。
+[实际坐标检查](results/flow_diagnostic_fixed_3EXE_run4/tangent_audit.json)。yizhi 
 
 #### 2. 参数没有获得有效更新
 
