@@ -9,7 +9,7 @@ import tempfile
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from run_overnight import STAGES, run_command, run_plan, validate_plan, validate_report
+from run_overnight import STAGES, gpu3_visibility, run_command, run_plan, validate_plan, validate_report
 
 
 CHILD = '''
@@ -162,6 +162,20 @@ def test_gpu_allocation_is_required(tmp_path):
         else:
             raise AssertionError('unallocated GPU 3 allowed')
     assert not (tmp_path / 'run').exists()
+
+
+def test_explicit_direct_mode_resolves_only_gpu3():
+    with patch.dict(os.environ, {}, clear=True), \
+            patch('run_overnight.subprocess.check_output',
+                  return_value='0, GPU-other\n3, GPU-authorized\n'):
+        assert gpu3_visibility(direct=True) == 'GPU-authorized'
+    with patch('run_overnight.subprocess.check_output', return_value='0, GPU-other\n'):
+        try:
+            gpu3_visibility(direct=True)
+        except ValueError as error:
+            assert 'physical GPU 3' in str(error)
+        else:
+            raise AssertionError('must not fall back to another GPU')
 
 
 def test_nonfinite_report_is_rejected(tmp_path):

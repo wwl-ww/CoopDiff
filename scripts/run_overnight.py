@@ -141,27 +141,34 @@ def run_command(argv, env, log, seconds):
             stop_group(process)
 
 
-def run_plan(plan, output, python, require_allocation=True):
-    total = validate_plan(plan)
-    if require_allocation and not os.environ.get('SLURM_JOB_ID'):
-        raise ValueError('run inside a SLURM allocation; no login-node GPU execution')
-    if require_allocation:
-        probe = subprocess.check_output(
-            ['nvidia-smi', '--query-gpu=index,uuid', '--format=csv,noheader'], text=True)
-        matches = [line.split(',')[1].strip() for line in probe.splitlines()
-                   if line.split(',')[0].strip() == '3']
-        if len(matches) != 1:
-            raise ValueError('cannot identify physical GPU 3')
+def gpu3_visibility(direct=False):
+    """Resolve physical GPU 3 by UUID; direct mode requires explicit CLI opt-in."""
+    if not direct and not os.environ.get('SLURM_JOB_ID'):
+        raise ValueError('run inside SLURM or explicitly select --direct-gpu3')
+    probe = subprocess.check_output(
+        ['nvidia-smi', '--query-gpu=index,uuid', '--format=csv,noheader'], text=True)
+    matches = [line.split(',')[1].strip() for line in probe.splitlines()
+               if line.split(',')[0].strip() == '3']
+    if len(matches) != 1:
+        raise ValueError('cannot identify physical GPU 3')
+    if not direct:
         allocation = os.environ.get('SLURM_JOB_GPUS', '').split(',')
         if '3' not in allocation and matches[0] not in allocation:
             raise ValueError('SLURM allocation must include physical GPU 3')
-        visible_gpu = matches[0]
+    return matches[0]
+
+
+def run_plan(plan, output, python, require_allocation=True, direct_gpu3=False):
+    total = validate_plan(plan)
+    if require_allocation or direct_gpu3:
+        visible_gpu = gpu3_visibility(direct=direct_gpu3)
     else:
         visible_gpu = ''  # CPU-only test hook; never exposed as a CLI bypass.
     output.mkdir(parents=True, exist_ok=False)
     run_id = uuid.uuid4().hex
     state = {'run_id': run_id, 'architecture': plan['architecture'],
-             'status': 'running', 'stages': [], 'budget_seconds': total}
+             'status': 'running', 'stages': [], 'budget_seconds': total,
+             'gpu_uuid': visible_gpu, 'direct_gpu3': direct_gpu3}
     state['git_commit'] = subprocess.check_output(
         ['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], text=True).strip()
     state['git_status'] = subprocess.check_output(
@@ -224,6 +231,8 @@ def main():
     parser.add_argument('--out', type=Path)
     parser.add_argument('--python', default=sys.executable)
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--direct-gpu3', action='store_true',
+                        help='Explicitly authorize physical GPU 3 on this dedicated host without SLURM')
     args = parser.parse_args()
     try:
         plan = json.loads(args.plan.read_text())
@@ -236,7 +245,7 @@ def main():
         def interrupted(signum, frame):
             raise KeyboardInterrupt(f'received signal {signum}')
         signal.signal(signal.SIGTERM, interrupted)
-        return run_plan(plan, args.out.resolve(), args.python)
+        return run_plan(plan, args.out.resolve(), args.python, direct_gpu3=args.direct_gpu3)
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f'PREFLIGHT FAILED: {error}', file=sys.stderr)
         return 2

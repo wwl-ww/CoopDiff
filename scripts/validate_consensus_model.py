@@ -31,7 +31,8 @@ def main():
     parser.add_argument('--out', required=True)
     parser.add_argument('--expert-model-dir', required=True)
     args = parser.parse_args()
-    if os.environ.get('CUDA_VISIBLE_DEVICES') != '3':
+    from run_overnight import gpu3_visibility
+    if os.environ.get('CUDA_VISIBLE_DEVICES') not in ('3', gpu3_visibility(direct=True)):
         parser.error('use only physical GPU 3')
     output = Path(args.out)
     output.mkdir(parents=True, exist_ok=False)
