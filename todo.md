@@ -14,11 +14,15 @@
 
   sha256sum -c tricoopdiff_phase1_joint.tar.gz.sha256
 
-下载执行回复：目标目录为 `/tmp/pymp-f2c2db1a/checkpoints/phase1_joint/`，空间充足。
-已尝试连接 `scwb792@ssh.cn-zhongwei-1.paracloud.com`，默认 SSH 端口 `22`
-连接超时，尚未进入身份验证；压缩包和校验文件均未下载，SHA256 校验尚未执行。
-结论：当前阻塞在集群连接，不是模型文件或校验失败。
-后续：确认实际 SSH 端口或当前环境可达的登录地址后重试；下载完成后先校验再使用。
+下载执行回复（已完成）：SSH 端口 22 超时后，改用你提供的
+[Hugging Face 仓库](https://huggingface.co/chiww6/CoopDiff-checkpoints/tree/main/tricoopdiff_phase1_joint)，
+固定 revision `ee45e6740443e56ab7511ac320f26cc1783dbff5`。
+`best_model.pt`、epoch 5/10/15/20 权重和 `config.json` 已下载至
+`/tmp/pymp-f2c2db1a/checkpoints/phase1_joint/`，5 个权重均通过仓库 LFS SHA256 校验。
+`best_model.pt` 与 `checkpoint_epoch20.pt` 均记录 epoch=20、global_step=11740，
+checkpoint_version=17、architecture=trifuse_v13、generative_process=sdpi_flow_v1。
+结论：下载阻塞已解除；这是训练计划 100 epoch 中的 20 epoch 阶段性权重，不是最终模型。
+下一轮诊断以 `checkpoint_epoch20.pt` 为基线，保留原文件不覆盖。
 
 # FiLM＋LoRA 条件流排查清单与逐项结论
 
@@ -26,7 +30,9 @@
 
 分支：`diagnose/film-lora-flow`。诊断代码提交：`d1c085a`、`80aed04`；运行指南：`3c33cc7`。
 全部 GPU 工作只使用物理 GPU 3。本轮从冻结 DiffDock 预训练专家与新初始化的
-TriFuse/LoRA 开始，**尚未加载你之前训练得到的 checkpoint**，不能将以下结果直接归因于旧模型。
+TriFuse/LoRA 开始，以下首轮结果未使用你之前训练得到的 checkpoint，不能直接归因于旧模型。
+现已取得 epoch 20 checkpoint，第二轮模型对照已执行；新增结果在文末逐项单列，
+首轮记录保留用于追溯，当前状态以第二轮结果为准。
 
 真实训练样本为 `3EXE_B_C_TPP`、`6JLL_A_b_LMT`、`5Z86_A_M_PGV`，
 分别包含 8、16、42 个 torsion；均取自官方 cluster 训练划分，并排除了 benchmark 同 PDB。
@@ -255,13 +261,95 @@ seed=42、200 步的保留路径平均 loss 为 `5.30510 → 3.42927`；seed=43�
 关于推理步数的回复：本轮没有增加推理步数或用 benchmark 调参；也未执行 20 步与
 更多步数的采样精度对照。当前没有证据将训练优化问题归因于推理步数。
 
-## 下一轮工作与所需输入
+## 第二轮：原始 epoch 20 checkpoint 的逐项回复与结论
 
-1. 接入你之前训练得到的 checkpoint，先核对版本、生成过程及训练配置。
-   目前尚未接入；需要确认用于这轮诊断的具体文件，最好附训练日志和启动命令。
-2. 优先复现 `5Z86_A_M_PGV, t=0.1` 的 POI 退化，再做平移/旋转/torsion 分阶段对照。
-3. 在相同路径、步数与初始化下对照学习率、梯度裁剪和 activation clamp。
-4. 扩大保留路径、独立验证结构及双向条件消融；通过后才考虑全数据训练与生成质量评估。
+本轮恢复原权重、optimizer 和 global_step=11740。每个对照单独恢复同一 checkpoint，
+没有覆盖原模型，也没有改变生产学习率或裁剪参数。GPU 仅为物理 3。
+运行命令须加 `env -u GCC_ROOT`，避免继承的无效 GCC 路径阻止 Triton backward 编译。
+以下内部验证来自当前仓库官方 val clusters 的 `5OL2_C_F_FAD`、`6U9D_U_V_60G`、
+`1XK4_F_J_FLC`，每结构 3 条路径 × 3 个时间点，共 27 探针；不是 benchmark。
+原训练索引清单未随 checkpoint 提供，因此尚不能独立核验原训练使用的划分完全相同。
 
-后续每完成一步，继续在对应条目补充实验配置、证据、结论及剩余限制；
-“已执行”与“假设被排除/门禁通过”分别记录，未做的检查不标记为完成。
+### 1. 输入与速度目标对应：已执行，所测路径通过
+
+回复：历史失败路径回放最大 loss 差 `4.63e-5`，目标 RMS 一致，符合 CUDA 浮点容差。
+原模型在 `5Z86, t=0.1` 的 loss 为 `4.02010`，不是首轮短训练后的 `15.9726`。
+该结构 `t=0.1/0.5/0.9` 实际坐标切向检查均通过，半步误差最大约 `3.18e-5 Å`。
+结论：没有复现目标映射/反向符号错误；不能把首轮退化归因于用户的训练模型。
+证据：`results/epoch20_diagnostic_run3/{summary.json,tangent_audit.json}`。
+
+### 2. 模块更新与 warmup：已执行，模块级通过
+
+回复：恢复后 LoRA 已启用，没有重启 100-step warmup。FiLM、bridge、torsion coordinator
+及两侧 LoRA 均有非零梯度和实际参数增量。失败路径初始总梯度范数 `16.0556`，
+FiLM 为 `15.3711`；两侧最大逐层 clamp 比例约 `3.14%/7.98%`。
+结论：未发现模块级 detach 或 optimizer 漏参；存在裁剪，但裁剪存在本身不是错误。
+证据：`results/epoch20_diagnostic_run3/all.jsonl`，clamp 对照见第 4 项。
+
+### 3. 分项尺度：已执行，所测退化以刚体为主
+
+回复：原模型该路径 POI 平移/旋转 loss 为 `1.28741/1.51304`，joint torsion 为 `0.39821`。
+未加权分项梯度范数：E3 平移/旋转 `3.3195/1.0019`，POI 平移/旋转 `13.7254/6.0312`，
+joint torsion `0.6185`，两侧 auxiliary torsion `0.5345/1.1417`（实际各乘 0.125）。
+结论：该路径不支持“torsion 梯度压住刚体”的假设；不同分量梯度不能直接相加。
+证据：`results/epoch20_gradient_probe/summary.json`；27 条训练结构探针分项见第二轮 summary。
+
+### 4. 学习率、裁剪、clamp：受控实验已执行，保留原配置
+
+回复：同一固定路径各训练 40 步，基线联合 loss `4.02010 → 0.72713`；
+学习率减半终值 `0.96152`；clip=10 终值 `0.25947`；clamp=200 为 `4.87630 → 0.91357`。
+改变 clamp 会改变初始函数，不能只按下降幅度比较。
+进一步固定 100 条随机训练路径、dropout seeds、原权重和 optimizer：
+clip=1 的独立结构验证 `3.14563 → 3.36449`；clip=10 为 `3.14553 → 3.72697`。
+结论：放宽裁剪能改善局部拟合，但没有改善这组验证；不据此修改生产配置。
+此为 3 个训练结构上的短实验，不是全数据最优超参数搜索。
+证据：`results/epoch20_diagnostic_run3/summary.json`、`results/epoch20_random_clipping/summary.json`。
+
+### 5. 平移／刚体／全目标拟合：已执行，表达能力门禁通过
+
+回复：分别从同一原 checkpoint 开始，关闭 dropout，各训练 40 步：
+仅平移 `1.69080 → 0.00753`；加旋转 `3.52145 → 0.30474`；全目标 `4.02010 → 0.72713`。
+全目标末尾主要剩余 E3 rotation `0.26059`、joint torsion `0.34870`。
+同一 27 条独立验证路径，epoch 5/10/15/20 loss 分别为
+`3.82851/3.31656/3.34178/3.14560`；最后一轮较 epoch 5 约降低 18%。
+结论：训练确实学到了东西，不支持“速度任务完全学不动”；仍不能保证生成质量。
+证据：`results/epoch20_diagnostic_run3/summary.json`、
+`results/epoch20_validation_conditions/epoch_comparison.json`。
+
+### 6. 双向条件消融：已执行，有响应但收益未证明
+
+回复：固定本侧 expert 输入、共享 ligand 和监督目标，仅替换 TriFuse 的对侧坐标。
+反方向干预先对齐公共 ligand frame，并断言本侧几何不变。
+独立验证 27 探针的正确/打乱条件刚体 loss：E3-L `1.518705/1.512688`，
+POI-L `1.247008/1.247022`；正确条件更好分别为 `12/27`、`11/27`。
+两方向 FiLM 均有约 `4e-5–2.3e-4` RMS 响应，输出速度也改变。
+结论：没有稳定的正确条件优势；极小差值不能排除数值噪声。此干预只针对 TriFuse，
+并未删除 bridge 等全部条件通路，不能据此宣称整个模型无条件化。
+证据：`results/epoch20_validation_conditions/summary.json`。
+
+### 7. 条件目标方差：端点检查已执行，整体噪声下限未确定
+
+回复：每个训练结构抽取 128 个 coupling，在 `t=0` 断言模型状态输入完全相同；
+归一化且按生产权重加权的经验目标方差为 `2.96421/2.95336/3.70654`。
+结论：同一干净端点确实对应多种速度目标。但连续时间采样命中精确端点的概率为零，
+该数值不能作为整体训练 loss 下限，也不能解释所有剩余误差。
+不把“已做噪声诊断”写成“已证明训练到达不可约下限”；生成质量另用 benchmark 检验。
+证据：`results/epoch20_diagnostic_run3/endpoint_target_variance.json`。
+
+### 8. 异常样本与全池数据：失败路径复查完成，全池门禁进行中
+
+回复：`5Z86` 目标/坐标检查通过，原模型 loss 正常，且固定拟合可显著降低。
+不能将首轮短训练的高梯度当作损坏标签而剔除该 case。
+正在从本地已通过 gzip 完整性检查的压缩包提取官方 7,198-case 联合池，
+按现行 index builder 执行全部结构拆分和连通配体门禁，结果随后补充。
+联合池是 PROTAC/MGD 两训练来源的交集，不能把来源目录直接当作互斥任务标签。
+本轮 loss 统计只覆盖 6 个结构，不声称已完成全池神经网络 loss 归因。
+
+## 后续生成质量评估（用户追加）
+
+完成上述检查及数据门禁后，使用未经诊断更新的原始 `checkpoint_epoch20.pt`，
+按 `doc/Phase 1 数据协议.md` 评估 PROTAC22 unbound × 40 seeds、MGD94 bound × 1 seed，
+SDPI 初始化、20 步、seed=0 起始，仅物理 GPU 3；先做单例完整原子 DockQ 门禁。
+权重、索引哈希和逐 case 输出须保留。PROTAC 的 best 只称 oracle-best，
+当前不存在经监督的模型排名 top-1；失败 case、无效 walker 与样本分母必须公开。
+本轮不继续训练剩余 80 epochs，也不使用 benchmark 选择参数或 checkpoint。
