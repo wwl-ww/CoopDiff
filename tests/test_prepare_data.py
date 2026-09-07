@@ -89,10 +89,30 @@ def test_ligand_graph_rejects_distant_fragments(tmp_path):
     )
     try:
         make_deepternary_index.validate_ligand_graph(pdb)
-    except RuntimeError as error:
+    except make_deepternary_index.UnsupportedLigandGraphError as error:
         assert 'disconnected fragments' in str(error)
     else:
         raise AssertionError('distant ligand fragments must not be joined')
+
+
+def test_build_index_classifies_unsupported_ligand_graph():
+    def reject(*args, **kwargs):
+        raise make_deepternary_index.UnsupportedLigandGraphError('disconnected')
+
+    original = make_deepternary_index.export_case
+    try:
+        make_deepternary_index.export_case = reject
+        entries, rejected = make_deepternary_index.build_index(
+            ['case_A_B_LIG'], '.', '.',
+        )
+    finally:
+        make_deepternary_index.export_case = original
+    assert entries == []
+    assert rejected == [{
+        'case': 'case_A_B_LIG',
+        'code': 'unsupported_ligand_graph',
+        'reason': 'disconnected',
+    }]
 
 
 def test_joint_cluster_intersection_merges_relations_and_excludes_pdbs():

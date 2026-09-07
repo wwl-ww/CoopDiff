@@ -18,6 +18,10 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+class UnsupportedLigandGraphError(RuntimeError):
+    """The deposited ligand cannot satisfy CoopDiff's single-graph contract."""
+
+
 class UnionFind:
     """Minimal disjoint-set implementation used to merge cluster relations."""
 
@@ -197,7 +201,7 @@ def validate_ligand_graph(path):
                             candidates.append((distance, atom_i, atom_j))
         if not candidates:
             sizes = sorted((len(fragment) for fragment in fragments), reverse=True)
-            raise RuntimeError(
+            raise UnsupportedLigandGraphError(
                 f'ligand has disconnected fragments {sizes} with no plausible '
                 'missing covalent bond'
             )
@@ -293,7 +297,15 @@ def build_index(cases, pdb_root, output_root, min_ligand_heavy_atoms=1):
                 )
             entries.append(entry)
         except Exception as error:
-            rejected.append({'case': case, 'reason': str(error)})
+            rejected.append({
+                'case': case,
+                'code': (
+                    'unsupported_ligand_graph'
+                    if isinstance(error, UnsupportedLigandGraphError)
+                    else 'materialization_error'
+                ),
+                'reason': str(error),
+            })
         if index % 100 == 0:
             print(f'Processed {index}/{len(cases)} cases', flush=True)
     return entries, rejected
@@ -333,6 +345,9 @@ def main():
     parser.add_argument('--split-seed', type=int, default=0)
     parser.add_argument('--expect-pool-cases', type=int, default=7198)
     parser.add_argument('--expect-pool-clusters', type=int, default=653)
+    parser.add_argument('--expect-unsupported-ligands', type=int, default=111,
+                        help='Versioned count of disconnected multi-component '
+                             'ligands excluded by the CoopDiff graph contract')
     parser.add_argument('--output-root', default='data/ternary_deepternary')
     parser.add_argument('--index-dir', default='data')
     parser.add_argument('--limit', type=int, default=None)
@@ -361,7 +376,7 @@ def main():
         clusters, args.validation_fraction, args.split_seed,
     )
     splits = {'train': train_clusters, 'val': validation_clusters}
-    total_rejected = 0
+    all_rejected = []
     for split, split_cluster_list in splits.items():
         cases = sorted({case for cluster in split_cluster_list
                         for case in cluster['items']})
@@ -371,7 +386,7 @@ def main():
             cases, release / 'pdbs', Path(args.output_root) / split,
             min_ligand_heavy_atoms=args.min_ligand_heavy_atoms,
         )
-        total_rejected += len(rejected)
+        all_rejected.extend(rejected)
         destination = Path(args.index_dir) / f'ternary_{split}.json'
         write_index(destination, entries, rejected, {
             'protocol': 'joint_train_intersection_v1',
@@ -387,13 +402,32 @@ def main():
             'min_ligand_heavy_atoms': args.min_ligand_heavy_atoms,
             'accepted': len(entries),
             'rejected': len(rejected),
+            'exclusion_policy': {
+                'allowed_code': 'unsupported_ligand_graph',
+                'single_connected_ligand_required': True,
+                'never_strip_or_force_join_fragments': True,
+            },
         }, clusters=split_cluster_list)
         print(f'{split}: {len(entries)} accepted, {len(rejected)} rejected -> {destination}')
-    if total_rejected:
+    unexpected = [item for item in all_rejected
+                  if item['code'] != 'unsupported_ligand_graph']
+    unsupported = [item for item in all_rejected
+                   if item['code'] == 'unsupported_ligand_graph']
+    if unexpected:
         raise RuntimeError(
-            f'{total_rejected} joint-pool cases failed materialization; '
-            'refusing to start training with a silently reduced dataset'
+            f'{len(unexpected)} joint-pool cases failed materialization for '
+            'unexpected reasons; refusing to start training'
         )
+    if len(unsupported) != args.expect_unsupported_ligands:
+        raise RuntimeError(
+            'unsupported-ligand contract changed: expected '
+            f'{args.expect_unsupported_ligands}, found {len(unsupported)}'
+        )
+    print(
+        f'Explicitly excluded {len(unsupported)} disconnected ligand graphs; '
+        f'{pool_cases - len(unsupported)} usable cases remain',
+        flush=True,
+    )
 
 
 if __name__ == '__main__':
