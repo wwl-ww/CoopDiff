@@ -191,6 +191,9 @@ class TriCoopDiffTrainer:
         total = (losses['loss_e3l_tr'] + losses['loss_e3l_rot']
                  + losses['loss_pol_tr'] + losses['loss_pol_rot'] + losses['loss_score_tor']
                  + self.torsion_expert_aux_weight * 0.5 * (losses['loss_e3l_tor'] + losses['loss_pol_tor']))
+        if 'residual_penalty' in output:
+            losses['loss_residual'] = output['residual_penalty']
+            total = total + self.residual_weight * losses['loss_residual']
         if diagnostics:
             return {'loss_total': total, 'components': losses, 'rms': rms}
         return {'loss_total': total, 'loss_score': total.item(),

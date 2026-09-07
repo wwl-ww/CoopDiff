@@ -308,6 +308,10 @@ def sample_single(
                     "poi_ligand_rot": _tensor_summary(s_pol["rot"]),
                 },
                 "step0_probe": step0_probe,
+                "consensus": {
+                    key: value.detach().cpu().tolist()
+                    for key, value in out.get('consensus_diagnostics', {}).items()
+                },
             }
             trace.append(step_record)
 

@@ -133,6 +133,8 @@ class SDPIFlow:
         This is a trainable function parameterization, not a score-to-flow
         identity. LoRA/TriFuse must be retrained under the velocity loss.
         """
+        if 'normalized_velocity' in output:
+            return output['normalized_velocity']
         from .diffdock.utils import torus
 
         tr, rot, tor = self.t_to_sigma(t, t, t)
