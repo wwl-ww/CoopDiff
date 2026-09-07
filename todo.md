@@ -404,3 +404,68 @@ unbound-template 刚体重建测试通过。`.gitignore` 用户原有改动未�
   已完成 case 中 DockQ≥0.23 均为 0；未完成 case 不能据此判为失败。
   快照：`results/epoch20_partial_{protac,mgd}.json`，`complete_all_cases_and_seeds=false`。
   全部评测仍在后台运行，最终指标待全量汇总。
+
+## 用户叫停全量评测：转入失败轨迹分析
+
+用户明确要求停止后，已向四个已核实的评测进程发送 SIGTERM，并确认全部退出；
+没有删除文件或终止其他用户的进程。停止时保留 PROTAC 6/22 cases（240 seeds）、
+MGD 64/94 cases（64 seeds）；已完成部分 mean oracle-best PROTAC DockQ `0.15032`、
+MGD mean DockQ `0.02163`，均无 DockQ≥0.23 的 case。
+这是主动中止的部分评测，不是完整 benchmark；未完成 case 不算模型失败。
+
+接下来仅物理 GPU 3 上运行 4 条失败轨迹复现：`5T35_D_A_759` seeds 0、18
+（18 为已完成 40 次中的 oracle-best），`3JRQ_B_A_A8S` seed 0、
+`6Q0R_B_D_O6M` seed 0（停止时已完成 MGD 中最好者）。
+不改变模型权重、初始化或 20-step sampler；逐状态保存完整原子 DockQ、
+配体放置/内部构象 RMSD、POI 刚体位姿、两界面 Cα 接触与模型速度统计。
+初始化状态作为“同 seed、不积分”的对照，不混称冻结 DiffDock 对照。
+原始数组保存在 `.npz`，每步指标与 trace 保存在 `.json`，
+输出目录 `results/epoch20_failure_trajectories/`，日志 `results/epoch20_failure_trajectories.log`。
+首轮严格复现门禁因 seed 0 的 DockQ 差 `0.001166` 停止，未将其当作成功复现。
+因此增加同初始化、关闭 trace 的两次重跑以及确定性算法对照，结果如下。
+
+### 失败轨迹分析结果（已完成，未修改生产模型）
+
+| Case / seed | 初始 DockQ → 最终 | 配体质心误差 Å | POI 质心误差 Å | POI 朝向误差 ° |
+| --- | --- | --- | --- | --- |
+| 5T35 / 0 | 0.01103 → 0.01384 | 39.08 → 31.40 | 43.85 → 40.06 | 149.83 → 171.92 |
+| 5T35 / 18（oracle-best seed） | 0.15218 → 0.17500 | 17.55 → 5.34 | 34.55 → 34.31 | 172.84 → 154.55 |
+| 3JRQ / 0 | 0.01670 → 0.01864 | 46.12 → 34.04 | 65.95 → 63.11 | 137.16 → 142.16 |
+| 6Q0R / 0 | 0.03889 → 0.08702 | 38.73 → 22.25 | 23.93 → 5.84 | 137.16 → 169.73 |
+
+误差定义：配体质心相对于原参考配体；POI 位姿相对于原输入模板，unbound 是预对齐输入，
+不能把它的角度误差冒充基于完整 native 原子映射或对称校正的朝向指标。
+DockQ 始终使用完整原子标准接口和先前相同的模板重建协议。
+
+1. **不是完全没有运动，但正确三元装配没有形成。** 5T35/18 的配体位置明显改善，
+   POI 仍偏移约 34 Å、旋转偏差约 155°；6Q0R 的 POI 质心接近了，朝向却更差。
+   配体独立对齐 RMSD 分别 `5.01→4.87`、`5.07→4.30`、`2.24→1.61`、`2.70→2.33 Å`，
+   所以问题不只是内部构象，刚体摆放和两界面协调同样明显失败。
+2. **碰撞与错误界面仍然存在。** 5T35/0 末态 ligand–E3 最小 Cα 距离约 18.51 Å，
+   ligand–POI 最小 Cα 距离仅 0.90 Å；5T35/18 ligand–E3 最小距离 0.87 Å，
+   蛋白 Cα 距离小于 3 Å 的原子对从 34 增至 50。Cα 检查仅是几何诊断，
+   不是替代全原子 clash score，也不是可直接用于筛选的新排名函数。
+3. **后半程会退化，但改成少步数不足以解决。** 6Q0R 第 10 步 DockQ 达 0.16145，
+   第 20 步退回 0.08702；5T35/18 第 18 步为 0.19760，终值为 0.17500。
+   四条轨迹即使按真实结构挑最佳中间步，也均未到 0.23；不据此用 benchmark 调步数。
+4. **确定了部分轨迹的数值复现问题。** 独立控制实验中，5T35/0 三次初始化坐标完全一致，
+   默认计算的最终 ligand RMSD 相对 traced run 差 3.35–5.21 Å，POI 差 4.94–6.62 Å。
+   使用 `CUBLAS_WORKSPACE_CONFIG=:4096:8` 和 `torch.use_deterministic_algorithms(True)` 后，
+   traced + 两次 untraced 的末态坐标完全一致，DockQ 均为 `0.01293295`。
+   其他三条轨迹的重复末态误差约 `1e-5–3.4e-4 Å`，说明并非所有 seed 都同样敏感。
+   这支持非确定性数值计算在部分轨迹中被放大，但尚未定位具体算子；
+   不归咎于单一 scatter、模型层或 integration step。确定性只恢复复现性，未恢复质量。
+5. **远距离回收的线索。** seed 0 的 E3–ligand cross edges 随时间从 9,798 减到个位数，
+   末端 POI–ligand 仍约 6,300 条。半径本来就随 schedule 缩小，所以这里只能说：
+   配体尚未靠近正确界面时，E3 的局部接触信息已经很稀疏；因果关系需固定状态对照。
+
+证据：`results/epoch20_failure_trajectories_v2/summary.json` 与同目录每条 `.json/.npz`；
+`results/epoch20_replay_control/`、`results/epoch20_replay_deterministic/`。
+四条分析轨迹末态 DockQ 与历史结果误差分别为 `5.85e-4`、`5.55e-7`、`6.71e-7`、`4.23e-6`；
+seed 0 必须同时参照上述坐标差异，不能仅凭 DockQ 容差称其精确复现。
+新脚本 `scripts/analyze_failed_trajectories.py` 支持 `--limit 1 --deterministic`，
+`tests/test_failure_geometry.py` 验证内部形状与刚体位姿误差的分离。
+
+当前结论：停止追加大规模评测/训练是合理的；下一步优先在确定性诊断设置下，
+检查固定状态的速度方向和 POI 刚体目标，再做同起点的条件/专家对照。
+本轮没有修改生产 sampler、checkpoint、学习率或启用碰撞过滤，也未证明架构必然不可行。
