@@ -665,6 +665,16 @@ def evaluate_model(
             'protac_rmsd': compute_rmsd(pred, ref_lig, align_first=True),
             'pocket_dist': float(np.linalg.norm(pred.mean(axis=0) - ref_lig.mean(axis=0))),
         }
+        if 'consensus_rmsd' in r:
+            rec['consensus_rmsd'] = float(r['consensus_rmsd'])
+            rec['collapse'] = r['collapse']
+        if 'hypothesis_b_coords' in r:
+            from .deepternary_metrics import _fit_rigid
+            rotation, offset = _fit_rigid(pred_poi, ref_poi)
+            local_b = compute_e3_interface_dockq(
+                ref_poi, r['hypothesis_b_coords'] @ rotation + offset, ref_lig)
+            if local_b is not None:
+                rec['hypothesis_b_local_approx_dockq'] = local_b['dockq']
         deepternary_m = compute_deepternary_dockq(
             ref_lig, e3_ca, ref_poi,
             pred, e3_ca, pred_poi,

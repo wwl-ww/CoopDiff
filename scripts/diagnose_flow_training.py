@@ -170,7 +170,7 @@ def main():
                 **copy.deepcopy(batch), t_override=torch.tensor([time]),
                 coupling_override=copy.deepcopy(coupling), diagnostics=True)
             row = {'step': step, 'case': batch['case'], 'time': time,
-                   'n_torsions': len(coupling['angles']), 'loss': losses['loss_total'].item(),
+                   'n_torsions_per_hypothesis': len(coupling['bonds']), 'loss': losses['loss_total'].item(),
                    'components': {k: v.item() for k, v in losses['components'].items()},
                    'rms': losses['rms'],
                    'expert_probe': model._last_step0_probe,

@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from tricoopdiff.train import TriCoopDiffTrainer
-from tricoopdiff.sdpi_flow import SDPIFlow
+from tricoopdiff.dual_consensus import DualConsensusFlow as SDPIFlow
 from train_entry import swap_protein_reference
 
 

@@ -39,7 +39,7 @@ def probe(trainer, batch, coupling, value, local_dt):
     """Evaluate one fixed path state, including an actual reverse-step check."""
     flow, model = trainer.diffusion, trainer.model
     time = torch.tensor([value], device=trainer.device)
-    ligand, poi, body, targets = flow.path(
+    state, targets = flow.path(
         batch['ligand_data'], batch['poi_data']['coords'], coupling, time)
     dt = time.new_tensor([min(local_dt, value)])
     conditioning = flow.conditioning(
@@ -48,34 +48,29 @@ def probe(trainer, batch, coupling, value, local_dt):
     crop = (tr_sigma * 3 + 20
             if bool(getattr(model.expert.model, 'dynamic_max_cross', False)) else None)
     output = model(
-        batch['e3_data'], {**batch['poi_data'], 'coords': poi},
-        {**batch['ligand_data'], 'coords': ligand}, t_e3l=time, t_pol=time,
-        r_e3_to_poi=body, diffusion_state=conditioning,
+        batch['e3_data'], {**batch['poi_data'], 'coords': state['poi']},
+        {**batch['ligand_data'], 'coords': state['a']}, t_e3l=time, t_pol=time,
+        ligand_b_coords=state['b'], r_e3_to_poi=state['body'], diffusion_state=conditioning,
         receptor_crop_cutoff=crop)
     normalized = flow.normalized_predictions(output, time)
     predicted = flow.velocities(
         normalized, batch['e3_data']['coords'], batch['poi_data']['coords'])
-    target_velocity = {
-        'e3_ligand': targets['e3_ligand'],
-        'poi_ligand': targets['poi_ligand'],
-        'torsion': targets['torsion'],
-    }
+    target_velocity = targets
     components = {}
-    for branch in ('e3_ligand', 'poi_ligand'):
-        for component in ('tr', 'rot'):
+    for branch in targets:
+        for component in predicted[branch]:
             components[f'{branch}.{component}'] = vector_metrics(
                 predicted[branch][component], targets[branch][component])
-    components['torsion'] = vector_metrics(predicted['torsion'], targets['torsion'])
 
-    expected = flow.path(batch['ligand_data'], batch['poi_data']['coords'],
+    expected, _ = flow.path(batch['ligand_data'], batch['poi_data']['coords'],
                          coupling, time - dt)
     predicted_step = flow.step(
-        ligand, poi, body, predicted, dt, batch['ligand_data'])
+        state, predicted, dt, batch['ligand_data'])
     oracle_step = flow.step(
-        ligand, poi, body, target_velocity, dt, batch['ligand_data'])
+        state, target_velocity, dt, batch['ligand_data'])
     step_errors = {}
-    for name, index in (('ligand', 0), ('poi', 1)):
-        zero = coordinate_rms((ligand, poi)[index], expected[index])
+    for name, index in (('ligand', 'a'), ('ligand_b', 'b'), ('poi', 'poi')):
+        zero = coordinate_rms(state[index], expected[index])
         actual = coordinate_rms(predicted_step[index], expected[index])
         oracle = coordinate_rms(oracle_step[index], expected[index])
         step_errors[name] = {
@@ -150,7 +145,7 @@ def main():
                                         if projections else None),
             'n_directional': len(cosines),
         }
-    for molecule in ('ligand', 'poi'):
+    for molecule in ('ligand', 'ligand_b', 'poi'):
         improvements = [row['local_step'][molecule]['improvement_over_zero_A'] for row in records]
         summary[f'{molecule}_local_step'] = {
             'mean_improvement_over_zero_A': float(np.mean(improvements)),

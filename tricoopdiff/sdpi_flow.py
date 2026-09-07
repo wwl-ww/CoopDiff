@@ -1,4 +1,6 @@
-"""Conditional flow matching on dual poses and shared ligand torsions.
+"""Archived v17 shared-ligand path and reusable expert preconditioning utilities.
+
+Production training/sampling use DualConsensusFlow in dual_consensus.py.
 
 Time is clean=0, SDPI=1. Native crystal coordinates remain the training target.
 Endpoint equivalence is on movable DOFs conditional on rigid-fragment geometry,

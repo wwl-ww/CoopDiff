@@ -29,10 +29,18 @@ def test_index_entry_and_paths(tmp_path):
 
 def test_checkpoint_preflight_rejects_missing_lora():
     payload = {
-        "checkpoint_version": 17,
-        "generative_process": "sdpi_flow_v1",
-        "architecture": "trifuse_v13",
+        "checkpoint_version": 18,
+        "generative_process": "dual_consensus_flow_v1",
+        "architecture": "dual_consensus_v1",
+        "dual_consensus_contract": {
+            "conformer": "ETKDGv3_seed0_random_coords",
+            "target": "torsion_kabsch_least_squares_v1",
+            "poi_prior": "haar_gaussian_sum_receptor_scales",
+            "consensus": "internal_then_endpoint_then_pose_v1",
+            "collapse": "a_manifold_no_coordinate_average",
+        },
         "runtime_config": {
+            "dual_stage": "annealed",
             "activation_clamp": 100.0,
             "torsion_expert_aux_weight": 0.25,
             "lora_warmup_steps": 100,
@@ -58,17 +66,25 @@ def test_checkpoint_preflight_rejects_legacy_architecture():
     try:
         evaluation_common.validate_checkpoint_payload(payload)
     except ValueError as error:
-        assert "checkpoint_version=17" in str(error)
+        assert "checkpoint_version=18" in str(error)
     else:
         raise AssertionError("legacy architecture checkpoint must be rejected")
 
 
 def test_checkpoint_preflight_accepts_complete_payload():
     payload = {
-        "checkpoint_version": 17,
-        "generative_process": "sdpi_flow_v1",
-        "architecture": "trifuse_v13",
+        "checkpoint_version": 18,
+        "generative_process": "dual_consensus_flow_v1",
+        "architecture": "dual_consensus_v1",
+        "dual_consensus_contract": {
+            "conformer": "ETKDGv3_seed0_random_coords",
+            "target": "torsion_kabsch_least_squares_v1",
+            "poi_prior": "haar_gaussian_sum_receptor_scales",
+            "consensus": "internal_then_endpoint_then_pose_v1",
+            "collapse": "a_manifold_no_coordinate_average",
+        },
         "runtime_config": {
+            "dual_stage": "annealed",
             "activation_clamp": 100.0,
             "torsion_expert_aux_weight": 0.25,
             "lora_warmup_steps": 100,
@@ -83,9 +99,16 @@ def test_checkpoint_preflight_accepts_complete_payload():
 
 def test_checkpoint_preflight_rejects_missing_runtime_config():
     payload = {
-        "checkpoint_version": 17,
-        "generative_process": "sdpi_flow_v1",
-        "architecture": "trifuse_v13",
+        "checkpoint_version": 18,
+        "generative_process": "dual_consensus_flow_v1",
+        "architecture": "dual_consensus_v1",
+        "dual_consensus_contract": {
+            "conformer": "ETKDGv3_seed0_random_coords",
+            "target": "torsion_kabsch_least_squares_v1",
+            "poi_prior": "haar_gaussian_sum_receptor_scales",
+            "consensus": "internal_then_endpoint_then_pose_v1",
+            "collapse": "a_manifold_no_coordinate_average",
+        },
         "trifuse_state_dict": {"x": 1},
         "expert_lora_state_dict": {str(i): i for i in range(336)},
         "expert_lora_config": {"rank": 4},

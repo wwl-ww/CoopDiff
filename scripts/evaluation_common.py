@@ -35,17 +35,28 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=336):
     """Reject incomplete or legacy checkpoints before expensive inference."""
     if not isinstance(payload, dict):
         raise ValueError("checkpoint must contain a mapping")
-    if payload.get("checkpoint_version") != 17:
+    if payload.get("checkpoint_version") != 18:
         raise ValueError(
-            "TriFuse evaluation requires checkpoint_version=17"
+            "Dual consensus evaluation requires checkpoint_version=18"
         )
-    if payload.get('generative_process') != 'sdpi_flow_v1':
-        raise ValueError('checkpoint generative process is not sdpi_flow_v1')
-    if payload.get("architecture") != "trifuse_v13":
+    if payload.get('generative_process') != 'dual_consensus_flow_v1':
+        raise ValueError('checkpoint generative process is not dual_consensus_flow_v1')
+    if payload.get("architecture") != "dual_consensus_v1":
         raise ValueError(
-            "checkpoint architecture is not trifuse_v13"
+            "checkpoint architecture is not dual_consensus_v1"
         )
+    expected_contract = {
+        'conformer': 'ETKDGv3_seed0_random_coords',
+        'target': 'torsion_kabsch_least_squares_v1',
+        'poi_prior': 'haar_gaussian_sum_receptor_scales',
+        'consensus': 'internal_then_endpoint_then_pose_v1',
+        'collapse': 'a_manifold_no_coordinate_average',
+    }
+    if payload.get('dual_consensus_contract') != expected_contract:
+        raise ValueError('checkpoint dual consensus contract differs')
     activation_clamp = payload.get("runtime_config", {}).get("activation_clamp")
+    if payload.get('runtime_config', {}).get('dual_stage') not in ('independent', 'exchange', 'soft', 'annealed'):
+        raise ValueError('checkpoint has no valid dual_stage / activation_clamp runtime config')
     if not isinstance(activation_clamp, (int, float)) or activation_clamp <= 0:
         raise ValueError("checkpoint has no valid runtime activation_clamp")
     torsion_aux_weight = payload.get("runtime_config", {}).get(

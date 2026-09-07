@@ -25,7 +25,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from .model import TriCoopDiff
-from .sdpi_flow import SDPIFlow, CHECKPOINT_VERSION, FLOW_VERSION
+from .dual_consensus import DualConsensusFlow as SDPIFlow, CHECKPOINT_VERSION, FLOW_VERSION, ARCHITECTURE, CONTRACT
 from .diffdock.utils.torus import SCORE_NORM_VERSION, validate_score_norm_version
 from .checkpoint_contract import expert_base_identity, validate_expert_base_identity
 
@@ -125,76 +125,9 @@ class TriCoopDiffTrainer:
         t_pol_override: Optional[torch.Tensor] = None,
         coupling_override=None, diagnostics: bool = False,
     ) -> dict:
-        """Conditional velocity matching; t=0 crystal, t=1 SDPI movable DOFs."""
-        if e3_data['coords'].shape[0] != 1:
-            raise ValueError("SDPI flow training requires B=1")
-        device = self.device
-        e3_data = {**e3_data, 'coords': e3_data['coords'].to(device)}
-        poi_data = {**poi_data, 'coords': poi_data['coords'].to(device)}
-        ligand_data = {**ligand_data, 'coords': ligand_data['coords'].to(device)}
-        t = (torch.rand(1, device=device) if t_override is None
-             else torch.as_tensor(t_override, device=device, dtype=torch.float32).reshape(-1))
-        if t.shape != (1,) or not torch.isfinite(t).all() or not bool(((t >= 0) & (t <= 1)).all()):
-            raise ValueError("flow time must be one finite value in [0, 1]")
-        if t_pol_override is not None:
-            other = torch.as_tensor(t_pol_override, device=device, dtype=t.dtype).reshape(-1)
-            if other.shape != t.shape or not torch.equal(t, other):
-                raise ValueError("SDPI flow requires one shared interface clock")
-        coupling = coupling_override if coupling_override is not None else self.diffusion.sample_coupling(
-            e3_data['coords'], poi_data['coords'], ligand_data,
-            no_torsion=bool(getattr(self.model.expert.model, 'no_torsion', False)),
-        )
-        ligand, poi, body, targets = self.diffusion.path(ligand_data, poi_data['coords'], coupling, t)
-        dt = t.new_full((1,), 1 / self.diffusion.inference_steps)
-        conditioning = self.diffusion.conditioning(t, dt, e3_data['coords'], poi_data['coords'])
-        tr_condition, _, _ = self.diffusion.t_to_sigma(t, t, t)
-        crop = (tr_condition * 3 + 20
-                if bool(getattr(self.model.expert.model, 'dynamic_max_cross', False)) else None)
-        output = self.model(
-            e3_data, {**poi_data, 'coords': poi}, {**ligand_data, 'coords': ligand},
-            t_e3l=t, t_pol=t, r_e3_to_poi=body,
-            diffusion_state=conditioning, receptor_crop_cutoff=crop,
-        )
-        predictions = self.diffusion.normalized_predictions(output, t)
-        scales = self.diffusion.scales(e3_data['coords'], poi_data['coords'])
-        losses = {}
-        rms = {}
-        def record_rms(name, predicted, target):
-            if diagnostics:
-                for label, value in (('prediction', predicted), ('target', target)):
-                    rms[f'{name}_{label}_rms'] = (
-                        value.detach().square().mean().sqrt().item()
-                        if value.numel() else 0.0)
-        for index, (branch, prefix) in enumerate((('e3_ligand', 'e3l'), ('poi_ligand', 'pol'))):
-            for component, scale in (('tr', scales[index]), ('rot', np.pi)):
-                predicted = predictions[branch][component]
-                target = targets[branch][component] / scale
-                if predicted.shape != target.shape:
-                    raise ValueError(f"{branch}.{component} shape mismatch: {predicted.shape} vs {target.shape}")
-                losses[f'loss_{prefix}_{component}'] = (predicted - target).square().mean()
-                record_rms(f'{prefix}_{component}', predicted, target)
-        tor_target = targets['torsion'] / np.pi
-        if bool(getattr(self.model.expert.model, 'no_torsion', False)):
-            tor_target = tor_target[:, :0]
-        for name, predicted in (
-            ('loss_score_tor', predictions['torsion']),
-            ('loss_e3l_tor', predictions['e3_ligand']['tor']),
-            ('loss_pol_tor', predictions['poi_ligand']['tor']),
-        ):
-            if predicted.shape != tor_target.shape:
-                raise ValueError(f"{name} shape mismatch: {predicted.shape} vs {tor_target.shape}")
-            losses[name] = ((predicted - tor_target).square().mean()
-                            if predicted.numel() else t.new_zeros(()))
-            record_rms(name.removeprefix('loss_'), predicted, tor_target)
-        if any(not torch.isfinite(value) for value in losses.values()):
-            raise NonFiniteTrainingError(f"case={case}: non-finite SDPI velocity loss")
-        total = (losses['loss_e3l_tr'] + losses['loss_e3l_rot']
-                 + losses['loss_pol_tr'] + losses['loss_pol_rot'] + losses['loss_score_tor']
-                 + self.torsion_expert_aux_weight * 0.5 * (losses['loss_e3l_tor'] + losses['loss_pol_tor']))
-        if diagnostics:
-            return {'loss_total': total, 'components': losses, 'rms': rms}
-        return {'loss_total': total, 'loss_score': total.item(),
-                **{name: value.item() for name, value in losses.items()}}
+        from .dual_consensus import dual_loss
+        return dual_loss(self, e3_data, poi_data, ligand_data, case, t_override,
+                         t_pol_override, coupling_override, diagnostics)
 
     def train_step(self, **batch) -> dict:
         """Forward + backward + optimizer step."""
@@ -270,9 +203,11 @@ class TriCoopDiffTrainer:
         payload = {
             'checkpoint_version': CHECKPOINT_VERSION,
             'generative_process': FLOW_VERSION,
-            'architecture': 'trifuse_v13',
+            'architecture': ARCHITECTURE,
+            'dual_consensus_contract': CONTRACT.copy(),
             'expert_base_identity': expert_base_identity(self.model.expert),
             'runtime_config': {
+                'dual_stage': self.model.dual_stage,
                 'torus_score_norm_version': SCORE_NORM_VERSION,
                 'activation_clamp': self.activation_clamp,
                 'torsion_expert_aux_weight': self.torsion_expert_aux_weight,
@@ -298,26 +233,25 @@ class TriCoopDiffTrainer:
         os.replace(temporary_path, path)
 
     def load_checkpoint(self, path: str):
-        """Load model checkpoint (for fine-tuning / resume).
-
-        Restores TriFuse weights plus optimizer/scheduler state when present.
-        Older checkpoints without optimizer/scheduler keys are handled gracefully
-        (weights + global step only).
-        """
+        """Resume only the matching v18 dual architecture and runtime contract."""
         ckpt = torch.load(path, map_location=self.device)
         validate_score_norm_version(ckpt.get('runtime_config', {}))
         validate_expert_base_identity(ckpt, self.model.expert)
         if ckpt.get('checkpoint_version') != CHECKPOINT_VERSION:
             raise ValueError(
-                "TriFuse flow training requires checkpoint_version=17"
+                "Dual consensus training requires checkpoint_version=18"
             )
         if ckpt.get('generative_process') != FLOW_VERSION:
-            raise ValueError('checkpoint generative process is not sdpi_flow_v1')
-        if ckpt.get('architecture') != 'trifuse_v13':
+            raise ValueError('checkpoint generative process is not dual_consensus_flow_v1')
+        if ckpt.get('dual_consensus_contract') != CONTRACT:
+            raise ValueError('checkpoint dual consensus contract differs')
+        if ckpt.get('architecture') != ARCHITECTURE:
             raise ValueError(
-                "checkpoint architecture is not trifuse_v13"
+                "checkpoint architecture is not dual_consensus_v1"
             )
         saved_lora_config = ckpt.get('expert_lora_config')
+        if ckpt.get('runtime_config', {}).get('dual_stage') != self.model.dual_stage:
+            raise ValueError('checkpoint dual stage differs; resume must preserve the trained field')
         runtime_lora_config = getattr(self.model.expert, 'lora_config', None)
         if saved_lora_config != runtime_lora_config:
             raise ValueError(

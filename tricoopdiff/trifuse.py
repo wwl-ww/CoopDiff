@@ -852,8 +852,8 @@ class LayerwiseExpertBridge(nn.Module):
             raise ValueError("dual expert ligand scalar shapes differ")
         if scalar_e3l.ndim != 2 or scalar_e3l.shape[1] != self.scalar_dim:
             raise ValueError("expert bridge expects [N_lig, scalar_dim]")
-        bounded_e3l = torch.tanh(scalar_e3l / 10.0)
-        bounded_pol = torch.tanh(scalar_pol / 10.0)
+        bounded_e3l = torch.tanh(scalar_e3l.detach() / 10.0)
+        bounded_pol = torch.tanh(scalar_pol.detach() / 10.0)
         hidden = self.input(torch.cat((
             bounded_e3l, bounded_pol,
             bounded_e3l - bounded_pol,
@@ -996,6 +996,8 @@ class TriFuse(nn.Module):
         self.input_dim = input_dim
         self.num_conv_layers = num_conv_layers_per_expert
         self.film_dim = film_dim
+        from .dual_consensus import ConsensusController
+        self.consensus_controller = ConsensusController(node_dim)
 
         self.pooling = TernaryGeometryEncoder(
             input_dim=input_dim, hidden_dim=node_dim,
@@ -1024,9 +1026,6 @@ class TriFuse(nn.Module):
         self.layerwise_bridge = LayerwiseExpertBridge(
             scalar_dim=film_dim, hidden_dim=node_dim,
             num_layers=num_conv_layers_per_expert,
-        )
-        self.torsion_coordinator = TorsionCoordinator(
-            context_dim=node_dim,
         )
         self.bond_context_encoder = BondContextEncoder(node_dim)
         telemetry_dim = (

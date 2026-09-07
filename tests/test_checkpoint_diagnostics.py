@@ -10,7 +10,7 @@ import torch
 
 from diagnose_checkpoint import objective
 from flow_condition_audit import opposite_state
-from test_sdpi_flow import fixture
+from test_dual_consensus import fixture
 
 
 def test_staged_objectives_isolate_gradients():

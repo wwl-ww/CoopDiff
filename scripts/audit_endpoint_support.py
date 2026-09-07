@@ -9,7 +9,7 @@ import torch
 
 from train_entry import TernaryDataLoader, _load_score_model_args, seed_training
 from tricoopdiff.initialization import TernaryInitializer
-from tricoopdiff.sdpi_flow import SDPIFlow
+from tricoopdiff.dual_consensus import DualConsensusFlow as SDPIFlow
 
 
 def aligned_rmsd(moving, target):
@@ -142,21 +142,19 @@ def main():
         for seed_offset in range(args.seeds):
             seed = args.seed + case_index * 1000 + seed_offset
             seed_training(seed, torch.device('cuda'))
-            inference_ligand, _, _, metadata = initializer.initialize(
-                batch['e3_data']['coords'][0], batch['poi_data']['coords'][0],
-                batch['ligand_data'], seed=seed)
+            inference_state, metadata = flow.initialize(
+                batch['e3_data']['coords'], batch['poi_data']['coords'],
+                batch['ligand_data'], seed=seed, no_torsion=initializer.no_torsion)
             coupling = flow.sample_coupling(
                 batch['e3_data']['coords'], batch['poi_data']['coords'],
                 batch['ligand_data'], no_torsion=initializer.no_torsion)
-            # Apply exactly the same torsion angles to the native training
-            # scaffold. Remaining mismatch is inaccessible bond/angle/scaffold
-            # geometry, not a different random torsion draw or rigid pose.
-            coupling['angles'] = np.asarray(metadata['torsion_updates'])
-            training_ligand, _, _, _ = flow.path(
+            # Both samples use the same ETKDG manifold. Remove their independent
+            # torsion/pose differences below before measuring internal support.
+            training_state, _ = flow.path(
                 batch['ligand_data'], batch['poi_data']['coords'], coupling,
                 torch.tensor([1.], device='cuda'))
-            inference = inference_ligand[0].detach().cpu().numpy()
-            training = training_ligand[0].detach().cpu().numpy()
+            inference = inference_state['a'][0].detach().cpu().numpy()
+            training = training_state['a'][0].detach().cpu().numpy()
             from rdkit import Chem
             mol = batch['ligand_data']['mol']
             if isinstance(mol, bytes):

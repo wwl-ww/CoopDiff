@@ -12,7 +12,7 @@ from evaluation_common import (
     evaluation_input_signature, sha256_file, validate_checkpoint_payload,
 )
 from featurize_common import featurize_complex
-from tricoopdiff.sdpi_flow import SDPIFlow
+from tricoopdiff.dual_consensus import DualConsensusFlow as SDPIFlow
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
 from tricoopdiff.expert_factory import build_diffdock_expert
@@ -105,6 +105,7 @@ class EvaluationRunner:
             trifuse=trifuse,
             num_conv_layers=self.expert.num_conv_layers,
             use_film=True,
+            dual_stage=self.checkpoint['runtime_config']['dual_stage'],
         ).to(self.device)
         self.model.trifuse.load_state_dict(self.checkpoint["trifuse_state_dict"])
         self.model.eval()
@@ -151,8 +152,8 @@ class EvaluationRunner:
                       else self.diffusion.inference_steps),
             "freeze_poi": freeze_poi,
             "init_mode": init_mode,
-            "initialization_version": "sdpi_v1",
-            "generative_process": "sdpi_flow_v1",
+            "initialization_version": "dual_consensus_flow_v1",
+            "generative_process": "dual_consensus_flow_v1",
             "t_anchor": (t_anchor if t_anchor is not None else
                          1.0),
             "trifuse_checkpoint": str(self.checkpoint_path.resolve()),

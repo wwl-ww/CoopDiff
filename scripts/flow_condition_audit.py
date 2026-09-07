@@ -21,13 +21,19 @@ def opposite_state(flow, batch, coupling, time, branch):
     donor['angles'] = coupling['angles'].copy()
     donor['omegas'][own] = coupling['omegas'][own]
     donor['centers'][own] = coupling['centers'][own]
-    ligand, poi, _, _ = flow.path(batch['ligand_data'], batch['poi_data']['coords'], coupling, time)
-    donor_ligand, donor_poi, _, _ = flow.path(
+    original, _ = flow.path(batch['ligand_data'], batch['poi_data']['coords'], coupling, time)
+    if own == 1:
+        donor['omegas'][2] = coupling['omegas'][2]
+        donor['poi_center'] = coupling['poi_center'].copy()
+    changed, _ = flow.path(
         batch['ligand_data'], batch['poi_data']['coords'], donor, time)
     if own == 0:
-        if not torch.equal(ligand, donor_ligand):
+        if not torch.equal(original['a'], changed['a']):
             raise AssertionError('conditioning intervention changed own ligand input')
-        return 1, donor_poi[0]
+        return 1, changed['poi'][0]
+    if not torch.allclose(original['b'], changed['b']) or not torch.allclose(original['poi'], changed['poi']):
+        raise AssertionError('conditioning intervention changed own B binary')
+    ligand, donor_ligand = original['a'], changed['a']
     # Vary E3-L while holding POI-L fixed, then align the donor's common rigid
     # frame back to the original one. Only E3 coordinates are passed to TriFuse.
     value = float(time.item())
@@ -40,8 +46,6 @@ def opposite_state(flow, batch, coupling, time, branch):
 
     if not torch.allclose(align(donor_ligand), ligand, atol=1e-4, rtol=1e-5):
         raise AssertionError('POI conditioning intervention changed own ligand input')
-    if not torch.allclose(align(donor_poi), poi, atol=1e-4, rtol=1e-5):
-        raise AssertionError('POI conditioning intervention changed own receptor input')
     return 0, align(batch['e3_data']['coords'])[0]
 
 
@@ -99,7 +103,7 @@ def audit_conditioning(trainer, validation, branch='e3_ligand'):
                 'case': batch['case'], 'time': value,
                 f'correct_{prefix}_loss': own_loss(baseline),
                 f'shuffled_{prefix}_loss': own_loss(shuffled),
-                'film_change_rms': (captured[1] - captured[0]).square().mean().sqrt().item(),
+                'film_change_rms': (captured[2 if prefix == 'e3l' else 3] - captured[0 if prefix == 'e3l' else 1]).square().mean().sqrt().item(),
                 'velocity_change_rms': {
                     k: (velocities[1][k] - velocities[0][k]).square().mean().sqrt().item()
                     for k in ('tr', 'rot')},

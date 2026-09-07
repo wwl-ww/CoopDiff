@@ -1,13 +1,11 @@
 """
 TriCoopDiff: Top-level model orchestrating two-body experts and TriFuse.
 
-The forward pass at each diffusion step:
-1. Build two disconnected subgraphs (E3-L, POI-L) + full ternary graph
-2. TriFuse processes the ternary graph → branch-specific FiLM params
-3. Two-body experts run forward with per-layer FiLM modulation
-4. Return both interface score fields without merging their rigid coordinates
-5. The sampler updates E3--Ligand directly and applies the inverse POI--Ligand
-   rigid update to POI
+Build E3--P_A and POI--P_B graphs with shared chemistry, independent geometry.
+TriFuse encodes both hypotheses and conditions the experts with FiLM/bridges.
+Return two binary score fields and separate equivariant Fuse corrections,
+including an independently supervised POI body velocity. No shared torsion or
+inverse alignment update is executed by this model.
 """
 
 import torch
@@ -42,6 +40,7 @@ class TriCoopDiff(nn.Module):
         trifuse: TriFuse,
         num_conv_layers: int = 11,
         use_film: bool = True,
+        dual_stage: str = 'annealed',
     ):
         """
         Args:
@@ -55,6 +54,9 @@ class TriCoopDiff(nn.Module):
         self.trifuse = trifuse
         self.num_conv_layers = num_conv_layers
         self.use_film = use_film
+        if dual_stage not in ('independent', 'exchange', 'soft', 'annealed'):
+            raise ValueError('unknown dual consensus stage')
+        self.dual_stage = dual_stage
 
     def forward(
         self,
@@ -66,6 +68,7 @@ class TriCoopDiff(nn.Module):
         r_e3_to_poi: torch.Tensor = None,
         receptor_crop_cutoff: torch.Tensor = None,
         diffusion_state: torch.Tensor = None,
+        ligand_b_coords: torch.Tensor = None,
     ) -> dict:
         """
         Single diffusion step forward pass.
@@ -92,10 +95,16 @@ class TriCoopDiff(nn.Module):
         Returns:
             dict with:
               'interface_scores': raw E3--Ligand and mapped POI--Ligand scores
-              'torsion_score': TriFuse-coordinated shared Ligand torsion score
+              'dual_corrections': separate A/B tr/rot/tor and POI tr/rot
               'confidence': [B,1] clash confidence
               'state': [B,2] thermodynamic state predictions
         """
+        if ligand_b_coords is None:
+            raise ValueError('dual consensus requires independent ligand_b_coords')
+        if ligand_b_coords.shape != ligand_data['coords'].shape:
+            raise ValueError('hypotheses must share atom identity and shape')
+        if t_pol is not None and not torch.equal(t_pol, t_e3l):
+            raise ValueError('dual hypotheses require one shared flow clock')
         if t_pol is None:
             t_pol = t_e3l
 
@@ -110,12 +119,10 @@ class TriCoopDiff(nn.Module):
             'sub2': {'tr': [], 'rot': [], 'tor': []},
         }
         all_expert_telemetry = {'sub1': [], 'sub2': []}
-        all_torsion_scores = []
-        all_torsion_weights = []
-        all_torsion_residuals = []
         all_confidence = []
         all_state = []
         all_score_gains = []
+        all_corrections = []
 
         for b in range(B):
             # Compute E3↔POI relative transform. `r_e3_to_poi` maps E3-frame
@@ -131,7 +138,7 @@ class TriCoopDiff(nn.Module):
                 else torch.eye(3, device=device)
             )
             ligand_coords_poi = transform_ligand_to_poi_frame(
-                ligand_data['coords'][b], t_e3_to_poi, r_e3,
+                ligand_b_coords[b], t_e3_to_poi, r_e3,
             )
             # Both sides of the POI-L expert graph must use the same local POI
             # frame. Previously only the ligand was transformed while the POI
@@ -243,6 +250,24 @@ class TriCoopDiff(nn.Module):
             )
 
             film_params_b = tri_out['film_params']
+            # Encode both actual geometries. The B context must never silently
+            # reuse A's instantaneous ligand coordinates.
+            b_graph = build_trifuse_graph(
+                e3_coords=e3_data['coords'][b], e3_features=e3_data['features'][b],
+                poi_coords=poi_data['coords'][b], poi_features=poi_data['features'][b],
+                ligand_coords=ligand_b_coords[b], ligand_features=ligand_data['features'][b],
+                lig_edge_index=ligand_data.get('edge_index'),
+                lig_edge_mask=ligand_data.get('edge_mask'),
+                lig_mask_rotate=ligand_data.get('mask_rotate'),
+            )
+            tri_b = self.trifuse(
+                node_features=b_graph['node_features'], node_coords=b_graph['node_coords'],
+                node_types=b_graph['node_types'], t_e3l=t_e3l[b:b+1], t_pol=t_pol[b:b+1],
+                lig_edge_index=b_graph['lig_edge_index'], lig_edge_mask=b_graph['lig_edge_mask'],
+                lig_mask_rotate=b_graph['lig_mask_rotate'],
+                diffusion_state=diffusion_state[b:b+1] if diffusion_state is not None else None,
+            )
+            film_params_b = film_params_b[:self.num_conv_layers] + tri_b['film_params'][self.num_conv_layers:]
 
             # Expert forward with (optional) FiLM
             debug_step0 = (
@@ -251,7 +276,7 @@ class TriCoopDiff(nn.Module):
             )
             sub1_probe = {} if debug_step0 else None
             sub2_probe = {} if debug_step0 else None
-            if self.use_film:
+            if self.use_film and self.dual_stage != 'independent':
                 scores_1, scores_2 = _dual_expert_forward_with_bridge(
                     self.expert, sub1, sub2,
                     t_e3l[b:b + 1], t_pol[b:b + 1],
@@ -263,7 +288,12 @@ class TriCoopDiff(nn.Module):
                 )
             else:
                 # L0 ablation: no FiLM, use native expert forward
+                from .lora import set_expert_lora_branch
+                _set_time_embeddings(sub1, t_e3l[b:b+1], self.expert.model)
+                _set_time_embeddings(sub2, t_pol[b:b+1], self.expert.model)
+                set_expert_lora_branch(self.expert, 'sub1')
                 raw_out1 = self.expert(sub1)
+                set_expert_lora_branch(self.expert, 'sub2')
                 raw_out2 = self.expert(sub2)
                 scores_1 = {'tr_score': raw_out1[0], 'rot_score': raw_out1[1], 'tor_score': raw_out1[2]}
                 scores_2 = {'tr_score': raw_out2[0], 'rot_score': raw_out2[1], 'tor_score': raw_out2[2]}
@@ -326,7 +356,10 @@ class TriCoopDiff(nn.Module):
 
             # TriFuse may calibrate magnitudes but never invent a Cartesian
             # direction. Identity-zero-init gains preserve native parity.
-            gains = tri_out['score_gains']
+            gains = torch.cat((tri_out['score_gains'][:, :2], tri_b['score_gains'][:, 2:4],
+                               tri_out['score_gains'][:, 4:5]), dim=-1)
+            if self.dual_stage == 'independent':
+                gains = torch.ones_like(gains)
             scores_1['tr_score'] = scores_1['tr_score'] * gains[:, 0:1]
             scores_1['rot_score'] = scores_1['rot_score'] * gains[:, 1:2]
             scores_2['tr_score'] = scores_2['tr_score'] * gains[:, 2:3]
@@ -362,35 +395,23 @@ class TriCoopDiff(nn.Module):
             if debug_step0:
                 self._last_step0_probe['scores_sub2_mapped'] = _score_debug(scores_2)
 
-            # Torsion is the only coordinate shared by both interface states.
-            # The experts provide two interface-local opinions; TriFuse makes
-            # the single executable decision for every rotatable bond.
-            if scores_1['tor_score'].numel() and scores_2['tor_score'].numel():
-                bond_context = self.trifuse.condition_bonds_on_telemetry(
-                    tri_out['bond_context'], scores_1['telemetry'],
-                    scores_2['telemetry'],
-                )
-                torsion_score, torsion_weight, torsion_residual = (
-                    self.trifuse.torsion_coordinator(
-                        bond_context,
-                        scores_1['tor_score'],
-                        scores_2['tor_score'],
-                    )
-                )
-            elif scores_1['tor_score'].numel():
-                torsion_score = scores_1['tor_score']
-                torsion_weight = torch.ones_like(torsion_score)
-                torsion_residual = torch.zeros_like(torsion_score)
-            else:
-                torsion_score = scores_2['tor_score']
-                torsion_weight = torch.zeros_like(torsion_score)
-                torsion_residual = torch.zeros_like(torsion_score)
-            all_torsion_scores.append(torsion_score)
-            all_torsion_weights.append(torsion_weight)
-            all_torsion_residuals.append(torsion_residual)
             all_confidence.append(tri_out['confidence'])
             all_state.append(tri_out['state'])
             all_score_gains.append(gains)
+            all_corrections.append(self.trifuse.consensus_controller(
+                (tri_out['h_cond'], tri_b['h_cond']),
+                (self.trifuse.condition_bonds_on_telemetry(tri_out['bond_context'], scores_1['telemetry'].detach(), scores_2['telemetry'].detach()),
+                 self.trifuse.condition_bonds_on_telemetry(tri_b['bond_context'], scores_1['telemetry'].detach(), scores_2['telemetry'].detach())),
+                ligand_data['coords'][b:b+1], ligand_b_coords[b:b+1],
+                e3_data['coords'][b:b+1], poi_data['coords'][b:b+1],
+                (scores_1['tor_score'], scores_2['tor_score']), t_e3l[b:b+1],
+                rigid_scores=(scores_1, scores_2),
+            ))
+            if self.dual_stage in ('independent', 'exchange'):
+                all_corrections[-1] = {
+                    name: {key: torch.zeros_like(value) for key, value in items.items()}
+                    for name, items in all_corrections[-1].items()
+                }
 
         # Stack batch results. Each v[b] carries a leading batch dim of 1
         # (e.g. tr/rot are [1,3], tor is [1,K]), so torch.cat along dim 0
@@ -405,17 +426,14 @@ class TriCoopDiff(nn.Module):
         }
 
         return {
+            'dual_corrections': {
+                name: {key: torch.cat([item[name][key] for item in all_corrections], dim=0)
+                       for key in all_corrections[0][name]}
+                for name in all_corrections[0]
+            },
             'interface_scores': {
                 'e3_ligand': expert_scores['sub1'],
                 'poi_ligand': expert_scores['sub2'],
-            },
-            'torsion_score': (
-                torch.cat(all_torsion_scores, dim=0)
-                * torch.cat(all_score_gains, dim=0)[:, 4:5]
-            ),
-            'torsion_coordination': {
-                'e3l_weight': torch.cat(all_torsion_weights, dim=0),
-                'residual': torch.cat(all_torsion_residuals, dim=0),
             },
             'confidence': torch.cat(all_confidence, dim=0),
             'state': torch.cat(all_state, dim=0),

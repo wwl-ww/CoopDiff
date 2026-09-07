@@ -57,7 +57,7 @@ from evaluation_common import (
 from tricoopdiff.expert_factory import build_diffdock_expert
 from tricoopdiff.trifuse import TriFuse
 from tricoopdiff.model import TriCoopDiff
-from tricoopdiff.sdpi_flow import SDPIFlow
+from tricoopdiff.dual_consensus import DualConsensusFlow as SDPIFlow
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
 
@@ -291,6 +291,7 @@ def main():
     # --- Optional: load a trained TriFuse checkpoint ------------------------
     if args.trifuse_ckpt is not None:
         if "trifuse_state_dict" in trained_ckpt:
+            model.dual_stage = trained_ckpt['runtime_config']['dual_stage']
             model.trifuse.load_state_dict(trained_ckpt["trifuse_state_dict"])
             if trained_ckpt.get("expert_lora_state_dict"):
                 from tricoopdiff.lora import load_expert_lora_state_dict
@@ -336,8 +337,8 @@ def main():
         "steps": args.steps if args.steps is not None else diffusion.inference_steps,
         "freeze_poi": args.freeze_poi,
         "init_mode": args.init_mode,
-        "initialization_version": "sdpi_v1",
-        "generative_process": "sdpi_flow_v1",
+        "initialization_version": "dual_consensus_flow_v1",
+        "generative_process": "dual_consensus_flow_v1",
         "t_anchor": args.t_anchor if args.t_anchor is not None else 1.0,
         "trifuse_checkpoint": args.trifuse_ckpt,
         "activation_clamp": args.nan_clamp,

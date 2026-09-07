@@ -45,6 +45,8 @@ from featurize_common import featurize_complex  # noqa: E402
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="TriCoopDiff training")
+    p.add_argument('--dual-stage', choices=('independent', 'exchange', 'soft', 'annealed'),
+                   default='annealed', help='Controlled dual-hypothesis ablation stage')
 
     # Data
     p.add_argument("--train_data", required=True, help="Training data JSON")
@@ -188,7 +190,7 @@ def seed_training(seed, device):
 
 def main():
     args = parse_args()
-    args.generative_process = 'sdpi_flow_v1'
+    args.generative_process = 'dual_consensus_flow_v1'
     if args.nan_clamp <= 0:
         raise SystemExit("FATAL: --nan-clamp must be positive")
     os.environ["NAN_CLAMP"] = str(args.nan_clamp)
@@ -362,11 +364,11 @@ def main():
 def build_trainer(args, device, input_dim=None):
     """Build model, diffusion, and trainer."""
     if args.lora_rank <= 0 or args.lora_start_layer != 0:
-        raise ValueError('version-17 flow training requires LoRA from layer 0')
+        raise ValueError('version-18 dual flow training requires LoRA from layer 0')
     from tricoopdiff import TriCoopDiff
     from tricoopdiff.trifuse import TriFuse
     from tricoopdiff.expert_factory import build_diffdock_expert
-    from tricoopdiff.sdpi_flow import SDPIFlow
+    from tricoopdiff.dual_consensus import DualConsensusFlow as SDPIFlow
     from tricoopdiff.train import TriCoopDiffTrainer
 
     # Build frozen DiffDock-L expert from pretrained weights (self-contained
@@ -410,7 +412,8 @@ def build_trainer(args, device, input_dim=None):
         film_dim=frozen_expert.ns,
     )
 
-    model = TriCoopDiff(frozen_expert, trifuse, num_conv_layers=num_conv_layers)
+    model = TriCoopDiff(frozen_expert, trifuse, num_conv_layers=num_conv_layers,
+                       dual_stage=args.dual_stage)
 
     # Build diffusion
     diffusion = SDPIFlow(inference_steps=20)
