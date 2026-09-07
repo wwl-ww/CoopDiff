@@ -30,6 +30,21 @@
 | Q-010 | P0 | Trainer 的 activation clamp 依赖入口脚本设置隐藏环境变量 | 已修复并复核 |
 | Q-011 | P0 | Adapter checkpoint 未绑定冻结 DiffDock 基座身份 | 已修复；旧 checkpoint 明示不确定 |
 | Q-012 | P0 | 推理 ETKDG scaffold 不在训练 native-scaffold 端点支持上 | 已确认；训练/状态设计待修 |
+| Q-013 | P0 | 独立 DiffDock 双界面是否确有高质量先验 | 两案例未见低 LRMSD；官方完整推理一致性待核对 |
+| Q-014 | P1 | DockQ 小分子对称匹配失败与指标误读 | 已定位并显式报告；相关预测几何问题仍未解决 |
+
+## Q-013 / Q-014：独立二元对照与官方 DockQ 小分子评估
+
+- 两案例、两侧、每侧 4 seeds；12/16 获得有限官方 DockQ 2.1.3 LRMSD，均 > 2 Å。
+  最佳 LRMSD：PROTAC E3/POI 为 12.2926/13.5932 Å，MGD 两侧为 6.2367/6.9340 Å。
+- 1 条原预测非有限；3 条 PROTAC 的坐标成键图增加 1 或 8 条近距离推断边，
+  导致官方图同构匹配失败。保留失败，不把其内部默认 1/3 分数当作有效 DockQ。
+- 官方 CLI 的 `DockQ-small_molecules` 是 LRMSD 派生分数；不同于传统三项
+  DockQ，不能沿用其质量阈值。四个 native 身份对照均 < 1e-6 Å。
+- 完整结果和协议见 [独立 DiffDock 小分子评估](doc/独立DiffDock小分子评估.md)。
+  原始预测没有重跑或改写；新模型工作按用户要求暂停，当前优先核对二元基线。
+- 状态：完成对已有样本的官方评分；尚未完成官方完整 DiffDock 入口的一致性
+  审计或广泛案例验证，不据此断言整个 binary prior 无效。
 
 ## Q-001：同 seed 跨进程推理漂移
 
