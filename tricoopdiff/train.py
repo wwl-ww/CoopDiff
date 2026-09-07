@@ -195,6 +195,7 @@ class TriCoopDiffTrainer:
         omitted to avoid duplicating the pretrained checkpoint.
         """
         from .lora import expert_lora_state_dict
+        from .reproducibility import capture_rng_state
         lora_state = expert_lora_state_dict(self.model.expert)
         if len(lora_state) != 336:
             raise RuntimeError(
@@ -215,6 +216,7 @@ class TriCoopDiffTrainer:
                 'optimizer_groups': self.optimizer_config,
             },
             'global_step': self.global_step,
+            'rng_state': capture_rng_state(),
             'training_state': {
                 'epoch': int(epoch),
                 'best_val_loss': float(best_val_loss),
@@ -308,6 +310,12 @@ class TriCoopDiffTrainer:
             and ckpt.get('scheduler_type') == type(self.scheduler).__name__
         ):
             self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        if 'rng_state' in ckpt:
+            from .reproducibility import restore_rng_state
+            restore_rng_state(ckpt['rng_state'])
+        else:
+            import warnings
+            warnings.warn('legacy v18 checkpoint has no RNG state; resume is not exact')
 
 
 # so3_score_norm — imported from tricoopdiff.diffusion where needed

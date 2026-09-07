@@ -31,6 +31,7 @@ def main():
     parser.add_argument('--cache-dir', default='results/featurize_cache')
     parser.add_argument('--cases', nargs='+', default=['5T35_D_A_759'])
     parser.add_argument('--steps', type=int, default=20)
+    parser.add_argument('--time', type=float, default=.1, help='Fixed flow time for this diagnostic (0 < t < 1)')
     parser.add_argument('--sampling-steps', type=int, default=5)
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--out', required=True)
@@ -39,6 +40,8 @@ def main():
     parser.add_argument('--trace-parity-layers', action='store_true', help='Record per-convolution input equality and output errors')
     parser.add_argument('--nondeterministic-audit', action='store_true', help='Diagnostic negative control; requires --parity-only and is not a passing gate')
     args = parser.parse_args()
+    if not 0 < args.time < 1:
+        parser.error('--time must lie strictly between zero and one')
     if args.steps < 1 or args.sampling_steps < 1:
         parser.error('steps must be positive')
     if args.nondeterministic_audit and not args.parity_only:
@@ -66,7 +69,7 @@ def main():
     trainer._set_lora_trainable(True)
     pairs = [(batch, flow.sample_coupling(batch['e3_data']['coords'], batch['poi_data']['coords'],
                                          batch['ligand_data'], model.expert.model.no_torsion)) for batch in batches]
-    t = torch.tensor([.1], device=device)
+    t = torch.tensor([args.time], device=device)
     # At zero initialization, the full coordinated forward must preserve both
     # native binary fields for their respective (different) geometries.
     with torch.no_grad():
@@ -92,7 +95,7 @@ def main():
                 'components': {k: float(v.detach()) for k, v in result['components'].items()},
                 'metrics': result['rms']}
     report = {'process': FLOW_VERSION, 'cases': args.cases, 'initial': [], 'steps': [],
-              'diagnostic_only': True, 'time': .1, 'binary_preservation_max_error': parity,
+              'diagnostic_only': True, 'time': args.time, 'binary_preservation_max_error': parity,
               'reproducibility': reproducibility}
     with torch.no_grad():
         for batch, coupling in pairs:

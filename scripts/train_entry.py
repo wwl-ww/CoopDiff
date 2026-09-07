@@ -26,6 +26,7 @@ Usage:
 import argparse
 import json
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -183,9 +184,20 @@ def swap_protein_reference(e3_data, poi_data, ligand_data):
 def seed_training(seed, device):
     """Seed training RNGs independently of cache/featurization side effects."""
     np.random.seed(seed)
+    random.seed(seed)
     torch.manual_seed(seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
+
+
+def check_output_directory(output_dir, resume=None):
+    """Never silently overwrite an earlier experiment."""
+    destination = Path(output_dir)
+    if resume is not None and not Path(resume).is_file():
+        raise ValueError(f"resume checkpoint does not exist: {resume}")
+    if destination.exists() and any(destination.iterdir()):
+        if resume is None or Path(resume).resolve().parent != destination.resolve():
+            raise ValueError(f"nonempty output directory requires an in-directory --resume: {destination}")
 
 
 def main():
@@ -196,14 +208,22 @@ def main():
     os.environ["NAN_CLAMP"] = str(args.nan_clamp)
     device = torch.device(args.device)
 
+    from tricoopdiff.reproducibility import configure_inference_reproducibility
+    args.numerical_policy = configure_inference_reproducibility()
+
     seed_training(args.seed, device)
 
     # SO(3)/torus cache lookup resolves relative to CWD; chdir to project root.
     os.chdir(_PROJECT_ROOT)
+    check_output_directory(args.output_dir, args.resume)
+    for index in (args.train_data, args.val_data):
+        if not _load_entries(index):
+            raise SystemExit(f"FATAL: no entries in {index}")
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Save run config
-    with open(os.path.join(args.output_dir, "config.json"), "w") as f:
+    config_name = f"resume_config_{time.time_ns()}.json" if args.resume else "config.json"
+    with open(os.path.join(args.output_dir, config_name), "x") as f:
         json.dump(vars(args), f, indent=2)
 
     print(f"[TriCoopDiff] Training Phase {args.phase}")
@@ -452,12 +472,14 @@ def validate(trainer, val_loader, device):
     if device.type == 'cuda':
         cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()]
     numpy_state = np.random.get_state()
+    python_state = random.getstate()
     try:
         with torch.random.fork_rng(devices=cuda_devices):
             torch.manual_seed(0)
             if cuda_devices:
                 torch.cuda.manual_seed_all(0)
             np.random.seed(0)
+            random.seed(0)
             trainer.model.eval()
             total_loss = 0.0
             n_batches = 0
@@ -476,6 +498,7 @@ def validate(trainer, val_loader, device):
                 n_batches += 1
     finally:
         np.random.set_state(numpy_state)
+        random.setstate(python_state)
         trainer.model.train()
     return total_loss / n_batches if n_batches else float('nan')
 

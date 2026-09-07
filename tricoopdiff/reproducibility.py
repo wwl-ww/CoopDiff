@@ -1,8 +1,32 @@
 """Explicit numerical policy for reproducible inference and diagnostic controls."""
 
 import os
+import random
 
+import numpy as np
 import torch
+
+
+def capture_rng_state():
+    """Serializable epoch-boundary state, compatible with weights-only loading."""
+    numpy = np.random.get_state()
+    return {
+        'python': random.getstate(),
+        'numpy': (numpy[0], numpy[1].tolist(), numpy[2], numpy[3], numpy[4]),
+        'torch': torch.get_rng_state(),
+        'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else [],
+    }
+
+
+def restore_rng_state(state):
+    random.setstate(state['python'])
+    numpy = state['numpy']
+    np.random.set_state((numpy[0], np.asarray(numpy[1], dtype=np.uint32), *numpy[2:]))
+    torch.set_rng_state(state['torch'].cpu())
+    if state['cuda']:
+        if len(state['cuda']) != torch.cuda.device_count():
+            raise ValueError('resume CUDA device count differs from saved RNG state')
+        torch.cuda.set_rng_state_all([value.cpu() for value in state['cuda']])
 
 
 def configure_inference_reproducibility(deterministic=True):

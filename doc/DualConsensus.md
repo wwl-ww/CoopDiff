@@ -4,6 +4,16 @@
 [`sug_gpt6.md`](../sug_gpt6.md) 第 24 节的基础版。
 这是待验证的新建模假设，不能把数值稳定、loss 下降或双假设一致称为 DockQ 改善。
 
+## 大训练前准入
+
+- 正式 `train_entry.py` 和数值诊断启用相同确定性 kernel 策略（不支持时直接报错）；配置记录 numerical policy。
+- 新训练拒绝非空输出目录；续训只允许空目录或 checkpoint 所在目录，原始 config 不覆盖。
+- 新 checkpoint 保存 Python/NumPy/Torch/CUDA RNG，载入时恢复。旧 v18 缺失 RNG 时明确告警；不承诺跨硬件/软件版本逐位一致。
+- 先重建官方数据到独立目录，例如 `make_deepternary_index.py --output-root data/ternary_dual_v1 --index-dir data/dual_v1`，再运行 `check_dual_training_data.py --out results/dual_training_data.json`。该门禁检查完整计数、文件非空、集合重叠和 benchmark PDB 泄漏，**只代表数据检查，不代表模型准入**。
+- `check_dual_consensus.py --time 0.5` / `--time 0.9` 可补中间/高噪声端梯度检查。benchmark fixture 只能做数值诊断，不能用于超参选择。
+- 正式训练池需完成跨 LoRA warmup 的入口 smoke，以及 fresh-time/fresh-prior 的小集过拟合与完整采样评估；此前固定 t=0.1 单样本下降不足以放行大训练。
+- 不使用旧 `results/tricoopdiff_phase1_joint` 输出目录；也不要将旧 SDPI readiness 或旧 wrapper 的成功标记当作 dual-consensus 验收。
+
 ## 状态与坐标契约
 
 `state = {a, b, poi, body}`。两份配体共享原子顺序、分子图、旋转键定义，
