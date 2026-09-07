@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 from pathlib import Path
 
 
@@ -34,10 +35,12 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=336):
     """Reject incomplete or legacy checkpoints before expensive inference."""
     if not isinstance(payload, dict):
         raise ValueError("checkpoint must contain a mapping")
-    if payload.get("checkpoint_version") != 16:
+    if payload.get("checkpoint_version") != 17:
         raise ValueError(
-            "TriFuse evaluation requires checkpoint_version=16"
+            "TriFuse evaluation requires checkpoint_version=17"
         )
+    if payload.get('generative_process') != 'sdpi_flow_v1':
+        raise ValueError('checkpoint generative process is not sdpi_flow_v1')
     if payload.get("architecture") != "trifuse_v13":
         raise ValueError(
             "checkpoint architecture is not trifuse_v13"
@@ -55,6 +58,9 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=336):
     )
     if not isinstance(lora_warmup_steps, int) or lora_warmup_steps < 0:
         raise ValueError("checkpoint has no valid lora_warmup_steps")
+    optimizer_groups = payload.get("runtime_config", {}).get("optimizer_groups")
+    if not isinstance(optimizer_groups, dict) or not optimizer_groups:
+        raise ValueError("checkpoint has no optimizer-group training config")
     if not payload.get("trifuse_state_dict"):
         raise ValueError("checkpoint has no TriFuse weights")
     lora = payload.get("expert_lora_state_dict")
@@ -86,11 +92,21 @@ def completed_report(path, case, checkpoint, expected_config=None,
         and config.get("trifuse_checkpoint") == checkpoint
         and ensemble.get("n_valid_walkers", 0) > 0
     )
+    dockq = report.get("structure", {}).get("dockq_best")
     exact_dockq_matches = (
         not require_exact_dockq
-        or report.get("structure", {}).get("dockq_best") is not None
+        or (isinstance(dockq, (int, float)) and math.isfinite(dockq))
     )
-    return core_matches and exact_dockq_matches and all(
+    if require_exact_dockq and 'n_exact_dockq_walkers' in ensemble:
+        exact_dockq_matches &= (
+            ensemble['n_exact_dockq_walkers'] == ensemble.get('n_valid_walkers', 0)
+        )
+    expected_walkers = (expected_config or {}).get("n_walkers")
+    walker_count_matches = (
+        expected_walkers is None
+        or ensemble.get("n_walkers") == expected_walkers
+    )
+    return core_matches and exact_dockq_matches and walker_count_matches and all(
         config.get(key) == value for key, value in (expected_config or {}).items()
     )
 
@@ -102,3 +118,14 @@ def sha256_file(path, chunk_size=1024 * 1024):
         for chunk in iter(lambda: handle.read(chunk_size), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def evaluation_input_signature(paths, native_complex_pdb=None):
+    """Fingerprint actual case inputs, including the reference used for metrics."""
+    sources = {**paths, "native_complex_pdb": native_complex_pdb}
+    payload = {
+        key: ({"path": str(Path(path).resolve()), "sha256": sha256_file(path)}
+              if path is not None else None)
+        for key, path in sources.items()
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()

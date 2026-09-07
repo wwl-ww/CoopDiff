@@ -34,6 +34,9 @@ def _ligand_records(path):
         )
         if molecule is None:
             raise ValueError(f"cannot parse ligand structure: {ligand_path}")
+        # DiffDock predicts heavy-atom coordinates. Some official SDFs carry
+        # explicit H atoms; remove them without reordering the heavy atoms.
+        molecule = Chem.RemoveHs(molecule, sanitize=False)
         lines = Chem.MolToPDBBlock(molecule).splitlines()
         indices = [
             index for index, line in enumerate(lines)
@@ -57,6 +60,14 @@ def _ca_coords(lines):
         for line in lines
         if line.startswith("ATOM") and line[12:16].strip() == "CA"
     ])
+
+
+def _featurized_ca_coords(path):
+    """Use DiffDock's residue/alternate-location selection and atom order."""
+    import prody as pr
+    from .diffdock.datasets.parse_chi import get_coords
+
+    return get_coords(pr.parsePDB(str(path)))[:, 1, :]
 
 
 def _fit_rigid(source, target):
@@ -96,13 +107,15 @@ def compute_fullatom_dockq(
     ligand_pdb,
     native_complex_pdb,
     deepternary_root,
+    metric_protein1_pdb=None,
+    metric_protein2_pdb=None,
 ):
     """Rebuild a predicted ternary PDB and call DeepTernary's ``cal_dockq``."""
     p1_lines, _, _ = _records(protein1_pdb, "ATOM")
     p2_lines, p2_indices, p2_atoms = _records(protein2_pdb, "ATOM")
     lig_lines, lig_indices, _ = _ligand_records(ligand_pdb)
-    p1_ca = _ca_coords(p1_lines)
-    p2_ca = _ca_coords(p2_lines)
+    p1_ca = _featurized_ca_coords(protein1_pdb)
+    p2_ca = _featurized_ca_coords(protein2_pdb)
 
     # Move TriCoopDiff's shared E3 frame back into the original PDB frame.
     frame_r, frame_t = _fit_rigid(np.asarray(featurized_e3_ca), p1_ca)
@@ -113,6 +126,15 @@ def compute_fullatom_dockq(
     # rigid transform to every protein2 atom before invoking full-atom DockQ.
     poi_r, poi_t = _fit_rigid(p2_ca, pred_poi_ca_pdb)
     pred_p2_atoms = p2_atoms @ poi_r + poi_t
+    if (metric_protein1_pdb is None) != (metric_protein2_pdb is None):
+        raise ValueError('provide both metric protein templates or neither')
+    if metric_protein1_pdb is not None:
+        # DeepTernary predict_one_unbound applies the predicted rigid motion
+        # of the unbound receptor to its prealigned bound all-atom template.
+        # Templates are used for scoring only, never as neural-model inputs.
+        p1_lines, _, _ = _records(metric_protein1_pdb, 'ATOM')
+        p2_lines, p2_indices, p2_atoms = _records(metric_protein2_pdb, 'ATOM')
+        pred_p2_atoms = p2_atoms @ poi_r + poi_t
     p2_pred_lines = _replace_coords(p2_lines, p2_indices, pred_p2_atoms)
     p1_chain = next(line[21] for line in p1_lines if line.startswith("ATOM"))
     lig_pred_lines = _replace_coords(lig_lines, lig_indices, pred_ligand_pdb, chain=p1_chain)

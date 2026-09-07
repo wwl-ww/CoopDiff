@@ -29,12 +29,14 @@ def test_index_entry_and_paths(tmp_path):
 
 def test_checkpoint_preflight_rejects_missing_lora():
     payload = {
-        "checkpoint_version": 16,
+        "checkpoint_version": 17,
+        "generative_process": "sdpi_flow_v1",
         "architecture": "trifuse_v13",
         "runtime_config": {
             "activation_clamp": 100.0,
             "torsion_expert_aux_weight": 0.25,
             "lora_warmup_steps": 100,
+            "optimizer_groups": {"trifuse": {"lr": 1e-4}},
         },
         "trifuse_state_dict": {"x": 1},
     }
@@ -56,19 +58,21 @@ def test_checkpoint_preflight_rejects_legacy_architecture():
     try:
         evaluation_common.validate_checkpoint_payload(payload)
     except ValueError as error:
-        assert "checkpoint_version=16" in str(error)
+        assert "checkpoint_version=17" in str(error)
     else:
         raise AssertionError("legacy architecture checkpoint must be rejected")
 
 
 def test_checkpoint_preflight_accepts_complete_payload():
     payload = {
-        "checkpoint_version": 16,
+        "checkpoint_version": 17,
+        "generative_process": "sdpi_flow_v1",
         "architecture": "trifuse_v13",
         "runtime_config": {
             "activation_clamp": 100.0,
             "torsion_expert_aux_weight": 0.25,
             "lora_warmup_steps": 100,
+            "optimizer_groups": {"trifuse": {"lr": 1e-4}},
         },
         "trifuse_state_dict": {"x": 1},
         "expert_lora_state_dict": {str(i): i for i in range(336)},
@@ -79,7 +83,8 @@ def test_checkpoint_preflight_accepts_complete_payload():
 
 def test_checkpoint_preflight_rejects_missing_runtime_config():
     payload = {
-        "checkpoint_version": 16,
+        "checkpoint_version": 17,
+        "generative_process": "sdpi_flow_v1",
         "architecture": "trifuse_v13",
         "trifuse_state_dict": {"x": 1},
         "expert_lora_state_dict": {str(i): i for i in range(336)},
@@ -117,3 +122,79 @@ def test_completed_report_requires_matching_checkpoint(tmp_path):
     assert evaluation_common.completed_report(
         path, "demo", "best.pt", require_exact_dockq=True,
     )
+    report['ensemble']['n_exact_dockq_walkers'] = 1
+    path.write_text(json.dumps(report), encoding='utf-8')
+    assert not evaluation_common.completed_report(
+        path, 'demo', 'best.pt', require_exact_dockq=True,
+    )
+
+
+def test_resume_fingerprints_detect_same_path_replacement(tmp_path):
+    source = tmp_path / 'ligand.sdf'
+    source.write_text('original chemical graph')
+    checkpoint = tmp_path / 'best.pt'
+    checkpoint.write_bytes(b'original weights')
+    paths = {'ligand': source}
+    signature = evaluation_common.evaluation_input_signature(paths)
+    digest = evaluation_common.sha256_file(checkpoint)
+    config = {'input_signature': signature, 'checkpoint_sha256': digest}
+    report = tmp_path / 'report.json'
+    report.write_text(json.dumps({
+        'case': 'demo',
+        'run_config': {'trifuse_checkpoint': str(checkpoint), **config},
+        'ensemble': {'n_valid_walkers': 1},
+    }))
+    assert evaluation_common.completed_report(report, 'demo', str(checkpoint), config)
+    source.write_text('replacement chemical graph')
+    changed_input = evaluation_common.evaluation_input_signature(paths)
+    assert changed_input != signature
+    assert not evaluation_common.completed_report(
+        report, 'demo', str(checkpoint), {**config, 'input_signature': changed_input},
+    )
+    checkpoint.write_bytes(b'replacement weights')
+    assert not evaluation_common.completed_report(
+        report, 'demo', str(checkpoint),
+        {**config, 'checkpoint_sha256': evaluation_common.sha256_file(checkpoint)},
+    )
+    native = tmp_path / 'native.pdb'
+    native.write_text('reference')
+    assert evaluation_common.evaluation_input_signature(paths, native) != changed_input
+
+
+def test_resume_rejects_nonfinite_metric_and_incomplete_ensemble(tmp_path):
+    path = tmp_path / 'report.json'
+    report = {
+        'case': 'demo',
+        'run_config': {'trifuse_checkpoint': 'best.pt', 'n_walkers': 32},
+        'ensemble': {'n_walkers': 1, 'n_valid_walkers': 1},
+        'structure': {'dockq_best': 0.1},
+    }
+    path.write_text(json.dumps(report))
+    assert not evaluation_common.completed_report(
+        path, 'demo', 'best.pt', {'n_walkers': 32}, require_exact_dockq=True,
+    )
+    report['ensemble']['n_walkers'] = 32
+    for invalid in (None, float('nan'), float('inf')):
+        report['structure']['dockq_best'] = invalid
+        path.write_text(json.dumps(report))
+        assert not evaluation_common.completed_report(
+            path, 'demo', 'best.pt', {'n_walkers': 32}, require_exact_dockq=True,
+        )
+
+
+def test_resume_rejects_changed_numerical_policy(tmp_path):
+    path = tmp_path / 'report.json'
+    policy = {'deterministic_algorithms': True,
+              'torus_score_norm_version': 'wrapped_normal_quadrature_v1'}
+    report = {'case': 'demo',
+              'run_config': {'trifuse_checkpoint': 'best.pt', **policy},
+              'ensemble': {'n_valid_walkers': 1}}
+    path.write_text(json.dumps(report))
+    assert evaluation_common.completed_report(path, 'demo', 'best.pt', policy)
+    for key, changed in (('deterministic_algorithms', False),
+                         ('torus_score_norm_version', 'old')):
+        assert not evaluation_common.completed_report(
+            path, 'demo', 'best.pt', {**policy, key: changed})
+    report['run_config'].pop('torus_score_norm_version')
+    path.write_text(json.dumps(report))
+    assert not evaluation_common.completed_report(path, 'demo', 'best.pt', policy)

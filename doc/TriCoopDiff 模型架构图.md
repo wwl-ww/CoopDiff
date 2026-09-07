@@ -6,7 +6,7 @@ flowchart TB
         E3["E3 蛋白<br/>残基特征 + 坐标"]
         POI["POI 蛋白<br/>残基特征 + 坐标"]
         LIG["PROTAC<br/>原子特征 + 共价键 + 坐标"]
-        TIME["扩散状态<br/>t · sigma · dt · progress"]
+        TIME["流时间与预条件状态<br/>t · sigma · dt · progress"]
     end
 
     subgraph TRIFUSE["TriFuse 协调网络"]
@@ -68,13 +68,13 @@ flowchart TB
     TOR --> TUPDATE
     E3FIX --> LUPDATE
     LUPDATE --> TUPDATE
-    TUPDATE --> OUTPUT["新的三元复合物状态<br/>进入下一扩散步"]
+    TUPDATE --> OUTPUT["新的三元复合物状态<br/>进入下一流积分步"]
     PUPDATE --> OUTPUT
 ```
 
 ## 模块职责
 
-- **TriFuse** 读取完整三元几何、Ligand 化学结构和扩散状态，产生两条专家路径各自的逐原子 FiLM。
+- **TriFuse** 读取完整三元几何、Ligand 化学结构和流时间与预条件状态，产生两条专家路径各自的逐原子 FiLM。
 - **sub1 DiffDock** 预测 E3–PROTAC 界面的平移、旋转和 torsion score。
 - **sub2 DiffDock** 在 POI 局部参考系中预测 POI–PROTAC 界面，再将向量 score 映射回 E3 全局参考系。
 - **Expert Bridge** 每层仅交换两路 Ligand 的标量表示，禁止跨参考系直接交换向量表示。
@@ -85,4 +85,4 @@ flowchart TB
 
 两个专家始终读取同一个更新前状态。Ligand 执行 sub1 的刚体 proposal；随后计算一个精确刚体变换，将 sub2 的 Ligand proposal 对齐到 sub1 proposal，并将同一变换施加到 POI。最后执行 TriFuse 协调后的 PROTAC torsion 更新。E3 在整个采样过程中保持固定。
 
-该组合保证一次更新后同时保留 E3–Ligand 与 POI–Ligand 两个界面的约束，避免先移动 Ligand 后继续使用旧 sub2 状态。
+该组合在 torsion 更新前精确保留两侧刚体 proposal 的 receptor–ligand 距离；随后共享 torsion 会同时改变两侧局部几何，不能把该保证延伸到完整一步之后。初始化及其精确装配见 [初始化方案_gpt6.md](初始化方案_gpt6.md)。

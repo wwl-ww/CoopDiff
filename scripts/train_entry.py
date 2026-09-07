@@ -2,7 +2,7 @@
 TriCoopDiff training entry point.
 
 Supervised training:
-  Phase 1: Interface score matching (TriFuse control + expert LoRA).
+  Phase 1: SDPI conditional velocity matching (TriFuse + expert LoRA).
   Auxiliary confidence/state training is intentionally unavailable until the
   dataset and loss expose explicit labels.
 
@@ -43,12 +43,26 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 from featurize_common import featurize_complex  # noqa: E402
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description="TriCoopDiff training")
 
     # Data
     p.add_argument("--train_data", required=True, help="Training data JSON")
     p.add_argument("--val_data", required=True, help="Validation data JSON")
+    p.add_argument(
+        "--max-train-clusters", type=int, default=None,
+        help="Bound training clusters for an allocated smoke run only",
+    )
+    p.add_argument(
+        "--max-val-clusters", type=int, default=None,
+        help="Bound validation clusters for an allocated smoke run only",
+    )
+    p.add_argument(
+        "--random-flip-proteins", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Randomly swap fixed/moving protein roles during training "
+             "(use --no-random-flip-proteins for an ablation)",
+    )
 
     # Training
     p.add_argument("--output_dir", required=True, help="Checkpoint output directory")
@@ -61,13 +75,13 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument(
         "--nan-clamp", type=float, default=100.0,
-        help="Per-layer expert activation clamp recorded in v16 checkpoints",
+        help="Per-layer expert activation clamp recorded in v17 flow checkpoints",
     )
     p.add_argument(
         "--torsion-expert-aux-weight", type=float, default=0.25,
         help="Weight for per-expert torsion losses in addition to joint torsion",
     )
-    p.add_argument("--lora_rank", type=int, default=0,
+    p.add_argument("--lora_rank", type=int, default=4,
                    help="Rank of independent sub1/sub2 expert adapters; 0 disables LoRA")
     p.add_argument("--lora_alpha", type=float, default=8.0)
     p.add_argument("--lora_start_layer", type=int, default=0)
@@ -83,7 +97,7 @@ def parse_args():
 
     # Phase
     p.add_argument("--phase", type=int, default=1, choices=[1],
-                   help="interface score matching (the only defined phase)")
+                   help="SDPI velocity matching (the only defined phase)")
     p.add_argument("--resume", default=None, help="Resume from checkpoint")
 
     # Model config
@@ -112,7 +126,7 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0,
                    help="Random seed for model initialization, shuffling, and diffusion noise")
 
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def _load_score_model_args(expert_model_dir):
@@ -123,7 +137,7 @@ def _load_score_model_args(expert_model_dir):
         return Namespace(**yaml.full_load(f))
 
 
-def _load_entries(data_json):
+def _load_index(data_json):
     """Read an index and resolve portable or stale-checkout input paths."""
     with open(data_json) as f:
         index = json.load(f)
@@ -144,20 +158,43 @@ def _load_entries(data_json):
                 )
             entry[key] = str(path.resolve())
         resolved.append(entry)
-    return resolved
+    entries_by_case = {entry['case']: entry for entry in resolved}
+    clusters = index.get('clusters') if isinstance(index, dict) else None
+    return resolved, clusters, entries_by_case
+
+
+def _load_entries(data_json):
+    """Backward-compatible flat-entry accessor."""
+    return _load_index(data_json)[0]
+
+
+def swap_protein_reference(e3_data, poi_data, ligand_data):
+    """Swap protein roles and express all coordinates in the new E3 frame."""
+    new_origin = poi_data['coords'].mean(dim=1, keepdim=True)
+    return (
+        {**poi_data, 'coords': poi_data['coords'] - new_origin},
+        {**e3_data, 'coords': e3_data['coords'] - new_origin},
+        {**ligand_data, 'coords': ligand_data['coords'] - new_origin},
+    )
+
+
+def seed_training(seed, device):
+    """Seed training RNGs independently of cache/featurization side effects."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
 
 
 def main():
     args = parse_args()
+    args.generative_process = 'sdpi_flow_v1'
     if args.nan_clamp <= 0:
         raise SystemExit("FATAL: --nan-clamp must be positive")
     os.environ["NAN_CLAMP"] = str(args.nan_clamp)
     device = torch.device(args.device)
 
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(args.seed)
+    seed_training(args.seed, device)
 
     # SO(3)/torus cache lookup resolves relative to CWD; chdir to project root.
     os.chdir(_PROJECT_ROOT)
@@ -191,6 +228,10 @@ def main():
         score_model_args, str(device), cache_dir=args.cache_dir,
     )
     print(f"  receptor_feat_dim={input_dim} (from {first['case']})")
+    # A cold ESM/graph cache can consume framework RNG state while a warm cache
+    # does not. Reset here so model initialization and epoch sampling depend
+    # only on --seed, never on whether the first feature was already cached.
+    seed_training(args.seed, device)
 
     # ----------------------------------------------------------------
     # 1. Build model
@@ -205,12 +246,13 @@ def main():
     train_loader = TernaryDataLoader(
         args.train_data, score_model_args,
         shuffle=True, device=str(device), cache_dir=args.cache_dir,
-        skip_on_error=False,
+        skip_on_error=False, max_clusters=args.max_train_clusters,
+        random_flip_proteins=args.random_flip_proteins,
     )
     val_loader = TernaryDataLoader(
         args.val_data, score_model_args,
         shuffle=False, device=str(device), cache_dir=args.cache_dir,
-        skip_on_error=False,
+        skip_on_error=False, max_clusters=args.max_val_clusters,
     )
 
     # ----------------------------------------------------------------
@@ -229,19 +271,20 @@ def main():
     # 4. Training loop
     # ----------------------------------------------------------------
     print(f"[4/6] Training {args.epochs} epochs...")
-    best_val_loss = float('inf')
+    start_epoch = trainer.resume_epoch + 1
+    best_val_loss = trainer.resume_best_val_loss
+    if start_epoch > args.epochs:
+        raise RuntimeError(
+            f"resume checkpoint already completed epoch {trainer.resume_epoch}, "
+            f"which meets/exceeds target --epochs={args.epochs}"
+        )
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         train_losses = []
         n_skipped = 0
         t0 = time.time()
         for batch_idx, batch in enumerate(train_loader):
             loss_dict = _guarded_train_step(trainer, batch)
-            if loss_dict is None:
-                n_skipped += 1
-                print(f"  Epoch {epoch} | Batch {batch_idx} | SKIP non-finite loss",
-                      flush=True)
-                continue
             train_losses.append(loss_dict)
 
             if batch_idx % args.log_interval == 0:
@@ -293,12 +336,16 @@ def main():
         # Save best & periodic
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            trainer.save_checkpoint(os.path.join(args.output_dir, "best_model.pt"))
+            trainer.save_checkpoint(
+                os.path.join(args.output_dir, "best_model.pt"),
+                epoch=epoch, best_val_loss=best_val_loss,
+            )
             print(f"  -> Saved best (val_loss={val_loss:.4f})")
 
         if epoch % args.save_interval == 0:
             trainer.save_checkpoint(
-                os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt")
+                os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt"),
+                epoch=epoch, best_val_loss=best_val_loss,
             )
 
     # ----------------------------------------------------------------
@@ -306,16 +353,20 @@ def main():
     # ----------------------------------------------------------------
     print("[5/6] Saving final model...")
     final_path = os.path.join(args.output_dir, "tricoopdiff_zero.pt")
-    trainer.save_checkpoint(final_path)
+    trainer.save_checkpoint(
+        final_path, epoch=args.epochs, best_val_loss=best_val_loss,
+    )
     print(f"Done. Model saved to {final_path}")
 
 
 def build_trainer(args, device, input_dim=None):
     """Build model, diffusion, and trainer."""
+    if args.lora_rank <= 0 or args.lora_start_layer != 0:
+        raise ValueError('version-17 flow training requires LoRA from layer 0')
     from tricoopdiff import TriCoopDiff
     from tricoopdiff.trifuse import TriFuse
     from tricoopdiff.expert_factory import build_diffdock_expert
-    from tricoopdiff.diffusion import InterfaceDiffusion
+    from tricoopdiff.sdpi_flow import SDPIFlow
     from tricoopdiff.train import TriCoopDiffTrainer
 
     # Build frozen DiffDock-L expert from pretrained weights (self-contained
@@ -362,7 +413,7 @@ def build_trainer(args, device, input_dim=None):
     model = TriCoopDiff(frozen_expert, trifuse, num_conv_layers=num_conv_layers)
 
     # Build diffusion
-    diffusion = InterfaceDiffusion(inference_steps=20)
+    diffusion = SDPIFlow(inference_steps=20)
 
     # Build trainer
     trainer = TriCoopDiffTrainer(
@@ -383,14 +434,13 @@ def build_trainer(args, device, input_dim=None):
 
 
 def _guarded_train_step(trainer, batch):
-    """Return ``None`` without stepping when a batch is numerically invalid."""
+    """Abort immediately when a batch is numerically invalid."""
     from tricoopdiff.train import NonFiniteTrainingError
 
     try:
         return trainer.train_step(**batch)
     except NonFiniteTrainingError as error:
-        print(f"[train] SKIP {error}", flush=True)
-        return None
+        raise RuntimeError(f"training aborted on first non-finite batch: {error}") from error
 
 
 def validate(trainer, val_loader, device):
@@ -446,21 +496,30 @@ class TernaryDataLoader:
     """
 
     def __init__(self, data_json, score_model_args, shuffle=True, device="cuda",
-                 cache_dir=None, skip_on_error=False):
-        self.entries = _load_entries(data_json)
+                 cache_dir=None, skip_on_error=False, max_clusters=None,
+                 random_flip_proteins=False):
+        self.entries, self.clusters, self.entries_by_case = _load_index(data_json)
+        if max_clusters is not None:
+            if max_clusters <= 0:
+                raise ValueError('max_clusters must be positive')
+            if self.clusters:
+                self.clusters = self.clusters[:max_clusters]
+            else:
+                self.entries = self.entries[:max_clusters]
+                self.entries_by_case = {
+                    entry['case']: entry for entry in self.entries
+                }
         self.score_model_args = score_model_args
         self.shuffle = shuffle
         self.device = device
         self.cache_dir = cache_dir
         self.skip_on_error = skip_on_error
+        self.random_flip_proteins = bool(random_flip_proteins)
         self.skipped = []
 
     def __iter__(self):
-        indices = list(range(len(self.entries)))
-        if self.shuffle:
-            np.random.shuffle(indices)
-        for i in indices:
-            entry = self.entries[i]
+        entries = self._epoch_entries()
+        for i, entry in enumerate(entries):
             try:
                 yield self._load_one(entry)
             except Exception as e:
@@ -470,13 +529,52 @@ class TernaryDataLoader:
                 print(f"[data] SKIP {entry.get('case', i)}: {e}", flush=True)
 
     def __len__(self):
-        return len(self.entries)
+        return len(self.clusters) if self.clusters else len(self.entries)
+
+    def _epoch_entries(self):
+        """Select one case per cluster, following DeepTernary's 80/20 rule."""
+        if not self.clusters:
+            selected = list(self.entries)
+        elif self.shuffle:
+            selected = []
+            for cluster in self.clusters:
+                items = [case for case in cluster['items']
+                         if case in self.entries_by_case]
+                representatives = [case for case in cluster.get('representative', [])
+                                   if case in self.entries_by_case]
+                if not items:
+                    raise RuntimeError('cluster has no materialized entries')
+                candidates = items if np.random.random() < 0.8 else (
+                    representatives or items)
+                selected.append(self.entries_by_case[np.random.choice(candidates)])
+        else:
+            selected = []
+            for cluster in self.clusters:
+                candidates = [case for case in cluster.get('representative', [])
+                              if case in self.entries_by_case]
+                if not candidates:
+                    candidates = [case for case in cluster['items']
+                                  if case in self.entries_by_case]
+                if not candidates:
+                    raise RuntimeError('cluster has no materialized entries')
+                selected.append(self.entries_by_case[candidates[0]])
+        if self.shuffle:
+            np.random.shuffle(selected)
+        return selected
 
     def _load_one(self, entry):
         e3_data, poi_data, ligand_data, _ = featurize_complex(
             entry["case"], entry["protein1"], entry["protein2"], entry["ligand"],
             self.score_model_args, self.device, cache_dir=self.cache_dir,
         )
+        if self.random_flip_proteins and np.random.random() < 0.5:
+            # Re-express the entire ternary state in the old POI-centered frame,
+            # then exchange branch identities. This matches DeepTernary's
+            # training-only random protein flip while preserving the invariant
+            # that the current E3/reference partner is centered at the origin.
+            e3_data, poi_data, ligand_data = swap_protein_reference(
+                e3_data, poi_data, ligand_data,
+            )
         return {
             'case': entry['case'],
             'e3_data': e3_data,

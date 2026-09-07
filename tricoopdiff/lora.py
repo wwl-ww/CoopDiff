@@ -112,5 +112,9 @@ def load_expert_lora_state_dict(expert, state_dict):
     incompatible = expert.load_state_dict(state_dict, strict=False)
     unexpected = [name for name in incompatible.unexpected_keys
                   if ".lora_a." in name or ".lora_b." in name]
+    missing = [name for name in incompatible.missing_keys
+               if ".lora_a." in name or ".lora_b." in name]
     if unexpected:
         raise RuntimeError(f"unexpected LoRA checkpoint keys: {unexpected}")
+    if missing:
+        raise RuntimeError(f"missing LoRA checkpoint keys: {missing}")

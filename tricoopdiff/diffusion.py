@@ -18,6 +18,8 @@ import torch.nn as nn
 from scipy.spatial.transform import Rotation as R
 
 from .diffdock.utils.geometry import rigid_transform_Kabsch_3D_torch_batch
+from .initialization import TernaryInitializer
+from .rigid import assemble_interface_pair
 
 
 class InterfaceDiffusion(nn.Module):
@@ -169,23 +171,22 @@ class InterfaceDiffusion(nn.Module):
 
         ``E3--Ligand`` and ``POI--Ligand`` are independent DiffDock forward
         variables.  We first noise Ligand once relative to E3 and once relative
-        to the clean POI.  A rigid alignment then maps the second noisy Ligand
-        pose onto the first and applies the same transform to POI.  Consequently
+        to the clean POI. The exact sampled transforms then map the second pose
+        onto the first using the same composition as initialization. Consequently
         each expert observes exactly one native DiffDock marginal, while all
         coordinates remain in one consistent global frame.
         """
         noisy_ligand, tr_e3l, rot_e3l, omega_e3l = self.add_noise_protac(
             ligand_pos, t_e3l, t_e3l, t_e3l,
         )
-        noisy_ligand_pol, tr_pol, rot_pol, omega_pol = self.add_noise_protac(
+        _, tr_pol, rot_pol, omega_pol = self.add_noise_protac(
             ligand_pos, t_pol, t_pol, t_pol,
         )
-        poi_to_global, poi_translation = rigid_transform_Kabsch_3D_torch_batch(
-            noisy_ligand_pol, noisy_ligand,
-        )
-        noisy_poi = (
-            torch.bmm(poi_pos, poi_to_global.transpose(-1, -2))
-            + poi_translation.transpose(-1, -2)
+        center = ligand_pos.mean(dim=1)
+        offset_e3l = center + tr_e3l - (rot_e3l @ center.unsqueeze(-1)).squeeze(-1)
+        offset_pol = center + tr_pol - (rot_pol @ center.unsqueeze(-1)).squeeze(-1)
+        noisy_poi, poi_to_global = assemble_interface_pair(
+            poi_pos, rot_e3l, offset_e3l, rot_pol, offset_pol,
         )
         noise = {
             "e3_ligand": {
@@ -530,210 +531,6 @@ class InterfaceDiffusion(nn.Module):
             'rot_schedule': schedule.copy(),
             'tor_schedule': schedule.copy(),
         }
-
-
-# ------------------------------------------------------------------
-# Initialization
-# ------------------------------------------------------------------
-
-class TernaryInitializer:
-    """
-    Initializes the three-molecule system at t=1 (fully noised).
-
-    Reference: E3 fixed at origin (COM=0).
-    ``native`` reproduces DiffDock's wide PROTAC prior and places POI on a
-    30-60 Å shell. ``coupled5a`` is the validated numerical fallback. The
-    ``anchor_local`` mode preserves the observed E3-POI separation and places
-    PROTAC near a predicted interface anchor with bounded local perturbations.
-    """
-
-    def __init__(
-        self,
-        protac_shell_min: float = 0.0,
-        protac_shell_max: float = 10.0,
-        poi_shell_min: float = 30.0,
-        poi_shell_max: float = 60.0,
-        coupled_radius: float = 5.0,
-    ):
-        self.protac_shell_min = protac_shell_min
-        self.protac_shell_max = protac_shell_max
-        self.poi_shell_min = poi_shell_min
-        self.poi_shell_max = poi_shell_max
-        self.coupled_radius = coupled_radius
-
-    def initialize_protac(
-        self,
-        e3_center: torch.Tensor,
-        ligand_template: torch.Tensor,
-        lig_edge_index=None,
-        lig_edge_mask=None,
-        lig_mask_rotate=None,
-        tr_sigma_max: float = None,
-        init_mode: str = "native",
-        anchor_center: torch.Tensor = None,
-        local_radius: float = 5.0,
-    ) -> torch.Tensor:
-        """
-        Initialize the PROTAC at t=1 (fully noised).
-
-        Two modes:
-
-        * **Legacy shell** (``tr_sigma_max is None``): random point on a
-          spherical shell ``[protac_shell_min, protac_shell_max]`` around
-          ``e3_center`` + a random rotation about the origin, keeping the
-          template torsion angles. Kept for backward compatibility with the old
-          call sites; NOT what native DiffDock does.
-
-        * **Native** (``tr_sigma_max`` given, matching DiffDock's
-          ``randomize_position`` — the 0.844 E3-L baseline path): (1) uniform
-          torsion angles in [-π, π] on all rotatable bonds (``no_torsion: false``),
-          (2) rotate the conformer about its own COM, (3) translate its COM onto
-          the receptor COM (``receptor.pos.mean(0)`` = ``e3_center``), (4) add a
-          Gaussian translation N(0, tr_sigma_max²). This is what makes the
-          zero-FiLM baseline seed-comparable to native DiffDock.
-
-        Args:
-            e3_center: [B, 3] receptor (E3) centroid — native ``receptor.pos.mean(0)``.
-            ligand_template: [N_lig, 3] template ligand geometry.
-            lig_edge_index: [2, E] ligand internal bond edges (native init only).
-            lig_edge_mask: [E] bool rotatable-bond mask (native init only).
-            lig_mask_rotate: [n_rot, N_lig] bool, or list of per-complex masks.
-            tr_sigma_max: translation std for the native Gaussian step (DiffDock's
-                ``initial_noise_std_proportion=-1.0`` -> std = tr_sigma_max = 19.0).
-                When None, use the legacy spherical-shell init.
-
-        Returns:
-            [B, N_lig, 3] initialized ligand positions.
-        """
-        if init_mode not in {"native", "coupled5a", "anchor_local"}:
-            raise ValueError(f"unknown initialization mode: {init_mode}")
-        B = e3_center.shape[0]
-        N_lig = ligand_template.shape[0]
-        device = e3_center.device
-
-        # --- Legacy spherical-shell init -------------------------------------
-        if tr_sigma_max is None:
-            r = (
-                self.protac_shell_min
-                + torch.rand(B, device=device) * (self.protac_shell_max - self.protac_shell_min)
-            )
-            direction = torch.randn(B, 3, device=device)
-            direction = direction / torch.linalg.vector_norm(
-                direction, dim=-1, keepdim=True
-            ).clamp_min(1e-8)
-            translation = e3_center + r.unsqueeze(-1) * direction
-            rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)
-            ligand_pos = ligand_template.unsqueeze(0).repeat(B, 1, 1)
-            ligand_pos = torch.bmm(ligand_pos, rot) + translation.unsqueeze(1)
-            return ligand_pos
-
-        # --- Native DiffDock init (randomize_position) -----------------------
-        from .diffdock.utils.torsion import modify_conformer_torsion_angles
-
-        ligand_pos = ligand_template.unsqueeze(0).repeat(B, 1, 1)  # [B, N_lig, 3]
-
-        # (1) uniform-random torsion angles in [-pi, pi] (no_torsion: false).
-        if lig_edge_mask is not None and bool(lig_edge_mask.any()):
-            rot_edges = lig_edge_index.T[lig_edge_mask]  # [n_rot, 2]
-            n_rot = rot_edges.shape[0]
-            if not isinstance(lig_mask_rotate, (list, tuple)):
-                lig_mask_rotate = [lig_mask_rotate] * B
-            torsion_updates = np.random.uniform(low=-np.pi, high=np.pi, size=(B, n_rot))
-            for b in range(B):
-                mr = lig_mask_rotate[b]
-                if isinstance(mr, torch.Tensor):
-                    mr = mr.detach().cpu().numpy()
-                ligand_pos[b] = modify_conformer_torsion_angles(
-                    ligand_pos[b].detach().cpu(), rot_edges, mr,
-                    torsion_updates[b], as_numpy=False,
-                ).to(device)
-
-        # (2) rotate about the ligand's own COM, then translate onto the selected
-        # anchor. ``anchor_local`` uses a small-angle rotation and a bounded
-        # displacement; ``native``/``coupled5a`` retain their historical priors.
-        # Match vendored DiffDock randomize_position exactly: it draws a single
-        # rotation matrix, applies `@ random_rotation.T`, and then centers onto the
-        # receptor COM before the Gaussian translation. Keeping the transpose here
-        # is important for seed-level parity with the native initialization path.
-        ligand_center = ligand_pos.mean(dim=1, keepdim=True)  # [B, 1, 3]
-        if init_mode == "anchor_local":
-            rot = so3_exp(
-                torch.randn(B, 3, device=device, dtype=ligand_pos.dtype) * 0.25
-            )
-        else:
-            rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)  # [B, 3, 3]
-        ligand_pos = torch.bmm(ligand_pos - ligand_center, rot.transpose(-1, -2)) + e3_center.unsqueeze(1)
-
-        # (3) Gaussian translation N(0, tr_sigma_max^2) (initial_noise_std_proportion=-1.0).
-        if init_mode in {"coupled5a", "anchor_local"}:
-            radius = torch.rand(B, device=device) * (self.coupled_radius if init_mode == "coupled5a" else local_radius)
-            direction = torch.randn(B, 3, device=device)
-            direction = direction / torch.linalg.vector_norm(
-                direction, dim=-1, keepdim=True
-            ).clamp_min(1e-8)
-            tr_update = direction * radius.unsqueeze(-1)
-            if init_mode == "anchor_local":
-                if anchor_center is None:
-                    raise ValueError("anchor_local requires anchor_center")
-                ligand_pos = ligand_pos - e3_center.unsqueeze(1) + anchor_center.unsqueeze(1)
-        else:
-            tr_update = torch.randn(B, 3, device=device) * tr_sigma_max
-        ligand_pos = ligand_pos + tr_update.unsqueeze(1)
-
-        return ligand_pos
-
-    def initialize_poi(
-        self,
-        e3_center: torch.Tensor,
-        poi_template: torch.Tensor,
-        return_rotation: bool = False,
-        init_mode: str = "native",
-        local_radius: float = 5.0,
-    ):
-        """
-        Initialize POI using the selected prior. ``anchor_local`` preserves its
-        current E3-frame center and only applies a bounded local perturbation.
-
-        Args:
-            e3_center: [B, 3] E3 center (typically origin)
-            poi_template: [N_poi, 3] template POI geometry
-        Returns:
-            [B, N_poi, 3] initialized POI positions. If ``return_rotation`` is
-            True, returns ``(poi_pos, rot)`` where ``rot`` [B,3,3] maps current
-            E3-frame row vectors back into the POI template/body frame.
-        """
-        if init_mode not in {"native", "coupled5a", "anchor_local"}:
-            raise ValueError(f"unknown initialization mode: {init_mode}")
-        B = e3_center.shape[0]
-        N_poi = poi_template.shape[0]
-        device = e3_center.device
-
-        if init_mode == "coupled5a":
-            r = torch.rand(B, device=device) * self.coupled_radius
-        elif init_mode == "anchor_local":
-            r = torch.rand(B, device=device) * local_radius
-        else:
-            r = self.poi_shell_min + torch.rand(B, device=device) * (self.poi_shell_max - self.poi_shell_min)
-        direction = torch.randn(B, 3, device=device)
-        direction = direction / torch.linalg.vector_norm(
-            direction, dim=-1, keepdim=True
-        ).clamp_min(1e-8)
-
-        poi_pos = poi_template.unsqueeze(0).repeat(B, 1, 1)
-        poi_center = poi_pos.mean(dim=1, keepdim=True)
-        if init_mode == "anchor_local":
-            rot = so3_exp(
-                torch.randn(B, 3, device=device, dtype=poi_pos.dtype) * 0.25
-            )
-            translation = poi_center.squeeze(1) + r.unsqueeze(-1) * direction
-        else:
-            translation = e3_center + r.unsqueeze(-1) * direction
-            rot = torch.from_numpy(R.random(B).as_matrix()).float().to(device)
-        poi_pos = torch.bmm(poi_pos - poi_center, rot.transpose(-1, -2)) + translation.unsqueeze(1)
-
-        if return_rotation:
-            return poi_pos, rot
-        return poi_pos
 
 
 # ------------------------------------------------------------------

@@ -436,7 +436,8 @@ def test_graph_construction():
 
 def test_initializer_body_frame():
     """The rotation returned by POI initialization is the inverse frame map."""
-    from tricoopdiff.diffusion import TernaryInitializer
+    from scipy.spatial.transform import Rotation
+    from tricoopdiff.rigid import assemble_interface_pair
     from tricoopdiff.graphs import transform_ligand_to_poi_frame
 
     np.random.seed(7)
@@ -448,8 +449,10 @@ def test_initializer_body_frame():
         [0.0, 0.0, 3.0],
     ])
     e3_center = torch.zeros(1, 3)
-    initialized, body_rotation = TernaryInitializer().initialize_poi(
-        e3_center, template, return_rotation=True, init_mode="coupled5a",
+    rotations = torch.tensor(Rotation.random(2).as_matrix(), dtype=template.dtype)
+    initialized, body_rotation = assemble_interface_pair(
+        template.unsqueeze(0), rotations[0:1], torch.randn(1, 3),
+        rotations[1:2], torch.randn(1, 3),
     )
     translation = initialized[0].mean(0) - e3_center[0]
     local = transform_ligand_to_poi_frame(

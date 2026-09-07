@@ -65,7 +65,20 @@ def test_parameter_groups_and_adapter_state_roundtrip():
     ), "LoRA checkpoint roundtrip changed adapter weights"
 
 
+def test_adapter_restore_rejects_missing_tensor():
+    expert = TinyExpert()
+    state = expert_lora_state_dict(expert)
+    state.pop(next(iter(state)))
+    try:
+        load_expert_lora_state_dict(TinyExpert(), state)
+    except RuntimeError as error:
+        assert "missing LoRA checkpoint keys" in str(error)
+    else:
+        raise AssertionError("incomplete LoRA state must be rejected")
+
+
 if __name__ == "__main__":
     test_zero_init_is_transparent_and_branches_are_independent()
     test_parameter_groups_and_adapter_state_roundtrip()
+    test_adapter_restore_rejects_missing_tensor()
     print("LoRA tests passed")

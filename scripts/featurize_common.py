@@ -46,7 +46,7 @@ os.chdir(_PROJECT_ROOT)
 # Featurization cache schema version. Bump whenever the geometry/frame handling
 # of the produced data changes, so stale on-disk caches (written before the
 # shared-reference-frame fix) are invalidated instead of silently reused.
-_FEATURIZE_CACHE_VERSION = 4
+_FEATURIZE_CACHE_VERSION = 5
 
 
 def _featurize_signature(protein1, protein2, ligand_path, score_model_args):
@@ -217,7 +217,15 @@ def extract_ligand(batch_graph, device):
     mask_rotate = batch_graph['ligand'].mask_rotate
     if isinstance(mask_rotate, (list, tuple)):
         mask_rotate = mask_rotate[0]
+    from rdkit import Chem
+
+    mol = batch_graph.mol[0] if isinstance(batch_graph.mol, (list, tuple)) else batch_graph.mol
+    if mol.GetNumAtoms() != batch_graph['ligand'].pos.shape[0]:
+        mol = Chem.RemoveHs(mol)
+    if mol.GetNumAtoms() != batch_graph['ligand'].pos.shape[0]:
+        raise ValueError("RDKit atom order/count does not match ligand graph")
     return {
+        'mol': mol.ToBinary(),
         'coords': batch_graph['ligand'].pos.unsqueeze(0).to(device),
         'features': batch_graph['ligand'].x.unsqueeze(0).to(device),
         'edge_index': batch_graph['ligand', 'ligand'].edge_index.to(device),
@@ -344,7 +352,7 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
 
     if cache_path is not None:
         os.makedirs(cache_dir, exist_ok=True)
-        torch.save({
+        payload = {
             'e3_data': _strip_batch_and_cpu(e3_data),
             'poi_data': _strip_batch_and_cpu(poi_data),
             'ligand_data': _strip_batch_and_cpu(ligand_data),
@@ -352,6 +360,9 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
             't_e3_to_poi': torch.tensor(t_e3_to_poi, dtype=torch.float32),
             'cache_version': _FEATURIZE_CACHE_VERSION,
             'source_signature': cache_signature,
-        }, cache_path)
+        }
+        temporary_path = cache_path.with_suffix(cache_path.suffix + '.tmp')
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, cache_path)
 
     return e3_data, poi_data, ligand_data, receptor_feat_dim
