@@ -122,6 +122,11 @@ def test_completed_report_requires_matching_checkpoint(tmp_path):
     assert evaluation_common.completed_report(
         path, "demo", "best.pt", require_exact_dockq=True,
     )
+    report['ensemble']['n_exact_dockq_walkers'] = 1
+    path.write_text(json.dumps(report), encoding='utf-8')
+    assert not evaluation_common.completed_report(
+        path, 'demo', 'best.pt', require_exact_dockq=True,
+    )
 
 
 def test_resume_fingerprints_detect_same_path_replacement(tmp_path):

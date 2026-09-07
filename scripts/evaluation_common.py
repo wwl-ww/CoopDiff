@@ -97,6 +97,10 @@ def completed_report(path, case, checkpoint, expected_config=None,
         not require_exact_dockq
         or (isinstance(dockq, (int, float)) and math.isfinite(dockq))
     )
+    if require_exact_dockq and 'n_exact_dockq_walkers' in ensemble:
+        exact_dockq_matches &= (
+            ensemble['n_exact_dockq_walkers'] == ensemble.get('n_valid_walkers', 0)
+        )
     expected_walkers = (expected_config or {}).get("n_walkers")
     walker_count_matches = (
         expected_walkers is None

@@ -345,14 +345,16 @@ POI-L `1.247008/1.247022`；正确条件更好分别为 `12/27`、`11/27`。
 验证 253 accepted / 1 rejected；111 个拒绝项全部为协议预期的不连通配体，
 无其他 materialization error，合计 7,087 usable cases。
 索引：`/tmp/pymp-f2c2db1a/epoch20_evaluation/indexes/ternary_{train,val}.json`。
-验证 253/253 通过有限坐标与双界面接触审计；训练集同项审计进行中。
+验证 253/253、训练 6,834/6,834 均通过有限坐标与双界面接触审计，无失败。
+证据：`results/epoch20_input_audit_{train,val}.json`。
 审计显式使用 `--min-ligand-heavy-atoms 1`，不套用旧的 20-heavy-atom 过滤器。
 联合池是 PROTAC/MGD 两训练来源的交集，不能把来源目录直接当作互斥任务标签。
 本轮 loss 统计只覆盖 6 个结构，不声称已完成全池神经网络 loss 归因。
 
 ## 后续生成质量评估（用户追加）
 
-完成上述检查及数据门禁后，使用未经诊断更新的原始 `checkpoint_epoch20.pt`，
+上述 8 项均已给出执行回复与结论；未证实的假设保留限制，不标作通过。
+数据门禁完成，现进入生成质量评估，使用未经诊断更新的原始 `checkpoint_epoch20.pt`，
 按 `doc/Phase 1 数据协议.md` 评估 PROTAC22 unbound × 40 seeds、MGD94 bound × 1 seed，
 SDPI 初始化、20 步、seed=0 起始，仅物理 GPU 3；先做单例完整原子 DockQ 门禁。
 权重、索引哈希和逐 case 输出须保留。PROTAC 的 best 只称 oracle-best，
@@ -371,3 +373,24 @@ PROTAC 不注入 DeepTernary 的双端点二元先验，因此历史 DeepTernary
 代码提交：`14a0c02`（真实 checkpoint 受控诊断）、`a5ce49d`（官方输入准备与逐 seed 记录）。
 回归：model-build 全部通过；数据/evaluation helper 共 21 项通过；逐 seed 与
 unbound-template 刚体重建测试通过。`.gitignore` 用户原有改动未包含在提交中。
+
+### 推理门禁与当前进度
+
+- PROTAC 首次门禁发现 Cα alternate-location 数量不一致；改用与 DiffDock 相同的
+  ProDy/get_coords 选择后解决。失败产物保留在 `results/epoch20_protac_gate{,_v2}/`。
+- 共享盘 `DockQ/fnat` 无法执行；改用已有 `/tmp/pymp-f2c2db1a/DeepTernary` 副本，
+  `dockq_util.py` 与 `fnat` SHA256 均与仓库一致，分别为
+  `22389a7e0743119b969f8c3788203dbc2c860274198c7cf3ac9adb7795b3b7fc`、
+  `6ce16a2241b4dd1d44486343a126ecdb010d09b978f6511282d4420f091218fa`。
+  通过 `--deepternary-root` 显式指定，报告记录两项哈希。
+- 完整原子门禁通过：`5T35_D_A_759` seed 0 DockQ 约 `0.0129`；
+  `3JRQ_B_A_A8S` seed 0 DockQ 约 `0.0186`，各 1/1 有效且完成精确打分。
+  证据：`results/epoch20_protac_gate_v3/`、`results/epoch20_mgd_gate/`。
+- 已启动 PROTAC 官方 22×40、MGD 官方 94×1，20 步，物理 GPU 3。
+  PROTAC 分为 8/7/7-case 三片，输出 `results/epoch20_benchmarks/protac/shard_{0,1,2}/`；
+  MGD 输出 `results/epoch20_benchmarks/mgd/`。日志为
+  `results/epoch20_protac_shard{0,1,2}.log` 与 `results/epoch20_mgd.log`。
+  所有 shard 同时只占用 GPU 3，不使用其他 GPU。
+- 修正批处理状态：完整原子 DockQ 缺失不再写成成功；逐 seed 报告先保存再标记失败。
+  新增官方集合汇总器，缺失 case 和失败 seed 计入分母，不能只汇总幸存样本。
+  最终汇总尚未完成，当前单例数值不能当作 benchmark 结果。

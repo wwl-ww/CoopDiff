@@ -29,8 +29,12 @@ class EvaluationRunner:
 
     def __init__(self, project_root, checkpoint, device="cuda",
                  model_dir="checkpoints/score_model",
-                 expert_checkpoint="best_ema_inference_epoch_model.pt"):
+                 expert_checkpoint="best_ema_inference_epoch_model.pt",
+                 deepternary_root=None):
         self.root = Path(project_root).resolve()
+        self.deepternary_root = (
+            self.root / (deepternary_root or 'DeepTernary')
+        ).resolve()
         self.device = torch.device(device)
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but is unavailable")
@@ -120,7 +124,7 @@ class EvaluationRunner:
                 "protein1_pdb": str(paths["protein1"]),
                 "protein2_pdb": str(paths["protein2"]),
                 "ligand_pdb": str(paths["ligand"]),
-                "deepternary_root": str(self.root / "DeepTernary"),
+                "deepternary_root": str(self.deepternary_root),
                 **{key + '_pdb': str(paths[key]) for key in
                    ('metric_protein1', 'metric_protein2') if key in paths},
             },
@@ -148,6 +152,9 @@ class EvaluationRunner:
                 if 'metric_protein1' in paths else "input_allatom_rigid_motion"
             ),
             "expert_model_dir": str(self.model_dir),
+            "deepternary_root": str(self.deepternary_root),
+            "dockq_source_sha256": sha256_file(self.deepternary_root / 'DockQ/dockq_util.py'),
+            "dockq_binary_sha256": sha256_file(self.deepternary_root / 'DockQ/fnat'),
             "dockq_implementation": (
                 "DeepTernary/DockQ/dockq_util.py::cal_dockq"
                 if native_complex_pdb else None

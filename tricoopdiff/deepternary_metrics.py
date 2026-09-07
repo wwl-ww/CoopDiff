@@ -59,6 +59,14 @@ def _ca_coords(lines):
     ])
 
 
+def _featurized_ca_coords(path):
+    """Use DiffDock's residue/alternate-location selection and atom order."""
+    import prody as pr
+    from .diffdock.datasets.parse_chi import get_coords
+
+    return get_coords(pr.parsePDB(str(path)))[:, 1, :]
+
+
 def _fit_rigid(source, target):
     """Return row-vector transform ``source @ R + t == target``."""
     if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
@@ -103,8 +111,8 @@ def compute_fullatom_dockq(
     p1_lines, _, _ = _records(protein1_pdb, "ATOM")
     p2_lines, p2_indices, p2_atoms = _records(protein2_pdb, "ATOM")
     lig_lines, lig_indices, _ = _ligand_records(ligand_pdb)
-    p1_ca = _ca_coords(p1_lines)
-    p2_ca = _ca_coords(p2_lines)
+    p1_ca = _featurized_ca_coords(protein1_pdb)
+    p2_ca = _featurized_ca_coords(protein2_pdb)
 
     # Move TriCoopDiff's shared E3 frame back into the original PDB frame.
     frame_r, frame_t = _fit_rigid(np.asarray(featurized_e3_ca), p1_ca)
