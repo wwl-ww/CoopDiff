@@ -64,6 +64,8 @@ def test_ligand_graph_gate_rejects_bondless_input(tmp_path):
 
 
 def test_ligand_graph_repairs_plausible_missing_pdb_bond(tmp_path):
+    from rdkit import Chem
+    from unittest.mock import patch
     pdb = tmp_path / 'ligand.pdb'
     pdb.write_text(
         'HETATM    1  C1  LIG A   1       0.000   0.000   0.000  1.00  0.00           C  \n'
@@ -73,7 +75,19 @@ def test_ligand_graph_repairs_plausible_missing_pdb_bond(tmp_path):
         'END\n',
         encoding='utf-8',
     )
-    make_deepternary_index.validate_ligand_graph(pdb)
+    # RDKit versions differ in whether 1.82 A is inferred automatically.
+    # Force the missing-bond input; the second parse must read the real repair.
+    original_read = Chem.MolFromPDBFile
+    def read_missing_bond(*args, **kwargs):
+        molecule = original_read(*args, **kwargs)
+        if 'CONECT' not in pdb.read_text(encoding='utf-8'):
+            editable = Chem.RWMol(molecule)
+            if editable.GetBondBetweenAtoms(1, 2) is not None:
+                editable.RemoveBond(1, 2)
+            molecule = editable.GetMol()
+        return molecule
+    with patch.object(Chem, 'MolFromPDBFile', side_effect=read_missing_bond):
+        make_deepternary_index.validate_ligand_graph(pdb)
     assert 'CONECT    2    3' in pdb.read_text(encoding='utf-8')
 
 

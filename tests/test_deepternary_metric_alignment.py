@@ -43,8 +43,10 @@ def test_sdf_ligand_records_preserve_atom_order():
         writer.write(molecule)
         writer.close()
         lines, indices, coords = exact._ligand_records(path)
-    assert len(indices) == molecule.GetNumAtoms()
-    assert coords.shape == (molecule.GetNumAtoms(), 3)
+    heavy = Chem.RemoveHs(molecule)
+    assert len(indices) == heavy.GetNumAtoms()
+    assert coords.shape == (heavy.GetNumAtoms(), 3)
+    assert np.allclose(coords, heavy.GetConformer().GetPositions(), atol=1e-3), 'heavy atom order changed'
     assert all(lines[index].startswith(("ATOM", "HETATM")) for index in indices)
 
 
