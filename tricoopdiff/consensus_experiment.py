@@ -121,3 +121,52 @@ class ExperimentalConsensusTrainer(ConsensusTrainer):
         self.global_step = payload['global_step']
         self.resume_epoch = payload['training_state']['epoch']
         self.resume_best_val_loss = payload['training_state']['best_val_loss']
+
+
+class RolloutAugmentedTrainer(ExperimentalConsensusTrainer):
+    """Mix teacher states with one-step states produced by the current model."""
+
+    def __init__(self, *args, rollout_probability=0.5, rollout_steps=1, **kwargs):
+        if not 0 <= rollout_probability <= 1:
+            raise ValueError('rollout_probability must be in [0, 1]')
+        if not isinstance(rollout_steps, int) or rollout_steps < 1:
+            raise ValueError('rollout_steps must be a positive integer')
+        self.rollout_probability = float(rollout_probability)
+        self.rollout_steps = rollout_steps
+        self.rollout_augmented_states = 0
+        super().__init__(*args, **kwargs)
+
+    def _training_state(self, e3_data, poi_data, ligand_data, coupling, t, dt):
+        teacher = self.diffusion.path(
+            ligand_data, poi_data['coords'], coupling, t)
+        if (self.rollout_probability == 0 or float(t.item()) >= 1
+                or float(torch.rand((), device=t.device)) >= self.rollout_probability):
+            return teacher
+
+        start = torch.clamp(t + dt * self.rollout_steps, max=1.0)
+        step_dt = (start - t) / self.rollout_steps
+        if not bool((step_dt > 0).all()):
+            return teacher
+        ligand, poi, body, _ = self.diffusion.path(
+            ligand_data, poi_data['coords'], coupling, start)
+        with torch.no_grad():
+            current = start
+            for _ in range(self.rollout_steps):
+                output = self._forward_state(
+                    e3_data, poi_data, ligand_data,
+                    ligand, poi, body, current, step_dt)
+                normalized = self.diffusion.normalized_predictions(output, current)
+                velocities = self.diffusion.velocities(
+                    normalized, e3_data['coords'], poi_data['coords'])
+                ligand, poi, body = self.diffusion.step(
+                    ligand, poi, body, velocities, step_dt, ligand_data)
+                current = current - step_dt
+        self.rollout_augmented_states += 1
+        return ligand.detach(), poi.detach(), body.detach(), teacher[3]
+
+    def runtime_contract(self):
+        return {
+            **super().runtime_contract(),
+            'rollout_probability': self.rollout_probability,
+            'rollout_steps': self.rollout_steps,
+        }

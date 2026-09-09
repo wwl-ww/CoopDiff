@@ -174,3 +174,29 @@ GPU-3ac265b1-130f-cf53-b680-8730370a5881
 
 当前 GPU3 已释放。工作树位于 `/tmp/coopdiff/repair_knn`，运行命令应从该目录
 执行；模型、数据和实验结果位于 `/tmp/coopdiff`，共享盘版本仅作为源仓库。
+
+## Rollout augmentation 小试验
+
+已实现 `RolloutAugmentedTrainer`，它在普通 teacher state 中按概率混入当前模型
+从更高时间点自由积分 1 或 5 步后到达的 off-path state。实验均从上述最佳
+checkpoint 的 EMA 权重开始，用 32 个训练 cluster、8 个验证 cluster 和 50%
+混合率做短程微调。
+
+一阶段 rollout（5 epochs）的最佳 checkpoint 在 8-case × 2-seed、20-step
+自由采样上没有改善：近似 DockQ 为 0.06925（base 0.06940），中心误差也基本
+不变。五阶段 rollout（3 epochs）的最佳 checkpoint 有弱正信号：近似 DockQ
+0.07407（base 0.06939），ligand/POI center error 分别从 31.37/41.48 Å 降至
+31.23/41.29 Å，但 PROTAC RMSD 从 2.51 Å 升至 2.55 Å。改善远小于总体刚体
+误差，且尚未用精确 DockQ 证实，不能视为根因修复或据此启动长训练。
+
+这说明单纯把同一 coupling 的解析速度目标搬到模型产生的 off-path state，监督
+信号仍可能不充分。下一步应优先验证 reflow/重新配对的 off-path target，或改为
+直接预测去噪 endpoint；任何候选都必须以 free-rollout 精确 DockQ 选型。
+
+相关结果：
+
+```text
+/tmp/coopdiff/results/rollout_pilot_32x8_v1/free_rollout_evaluation.json
+/tmp/coopdiff/results/rollout_pilot_32x8_v1/free_rollout_latest_evaluation.json
+/tmp/coopdiff/results/rollout_pilot_32x8_steps5_v1/free_rollout_evaluation.json
+```
