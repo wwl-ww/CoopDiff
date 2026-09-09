@@ -31,7 +31,8 @@ def test_invalid_parent_rejected_before_signals():
         kill.assert_not_called()
 
 
-def test_handoff_preserves_worker_and_continues_evaluations(tmp_path):
+def test_handoff_preserves_worker_and_continues_evaluations(tmp_path, foreground=False):
+    (tmp_path / "train.log").write_text("train 10 0.5\n")
     plan = json.loads((ROOT / 'scripts/overnight_v2.json').read_text())
     (tmp_path / 'plan.json').write_text(json.dumps(plan))
     state = {'architecture': plan['architecture'], 'status': 'running', 'run_id': 'test',
@@ -41,7 +42,7 @@ def test_handoff_preserves_worker_and_continues_evaluations(tmp_path):
     (tmp_path / 'status.json').write_text(json.dumps(state))
     ticks = int(time.monotonic() * os.sysconf('SC_CLK_TCK'))
     runner = {'pid': 1111, 'parent': 1, 'session': 1111, 'ticks': ticks,
-              'command': [sys.executable, str(ROOT / 'scripts/run_overnight.py'),
+              'command': [sys.executable, '-u', str(ROOT / 'scripts/run_overnight.py'),
                           '--out', str(tmp_path)]}
     worker = {'pid': 2222, 'parent': 1111, 'session': 2222, 'ticks': ticks,
               'command': [sys.executable, str(ROOT / 'scripts/v2_experiment.py'),
@@ -57,7 +58,7 @@ def test_handoff_preserves_worker_and_continues_evaluations(tmp_path):
             patch('takeover_overnight.gpu3_visibility', return_value='GPU-3'), \
             patch('takeover_overnight.validate_report', side_effect=report), \
             patch('takeover_overnight.run_command') as run:
-        assert supervise(tmp_path, 1111, 2222) == 0
+        assert supervise(tmp_path, 1111, 2222, foreground=foreground) == 0
         assert kill.call_args_list == [((1111, signal.SIGSTOP),), ((1111, signal.SIGKILL),)]
         killpg.assert_not_called()
         assert run.call_count == 2
@@ -67,6 +68,7 @@ def test_handoff_preserves_worker_and_continues_evaluations(tmp_path):
     result = json.loads((tmp_path / 'status.json').read_text())
     assert result['status'] == 'complete'
     assert result['supervision']['training_restarted'] is False
+    assert result['supervision']['mode'] == ('foreground' if foreground else 'detached')
 
 
 if __name__ == '__main__':
@@ -74,4 +76,6 @@ if __name__ == '__main__':
     test_invalid_parent_rejected_before_signals()
     with tempfile.TemporaryDirectory(prefix='takeover-test-') as directory:
         test_handoff_preserves_worker_and_continues_evaluations(Path(directory))
+    with tempfile.TemporaryDirectory(prefix='foreground-test-') as directory:
+        test_handoff_preserves_worker_and_continues_evaluations(Path(directory), foreground=True)
     print('Overnight handoff checks passed')

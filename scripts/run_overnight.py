@@ -195,9 +195,10 @@ def run_plan(plan, output, python, require_allocation=True, direct_gpu3=False):
     checkpoint = None
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=visible_gpu, HF_HUB_OFFLINE='1',
                TRANSFORMERS_OFFLINE='1', PYTHONUNBUFFERED='1',
-               HF_HOME='/tmp/pymp-f2c2db1a/results/huggingface',
+               HF_HOME=os.environ.get('HF_HOME', str(ROOT / 'results/huggingface')),
                CUBLAS_WORKSPACE_CONFIG=':4096:8',
-               TRICOOPDIFF_CACHE_DIR='/tmp/pymp-f2c2db1a/results/runtime_cache/diffdock')
+               TRICOOPDIFF_CACHE_DIR=os.environ.get(
+                   'TRICOOPDIFF_CACHE_DIR', str(ROOT / 'results/runtime_cache/diffdock')))
     try:
         for i, stage in enumerate(plan['stages']):
             name = stage['name']

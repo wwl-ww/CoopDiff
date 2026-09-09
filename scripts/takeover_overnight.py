@@ -1,4 +1,4 @@
-"""Detach supervision of an already-running v2 train stage without restarting it.
+"""Transfer supervision of an already-running v2 train stage without restarting it.
 
 Linux-only, explicit PID handoff. Prior gates are revalidated before the old
 supervisor is stopped. The training process already has its own session and
@@ -39,7 +39,10 @@ def verify_processes(output, runner, worker):
         raise ValueError('training worker is not a child of the specified supervisor')
     for info, script in ((runner, 'run_overnight.py'), (worker, 'v2_experiment.py')):
         command = info['command']
-        if len(command) < 2 or Path(command[1]).resolve() != ROOT / 'scripts' / script:
+        script_args = command[1:]
+        while script_args and script_args[0] in ('-u', '-B'):
+            script_args = script_args[1:]
+        if not script_args or Path(script_args[0]).resolve() != ROOT / 'scripts' / script:
             raise ValueError('unexpected command identity')
         expected_output = output if info is runner else output / 'train'
         if '--out' not in command or Path(command[command.index('--out') + 1]).resolve() != expected_output:
@@ -65,7 +68,7 @@ def terminate_worker(identity):
         os.killpg(identity['pid'], signal.SIGKILL)
 
 
-def supervise(output, runner_pid, worker_pid):
+def supervise(output, runner_pid, worker_pid, foreground=False):
     plan = json.loads((output / 'plan.json').read_text())
     total = validate_plan(plan)
     state = json.loads((output / 'status.json').read_text())
@@ -94,6 +97,16 @@ def supervise(output, runner_pid, worker_pid):
     if deadline <= time.monotonic():
         raise ValueError('training budget already expired')
 
+    log_position = (output / 'train.log').stat().st_size if foreground else 0
+
+    def show_training_output():
+        nonlocal log_position
+        if foreground:
+            with (output / 'train.log').open() as stream:
+                stream.seek(log_position)
+                print(stream.read(), end='', flush=True)
+                log_position = stream.tell()
+
     # Freeze to eliminate a race with the old supervisor starting an evaluation.
     os.kill(runner_pid, signal.SIGSTOP)
     try:
@@ -107,26 +120,32 @@ def supervise(output, runner_pid, worker_pid):
         if same_process(runner):
             os.kill(runner_pid, signal.SIGCONT)
         raise
-    state['supervision'] = {'mode': 'detached', 'pid': os.getpid(),
-                            'replaced_pid': runner_pid, 'training_pid': worker_pid,
-                            'training_restarted': False, 'log': str(output / 'supervisor.log')}
+    log_name = 'supervisor.foreground.log' if foreground else 'supervisor.log'
+    state['supervision'] = {
+        'mode': 'foreground' if foreground else 'detached', 'pid': os.getpid(),
+        'replaced_pid': runner_pid, 'training_pid': worker_pid,
+        'training_restarted': False, 'log': str(output / log_name),
+    }
     write_json(output / 'status.json', state)
     write_json(output / 'supervisor.json', state['supervision'])
     print(f'ATTACHED: supervisor={os.getpid()}, existing training={worker_pid}', flush=True)
     try:
         while same_process(worker):
+            show_training_output()
             if time.monotonic() >= deadline:
                 terminate_worker(worker)
                 raise TimeoutError('original training-stage deadline exceeded')
             time.sleep(2)
+        show_training_output()
         checkpoint = validate_report(output / 'train.json', state['architecture'],
                                      'train', state['run_id'], checkpoint)
         state['stages'][-1].update(status='passed', elapsed_seconds=time.monotonic() - worker_start)
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu, HF_HUB_OFFLINE='1',
                    TRANSFORMERS_OFFLINE='1', PYTHONUNBUFFERED='1',
-                   HF_HOME='/tmp/pymp-f2c2db1a/results/huggingface',
+                   HF_HOME=os.environ.get('HF_HOME', str(ROOT / 'results/huggingface')),
                    CUBLAS_WORKSPACE_CONFIG=':4096:8',
-                   TRICOOPDIFF_CACHE_DIR='/tmp/pymp-f2c2db1a/results/runtime_cache/diffdock')
+                   TRICOOPDIFF_CACHE_DIR=os.environ.get(
+                       'TRICOOPDIFF_CACHE_DIR', str(ROOT / 'results/runtime_cache/diffdock')))
         for stage in plan['stages'][index + 1:]:
             name = stage['name']
             record = {'name': name, 'status': 'running'}
@@ -169,6 +188,8 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--runner-pid', type=int, required=True)
     parser.add_argument('--worker-pid', type=int, required=True)
+    parser.add_argument('--foreground', action='store_true',
+                        help='Stream ongoing training output to the attached terminal')
     args = parser.parse_args()
     output = args.out.resolve()
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
@@ -177,7 +198,7 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     with (output / '.supervisor.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return supervise(output, args.runner_pid, args.worker_pid)
+        return supervise(output, args.runner_pid, args.worker_pid, args.foreground)
 
 
 if __name__ == '__main__':
