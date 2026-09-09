@@ -68,6 +68,7 @@ class TriCoopDiffTrainer:
         # boundary so library callers cannot silently run a different model
         # from the trainer's recorded checkpoint contract.
         os.environ['NAN_CLAMP'] = str(self.activation_clamp)
+        os.environ['NAN_CLAMP_MODE'] = 'componentwise'
         if torsion_expert_aux_weight < 0:
             raise ValueError("torsion_expert_aux_weight must be non-negative")
         self.torsion_expert_aux_weight = float(torsion_expert_aux_weight)

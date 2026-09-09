@@ -10,6 +10,7 @@ from .checkpoint_contract import expert_base_identity, validate_expert_base_iden
 from .consensus import ARCHITECTURE, CONSENSUS_CHECKPOINT_VERSION
 from .diffdock.utils.torus import SCORE_NORM_VERSION, validate_score_norm_version
 from .sdpi_flow import FLOW_VERSION
+from .equivariant_clamp import validate_clamp_mode
 from .train import TriCoopDiffTrainer
 
 
@@ -24,6 +25,7 @@ def validate_consensus_checkpoint(payload):
         if not payload.get(key):
             raise ValueError(f'consensus checkpoint missing {key}')
     config = payload.get('runtime_config', {})
+    validate_clamp_mode(config.get('activation_clamp_mode', 'componentwise'))
     for key in ('activation_clamp', 'residual_weight', 'ema_decay'):
         value = config.get(key)
         if not isinstance(value, (int, float)) or not math.isfinite(value):
@@ -34,12 +36,15 @@ def validate_consensus_checkpoint(payload):
 
 
 class ConsensusTrainer(TriCoopDiffTrainer):
-    def __init__(self, *args, residual_weight=1e-3, ema_decay=0.999, **kwargs):
+    def __init__(self, *args, residual_weight=1e-3, ema_decay=0.999,
+                 activation_clamp_mode='irrep_norm', **kwargs):
         if not math.isfinite(residual_weight) or residual_weight < 0 or not 0 <= ema_decay < 1:
             raise ValueError('invalid residual regularization or EMA decay')
         kwargs['torsion_expert_aux_weight'] = 0.0
         kwargs['lora_warmup_steps'] = 0
         super().__init__(*args, **kwargs)
+        self.activation_clamp_mode = validate_clamp_mode(activation_clamp_mode)
+        os.environ['NAN_CLAMP_MODE'] = self.activation_clamp_mode
         self.residual_weight = float(residual_weight)
         self.ema_decay = float(ema_decay)
         self.set_phase(1)
@@ -78,6 +83,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             'runtime_config': {
                 'torus_score_norm_version': SCORE_NORM_VERSION,
                 'activation_clamp': self.activation_clamp,
+                'activation_clamp_mode': self.activation_clamp_mode,
                 'residual_weight': self.residual_weight, 'ema_decay': self.ema_decay,
                 'optimizer_groups': self.optimizer_config,
             },
@@ -99,6 +105,10 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         validate_expert_base_identity(payload, self.model.expert)
         if payload['model_config'] != self.model.trifuse.config:
             raise ValueError('consensus model configuration differs from checkpoint')
+        saved_mode = payload['runtime_config'].get('activation_clamp_mode', 'componentwise')
+        if saved_mode != self.activation_clamp_mode:
+            raise ValueError(f'checkpoint activation_clamp_mode={saved_mode!r}; '
+                             'construct the trainer with that explicit mode to resume')
         expected = {'activation_clamp': self.activation_clamp,
                     'residual_weight': self.residual_weight, 'ema_decay': self.ema_decay,
                     'optimizer_groups': self.optimizer_config}

@@ -92,6 +92,15 @@ def test_consensus_builder_passes_only_active_model_dimensions():
         )
         assert result is model.return_value
         assert trained is trainer.return_value
+        assert trainer.call_args.kwargs['activation_clamp_mode'] == 'irrep_norm'
+
+
+def test_legacy_clamp_mode_is_explicitly_selectable():
+    args = parse_args([
+        '--train_data', 'unused.json', '--val_data', 'unused.json',
+        '--output_dir', 'unused', '--activation-clamp-mode', 'componentwise',
+    ])
+    assert args.activation_clamp_mode == 'componentwise'
 
 
 def test_consensus_builder_rejects_lora_before_loading_expert():
@@ -112,4 +121,5 @@ if __name__ == "__main__":
     test_trainer_owns_recorded_activation_clamp_runtime()
     test_consensus_builder_passes_only_active_model_dimensions()
     test_consensus_builder_rejects_lora_before_loading_expert()
+    test_legacy_clamp_mode_is_explicitly_selectable()
     print("Training-contract tests passed")

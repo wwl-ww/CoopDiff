@@ -129,11 +129,14 @@ def sha256_file(path, chunk_size=1024 * 1024):
 
 
 def evaluation_input_signature(paths, native_complex_pdb=None):
-    """Fingerprint actual case inputs, including the reference used for metrics."""
+    """Fingerprint inputs, metric references and the directed-graph convention."""
     sources = {**paths, "native_complex_pdb": native_complex_pdb}
     payload = {
         key: ({"path": str(Path(path).resolve()), "sha256": sha256_file(path)}
               if path is not None else None)
         for key, path in sources.items()
     }
+    # Corrected preprocessing must not resume reports made with reversed edges.
+    payload['receptor_knn_convention'] = 'neighbor_to_query_no_self_v3_direct_distance'
+    payload['radius_convention'] = 'torch_cluster_1.6.3_cuda_source_scan_strict_v1'
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()

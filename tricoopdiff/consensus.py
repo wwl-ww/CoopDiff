@@ -124,6 +124,13 @@ class ConsensusCoopDiff(nn.Module):
         self.use_film = False
         self._conditioning = SDPIFlow()
 
+    def _expert_context(self):
+        return torch.no_grad()
+
+    def _select_expert_branch(self, index):
+        """Frozen production experts have no branch-specific parameters."""
+        return None
+
     def forward(self, e3_data, poi_data, ligand_data, t_e3l, t_pol=None,
                 r_e3_to_poi=None, receptor_crop_cutoff=None, diffusion_state=None):
         if t_e3l.shape != (1,):
@@ -137,8 +144,9 @@ class ConsensusCoopDiff(nn.Module):
         raw = {}
         # Private graph tensors ensure even in-place expert internals cannot
         # mutate the shared state or the other branch's input.
-        with torch.no_grad():
+        with self._expert_context():
             for index, (branch, receptor) in enumerate(zip(BRANCHES, (e3_data, poi_data))):
+                self._select_expert_branch(index)
                 center = receptor['coords'][0].mean(0)
                 rotation = frame if index else torch.eye(3, device=frame.device, dtype=frame.dtype)
                 rec_pos = (receptor['coords'][0] - center) @ rotation

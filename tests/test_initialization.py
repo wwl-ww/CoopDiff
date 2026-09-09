@@ -104,6 +104,23 @@ def test_joint_initialization_is_shared_and_reproducible():
     assert len(meta['torsion_updates']) == int(data['edge_mask'].sum())
 
 
+def test_diffdock_conformer_policy_is_explicit_and_reproducible():
+    data = ligand_input()
+    receptor = torch.tensor([[0., 0., 0.], [2., 0., 0.], [0., 3., 0.]])
+    init = TernaryInitializer(conformer_policy="diffdock_v1_1")
+    first = init.initialize(receptor, receptor * 2, data, seed=17)
+    second = init.initialize(receptor, receptor * 2, data, seed=17)
+    assert torch.equal(first[0], second[0])
+    assert first[3]["conformer"]["policy"] == "diffdock_v1_1"
+    assert first[3]["conformer"]["method"] == "ETKDGv2"
+    try:
+        TernaryInitializer(conformer_policy="unknown")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown conformer policy accepted")
+
+
 def test_bad_atom_and_torsion_maps_fail():
     data = ligand_input()
     mol = Chem.Mol(data['mol'])

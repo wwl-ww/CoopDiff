@@ -86,8 +86,14 @@ def build_parser():
     )
     p.add_argument("--init-mode", choices=["sdpi"], default="sdpi",
                    help="Shared full-ligand dual binary receptor-size-adaptive prior")
+    p.add_argument("--conformer-policy",
+                   choices=["etkdgv3_random", "diffdock_v1_1"],
+                   default="etkdgv3_random",
+                   help="Blind ligand conformer generator")
     p.add_argument("--t-anchor", type=float, choices=[1.0], default=None,
                    help="sdpi starts at t=1; other values are rejected")
+    p.add_argument("--translation-velocity-scale", type=float, default=1.0)
+    p.add_argument("--rotation-velocity-scale", type=float, default=1.0)
     return p
 
 
@@ -97,6 +103,7 @@ def main():
         raise SystemExit("FATAL: --nan-clamp must be positive")
     if args.trifuse_ckpt is None:
         os.environ["NAN_CLAMP"] = str(args.nan_clamp)
+        os.environ['NAN_CLAMP_MODE'] = 'irrep_norm'
 
     if args.trifuse_ckpt is None and not args.allow_zero_init:
         print("FATAL: --trifuse-ckpt is required; use --allow-zero-init only "
@@ -165,6 +172,7 @@ def main():
                 _PROJECT_ROOT, checkpoint=args.trifuse_ckpt,
                 device=args.device, model_dir=args.model_dir,
                 expert_checkpoint=args.ckpt,
+                conformer_policy=args.conformer_policy,
             )
             report = runner.evaluate_case(
                 args.case, paths, cache_dir=_PROJECT_ROOT / args.cache_dir,
@@ -173,6 +181,8 @@ def main():
                 freeze_poi=args.freeze_poi, init_mode=args.init_mode,
                 t_anchor=args.t_anchor, debug_trace=args.debug_trace,
                 debug_seed=args.debug_seed,
+                translation_velocity_scale=args.translation_velocity_scale,
+                rotation_velocity_scale=args.rotation_velocity_scale,
             )
         except (OSError, RuntimeError, ValueError) as error:
             print(f"FATAL: trained evaluation failed: {error}", flush=True)
@@ -227,6 +237,7 @@ def main():
     diffusion = SDPIFlow()
     initializer = TernaryInitializer(
         no_torsion=getattr(score_model_args, "no_torsion", False),
+        conformer_policy=args.conformer_policy,
     )
     n_params = sum(p.numel() for p in trifuse.parameters() if p.requires_grad)
     print(f"[model] TriFuse trainable params = {n_params:,}", flush=True)
@@ -252,6 +263,8 @@ def main():
         freeze_poi=args.freeze_poi,
         init_mode=args.init_mode,
         t_anchor=args.t_anchor,
+        translation_velocity_scale=args.translation_velocity_scale,
+        rotation_velocity_scale=args.rotation_velocity_scale,
         deepternary_dockq_paths={
             "protein1_pdb": protein1,
             "protein2_pdb": protein2,
@@ -271,6 +284,7 @@ def main():
         "t_anchor": args.t_anchor if args.t_anchor is not None else 1.0,
         "trifuse_checkpoint": args.trifuse_ckpt,
         "activation_clamp": args.nan_clamp,
+        "activation_clamp_mode": 'irrep_norm',
         "expert_model_dir": args.model_dir,
         "expert_checkpoint": args.ckpt,
     }
