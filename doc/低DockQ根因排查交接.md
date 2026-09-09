@@ -9,12 +9,17 @@ DockQ。当前最强证据不是单一化学或初始化缺陷，而是训练状
 
 全原子 DockQ 重建链已经用原生坐标验证。`3CXH_C_E_6PH`、
 `6U9D_Q_R_TPP`、`4I0P_D_H_PGE` 均得到 DockQ=1、Fnat=1、LRMSD=0，
-因此当前低 DockQ 不是坐标写回或 DockQ 调用错误。
+这排除了这三个 native 自检案例中的明显坐标写回/调用错误；不代表所有预测
+构象、原子映射和所有 case 已获得完整验证。
 
-下一项优先实验应是 rollout augmentation：从 teacher path 的较高时间点执行一到
-数步当前模型，再在模型实际到达的偏离状态上监督返回同一 coupling teacher path
-的速度。不要继续只增加普通 teacher-forced epoch，也不要根据内部近似 DockQ
-调采样倍率。
+本次交接已完成 rollout augmentation、off-path target 审计和单分支 endpoint
+translation 小试验，均未证明精确 DockQ 改善。下一步是先修复实验比较的可重复性、
+建立精确指标闭环，再验证双界面联合 endpoint 目标的数学与训练可行性。
+联合目标目前尚未实现，也没有成功的 reflow 或 endpoint prediction 模型。
+
+本文结果路径是实验产物的逻辑标识，不是接手设备必须存在的目录。
+Git 提交包含源代码和本文记录的数值结论，不包含数据集、缓存、checkpoint 或完整
+实验 JSON。接手者需要重新生成或另行取得这些产物，不能把 clone 等同于恢复实验。
 
 ## 已完成的代码修复
 
@@ -39,7 +44,7 @@ DockQ。当前最强证据不是单一化学或初始化缺陷，而是训练状
 有效运行目录：
 
 ```text
-/tmp/coopdiff/results/overnight_root_cause_v3_run04
+results/overnight_root_cause_v3_run04
 ```
 
 10 个 arm 全部完成。主要训练 validation 最优值：
@@ -65,9 +70,9 @@ DockQ。当前最强证据不是单一化学或初始化缺陷，而是训练状
 结果文件：
 
 ```text
-/tmp/coopdiff/results/overnight_root_cause_v3_run04/fixed_validation_evaluation.json
-/tmp/coopdiff/results/overnight_root_cause_v3_run04/paired_contrasts.json
-/tmp/coopdiff/results/overnight_root_cause_v3_run04/raw_expert_factorial.json
+results/overnight_root_cause_v3_run04/fixed_validation_evaluation.json
+results/overnight_root_cause_v3_run04/paired_contrasts.json
+results/overnight_root_cause_v3_run04/raw_expert_factorial.json
 ```
 
 这些是内部 velocity loss，不是 DockQ，不能据此宣称 docking 质量改善。
@@ -108,11 +113,11 @@ DiffDock v1.1 初始化在 21 个独立二元 case 上将 ODE ligand RMSD 平均
 相关结果：
 
 ```text
-/tmp/coopdiff/results/root_cause_v2/round2/initialization_contract_audit.json
-/tmp/coopdiff/results/root_cause_v2/round2/paired_endpoint_expert.json
-/tmp/coopdiff/results/root_cause_v2/round2/diffdock_v2_binary.json
-/tmp/coopdiff/results/root_cause_v2/round2/matched_conformer_geometry.json
-/tmp/coopdiff/results/root_cause_v2/round2/matched_reference_dsm.json
+results/root_cause_v2/round2/initialization_contract_audit.json
+results/root_cause_v2/round2/paired_endpoint_expert.json
+results/root_cause_v2/round2/diffdock_v2_binary.json
+results/root_cause_v2/round2/matched_conformer_geometry.json
+results/root_cause_v2/round2/matched_reference_dsm.json
 ```
 
 ## Rollout 漂移与速度审计
@@ -147,33 +152,11 @@ Teacher-path 上的方向余弦：
 相关结果：
 
 ```text
-/tmp/coopdiff/results/root_cause_v2/round2/consensus_correction_audit.json
-/tmp/coopdiff/results/root_cause_v2/round2/rollout_teacher_divergence.json
-/tmp/coopdiff/results/root_cause_v2/round2/velocity_calibration_8cases.json
-/tmp/coopdiff/results/root_cause_v2/round2/factorial_initializer_evaluation.json
+results/root_cause_v2/round2/consensus_correction_audit.json
+results/root_cause_v2/round2/rollout_teacher_divergence.json
+results/root_cause_v2/round2/velocity_calibration_8cases.json
+results/root_cause_v2/round2/factorial_initializer_evaluation.json
 ```
-
-## 下一步建议
-
-1. 为 experimental trainer 增加一到数步 scheduled rollout augmentation。
-   从 `t + Δt` 的 teacher state 出发，用当前 EMA/model 无梯度走到 `t`，然后在
-   到达状态上监督相同 coupling 的 forward velocity。
-2. 同时保留普通 teacher states，建议先做 50/50 混合，避免完全丢掉解析路径。
-3. 优先使用 CCD + single-bond + frozen expert arm；现有 factorial 表明此时 LoRA
-   没有可靠收益。
-4. validation 必须同时报告 teacher-path loss、free-rollout center error 和精确
-   full-atom DockQ。内部 approximate DockQ 只用于调试，不能用于选 checkpoint。
-5. 先用 8 个非 BCR case 做 5-epoch pilot；确认 rollout center error 明显下降后，
-   再运行 20–25 epoch 正式对照。ETKDG/matching 必须设置逐 case 超时。
-
-GPU3 UUID 为：
-
-```text
-GPU-3ac265b1-130f-cf53-b680-8730370a5881
-```
-
-当前 GPU3 已释放。工作树位于 `/tmp/coopdiff/repair_knn`，运行命令应从该目录
-执行；模型、数据和实验结果位于 `/tmp/coopdiff`，共享盘版本仅作为源仓库。
 
 ## Rollout augmentation 小试验
 
@@ -182,9 +165,9 @@ GPU-3ac265b1-130f-cf53-b680-8730370a5881
 checkpoint 的 EMA 权重开始，用 32 个训练 cluster、8 个验证 cluster 和 50%
 混合率做短程微调。
 
-一阶段 rollout（5 epochs）的最佳 checkpoint 在 8-case × 2-seed、20-step
+1 步 rollout（5 epochs）的最佳 checkpoint 在 8-case × 2-seed、20-step
 自由采样上没有改善：近似 DockQ 为 0.06925（base 0.06940），中心误差也基本
-不变。五阶段 rollout（3 epochs）的最佳 checkpoint 有弱正信号：近似 DockQ
+不变。5 步 rollout（3 epochs）的最佳 checkpoint 有弱正信号：近似 DockQ
 0.07407（base 0.06939），ligand/POI center error 分别从 31.37/41.48 Å 降至
 31.23/41.29 Å，但 PROTAC RMSD 从 2.51 Å 升至 2.55 Å。改善远小于总体刚体
 误差，且尚未用精确 DockQ 证实，不能视为根因修复或据此启动长训练。
@@ -193,7 +176,8 @@ checkpoint 的 EMA 权重开始，用 32 个训练 cluster、8 个验证 cluster
 信号仍可能不充分。下一步应优先验证 reflow/重新配对的 off-path target，或改为
 直接预测去噪 endpoint；任何候选都必须以 free-rollout 精确 DockQ 选型。
 
-进一步的 off-path target 审计确认了这个判断。E3--ligand translation 的原
+进一步的 off-path target 审计提供了差异证据，但没有证明原 flow-matching
+目标在数学上错误。4 case × 2 coupling seeds、t≈0.75/0.50/0.25 上，E3--ligand translation 的原
 coupling target 与当前状态直接返回 clean endpoint 的 target 平均方向余弦仍为
 0.972，但尺度投影中位数仅为 0.595；rotation 的方向余弦只有 0.293。模型预测
 对 endpoint target 的方向余弦分别为 0.323 和 -0.032。teacher-path 自检中
@@ -203,15 +187,92 @@ translation 方向/尺度均为 1，证明 translation endpoint 计算没有坐�
 的训练 loss 从 43.6 增至 478.3，已提前停止。有界版本只在 t>=0.25 使用 target，
 将修正限制在一个受体尺度并按 25% 混合，训练恢复稳定；但 8-case × 2-seed
 自由采样中 ligand center error 仅从 31.35 降到 31.27 Å，POI error 从 41.09
-升到 41.42 Å，近似 DockQ 从 0.0732 降到 0.0703。因此不能只修 E3 分支，后续
-必须联合求解两个界面的 endpoint 刚体 target。
+升到 41.42 Å，近似 DockQ 从 0.0732 降到 0.0703。这次短试验未显示收益。它尚不足以证明单分支修正必然失败，也不足以确认
+POI 误差变化由双界面不一致造成；联合目标是待检验假设。
 
 相关结果：
 
 ```text
-/tmp/coopdiff/results/rollout_pilot_32x8_v1/free_rollout_evaluation.json
-/tmp/coopdiff/results/rollout_pilot_32x8_v1/free_rollout_latest_evaluation.json
-/tmp/coopdiff/results/rollout_pilot_32x8_steps5_v1/free_rollout_evaluation.json
-/tmp/coopdiff/results/root_cause_v2/round3/offpath_target_audit.json
-/tmp/coopdiff/results/endpoint_translation_bounded_32x8_v1/free_rollout_evaluation.json
+results/rollout_pilot_32x8_v1/free_rollout_evaluation.json
+results/rollout_pilot_32x8_v1/free_rollout_latest_evaluation.json
+results/rollout_pilot_32x8_steps5_v1/free_rollout_evaluation.json
+results/root_cause_v2/round3/offpath_target_audit.json
+results/endpoint_translation_bounded_32x8_v1/free_rollout_evaluation.json
 ```
+
+## 接手必须知道的实验局限
+
+- `audit_offpath_targets.py` 从晶体内部构象的 teacher t=1 出发，自由走 15 步；
+  它不是从盲 ETKDG 初始化出发的完整推理评估。`offpath_center_error_A` 实际
+  记录距 native 中心的距离，不是距同时间 teacher 中心的偏差。
+- translation endpoint target 是 `(current_center - native_center) / t`，
+  符号对应 clean→prior 的 forward velocity；实际 solver 用负方向积分。
+  teacher 自检误差约 2.9e-6。rotation 是全配体 Kabsch 最佳刚体旋转除以 t，
+  不能精确代表带 torsion 的瞬时切向速度：2-case 自检余弦约 0.897，误差约
+  1.226。应先关闭 torsion 做精确验证，再推导 gauge 修正。
+- 沿原路径的速度和重新连向终点的速度属于不同路径定义，两者有差异并不自动
+  说明训练目标错误。本文 endpoint 用到了真实终点，只能作训练监督或 oracle
+  诊断，不能在盲推理中读取 native 坐标。
+- 各 pilot 训练 seed 不同，teacher validation 每轮重新采样 coupling/time。
+  目前并非严格同种子的训练消融；`best.pt` 仍由随机 teacher loss 选择。
+- `evaluate_rollout_pilot.py` 的 base 在不同运行中也有指标波动。虽然传入相同
+  seed，尚未验证两模型的完整起始坐标逐元素一致。应保存并复用初始化状态和
+  构象，检查坐标校验值，再做配对统计。现有不足 1 Å 的差异不应作因果结论。
+- 短训 96 step 使用 EMA decay=0.999，初始权重仍占约 90.8%；小变化可能受
+  EMA 滞后影响。下一轮同时比较 raw 与 EMA，先验证梯度、参数变化和可拟合性。
+- 无界 endpoint 版出现大 loss 与 1/t 放大机制一致，但未记录逐样本 t/target
+  norm 来定位全部异常来源，不能把这一推断写成完成的因果验证。
+- 最新 endpoint trainer 已增加最小时间、混合和限幅字段。早期无界版本的
+  checkpoint 没有这些 runtime 字段，不能用最新版 loader 无修改加载；需要
+  对应历史实现或显式迁移。禁止静默套用新默认值。
+
+## 代码导航与已完成验证
+
+| 文件 | 职责及当前状态 |
+|---|---|
+| `tricoopdiff/train.py` | 提取 `_training_state` / `_forward_state` 扩展点，默认仍走解析路径 |
+| `tricoopdiff/consensus_experiment.py` | factorial checkpoint；短 rollout 增强；有界 E3 endpoint translation 实验 trainer |
+| `scripts/train_rollout_pilot.py` | 从 base EMA 开始、fresh optimizer、lr=5e-5；32 train cluster / 8 val cluster；保存 history、best/latest |
+| `scripts/evaluate_rollout_pilot.py` | checkpoint 加载和 8 case × 2 seed × 20 step 自由采样；仅近似 DockQ |
+| `scripts/audit_offpath_targets.py` | off-path E3 刚体 target 比较及 teacher-path 对照；不含联合 POI target |
+| `tricoopdiff/sdpi_flow.py` / `tricoopdiff/rigid.py` | 路径切向速度、SO(3) 与双界面逆装配；推导必须以此为准 |
+
+入口参数：审计使用 `--checkpoint --out --cases --paths --seed`；训练使用
+`--base-checkpoint --out --train-cases --val-cases --epochs --seed
+--rollout-probability --rollout-steps --offpath-target`，有界 target 另有
+`--rollout-min-time --endpoint-blend --endpoint-correction-ratio`；评估使用
+`--base --pilot --out`。这些研究脚本的数据/模型定位仍有硬编码，移植前应参数化
+路径，并保持相同数据成员、化学处理、专家身份和 checkpoint contract。
+
+固定评估成员为 `3CXH_C_E_6PH`、`6U9D_Q_R_TPP`、`4I0P_D_H_PGE`、
+`5W7C_A_C_FTT`、`6HS4_A_B_GON`、`4IL6_C_I_LMT`、`7L0F_G_H_GSP`、
+`3ZCB_A_B_ATP`；采样 seeds 为 12001/12002。基线为 factorial 的
+`ccd_single_bond_frozen_seed1729/best.pt`，不是任意生产 checkpoint。
+有界试验训练 seed=14004，3 epochs，rollout probability=0.5，steps=5，
+min time=0.25，blend=0.25，correction ratio=1.0；原 5 步增强 seed=11024。
+
+本轮实际通过 Python 编译检查、`git diff --check`、
+`python tests/test_model_build.py`、真实数据训练 smoke 和自由采样 checkpoint
+加载。尚未添加 endpoint 分支边界/目标的专用自动化测试；模型 smoke 不能替代
+这些数学测试。最新 pilot 没有精确全原子 DockQ 评估。
+
+提交导航：`6a5b46f` 为集成修复与根因实验，`731fee6` 为 rollout pilot，
+`516e5e3` 为 off-path 审计与有界 endpoint translation 实验。
+
+## 下一位接手者的行动顺序
+
+1. 固定病例、构象、初始化坐标、训练 coupling/time 和种子；对同 checkpoint
+   重复评估，建立可重复性基线。将原子映射/写回自检接入完整全原子 DockQ。
+2. 在无 torsion 的合成刚体数据上验证双界面 target：反向一步至终点能同时恢复
+   ligand 和 POI，body frame 一致；随机整体旋转/平移后结果等变；teacher path
+   极小步长的有限差分一致。再加入 torsion gauge，不能直接用 Kabsch 当精确目标。
+3. 先验证单 case 可拟合、各分支梯度和 raw/EMA 变化，再以相同训练随机状态做
+   原 teacher、原 coupling rollout、联合 endpoint/reflow 的 3–5 epoch 消融。
+   配套记录 t、target norm、各分量 loss、每步漂移；明确低 t 的目标与加权定义。
+4. 用自由采样的精确 DockQ、LRMS/iRMS/Fnat 和中心误差比较多数病例及配对分布。
+   不以 teacher loss 或近似 DockQ 选择结论；确认可复现收益后再投入正式训练。
+   正式训练通常以 20–25 epoch 为上限候选，按收敛和真实指标提前停止。
+5. ETKDG/matching 增加逐 case 超时及失败记录，避免构象生成阻塞整个评估。
+
+当前工作止于上述审计和短试验；没有待接管的本轮训练任务，也没有实现联合
+endpoint/reflow 或新的 endpoint head。保持生产默认值，先完成验证再考虑替换。

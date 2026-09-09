@@ -44,7 +44,7 @@
 | [初始化方案_gpt6.md](初始化方案_gpt6.md) | 唯一 `sdpi` 初始化、共享构象、精确装配与验收 | 修改采样或初始化时 |
 | [训练入口 SLURM 与 Phase1 smoke 交接文档.md](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md) | 环境预检、SLURM、缓存和训练入口 | 提交训练前 |
 | [DiffDock 审计文档.md](DiffDock%20审计文档.md) | 冻结二体专家的结构和扩散实现 | 修改 expert 集成时 |
-| [低DockQ根因排查交接.md](低DockQ根因排查交接.md) | 化学、初始化、建图、factorial 与 rollout 漂移的最新证据和下一步 | 接手低 DockQ 排查时 |
+| [低DockQ根因排查交接.md](低DockQ根因排查交接.md) | 化学、初始化、建图、rollout/endpoint 试验、证据局限与接手步骤 | 接手低 DockQ 排查时 |
 | [公式推导参考.md](公式推导参考.md) | SO(3)、DSM、Tweedie 和物理项推导 | 核对数学约定时 |
 
 ## 当前权威结论
