@@ -193,10 +193,25 @@ checkpoint 的 EMA 权重开始，用 32 个训练 cluster、8 个验证 cluster
 信号仍可能不充分。下一步应优先验证 reflow/重新配对的 off-path target，或改为
 直接预测去噪 endpoint；任何候选都必须以 free-rollout 精确 DockQ 选型。
 
+进一步的 off-path target 审计确认了这个判断。E3--ligand translation 的原
+coupling target 与当前状态直接返回 clean endpoint 的 target 平均方向余弦仍为
+0.972，但尺度投影中位数仅为 0.595；rotation 的方向余弦只有 0.293。模型预测
+对 endpoint target 的方向余弦分别为 0.323 和 -0.032。teacher-path 自检中
+translation 方向/尺度均为 1，证明 translation endpoint 计算没有坐标系错误。
+
+直接使用 endpoint translation 会因除以剩余时间在低 t 产生奇异大 target，短试验
+的训练 loss 从 43.6 增至 478.3，已提前停止。有界版本只在 t>=0.25 使用 target，
+将修正限制在一个受体尺度并按 25% 混合，训练恢复稳定；但 8-case × 2-seed
+自由采样中 ligand center error 仅从 31.35 降到 31.27 Å，POI error 从 41.09
+升到 41.42 Å，近似 DockQ 从 0.0732 降到 0.0703。因此不能只修 E3 分支，后续
+必须联合求解两个界面的 endpoint 刚体 target。
+
 相关结果：
 
 ```text
 /tmp/coopdiff/results/rollout_pilot_32x8_v1/free_rollout_evaluation.json
 /tmp/coopdiff/results/rollout_pilot_32x8_v1/free_rollout_latest_evaluation.json
 /tmp/coopdiff/results/rollout_pilot_32x8_steps5_v1/free_rollout_evaluation.json
+/tmp/coopdiff/results/root_cause_v2/round3/offpath_target_audit.json
+/tmp/coopdiff/results/endpoint_translation_bounded_32x8_v1/free_rollout_evaluation.json
 ```

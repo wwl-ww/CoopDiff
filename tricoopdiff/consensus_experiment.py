@@ -140,6 +140,7 @@ class RolloutAugmentedTrainer(ExperimentalConsensusTrainer):
         teacher = self.diffusion.path(
             ligand_data, poi_data['coords'], coupling, t)
         if (self.rollout_probability == 0 or float(t.item()) >= 1
+                or float(t.item()) < getattr(self, 'rollout_min_time', 0.0)
                 or float(torch.rand((), device=t.device)) >= self.rollout_probability):
             return teacher
 
@@ -169,4 +170,58 @@ class RolloutAugmentedTrainer(ExperimentalConsensusTrainer):
             **super().runtime_contract(),
             'rollout_probability': self.rollout_probability,
             'rollout_steps': self.rollout_steps,
+        }
+
+
+class EndpointTranslationRolloutTrainer(RolloutAugmentedTrainer):
+    """Use the exact clean-endpoint E3 translation target off teacher paths."""
+
+    def __init__(self, *args, rollout_min_time=0.25, endpoint_blend=0.25,
+                 endpoint_correction_ratio=1.0, **kwargs):
+        if not 0 < rollout_min_time < 1:
+            raise ValueError('rollout_min_time must be in (0, 1)')
+        if not 0 < endpoint_blend <= 1:
+            raise ValueError('endpoint_blend must be in (0, 1]')
+        if endpoint_correction_ratio <= 0:
+            raise ValueError('endpoint_correction_ratio must be positive')
+        self.rollout_min_time = float(rollout_min_time)
+        self.endpoint_blend = float(endpoint_blend)
+        self.endpoint_correction_ratio = float(endpoint_correction_ratio)
+        self._endpoint_applied_states = 0
+        super().__init__(*args, **kwargs)
+
+    def _training_state(self, e3_data, poi_data, ligand_data, coupling, t, dt):
+        state = super()._training_state(
+            e3_data, poi_data, ligand_data, coupling, t, dt)
+        ligand, poi, body, targets = state
+        # The parent increments this counter only when it returns a generated
+        # off-path state. Teacher states retain their analytic coupling target.
+        if not ligand.requires_grad and self.rollout_augmented_states > getattr(
+                self, '_endpoint_applied_states', 0):
+            target_center = ligand_data['coords'].mean(dim=1)
+            endpoint_tr = (ligand.mean(dim=1) - target_center) / t[:, None]
+            original_tr = targets['e3_ligand']['tr']
+            correction = endpoint_tr - original_tr
+            limit = (self.diffusion.scales(
+                e3_data['coords'], poi_data['coords'])[0]
+                * self.endpoint_correction_ratio)
+            norm = torch.linalg.vector_norm(correction, dim=-1, keepdim=True)
+            correction = correction * torch.clamp(limit / norm.clamp(min=1e-8), max=1)
+            targets = {
+                **targets,
+                'e3_ligand': {
+                    **targets['e3_ligand'],
+                    'tr': (original_tr + self.endpoint_blend * correction).detach(),
+                },
+            }
+            self._endpoint_applied_states = self.rollout_augmented_states
+        return ligand, poi, body, targets
+
+    def runtime_contract(self):
+        return {
+            **super().runtime_contract(),
+            'offpath_target': 'e3_ligand_endpoint_translation_v1',
+            'rollout_min_time': self.rollout_min_time,
+            'endpoint_blend': self.endpoint_blend,
+            'endpoint_correction_ratio': self.endpoint_correction_ratio,
         }

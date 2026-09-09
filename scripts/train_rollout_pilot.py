@@ -15,7 +15,8 @@ from factorial_arm import PairedTorsionFlow, restrict_non_single
 from train_entry import TernaryDataLoader, _load_score_model_args
 from tricoopdiff.consensus import ConsensusFuse
 from tricoopdiff.consensus_experiment import (
-    ExperimentalConsensus, RolloutAugmentedTrainer,
+    EndpointTranslationRolloutTrainer, ExperimentalConsensus,
+    RolloutAugmentedTrainer,
 )
 from tricoopdiff.expert_factory import build_diffdock_expert
 
@@ -30,6 +31,12 @@ def main():
     parser.add_argument('--seed', type=int, default=11021)
     parser.add_argument('--rollout-probability', type=float, default=0.5)
     parser.add_argument('--rollout-steps', type=int, default=1)
+    parser.add_argument(
+        '--offpath-target', choices=('coupling', 'e3_endpoint_translation'),
+        default='coupling')
+    parser.add_argument('--rollout-min-time', type=float, default=0.25)
+    parser.add_argument('--endpoint-blend', type=float, default=0.25)
+    parser.add_argument('--endpoint-correction-ratio', type=float, default=1.0)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
 
@@ -65,14 +72,26 @@ def main():
         'seed': args.seed, 'training': 'rollout_augmentation',
         'rollout_probability': args.rollout_probability,
         'rollout_steps': args.rollout_steps,
+        'offpath_target': args.offpath_target,
+        'rollout_min_time': args.rollout_min_time,
+        'endpoint_blend': args.endpoint_blend,
+        'endpoint_correction_ratio': args.endpoint_correction_ratio,
         'base_checkpoint': str(args.base_checkpoint.resolve()),
     }
-    trainer = RolloutAugmentedTrainer(
+    trainer_class = (EndpointTranslationRolloutTrainer
+                     if args.offpath_target == 'e3_endpoint_translation'
+                     else RolloutAugmentedTrainer)
+    endpoint_args = ({
+        'rollout_min_time': args.rollout_min_time,
+        'endpoint_blend': args.endpoint_blend,
+        'endpoint_correction_ratio': args.endpoint_correction_ratio,
+    } if trainer_class is EndpointTranslationRolloutTrainer else {})
+    trainer = trainer_class(
         model, PairedTorsionFlow(), device='cuda', experiment_contract=contract,
         lr=5e-5, lora_lr=1e-5, lora_early_lr=5e-6,
         lora_warmup_steps=0, activation_clamp_mode='irrep_norm',
         rollout_probability=args.rollout_probability,
-        rollout_steps=args.rollout_steps)
+        rollout_steps=args.rollout_steps, **endpoint_args)
 
     val_batches = [restrict_non_single(batch, ccd_paths[batch['case']]) for batch in val]
     np.random.seed(args.seed)
