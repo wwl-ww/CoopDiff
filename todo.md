@@ -588,3 +588,23 @@ endpoint/reflow，仍以同 seed teacher、raw 权重、固定初始化和 exact
 当前决定：保留可微 solver 作为后续研究基础，但不扩大当前三步坐标损失训练。
 若继续，应先分析 seed 12005 独有增益来自哪些 case/轨迹阶段，再决定是否改成
 分阶段 rotation/interface loss；不再仅通过增大 weight 或增加训练 seed 搜索结果。
+
+### 可微轨迹目标的配对状态定位（已完成）
+
+- weight=1.0、训练 seed 24006 的 trajectory 与同 seed teacher 逐阶段对照
+  显示：seed 12005 的 8 case 全部改善，主要信号是 step 10--15 附近 POI
+  质心与旋转方向同时改善。seed 12001 常出现旋转改善而质心方向退化；
+  `7L0F` 最终 POI 质心误差增加约 `1.89 Å`，DockQ 下降 `0.001271`。
+- identical-state 审计在两条保存轨迹的 step 5/10/15/19 上，将两个 raw
+  checkpoint 输入完全相同状态，再比较一个有限 solver step。它确认 seed 12005
+  在 step 10--15 有 POI center+rotation 联合增益，而另两个初始化没有稳定出现该
+  组合。teacher-path raw velocity 差异很小且混合，说明收益主要来自 off-path response。
+- 24 个 case×初始化配对的描述性分析中，DockQ 增益与初始 POI 质心距离
+  Pearson 相关为 `-0.384`，按 case 去均值后为 `-0.437`。唯一面板均值改善的
+  seed 12005 初始 ligand/POI 质心误差均值为 `26.39/36.15 Å`；seed 12001
+  与 12006 的 POI 均值为 `52.92/53.54 Å`。样本仅 24 个且存在混杂，不能作因果结论。
+
+当前决定：不实施 rotation-only loss，也不继续盲调 trajectory weight。先把评估按
+初始 POI 距离与轨迹阶段分层，再考虑 middle/late POI center+orientation 联合目标，
+并仍要求多数固定初始化面板改善。复现工具为 `scripts/audit_paired_state_velocities.py`；
+`scripts/local_velocity_audit.py` 现可恢复本轮所有实验 contract。

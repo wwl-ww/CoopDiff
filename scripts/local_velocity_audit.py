@@ -36,7 +36,12 @@ from factorial_arm import PairedTorsionFlow, restrict_non_single
 from featurize_common import _to_device_and_batch
 from train_entry import _load_score_model_args
 from tricoopdiff.consensus import ConsensusFuse
-from tricoopdiff.consensus_experiment import ExperimentalConsensus, ExperimentalConsensusTrainer
+from tricoopdiff.consensus_experiment import (
+    EndpointTranslationRolloutTrainer,
+    ExperimentalConsensus,
+    ExperimentalConsensusTrainer,
+    RolloutAugmentedTrainer,
+)
 from tricoopdiff.expert_factory import build_diffdock_expert
 from tricoopdiff.reproducibility import configure_inference_reproducibility
 
@@ -94,18 +99,73 @@ def load_batch(entry, plan, score_args):
 
 def build(checkpoint, expert_dir):
     saved = torch.load(checkpoint, map_location='cpu', weights_only=False)
-    assert saved['experiment_contract'] == {
-        'chemistry': 'ccd', 'torsion': 'single_bond', 'adaptation': 'frozen', 'seed': 1729}
     expert = build_diffdock_expert(str(expert_dir), 'cuda')
     model = ExperimentalConsensus(expert, ConsensusFuse(**saved['model_config']),
                                   saved['expert_lora_config'])
     runtime = saved['runtime_config']
-    trainer = ExperimentalConsensusTrainer(
+    variant = {}
+    if runtime.get('trajectory_objective') == 'differentiable_sdpi_trajectory_v1':
+        from tricoopdiff.trajectory_experiment import TrajectoryConsistencyTrainer
+        trainer_class = TrajectoryConsistencyTrainer
+        variant = {
+            'trajectory_steps': runtime['trajectory_steps'],
+            'trajectory_weight': runtime['trajectory_weight'],
+            'trajectory_min_time': runtime['trajectory_min_time'],
+            'contract_mode': runtime['trajectory_objective'],
+        }
+    elif runtime.get('offpath_target') == 'e3_ligand_endpoint_translation_v1':
+        trainer_class = EndpointTranslationRolloutTrainer
+        variant = {
+            'rollout_probability': runtime['rollout_probability'],
+            'rollout_steps': runtime['rollout_steps'],
+            'rollout_min_time': runtime['rollout_min_time'],
+            'endpoint_blend': runtime['endpoint_blend'],
+            'endpoint_correction_ratio': runtime['endpoint_correction_ratio'],
+        }
+    elif runtime.get('offpath_target') in {
+            'poi_body_frame_transported_coupling_v1',
+            'poi_body_frame_transported_gauge_correct_v2',
+            'joint_rigid_endpoint_kabsch_bounded_v1'}:
+        from tricoopdiff.offpath_experiments import (
+            BodyFrameTransportRolloutTrainer,
+            BoundedJointEndpointRolloutTrainer,
+            GaugeCorrectBodyFrameTransportRolloutTrainer,
+        )
+        classes = {
+            'poi_body_frame_transported_coupling_v1': BodyFrameTransportRolloutTrainer,
+            'poi_body_frame_transported_gauge_correct_v2': (
+                GaugeCorrectBodyFrameTransportRolloutTrainer),
+            'joint_rigid_endpoint_kabsch_bounded_v1': BoundedJointEndpointRolloutTrainer,
+        }
+        trainer_class = classes[runtime['offpath_target']]
+        variant = {
+            'rollout_probability': runtime['rollout_probability'],
+            'rollout_steps': runtime['rollout_steps'],
+            'rollout_min_time': runtime['rollout_min_time'],
+            'contract_mode': runtime['offpath_target'],
+        }
+        if runtime['offpath_target'] == 'joint_rigid_endpoint_kabsch_bounded_v1':
+            variant.update({
+                'endpoint_blend': runtime['endpoint_blend'],
+                'endpoint_translation_cap': runtime['endpoint_translation_cap'],
+                'endpoint_rotation_cap': runtime['endpoint_rotation_cap'],
+            })
+    elif 'rollout_probability' in runtime:
+        trainer_class = RolloutAugmentedTrainer
+        variant = {
+            'rollout_probability': runtime['rollout_probability'],
+            'rollout_steps': runtime['rollout_steps'],
+        }
+    else:
+        trainer_class = ExperimentalConsensusTrainer
+    trainer = trainer_class(
         model, PairedTorsionFlow(), device='cuda',
-        experiment_contract=saved['experiment_contract'], lr=1e-4,
+        experiment_contract=saved['experiment_contract'],
+        lr=runtime['optimizer_groups']['trifuse']['lr'],
         lora_lr=1e-5, lora_early_lr=5e-6, lora_warmup_steps=0,
         **{key: runtime[key] for key in (
-            'activation_clamp', 'activation_clamp_mode', 'residual_weight', 'ema_decay')})
+            'activation_clamp', 'activation_clamp_mode', 'residual_weight', 'ema_decay')},
+        **variant)
     trainer.load_checkpoint(checkpoint)
     model.eval()
     return trainer, {key: saved[key] for key in (

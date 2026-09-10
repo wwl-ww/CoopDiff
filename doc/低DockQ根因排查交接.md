@@ -480,3 +480,24 @@ sampler。
 baseline seed 12007 mean exact DockQ 为 `0.0187896`，其 operator 双跑与 velocity
 audit 重放也完全一致。下一步应定位 seed 12005 的增益集中于哪些 case 和轨迹阶段，
 再判断是否值得设计分阶段 rotation/interface loss，而不是继续盲调 trajectory weight。
+
+### 可微轨迹目标的配对状态定位
+
+训练 seed 24006、trajectory weight 1.0 与同 seed teacher 的配对轨迹显示：seed
+12005 的 8 个 case 全部改善，主要信号是 step 10--15 附近 POI 质心与旋转方向
+同时改善。seed 12001 则常出现旋转改善而质心方向退化；最明显的 `7L0F`
+最终 POI 质心误差增加约 `1.89 Å`，DockQ 下降 `0.001271`。seed 12006 变化很小且混合。
+因此不能把 seed 12005 的收益简化为 rotation-only 问题。
+
+`scripts/audit_paired_state_velocities.py` 在两条保存轨迹的 step 5/10/15/19 上
+给两个 raw checkpoint 输入同一状态，并用一个有限 SDPI solver step 比较朝向 native
+的方向。该 cross-state 审计复现了 seed 12005 的中段 POI center+rotation 联合增益，
+而其他初始化没有稳定出现；teacher-path raw velocity 差异很小且混合，说明主要
+差别在 off-path response。
+
+24 个配对的描述性初始化分析中，DockQ delta 与初始 POI 质心距离的 Pearson
+相关为 `-0.384`，按 case 去均值后为 `-0.437`。seed 12005 的平均初始 ligand/POI
+质心误差为 `26.39/36.15 Å`，而 seed 12001、12006 的 POI 均值为 `52.92/53.54 Å`。
+样本量小且有混杂，不能视为因果证据；它只提示当前目标可能局限于较温和初始化。
+下一轮应先按初始 POI 距离与阶段做门禁，再决定是否测试 middle/late POI
+center+orientation 联合目标，不继续盲调 trajectory weight 或单独加强 rotation。
