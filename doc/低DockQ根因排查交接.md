@@ -303,3 +303,64 @@ min time=0.25，blend=0.25，correction ratio=1.0；原 5 步增强 seed=11024�
 
 当前工作止于上述审计和短试验；没有待接管的本轮训练任务，也没有实现联合
 endpoint/reflow 或新的 endpoint head。保持生产默认值，先完成验证再考虑替换。
+
+## 2026-09-10 `model-v2` 基线重建与交叉验收
+
+本轮所有新增结果均从 `origin/model-v2` 的 `a369265` 开始，分支为
+`investigate/dockq-model-v2`；不要与 `model-v2-dual-consensus` 的 v18 架构
+混用。基线检查点仍为 `ccd_single_bond_frozen_seed1729/best.pt`，SHA256 为
+`feddd609bb1b8c95c2022486c0425662c3570ef7ee85d07d549ac18fa56fe683`。
+
+确定性全原子 exact DockQ 在固定 8-case 面板上得到 seed 12001 平均
+`0.0154252`，另一张 GPU 重跑逐例完全一致；seed 12002 平均 `0.0129708`，
+跨卡重跑也逐例一致。两个初始化 seed 相差 `0.0024544`，已达到此前短程干预的
+效应量，因此后续候选至少需要同时通过两个固定初始化面板。
+
+5LZH 固定状态拟合从 loss `9.4087` 降至 `0.0021947`，跨 GPU 复验终值相差
+约 `1e-8`。速度审计使用保存的固定 couplings 重放后，teacher rows、rollout
+rows 和 local-step checks 均逐元素一致。EMA 在三个时间点的双界面旋转平均
+cosine 仍为负或接近零，支持“自由轨迹向量场学习失败”而非单点不可表达。
+
+严格相同训练 seed 24001、3 epoch 的短训对照在 seed 12001 exact DockQ 上均
+低于未训练基线：teacher `0.0144663`、legacy transported `0.0144896`、E3
+endpoint `0.0142528`、gauge-transposed `0.0139858`。四者差异小于共同退化，
+且 raw validation loss 随训练恶化、EMA validation loss 基本停滞。当前不能把
+旧分支上观察到的组合收益迁移到 `model-v2`；应优先解决 checkpoint 选择、EMA
+滞后和自由轨迹监督失配，再扩大训练。
+
+同一批 EMA 候选换到 seed 12002 后更接近未训练基线 `0.0129708`：teacher
+`0.0129624`、legacy transported `0.0129730`、E3 endpoint `0.0129683`、
+gauge-transposed `0.0129726`。变体间最大差约 `1.1e-5`，说明 3 epoch、
+decay=0.999 下 EMA 几乎没有吸收短训变化；这组数不能用于比较目标优劣，必须
+同时评估 raw 权重或为短训使用匹配训练长度的 EMA decay。
+
+epoch 1 raw 权重在两个 seed 上都优于各自基线。seed 12001 的 teacher、legacy
+transported、E3 endpoint、gauge-transposed 分别为 `0.0166639`、`0.0163624`、
+`0.0162210`、`0.0164887`；seed 12002 分别为 `0.0132901`、`0.0132953`、
+`0.0131293`、`0.0132716`。两 seed 平均提升约为 teacher `+0.000779`、legacy
+transported `+0.000631`、E3 endpoint `+0.000477`、gauge-transposed
+`+0.000682`。普通 teacher 暂时最佳，说明短训本身有益，但现有 rollout 或
+endpoint target 没有提供稳定附加收益。继续比较 epoch 2/3 的 exact DockQ，
+不要用 fixed validation loss 代替真实早停指标。
+
+训练 seed 24001 的完整 raw 曲线进一步区分了机制。两个采样 seed 合并后，
+teacher 在 epoch 1/2/3 为 `0.014977/0.014733/0.014766`；legacy transported
+为 `0.014829/0.015218/0.015573`；E3 endpoint 为
+`0.014675/0.015085/0.015079`；gauge-transposed 为
+`0.014880/0.015241/0.015572`。epoch 3 的 transported 与 gauge 相对基线均
+提高约 `0.001375`，两者只差 `1.0e-6`；gauge 修正仍没有可辨别增益。逐例上
+两者均为 16 例中 11 例改善，median delta 分别约 `+0.000944` 与
+`+0.000998`。短 rollout 的收益需要 2--3 epoch 才出现，teacher 则在 epoch 1
+达到本轮最佳，进一步证明 fixed validation loss 不能可靠选择 DockQ checkpoint。
+
+第二个训练 seed 24002 的 epoch 3 raw 结果更强但方差更大。两个采样 seed 合并
+后，teacher、legacy transported、E3 endpoint、gauge-transposed 分别为
+`0.013714/0.019444/0.014775/0.015947`。相对基线，legacy transported 为
+16 例中 14 例改善，median delta `+0.000920`，但 mean delta `+0.005246` 被
+一个 `+0.062522` 的高响应病例明显放大；gauge-transposed 同为 14/16 改善，
+median `+0.000803`、mean `+0.001749`，分布更稳。该结果支持 rollout 有益，
+但 transported 的大均值仍需更多固定初始化和跨卡复验，不能只报平均数。
+
+机器可用物理 GPU 为 2--5；0、1、6 有其他任务，7 保留避让。新增结果位于
+`results/local_exact_gate/modelv2_*`、`results/modelv2_round1b_*` 和
+`results/paired_pilots/modelv2_*`。这些目录为运行产物，不提交到 Git。
