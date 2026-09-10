@@ -501,3 +501,24 @@ audit 重放也完全一致。下一步应定位 seed 12005 的增益集中于�
 样本量小且有混杂，不能视为因果证据；它只提示当前目标可能局限于较温和初始化。
 下一轮应先按初始 POI 距离与阶段做门禁，再决定是否测试 middle/late POI
 center+orientation 联合目标，不继续盲调 trajectory weight 或单独加强 rotation。
+
+### 阶段 POI 目标与跨训练 seed 复验
+
+中后段 POI center+body orientation 新目标使用 t=0.25--0.65 窗口和 5-step
+可微 rollout；另一臂对距离 native 较远的 POI 状态加权，cap=3。两者有独立
+checkpoint contract，均是训练诊断，不改生产 sampler。
+
+训练 seed 24007 上，staged 与 distance-staged 相对 teacher 的 24-case mean
+delta 为 `+0.000090/+0.000132`，wins 为 12/24 与 13/24；两者均只改善
+1/3 初始化面板。distance-staged 的 far (initial POI >=55 Å) 组平均为
+`-0.000041`，因此它没有修复预期失效区间，两个新目标都不扩大。
+
+原三步全坐标 trajectory weight=1.0 在训练 seed 24007--24009 上重复，并与
+各自 teacher 严格配对。合并已有 24006 后，96 个配对的 mean/median delta 为
+`+0.000195/+0.000024`，56/96 改善。初始 seed 12001/12005 分别为
+`+0.000373/+0.000308`，但 12006 为 `-0.000095`。这说明小正效应可跨
+训练 seed 复现，但尚未解决特定初始化的稳定退化。
+
+trajectory-24007 和 teacher-24007 的 8 case×3 initialization×EMA/raw 审计重放均
+逐字段一致。当前只保留原 trajectory 作为后续候选；全量训练前必须扩充
+独立初始化，并把 far/12006-like 分层不退化写入门禁。

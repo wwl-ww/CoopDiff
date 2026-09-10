@@ -608,3 +608,24 @@ endpoint/reflow，仍以同 seed teacher、raw 权重、固定初始化和 exact
 初始 POI 距离与轨迹阶段分层，再考虑 middle/late POI center+orientation 联合目标，
 并仍要求多数固定初始化面板改善。复现工具为 `scripts/audit_paired_state_velocities.py`；
 `scripts/local_velocity_audit.py` 现可恢复本轮所有实验 contract。
+
+### 阶段 POI 目标与原 trajectory 复验（已完成）
+
+- 新增两个独立 contract：`differentiable_sdpi_staged_poi_v2` 只在
+  t=0.25--0.65 约束 POI center+body orientation；`..._distance_v2` 再按当前
+  POI 到 native 的归一化距离加权，且权重 cap=3。两者都不进入推理路径。
+- 训练 seed 24007 的 24-case exact 对照：staged 平均 delta `+0.000090`、
+  12/24 改善；distance staged `+0.000132`、13/24。两者都只有 1/3 初始化
+  面板均值改善。distance staged 在初始 POI >=55 Å 的 far 组平均为
+  `-0.000041`，没有修复原失效区间；两个新目标均停止扩大。
+- 原三步全坐标 trajectory weight=1.0 补训 24007--24009，与各自同 seed
+  teacher 比较。连同 24006，4 个训练 seed×3 初始化×8 case 共 96 对，
+  mean/median delta `+0.000195/+0.000024`，56/96 改善。按初始化汇总：
+  12001 `+0.000373` (23/32)，12005 `+0.000308` (19/32)，12006
+  `-0.000095` (14/32)。效应能跨训练 seed 复现，但对 12006 仍稳定失效。
+- trajectory-24007 与 teacher-24007 的 8 case×3 seed×EMA/raw 长速度审计
+  已分别重放，`teacher_rows`/`rollout_rows`/`local_step_checks` 均逐字段一致。
+
+当前决定：保留原 trajectory objective 作为唯一值得继续的候选，不保留
+staged/distance 作为扩训方向。在全量训练前，下一门禁应扩充独立初始化，
+并专门要求 far/12006-like 分层不退化；否则平均正增益依然可能掩盖稳定失效模式。

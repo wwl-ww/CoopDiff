@@ -10,9 +10,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.trajectory_experiment import (
+    DISTANCE_STAGED_POI_CONTRACT_MODE,
+    STAGED_POI_CONTRACT_MODE,
     TRAJECTORY_CONTRACT_MODE,
+    StagedPOITrajectoryTrainer,
     TrajectoryConsistencyTrainer,
     differentiable_sdpi_step,
+    staged_poi_state_loss,
 )
 
 
@@ -109,6 +113,49 @@ def test_trajectory_contract_has_checkpoint_identity():
     assert contract['trajectory_steps'] == 3
     assert contract['trajectory_weight'] == .1
     assert contract['trajectory_min_time'] == .25
+
+
+def test_staged_poi_loss_jointly_penalizes_center_and_orientation():
+    poi = torch.tensor(
+        [[[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]]],
+        dtype=torch.float64, requires_grad=True)
+    target = poi.detach() + torch.tensor([[[2., -1., 3.]]], dtype=torch.float64)
+    native = target + torch.tensor([[[20., 0., 0.]]], dtype=torch.float64)
+    body = torch.eye(3, dtype=torch.float64).reshape(1, 3, 3).requires_grad_()
+    target_body = body.detach().clone()
+    target_body[:, 0, 0] = 0
+    loss, parts = staged_poi_state_loss(
+        poi, target, native, body, target_body, poi.new_tensor(10.),
+        distance_weighted=True, distance_weight_cap=3.)
+    assert parts['center'] > 0 and parts['orientation'] > 0
+    assert 1 < parts['distance_weight'] <= 3
+    loss.backward()
+    assert float(poi.grad.abs().sum()) > 0
+    assert float(body.grad.abs().sum()) > 0
+
+
+def test_staged_poi_contracts_are_distinct_and_complete():
+    for mode, weighted in (
+            (STAGED_POI_CONTRACT_MODE, False),
+            (DISTANCE_STAGED_POI_CONTRACT_MODE, True)):
+        trainer = StagedPOITrajectoryTrainer.__new__(StagedPOITrajectoryTrainer)
+        trainer.trajectory_contract_mode = mode
+        trainer.trajectory_steps = 5
+        trainer.trajectory_weight = 1.
+        trainer.trajectory_min_time = .25
+        trainer.trajectory_max_time = .65
+        trainer.distance_weighted = weighted
+        trainer.distance_weight_cap = 3.
+        trainer.activation_clamp = 100.
+        trainer.activation_clamp_mode = 'irrep_norm'
+        trainer.residual_weight = 1e-3
+        trainer.ema_decay = .999
+        trainer.optimizer_config = {'trifuse': {'lr': 5e-5, 'weight_decay': 1e-4}}
+        contract = trainer.runtime_contract()
+        assert contract['trajectory_objective'] == mode
+        assert contract['trajectory_max_time'] == .65
+        assert contract['trajectory_distance_weighted'] is weighted
+        assert contract['trajectory_distance_weight_cap'] == 3.
 
 
 if __name__ == '__main__':

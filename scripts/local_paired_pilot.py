@@ -99,6 +99,20 @@ def make_trainer(variant, model, flow, common, *, trajectory_steps=3,
             model, flow, trajectory_steps=trajectory_steps,
             trajectory_weight=trajectory_weight,
             trajectory_min_time=.25, **common)
+    if variant in ('poi_stage', 'poi_stage_distance'):
+        from tricoopdiff.trajectory_experiment import (
+            DISTANCE_STAGED_POI_CONTRACT_MODE,
+            STAGED_POI_CONTRACT_MODE,
+            StagedPOITrajectoryTrainer,
+        )
+        contract_mode = (DISTANCE_STAGED_POI_CONTRACT_MODE
+                         if variant == 'poi_stage_distance'
+                         else STAGED_POI_CONTRACT_MODE)
+        return StagedPOITrajectoryTrainer(
+            model, flow, trajectory_steps=trajectory_steps,
+            trajectory_weight=trajectory_weight,
+            trajectory_min_time=.25, trajectory_max_time=.65,
+            distance_weight_cap=3., contract_mode=contract_mode, **common)
     raise ValueError(variant)
 
 
@@ -109,7 +123,8 @@ def main():
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--variant', choices=('teacher', 'coupling', 'e3_endpoint',
                                            'transported', 'gauge_transported',
-                                           'joint_endpoint', 'trajectory'), required=True)
+                                           'joint_endpoint', 'trajectory',
+                                           'poi_stage', 'poi_stage_distance'), required=True)
     ap.add_argument('--train-cases', type=int, default=32)
     ap.add_argument('--val-cases', type=int, default=8)
     ap.add_argument('--epochs', type=int, default=3)

@@ -104,15 +104,26 @@ def build(checkpoint, expert_dir):
                                   saved['expert_lora_config'])
     runtime = saved['runtime_config']
     variant = {}
-    if runtime.get('trajectory_objective') == 'differentiable_sdpi_trajectory_v1':
-        from tricoopdiff.trajectory_experiment import TrajectoryConsistencyTrainer
-        trainer_class = TrajectoryConsistencyTrainer
+    if runtime.get('trajectory_objective') in {
+            'differentiable_sdpi_trajectory_v1',
+            'differentiable_sdpi_staged_poi_v2',
+            'differentiable_sdpi_staged_poi_distance_v2'}:
+        from tricoopdiff.trajectory_experiment import (
+            StagedPOITrajectoryTrainer, TrajectoryConsistencyTrainer)
+        staged = runtime['trajectory_objective'] != 'differentiable_sdpi_trajectory_v1'
+        trainer_class = (StagedPOITrajectoryTrainer if staged
+                         else TrajectoryConsistencyTrainer)
         variant = {
             'trajectory_steps': runtime['trajectory_steps'],
             'trajectory_weight': runtime['trajectory_weight'],
             'trajectory_min_time': runtime['trajectory_min_time'],
             'contract_mode': runtime['trajectory_objective'],
         }
+        if staged:
+            variant.update({
+                'trajectory_max_time': runtime['trajectory_max_time'],
+                'distance_weight_cap': runtime['trajectory_distance_weight_cap'],
+            })
     elif runtime.get('offpath_target') == 'e3_ligand_endpoint_translation_v1':
         trainer_class = EndpointTranslationRolloutTrainer
         variant = {
