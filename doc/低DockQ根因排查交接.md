@@ -522,3 +522,19 @@ delta 为 `+0.000090/+0.000132`，wins 为 12/24 与 13/24；两者均只改善
 trajectory-24007 和 teacher-24007 的 8 case×3 initialization×EMA/raw 审计重放均
 逐字段一致。当前只保留原 trajectory 作为后续候选；全量训练前必须扩充
 独立初始化，并把 far/12006-like 分层不退化写入门禁。
+
+### 扩充初始化门禁结果
+
+对训练 seed 24007/24008 的 trajectory 和各自 teacher，新增 initialization
+seed 12007--12010，共获得 64 个 exact DockQ 配对。每张 GPU 负责一个完整
+模型的 4 seed×8 case 任务，没有按 case 分片。
+
+24007 的 32 对 mean/median delta 为 `+0.000221/-0.000019`，10/32 改善；
+24008 为 `+0.000195/-0.0000004`，16/32 改善。合并 mean 虽为
+`+0.000208`，但 median 为 `-0.000013`，仅 26/64 改善。按初始 POI
+质心距离分层，near (<40 Å) 平均 `+0.000556`，middle (40--55 Å)
+`+0.000171`，far (>=55 Å) `-0.000057` 且仅 6/20 改善。
+
+因此原 trajectory 也未通过扩充门禁：正平均值受少数 near 高响应 case 驱动，
+不是广泛稳定改善。不启动全量训练，也不继续搜索 weight 或训练 seed。
+后续需要直接增加 far off-path 状态暴露，而不是继续在 teacher path 上重加权。
