@@ -112,7 +112,13 @@ def test_flow_loss_backward_and_shared_clock_guard():
             return {'interface_scores': scores, 'torsion_score': self.weight.expand(1, n_tor)}
 
     model = Predictor()
-    trainer = SimpleNamespace(device='cpu', model=model, diffusion=flow, torsion_expert_aux_weight=.25)
+    # Keep real bound state/forward hooks without constructing checkpoints or
+    # an optimizer. A SimpleNamespace no longer implements compute_loss's API.
+    trainer = TriCoopDiffTrainer.__new__(TriCoopDiffTrainer)
+    trainer.device = 'cpu'
+    trainer.model = model
+    trainer.diffusion = flow
+    trainer.torsion_expert_aux_weight = .25
     coupling = flow.sample_coupling(a, b, data)
     fixed = dict(t_override=torch.tensor([.5]), coupling_override=coupling)
     plain = TriCoopDiffTrainer.compute_loss(trainer, {'coords': a}, {'coords': b}, data, **fixed)

@@ -218,6 +218,33 @@ results/endpoint_translation_bounded_32x8_v1/free_rollout_evaluation.json
 - `evaluate_rollout_pilot.py` 的 base 在不同运行中也有指标波动。虽然传入相同
   seed，尚未验证两模型的完整起始坐标逐元素一致。应保存并复用初始化状态和
   构象，检查坐标校验值，再做配对统计。现有不足 1 Å 的差异不应作因果结论。
+
+## 2026-09-09 本地接手进展
+
+已建立严格确定性的全原子 exact DockQ evaluator。native 重建自检 DockQ/Fnat
+均为 1；相同初始化在多 GPU 上逐元素一致。默认 CUDA `index_add_` 的微小
+非确定性会沿自由轨迹放大，因此后续比较全部启用确定性 scatter 路径并记录
+初始化、checkpoint、index 和 DockQ 实现哈希。
+
+输出基不是当前瓶颈：18 个状态的几何子基全部满秩，teacher 刚体目标最大相对
+投影误差为 1.14e-15。主要失败在旋转系数学习：EMA rotation cosine 平均
+-0.120，36 项中 23 项为负，30 项幅度不足目标四分之一。固定单状态又能把
+loss 降到 0.001--0.02，说明局部表达能力存在，但单点速度 MSE、状态信息或
+条件平均没有产生正确的自由轨迹向量场。
+
+解析 torsion gauge 与 solver 的有限差分误差约 1e-9，production teacher path
+无需修改。旧 off-path transported target 会运输 teacher gauge；新实验变体先
+移除 teacher 公共 spin，只运输刚体项，再按 rollout 配体构象和 torsion rate
+重算 spin 并同时加入两个界面角速度。严格 RNG 配对、PDB 前缀去重后，短程
+`rollout + gauge` 相对 teacher 曾在 49 个 case 配对中提升 46 个，平均 exact
+DockQ +0.00243；但只比较新旧 gauge、保持 rollout 相同时，首批 28 个配对仅
+提升 15 个，平均约 +0.00057。当前证据更支持“短程 rollout 有益、gauge 修正
+贡献较小且不稳定”，不能把组合收益归因于 gauge。
+
+另一个稳定结论是 checkpoint 时点：两个目标变体在训练 seed 22001 都于
+epoch 1 达峰，在 seed 22002 都于 epoch 6 达峰，而 teacher validation loss
+不能选出这些点。下一步应使用 PDB/homology 去重的独立 exact DockQ 面板验证
+短程 rollout，并测试轨迹、终点或界面接触监督；不要直接扩大长训练。
 - 短训 96 step 使用 EMA decay=0.999，初始权重仍占约 90.8%；小变化可能受
   EMA 滞后影响。下一轮同时比较 raw 与 EMA，先验证梯度、参数变化和可拟合性。
 - 无界 endpoint 版出现大 loss 与 1/t 放大机制一致，但未记录逐样本 t/target
