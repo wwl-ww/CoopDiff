@@ -303,6 +303,17 @@ def main():
                            rollout_steps=runtime['rollout_steps'],
                            rollout_min_time=runtime['rollout_min_time'],
                            contract_mode=runtime['offpath_target'])
+        elif runtime.get('offpath_target') == 'joint_rigid_endpoint_kabsch_bounded_v1':
+            from tricoopdiff.offpath_experiments import BoundedJointEndpointRolloutTrainer
+            trainer_class = BoundedJointEndpointRolloutTrainer
+            variant = dict(
+                rollout_probability=runtime['rollout_probability'],
+                rollout_steps=runtime['rollout_steps'],
+                rollout_min_time=runtime['rollout_min_time'],
+                endpoint_blend=runtime['endpoint_blend'],
+                endpoint_translation_cap=runtime['endpoint_translation_cap'],
+                endpoint_rotation_cap=runtime['endpoint_rotation_cap'],
+                contract_mode=runtime['offpath_target'])
         elif 'rollout_probability' in runtime:
             trainer_class = RolloutAugmentedTrainer
             variant = dict(rollout_probability=runtime['rollout_probability'],

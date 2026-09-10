@@ -386,7 +386,7 @@ EMA；其 mean exact DockQ 为 `0.0277543`。此前临时 raw-base 数值不用�
 
 | 训练 seed | teacher | legacy transported | gauge transported |
 | --- | ---: | ---: | ---: |
-| 24003 | 未补跑 | 0.0305213 | 0.0306689 |
+| 24003 | **0.0336497** | 0.0305213 | 0.0306689 |
 | 24004 | **0.0313394** | 0.0297236 | 0.0304400 |
 | 24005 | **0.0314715** | 0.0276409 | 未补跑 |
 
@@ -423,3 +423,32 @@ teacher 的主要负差来自 `7L0F_G_H_GSP`；24005 该 case 的 exact DockQ
 - `results/local_exact_gate/followup_seed12005_*`、
   `results/paired_pilots/followup_seed24*`、
   `results/local_fixed_state_fit/followup_*`：本地运行产物，不提交 Git。
+
+### 有界 joint endpoint 复验
+
+已新增 `BoundedJointEndpointRolloutTrainer`，checkpoint contract 为
+`joint_rigid_endpoint_kabsch_bounded_v1`。它只在模型生成的 rollout 状态上工作：
+先计算 gauge-correct transported teacher target，再以 blend `0.25` 向 ligand/POI
+native 坐标的 Kabsch 刚体 endpoint 修正；translation/rotation correction cap 分别
+为 `10.0/0.5`，低于 t=0.25 时不生成 rollout，torsion 标签不变。由于 rollout 后
+ligand 含内部扭转，Kabsch 只代表最佳刚体投影，不是精确 joint reflow；该目标读取
+native 坐标，只可用于训练诊断，不能用于盲采样。
+
+固定 8 case、初始化 seed 12005、20 步、确定性后端、raw epoch 3 的结果为：
+
+| 训练 seed | teacher | bounded joint | joint - teacher | joint - EMA baseline |
+| --- | ---: | ---: | ---: | ---: |
+| 24004 | 0.0313394 | 0.0312703 | -0.0000691 | +0.0035160 |
+| 24005 | 0.0314715 | 0.0258546 | -0.0056169 | -0.0018997 |
+
+24004 近似持平，24005 明显退化，故 bounded joint 没有稳定超过同 seed teacher。
+补跑的 teacher-24003 为 `0.0336497`，同样高于 transported/gauge 的
+`0.0305213/0.0306689`。三个训练 seed 的配对证据现在一致指向：不扩大当前
+transported、gauge 或 bounded joint 实验。
+
+独立初始化 seed 12006 的原 EMA exact DockQ 为 `0.0138492`，比 seed 12005 的
+`0.0277543` 低 `0.0139051`；这远大于 24004 的 joint/teacher 微小差异。seed 12006
+的 8-case operator repeatability 双跑全部通过，三 case velocity audit 也逐字段一致，
+因此该差异应作为真实初始化敏感性处理，而不是复现噪声。另补齐 3ZCB 固定状态拟合，
+loss 从 `7.1083` 降至 `0.002295`。后续若提出新的整轨迹约束，必须先定义跨多个固定
+初始化 seed 的 exact DockQ 门禁；单一 seed 的均值提升不再作为扩训依据。

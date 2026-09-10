@@ -539,3 +539,27 @@ GPU 2--5 并行用于短训、exact DockQ、速度审计、固定状态拟合和
 当前决定：不扩大现有 transported/gauge 训练。下一项应实现并小试有界 joint
 endpoint/reflow，仍以同 seed teacher、raw 权重、固定初始化和 exact DockQ
 作为门禁；不得用 fixed validation loss 替代自由采样质量。
+
+### 有界 joint endpoint 小试（已完成）
+
+- 已实现训练专用的 `joint_rigid_endpoint_kabsch_bounded_v1`：只在 rollout 生成态
+  上将 gauge-correct teacher 刚体标签向 native Kabsch endpoint 混合 0.25，translation
+  correction cap 为 10 Å/time、rotation cap 为 0.5 rad/time；torsion 仍保留解析 teacher
+  标签。它是含 native 坐标的 oracle 诊断，不进入盲推理路径，也不声称 torsion 后的
+  Kabsch 投影是精确 reflow。
+- 固定 seed 12005、8 case、20 步、raw epoch 3 exact DockQ：训练 seed 24004 的
+  joint/teacher 为 `0.0312703/0.0313394`，差 `-0.0000691`；seed 24005 为
+  `0.0258546/0.0314715`，差 `-0.0056169`。joint-24004 相对 EMA baseline
+  `0.0277543` 有提升，但没有超过同 seed teacher；joint-24005 低于 baseline。
+- 补齐 teacher-24003 后为 `0.0336497`，高于同 seed transported `0.0305213`
+  和 gauge `0.0306689`。目前 24003--24005 的同 seed 对照均不支持现有 rollout、
+  gauge 或 bounded joint target 对普通 teacher 短训有稳定附加收益。
+- 另一个初始化 seed 12006 的 EMA baseline mean exact DockQ 仅 `0.0138492`；同一
+  轨迹 operator audit 的 8 case 双跑 endpoint hashes 全部一致。初始化方差远大于
+  24004 的 joint/teacher 差值，后续候选必须跨多个固定初始化 seed，而不能据
+  12005 的小差决定扩训。
+- 3ZCB 固定态 300-step loss 从 `7.1083` 降到 `0.002295`，补齐第 8 个结构后仍
+  支持“局部可表达、自由轨迹学习不足”。
+
+当前决定：停止扩大这三类 off-path target；下一项优先做能够直接约束整段自由轨迹
+方向的训练目标/损失设计，并在开训前定义跨初始化 seed 的 exact DockQ 门禁。

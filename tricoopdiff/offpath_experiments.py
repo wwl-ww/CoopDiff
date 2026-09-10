@@ -14,10 +14,12 @@ rotating that label is a controlled target convention, not a derivation of the
 full off-path tangent when ligand torsions changed during rollout.
 """
 
+import math
 import numpy as np
 import torch
 
 from .consensus_experiment import ExperimentalConsensusTrainer
+from .joint_endpoint_experiment import joint_rigid_endpoint_targets
 from .sdpi_flow import _horizontal_torsion_velocity
 
 
@@ -25,6 +27,8 @@ OFFPATH_CONTRACT_MODE = 'poi_body_frame_transported_coupling_v1'
 TORSION_GAUGE_CONTRACT = 'teacher_gauge_rotated_without_offpath_rederivation_v1'
 GAUGE_CORRECT_CONTRACT_MODE = 'poi_body_frame_transported_gauge_correct_v2'
 GAUGE_CORRECT_TORSION_CONTRACT = 'remove_teacher_recompute_rollout_common_spin_v1'
+JOINT_ENDPOINT_CONTRACT_MODE = 'joint_rigid_endpoint_kabsch_bounded_v1'
+JOINT_ENDPOINT_TORSION_CONTRACT = 'preserve_teacher_torsion_v1'
 
 
 def _validate_body(name, body):
@@ -163,11 +167,14 @@ class BodyFrameTransportRolloutTrainer(ExperimentalConsensusTrainer):
                     ligand, poi, body, velocities, step_dt, ligand_data)
                 current = current - step_dt
 
-        targets = self._map_targets(teacher, ligand, body, coupling)
+        targets = self._map_targets(
+            teacher, ligand, poi, body, coupling,
+            ligand_data=ligand_data, poi_data=poi_data, time=t)
         self.rollout_augmented_states += 1
         return ligand.detach(), poi.detach(), body.detach(), targets
 
-    def _map_targets(self, teacher, rollout_ligand, rollout_body, coupling):
+    def _map_targets(self, teacher, rollout_ligand, rollout_poi, rollout_body,
+                     coupling, **_):
         return transport_poi_body_frame_targets(teacher[3], teacher[2], rollout_body)
 
     def runtime_contract(self):
@@ -193,7 +200,8 @@ class GaugeCorrectBodyFrameTransportRolloutTrainer(BodyFrameTransportRolloutTrai
         super().__init__(*args, contract_mode=OFFPATH_CONTRACT_MODE, **kwargs)
         self.offpath_contract_mode = contract_mode
 
-    def _map_targets(self, teacher, rollout_ligand, rollout_body, coupling):
+    def _map_targets(self, teacher, rollout_ligand, rollout_poi, rollout_body,
+                     coupling, **_):
         return transport_targets_with_recomputed_gauge(
             teacher[3], teacher[2], rollout_body, teacher[0], rollout_ligand, coupling)
 
@@ -202,4 +210,62 @@ class GaugeCorrectBodyFrameTransportRolloutTrainer(BodyFrameTransportRolloutTrai
         result['offpath_target'] = self.offpath_contract_mode
         result['offpath_contract_mode'] = self.offpath_contract_mode
         result['offpath_torsion_gauge'] = GAUGE_CORRECT_TORSION_CONTRACT
+        return result
+
+
+class BoundedJointEndpointRolloutTrainer(BodyFrameTransportRolloutTrainer):
+    """Apply bounded joint rigid endpoint corrections at generated states.
+
+    The ligand may differ internally from its native coordinates after a
+    torsional rollout.  The endpoint helper therefore supplies only the best
+    Kabsch rigid correction; the analytic teacher torsion target is preserved.
+    This is a training-only oracle experiment, not a blind inference feature.
+    """
+
+    def __init__(self, *args, endpoint_blend=0.25,
+                 endpoint_translation_cap=10.0, endpoint_rotation_cap=0.5,
+                 contract_mode=JOINT_ENDPOINT_CONTRACT_MODE, **kwargs):
+        if contract_mode != JOINT_ENDPOINT_CONTRACT_MODE:
+            raise ValueError(f'unsupported off-path contract mode: {contract_mode!r}')
+        if not 0 < endpoint_blend <= 1:
+            raise ValueError('endpoint_blend must be in (0, 1]')
+        if (not math.isfinite(endpoint_translation_cap)
+                or not math.isfinite(endpoint_rotation_cap)
+                or endpoint_translation_cap <= 0 or endpoint_rotation_cap <= 0):
+            raise ValueError('endpoint correction caps must be finite and positive')
+        super().__init__(*args, contract_mode=OFFPATH_CONTRACT_MODE, **kwargs)
+        self.offpath_contract_mode = contract_mode
+        self.endpoint_blend = float(endpoint_blend)
+        self.endpoint_translation_cap = float(endpoint_translation_cap)
+        self.endpoint_rotation_cap = float(endpoint_rotation_cap)
+        self.joint_endpoint_applied_states = 0
+
+    def _map_targets(self, teacher, rollout_ligand, rollout_poi, rollout_body,
+                     coupling, *, ligand_data, poi_data, time):
+        base = transport_targets_with_recomputed_gauge(
+            teacher[3], teacher[2], rollout_body,
+            teacher[0], rollout_ligand, coupling)
+        endpoint, _ = joint_rigid_endpoint_targets(
+            rollout_ligand, rollout_poi, rollout_body,
+            ligand_data['coords'], poi_data['coords'], time,
+            teacher_targets=base, min_time=self.rollout_min_time,
+            low_time='clamp', blend=self.endpoint_blend,
+            correction_cap={
+                'tr': self.endpoint_translation_cap,
+                'rot': self.endpoint_rotation_cap,
+            },
+            exact_fit_tolerance=None, body_tolerance=None)
+        self.joint_endpoint_applied_states += 1
+        return {**endpoint, 'torsion': base['torsion']}
+
+    def runtime_contract(self):
+        result = super().runtime_contract()
+        result.update({
+            'offpath_target': self.offpath_contract_mode,
+            'offpath_contract_mode': self.offpath_contract_mode,
+            'offpath_torsion_gauge': JOINT_ENDPOINT_TORSION_CONTRACT,
+            'endpoint_blend': self.endpoint_blend,
+            'endpoint_translation_cap': self.endpoint_translation_cap,
+            'endpoint_rotation_cap': self.endpoint_rotation_cap,
+        })
         return result

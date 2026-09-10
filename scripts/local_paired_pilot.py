@@ -85,6 +85,13 @@ def make_trainer(variant, model, flow, common):
         return GaugeCorrectBodyFrameTransportRolloutTrainer(
             model, flow, rollout_probability=.5, rollout_steps=5,
             rollout_min_time=.25, **common)
+    if variant == 'joint_endpoint':
+        from tricoopdiff.offpath_experiments import BoundedJointEndpointRolloutTrainer
+        return BoundedJointEndpointRolloutTrainer(
+            model, flow, rollout_probability=.5, rollout_steps=5,
+            rollout_min_time=.25, endpoint_blend=.25,
+            endpoint_translation_cap=10., endpoint_rotation_cap=.5,
+            **common)
     raise ValueError(variant)
 
 
@@ -94,7 +101,8 @@ def main():
     ap.add_argument('--base', type=Path, required=True)
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--variant', choices=('teacher', 'coupling', 'e3_endpoint',
-                                           'transported', 'gauge_transported'), required=True)
+                                           'transported', 'gauge_transported',
+                                           'joint_endpoint'), required=True)
     ap.add_argument('--train-cases', type=int, default=32)
     ap.add_argument('--val-cases', type=int, default=8)
     ap.add_argument('--epochs', type=int, default=3)

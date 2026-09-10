@@ -8,10 +8,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tricoopdiff.offpath_experiments import (
+    BoundedJointEndpointRolloutTrainer,
     BodyFrameTransportRolloutTrainer,
     GAUGE_CORRECT_CONTRACT_MODE,
     GAUGE_CORRECT_TORSION_CONTRACT,
     GaugeCorrectBodyFrameTransportRolloutTrainer,
+    JOINT_ENDPOINT_CONTRACT_MODE,
+    JOINT_ENDPOINT_TORSION_CONTRACT,
     OFFPATH_CONTRACT_MODE,
     TORSION_GAUGE_CONTRACT,
     _state_torsion_gauge,
@@ -134,6 +137,71 @@ def test_gauge_correct_contract_has_distinct_checkpoint_identity():
     contract = trainer.runtime_contract()
     assert contract['offpath_contract_mode'] == GAUGE_CORRECT_CONTRACT_MODE
     assert contract['offpath_torsion_gauge'] == GAUGE_CORRECT_TORSION_CONTRACT
+
+
+def test_bounded_joint_endpoint_changes_only_rigid_targets_within_caps():
+    native_ligand, rollout_ligand, coupling = torsion_example()
+    native_poi = torch.tensor(
+        [[[0., 0., 0.], [0., 1., 0.], [0., 0., 1.], [1., 1., 1.]]],
+        dtype=torch.float64)
+    poi_rotation = rotation([-.2, .3, .1])
+    rollout_poi = native_poi @ poi_rotation.transpose(-1, -2) + torch.tensor(
+        [[[2., -1., .5]]], dtype=torch.float64)
+    teacher_body = rotation([.3, -.2, .1])
+    rollout_body = rotation([-.4, .2, .5])
+    original = targets()
+    original = {**original, 'torsion': original['torsion'][:, :1]}
+    teacher = (native_ligand, native_poi, teacher_body, original)
+
+    trainer = BoundedJointEndpointRolloutTrainer.__new__(
+        BoundedJointEndpointRolloutTrainer)
+    trainer.rollout_min_time = .25
+    trainer.endpoint_blend = .25
+    trainer.endpoint_translation_cap = 2.
+    trainer.endpoint_rotation_cap = .4
+    trainer.joint_endpoint_applied_states = 0
+    result = trainer._map_targets(
+        teacher, rollout_ligand, rollout_poi, rollout_body, coupling,
+        ligand_data={'coords': native_ligand},
+        poi_data={'coords': native_poi},
+        time=torch.tensor([.5], dtype=torch.float64))
+    base = transport_targets_with_recomputed_gauge(
+        original, teacher_body, rollout_body,
+        native_ligand, rollout_ligand, coupling)
+
+    assert trainer.joint_endpoint_applied_states == 1
+    assert result['torsion'] is base['torsion']
+    assert torch.equal(result['torsion'], original['torsion'])
+    for branch in ('e3_ligand', 'poi_ligand'):
+        for component, cap in (('tr', 2.), ('rot', .4)):
+            change = torch.linalg.vector_norm(
+                result[branch][component] - base[branch][component], dim=-1)
+            assert bool((change <= .25 * cap + 1e-12).all()), (
+                branch, component, change)
+
+
+def test_bounded_joint_endpoint_contract_has_distinct_checkpoint_identity():
+    trainer = BoundedJointEndpointRolloutTrainer.__new__(
+        BoundedJointEndpointRolloutTrainer)
+    trainer.offpath_contract_mode = JOINT_ENDPOINT_CONTRACT_MODE
+    trainer.rollout_probability = .5
+    trainer.rollout_steps = 5
+    trainer.rollout_min_time = .25
+    trainer.endpoint_blend = .25
+    trainer.endpoint_translation_cap = 10.
+    trainer.endpoint_rotation_cap = .5
+    trainer.activation_clamp = 100.0
+    trainer.activation_clamp_mode = 'irrep_norm'
+    trainer.residual_weight = 1e-3
+    trainer.ema_decay = .999
+    trainer.optimizer_config = {'trifuse': {'lr': 1e-4, 'weight_decay': 1e-4}}
+    contract = trainer.runtime_contract()
+    assert contract['offpath_target'] == JOINT_ENDPOINT_CONTRACT_MODE
+    assert contract['offpath_contract_mode'] == JOINT_ENDPOINT_CONTRACT_MODE
+    assert contract['offpath_torsion_gauge'] == JOINT_ENDPOINT_TORSION_CONTRACT
+    assert contract['endpoint_blend'] == .25
+    assert contract['endpoint_translation_cap'] == 10.
+    assert contract['endpoint_rotation_cap'] == .5
 
 
 class FakeFlow:
