@@ -11,7 +11,7 @@ import sys
 import time
 
 # Set before importing numerical libraries; expose only the assigned GPU.
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '3')
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 for name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
              'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):

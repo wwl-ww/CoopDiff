@@ -192,23 +192,38 @@ def summarize(rows):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--repeat', action='store_true', help='Reload saved couplings for a repeat run')
+    parser.add_argument(
+        '--repeat', action='store_true',
+        help='Reload saved couplings for a repeat run')
     parser.add_argument('--out', type=Path, default=OUT)
+    parser.add_argument('--checkpoint', type=Path)
+    parser.add_argument('--cases', nargs='+')
+    parser.add_argument('--seeds', nargs='+', type=int)
     args = parser.parse_args()
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
+    previous = None
+    if args.repeat and (out / 'audit.json').is_file():
+        previous = json.loads((out / 'audit.json').read_text())
+    cases = args.cases or (previous['cases'] if previous else list(CASES))
+    seeds = args.seeds or (previous['seeds'] if previous else list(SEEDS))
     torch.set_num_threads(4)
     torch.set_num_interop_threads(4)
     reproducibility = configure_inference_reproducibility(True)
     assert torch.cuda.device_count() == 1
     assert str(ROOT) in sys.modules['tricoopdiff'].__file__
     plan = ARTIFACTS / 'results/overnight_root_cause_v3_plan'
-    checkpoint = ARTIFACTS / 'results/overnight_root_cause_v3_run04/ccd_single_bond_frozen_seed1729/best.pt'
+    default_checkpoint = (ARTIFACTS / 'results/'
+        'overnight_root_cause_v3_run04/ccd_single_bond_frozen_seed1729/best.pt')
+    checkpoint = args.checkpoint or (
+        Path(previous['checkpoint']) if previous else default_checkpoint)
     expert_dir = ARTIFACTS / 'checkpoints/score_model'
     entries = {e['case']: e for e in json.loads((plan / 'indexes/ternary_val_ccd.json').read_text())['entries']}
     score_args = _load_score_model_args(str(expert_dir))
     batches, provenance = [], []
-    for case in CASES:
+    if len(set(cases)) < 1 or len(set(seeds)) < 1:
+        parser.error('at least one case and seed are required')
+    for case in cases:
         batch, evidence = load_batch(entries[case], plan, score_args)
         batches.append(batch)
         provenance.append(evidence)
@@ -220,7 +235,7 @@ def main():
                    if args.repeat else {})
     pairs = []
     for batch in batches:
-        for seed in SEEDS:
+        for seed in seeds:
             key = f"{batch['case']}:{seed}"
             random.seed(seed)
             np.random.seed(seed)
@@ -284,7 +299,7 @@ def main():
         'limitations': 'Crystal-reference teacher t=1 start, not blind ETKDG inference. Conditional target cosine is not marginal-flow correctness. Drift is not proof the flow objective is wrong. No DockQ measured.',
         'units': {'translation': 'angstrom / unit time', 'rotation_and_torsion': 'radian / unit time'},
         'checkpoint': str(checkpoint), 'checkpoint_sha256': sha256(checkpoint),
-        'checkpoint_metadata': metadata, 'cases': CASES, 'seeds': SEEDS,
+        'checkpoint_metadata': metadata, 'cases': cases, 'seeds': seeds,
         'environment': {key: os.environ[key] for key in (
             'CUDA_VISIBLE_DEVICES', 'TRICOOPDIFF_CACHE_DIR', 'HF_HUB_CACHE',
             'HF_HUB_OFFLINE', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS')},

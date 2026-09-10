@@ -374,3 +374,52 @@ seed，并分析 seed 12005 的状态/速度差异，而不是只扩大单次训
 机器可用物理 GPU 为 2--5；0、1、6 有其他任务，7 保留避让。新增结果位于
 `results/local_exact_gate/modelv2_*`、`results/modelv2_round1b_*` 和
 `results/paired_pilots/modelv2_*`。这些目录为运行产物，不提交到 Git。
+
+## 2026-09-10 多训练 seed 与 seed 12005 复查
+
+在普通分支 `investigate/model-v2-followup` 上补充训练 seed 24003--24005，
+训练、精确 DockQ、速度审计和固定状态拟合分别使用物理 GPU 2--5 并行运行，
+没有把一个数据分片任务拆到多卡。所有自由采样比较均固定 8 个验证 case、
+初始化 seed 12005、20 步、确定性后端和 raw 候选权重。短训 raw 权重从原
+factorial checkpoint 的 EMA 开始，因此公平基线也必须评估原 checkpoint 的
+EMA；其 mean exact DockQ 为 `0.0277543`。此前临时 raw-base 数值不用于结论。
+
+| 训练 seed | teacher | legacy transported | gauge transported |
+| --- | ---: | ---: | ---: |
+| 24003 | 未补跑 | 0.0305213 | 0.0306689 |
+| 24004 | **0.0313394** | 0.0297236 | 0.0304400 |
+| 24005 | **0.0314715** | 0.0276409 | 未补跑 |
+
+相对 EMA baseline，24004 的 teacher/transported/gauge 分别为
+`+0.0035851`、`+0.0019693`、`+0.0026857`；24005 的 teacher/transported
+为 `+0.0037172`、`-0.0001134`。两个具有同训练 seed teacher 对照的新复验都由
+普通 teacher 获得更高面板均值，因此**没有复现 rollout target 相对普通短训的
+附加收益**。这只覆盖一个固定初始化 seed，不能反向宣称 rollout 对所有初始化
+均有害；但已足以阻止按现有 transported/gauge target 扩大训练。
+
+seed 12005 的逐步配对分析验证所有候选与基线初始坐标逐元素一致，并将相邻状态
+差标作“经验步速度”，不冒充模型原始输出头。24004/24005 的 transported 相对
+teacher 的主要负差来自 `7L0F_G_H_GSP`；24005 该 case 的 exact DockQ
+为 `0.02923` 对 teacher `0.05646`。其 POI 中心总改善为 `8.01 Å` 对 teacher
+`8.02 Å`，但经验 POI 旋转方向 cosine 均值为 `-0.505` 对 `-0.282`；这支持
+“中心接近不等于双界面朝向正确”，不支持只调 translation 或只看中心误差。
+
+原 EMA 的 teacher-path 速度审计覆盖 8 case × seed 12005 × 3 times，并跨进程
+逐字段复现。t=0.5 的 E3/POI rotation cosine 均值为 `-0.268/0.356`，t=0.9
+为 `-0.113/-0.073`，对应 norm ratio 仅 `0.302/0.196` 与 `0.198/0.179`。
+旋转方向/幅度仍是明确弱项。
+
+另在 8-case 面板中的 7 结构上各做 300-step 固定状态拟合，终值 loss
+为 `0.00112--0.03153`；其中 6 个低于 `0.003`，较慢的 3CXH/4IL6 最终主要
+剩 torsion。结合模型在固定状态可拟合、自由轨迹方向仍差的证据，下一步应停止
+扩大现有 rollout/gauge，转向有界 joint endpoint/reflow 的短程实验，并继续以
+同 seed teacher、raw 权重和 exact DockQ 作选择门禁。
+
+新增代码与产物：
+
+- `scripts/compare_rollout_trajectories.py`：同初始化轨迹的中心、刚体旋转和状态
+  分叉配对分析；输出位于 `results/trajectory_comparisons/`。
+- `scripts/local_velocity_audit.py`：cases/seeds 参数化，repeat 自动恢复首轮配置。
+- `results/local_exact_gate/followup_seed12005_*`、
+  `results/paired_pilots/followup_seed24*`、
+  `results/local_fixed_state_fit/followup_*`：本地运行产物，不提交 Git。

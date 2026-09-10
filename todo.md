@@ -519,3 +519,23 @@ POI rotation 最小原始范数约 `0.0630`、最大归一化增益约 `2.518`�
 当前重点仍是失败轨迹中的刚体方向与双界面协调；已修复的复现问题让后续固定状态
 对照可解释，但尚未解决 epoch20 checkpoint 的低 DockQ。全量评测/长训练保持停止，
 本轮所有 GPU 推理只使用物理 GPU 3。
+
+## 2026-09-10 model-v2 后续复查
+
+已在综合分支 `investigate/model-v2-followup` 继续执行末尾待办，并按不同任务将
+GPU 2--5 并行用于短训、exact DockQ、速度审计、固定状态拟合和回归测试。
+
+- seed 12005 的公平 EMA baseline mean exact DockQ 为 `0.0277543`。
+- 新增训练 seed 24004/24005 的严格 teacher 对照均优于 transported rollout：
+  24004 为 `0.0313394 > 0.0297236`，24005 为
+  `0.0314715 > 0.0276409`。24004 gauge 为 `0.0304400`，也未超过 teacher。
+- seed 12005 的弱点不是单纯中心回收。`7L0F_G_H_GSP` 在 transported 24005
+  中 POI 中心改善与 teacher 接近，但经验旋转方向更差，DockQ 为
+  `0.02923` 对 teacher `0.05646`。
+- 8-case teacher-path 速度审计跨进程完全复现；中后段两界面 rotation cosine
+  多为负或幅度不足。7 个结构的 300-step 固定状态 loss 均显著下降，说明局部
+  表达能力存在，自由轨迹向量场仍是主要问题。
+
+当前决定：不扩大现有 transported/gauge 训练。下一项应实现并小试有界 joint
+endpoint/reflow，仍以同 seed teacher、raw 权重、固定初始化和 exact DockQ
+作为门禁；不得用 fixed validation loss 替代自由采样质量。
