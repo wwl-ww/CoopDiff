@@ -1,8 +1,9 @@
 """
 Subgraph construction for TriCoopDiff.
 
-Two physically disconnected subgraphs (E3-L and POI-L) are constructed to match
-DiffDock's pretraining input distribution exactly (zero OOD).
+Two physically disconnected subgraphs (E3-L and POI-L) use DiffDock's input
+schema. Chemistry, graph construction and pose distributions require separate
+validation against the pretrained expert's input contract.
 A third full ternary graph connects all three molecules for TriFuse coordination.
 """
 
@@ -27,7 +28,7 @@ def build_subgraph_e3l(
 
     Nodes: E3 residues + PROTAC atoms ONLY. No POI nodes.
     Edges: E3 internal, PROTAC internal, E3-PROTAC cross edges.
-    This matches DiffDock's standard protein-ligand docking input format exactly.
+    This uses DiffDock's standard protein-ligand graph schema.
 
     Args:
         e3_coords: [N_e3, 3] E3 ligase residue coordinates (Cα positions)

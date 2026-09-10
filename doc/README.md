@@ -44,6 +44,7 @@
 | [初始化方案_gpt6.md](初始化方案_gpt6.md) | 唯一 `sdpi` 初始化、共享构象、精确装配与验收 | 修改采样或初始化时 |
 | [训练入口 SLURM 与 Phase1 smoke 交接文档.md](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md) | 环境预检、SLURM、缓存和训练入口 | 提交训练前 |
 | [DiffDock 审计文档.md](DiffDock%20审计文档.md) | 冻结二体专家的结构和扩散实现 | 修改 expert 集成时 |
+| [低DockQ根因排查交接.md](低DockQ根因排查交接.md) | 化学、初始化、建图、rollout/endpoint 试验、证据局限与接手步骤 | 接手低 DockQ 排查时 |
 | [公式推导参考.md](公式推导参考.md) | SO(3)、DSM、Tweedie 和物理项推导 | 核对数学约定时 |
 
 ## 当前权威结论
@@ -52,6 +53,15 @@
 - 与 DeepTernary 横向比较时，主指标必须调用其完整原子 `DockQ/dockq_util.py::cal_dockq`；Cα 或接触恢复近似值只能作为诊断指标。
 - E3 固定；动态状态是 E3–Ligand 与 POI–Ligand 两个相对刚体界面以及共享 Ligand torsion。
 - 推理唯一支持 `sdpi`：从完整化学图生成一次构象并采样一次 torsion，分别使用两侧受体 RMS radius 计算平移尺度，再精确逆装配；旧 `native`、`coupled5a`、`anchor_local` 和固定 Å 初始化均已删除。
+- 初始化审计显示，原有上游一致性测试只覆盖固定共享构象、关闭 torsion 后的
+  刚体核。39 个缓存盲初始化中，ETKDG+torsion 构象与训练晶体构象 Kabsch
+  RMSD 平均 2.73 Å；冻结专家的配对平移输出方向余弦中位数为 0.998，旋转和
+  torsion 仅为 0.300/0.177。这是当前旋转学习不稳的主要候选根因，训练端应
+  增加与盲推理同分布的内部构象对照。
+- `TernaryInitializer(conformer_policy="diffdock_v1_1")` 提供上游
+  ETKDGv2 默认优先、三次失败后随机坐标加 MMFF 的显式诊断策略。它在 21 个
+  二元 case 上将 ODE ligand RMSD 平均降低 1.27 Å，但 3 个三元 case 的小样本
+  DockQ/RMSD 结果混合，因此生产默认仍为 `etkdgv3_random`。
 - 两个 rigid proposal 从同一个旧 Ligand 生成；Ligand 采用 `sub1` proposal，POI 接收将 `sub2` proposal 对齐到 `sub1` proposal 的精确刚体变换。
 - v2 在冻结专家完成推理后生成门控先验与等变残差，协调共享 torsion；
   不向专家内部注入 FiLM、LoRA 或逐层 bridge。历史 `trifuse_v13` 才使用 FiLM。
@@ -62,6 +72,19 @@
   `generative_process=sdpi_flow_v1`；评估使用 EMA。version 17 仅供旧模型参考，
   不能作为 v2 续训权重。运行配置记录 activation clamp、残差正则、EMA decay
   和 torus score norm 版本，并校验冻结专家身份。
+- 新训练按每个不可约表示副本的模长限幅 (`activation_clamp_mode=irrep_norm`)，
+  以保持冻结专家的旋转等变性。旧 checkpoint 缺少该字段时仍解释为
+  `componentwise`；续训须显式传 `--activation-clamp-mode componentwise`。
+  评估按 checkpoint 恢复模式，不能静默改变旧权重的运行语义。
+- 配体 PDB 的距离连通性检查不能恢复键级、芳香性或电荷。
+  `scripts/restore_ligand_chemistry.py --pdb ... --ccd ... --out ...` 可使用离线
+  CCD 恢复完整组分，保留重原子顺序与坐标；缺原子、未知修饰必须另行审查。
+  此工具不自动替换训练索引，也不自动删除未恢复案例。
+- 受体图使用 neighbor→query 的 kNN 约定且不含自环；特征缓存版本为 7，
+  修改图构建后应重建缓存。旧缓存不可直接复用。
+- 动态 radius fallback 按 torch_cluster 1.6.3 CUDA 的严格半径及源索引扫描
+  顺序截断邻域；CPU 原生实现的饱和邻居选择可以不同。radius_graph 保留该
+  版本先取 cap+1 再去自环的约定，饱和且未选中自身时可剩 cap+1 条边。
 - v2 已有构建、梯度、EMA 恢复及短轨迹检查，尚无充分训练后的质量结论。
 - 当前只定义 Phase 1；`judge_head/state_head` 缺少监督标签，因此保持冻结，不能用无损失的“Phase 2”假装完成微调。
 - Phase 1 使用 PROTAC/Molecular Glue 官方训练成员的去 benchmark 同 PDB

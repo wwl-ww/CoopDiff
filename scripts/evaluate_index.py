@@ -42,6 +42,9 @@ def build_parser():
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--allow-nondeterministic", action="store_true",
                         help="Explicit legacy diagnostic control; never mix with deterministic results")
+    parser.add_argument("--conformer-policy",
+                        choices=["etkdgv3_random", "diffdock_v1_1"],
+                        default="etkdgv3_random")
     return parser
 
 
@@ -73,6 +76,7 @@ def main():
         "native_root": str((_PROJECT_ROOT / args.native_root).resolve()),
         "metric_template_root": args.metric_template_root,
         "deterministic_algorithms": not args.allow_nondeterministic,
+        "conformer_policy": args.conformer_policy,
     }
     (output / "evaluation_manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8",
@@ -81,6 +85,7 @@ def main():
         _PROJECT_ROOT, checkpoint=checkpoint, device=args.device,
         deepternary_root=args.deepternary_root,
         deterministic=not args.allow_nondeterministic,
+        conformer_policy=args.conformer_policy,
     )
     failures = []
     for position, entry in enumerate(entries, start=1):
@@ -110,6 +115,8 @@ def main():
                 "expert_config_sha256": runner.expert_config_sha256,
                 "input_signature": evaluation_input_signature(paths, native),
                 "freeze_poi": False,
+                "activation_clamp_mode": runner.activation_clamp_mode,
+                "conformer_policy": args.conformer_policy,
                 "t_anchor": 1.0,
                 "dockq_source_sha256": sha256_file(runner.deepternary_root / 'DockQ/dockq_util.py'),
                 "dockq_binary_sha256": sha256_file(runner.deepternary_root / 'DockQ/fnat'),

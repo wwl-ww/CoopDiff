@@ -67,6 +67,8 @@ def sample_single(
     freeze_poi: bool = False,
     init_mode: str = "sdpi",
     t_anchor: float = None,
+    translation_velocity_scale: float = 1.0,
+    rotation_velocity_scale: float = 1.0,
 ) -> dict:
     """
     Run one reverse-flow trajectory (single walker) from t=1 to t=0.
@@ -102,6 +104,10 @@ def sample_single(
         steps = diffusion.inference_steps
     if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
         raise ValueError("steps must be a positive integer")
+    for name, value in (("translation_velocity_scale", translation_velocity_scale),
+                        ("rotation_velocity_scale", rotation_velocity_scale)):
+        if not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be a finite non-negative number")
 
     # Clean templates (drop the B=1 dim).
     ligand_template = ligand_data["coords"][0].detach()  # [N_lig, 3]
@@ -221,6 +227,11 @@ def sample_single(
             step0_probe = None
         predicted = diffusion.normalized_predictions(out, t_tr)
         velocities = diffusion.velocities(predicted, e3_data['coords'], poi_data['coords'])
+        for branch in ('e3_ligand', 'poi_ligand'):
+            velocities[branch]['tr'] = (
+                velocities[branch]['tr'] * translation_velocity_scale)
+            velocities[branch]['rot'] = (
+                velocities[branch]['rot'] * rotation_velocity_scale)
         interface_scores = velocities
         s_q = {}
         sanitized_components = []
@@ -351,6 +362,8 @@ def sample_ensemble(
     freeze_poi: bool = False,
     init_mode: str = "sdpi",
     t_anchor: float = None,
+    translation_velocity_scale: float = 1.0,
+    rotation_velocity_scale: float = 1.0,
 ) -> list:
     """
     Run ``n_walkers`` independent reverse-flow trajectories.
@@ -379,6 +392,8 @@ def sample_ensemble(
                 steps=steps, device=device, seed=seeds[i], freeze_poi=freeze_poi,
                 init_mode=init_mode,
                 t_anchor=t_anchor,
+                translation_velocity_scale=translation_velocity_scale,
+                rotation_velocity_scale=rotation_velocity_scale,
             )
         )
     return results

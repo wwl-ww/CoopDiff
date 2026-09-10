@@ -585,6 +585,8 @@ def evaluate_model(
     t_anchor: float = None,
     deepternary_dockq_paths: Optional[Dict[str, str]] = None,
     seed: int = 0,
+    translation_velocity_scale: float = 1.0,
+    rotation_velocity_scale: float = 1.0,
 ) -> dict:
     """
     Sample a conformational ensemble and score structure quality vs the native
@@ -631,6 +633,8 @@ def evaluate_model(
         freeze_poi=freeze_poi,
         init_mode=init_mode,
         t_anchor=t_anchor,
+        translation_velocity_scale=translation_velocity_scale,
+        rotation_velocity_scale=rotation_velocity_scale,
     )
 
     ref_lig = ligand_data['coords'][0].detach().cpu().numpy()  # [N_lig, 3] native

@@ -30,7 +30,8 @@ class EvaluationRunner:
     def __init__(self, project_root, checkpoint, device="cuda",
                  model_dir="checkpoints/score_model",
                  expert_checkpoint="best_ema_inference_epoch_model.pt",
-                 deepternary_root=None, deterministic=True):
+                 deepternary_root=None, deterministic=True,
+                 conformer_policy="etkdgv3_random"):
         self.reproducibility = configure_inference_reproducibility(deterministic)
         self.reproducibility['torus_score_norm_version'] = SCORE_NORM_VERSION
         self.root = Path(project_root).resolve()
@@ -54,6 +55,9 @@ class EvaluationRunner:
             self.checkpoint["runtime_config"]["activation_clamp"]
         )
         os.environ["NAN_CLAMP"] = str(self.activation_clamp)
+        self.activation_clamp_mode = self.checkpoint['runtime_config'].get(
+            'activation_clamp_mode', 'componentwise')
+        os.environ['NAN_CLAMP_MODE'] = self.activation_clamp_mode
 
         self.model_dir = Path(model_dir)
         if not self.model_dir.is_absolute():
@@ -74,6 +78,7 @@ class EvaluationRunner:
         self.diffusion = SDPIFlow()
         self.initializer = TernaryInitializer(
             no_torsion=getattr(self.score_model_args, "no_torsion", False),
+            conformer_policy=conformer_policy,
         )
 
     def _ensure_model(self, input_dim):
@@ -100,7 +105,9 @@ class EvaluationRunner:
     def evaluate_case(self, case, paths, cache_dir, native_complex_pdb=None,
                       n_walkers=32, steps=20, seed=0,
                       init_mode="sdpi", t_anchor=None, freeze_poi=False,
-                      debug_trace=False, debug_seed=0):
+                      debug_trace=False, debug_seed=0,
+                      translation_velocity_scale=1.0,
+                      rotation_velocity_scale=1.0):
         """Featurize and evaluate one case with the resident model."""
         torch.manual_seed(seed)
         if self.device.type == "cuda":
@@ -120,6 +127,8 @@ class EvaluationRunner:
                                 if native_complex_pdb else None),
             freeze_poi=freeze_poi, init_mode=init_mode, t_anchor=t_anchor,
             debug_trace=debug_trace, debug_seed=debug_seed,
+            translation_velocity_scale=translation_velocity_scale,
+            rotation_velocity_scale=rotation_velocity_scale,
             deepternary_dockq_paths={
                 "protein1_pdb": str(paths["protein1"]),
                 "protein2_pdb": str(paths["protein2"]),
@@ -132,6 +141,9 @@ class EvaluationRunner:
         report["case"] = case
         report["run_config"] = {
             **self.reproducibility,
+            "conformer_policy": self.initializer.conformer_policy,
+            "translation_velocity_scale": float(translation_velocity_scale),
+            "rotation_velocity_scale": float(rotation_velocity_scale),
             "seed": seed,
             "n_walkers": n_walkers,
             "steps": (steps if steps is not None
@@ -148,6 +160,7 @@ class EvaluationRunner:
             "expert_config_sha256": self.expert_config_sha256,
             "input_signature": evaluation_input_signature(paths, native_complex_pdb),
             "activation_clamp": self.activation_clamp,
+            "activation_clamp_mode": self.activation_clamp_mode,
             "dockq_reconstruction": (
                 "deepternary_bound_template_rigid_motion"
                 if 'metric_protein1' in paths else "input_allatom_rigid_motion"

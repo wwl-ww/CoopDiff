@@ -75,7 +75,12 @@ def parse_args(argv=None):
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument(
         "--nan-clamp", type=float, default=100.0,
-        help="Per-layer expert activation clamp recorded in v17 flow checkpoints",
+        help="Per-layer expert activation clamp recorded in checkpoints",
+    )
+    p.add_argument(
+        '--activation-clamp-mode', choices=('irrep_norm', 'componentwise'),
+        default='irrep_norm',
+        help='Use componentwise explicitly when resuming legacy v2 checkpoints',
     )
     p.add_argument(
         "--torsion-expert-aux-weight", type=float, default=0.25,
@@ -408,6 +413,7 @@ def build_trainer(args, device, input_dim=None):
         lora_early_lr=getattr(args, 'lora_early_lr', 5e-6),
         lora_early_layers=getattr(args, 'lora_early_layers', 4),
         activation_clamp=args.nan_clamp,
+        activation_clamp_mode=args.activation_clamp_mode,
         torsion_expert_aux_weight=args.torsion_expert_aux_weight,
         lora_warmup_steps=args.lora_warmup_steps,
         residual_weight=args.residual_weight,

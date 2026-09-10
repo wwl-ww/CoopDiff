@@ -68,6 +68,7 @@ class TriCoopDiffTrainer:
         # boundary so library callers cannot silently run a different model
         # from the trainer's recorded checkpoint contract.
         os.environ['NAN_CLAMP'] = str(self.activation_clamp)
+        os.environ['NAN_CLAMP_MODE'] = 'componentwise'
         if torsion_expert_aux_weight < 0:
             raise ValueError("torsion_expert_aux_weight must be non-negative")
         self.torsion_expert_aux_weight = float(torsion_expert_aux_weight)
@@ -119,6 +120,27 @@ class TriCoopDiffTrainer:
         for parameter in self._lora_params:
             parameter.requires_grad = bool(trainable)
 
+    def _training_state(self, e3_data, poi_data, ligand_data, coupling, t, dt):
+        """Return the state and velocity target used by one loss evaluation."""
+        return self.diffusion.path(
+            ligand_data, poi_data['coords'], coupling, t,
+        )
+
+    def _forward_state(self, e3_data, poi_data, ligand_data,
+                       ligand, poi, body, t, dt):
+        """Run the model at an explicitly supplied flow state."""
+        conditioning = self.diffusion.conditioning(
+            t, dt, e3_data['coords'], poi_data['coords'])
+        tr_condition, _, _ = self.diffusion.t_to_sigma(t, t, t)
+        crop = (tr_condition * 3 + 20
+                if bool(getattr(self.model.expert.model, 'dynamic_max_cross', False)) else None)
+        return self.model(
+            e3_data, {**poi_data, 'coords': poi},
+            {**ligand_data, 'coords': ligand},
+            t_e3l=t, t_pol=t, r_e3_to_poi=body,
+            diffusion_state=conditioning, receptor_crop_cutoff=crop,
+        )
+
     def compute_loss(
         self, e3_data: dict, poi_data: dict, ligand_data: dict,
         case: str = "unknown", t_override: Optional[torch.Tensor] = None,
@@ -144,16 +166,11 @@ class TriCoopDiffTrainer:
             e3_data['coords'], poi_data['coords'], ligand_data,
             no_torsion=bool(getattr(self.model.expert.model, 'no_torsion', False)),
         )
-        ligand, poi, body, targets = self.diffusion.path(ligand_data, poi_data['coords'], coupling, t)
         dt = t.new_full((1,), 1 / self.diffusion.inference_steps)
-        conditioning = self.diffusion.conditioning(t, dt, e3_data['coords'], poi_data['coords'])
-        tr_condition, _, _ = self.diffusion.t_to_sigma(t, t, t)
-        crop = (tr_condition * 3 + 20
-                if bool(getattr(self.model.expert.model, 'dynamic_max_cross', False)) else None)
-        output = self.model(
-            e3_data, {**poi_data, 'coords': poi}, {**ligand_data, 'coords': ligand},
-            t_e3l=t, t_pol=t, r_e3_to_poi=body,
-            diffusion_state=conditioning, receptor_crop_cutoff=crop,
+        ligand, poi, body, targets = self._training_state(
+            e3_data, poi_data, ligand_data, coupling, t, dt)
+        output = self._forward_state(
+            e3_data, poi_data, ligand_data, ligand, poi, body, t, dt,
         )
         predictions = self.diffusion.normalized_predictions(output, t)
         scales = self.diffusion.scales(e3_data['coords'], poi_data['coords'])

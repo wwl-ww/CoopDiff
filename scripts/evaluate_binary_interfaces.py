@@ -156,8 +156,8 @@ def main():
     results = []
     for cache in args.cache:
         payload = torch.load(cache, map_location='cuda', weights_only=False)
-        if payload.get('cache_version') != 5 or not payload.get('source_signature'):
-            raise ValueError(f'{cache}: expected signed feature cache v5')
+        if payload.get('cache_version') != 7 or not payload.get('source_signature'):
+            raise ValueError(f'{cache}: expected signed feature cache v7 (corrected k-NN edges)')
         for component in ('e3_data', 'poi_data', 'ligand_data'):
             for name in ('coords', 'features'):
                 value = payload[component][name]

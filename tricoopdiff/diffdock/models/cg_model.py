@@ -13,6 +13,7 @@ from .layers import GaussianSmearing, AtomEncoder
 from .tensor_layers import TensorProductConvLayer, get_irrep_seq
 from ..utils import so3, torus
 from ..constants import lig_feature_dims, rec_residue_feature_dims, rec_atom_feature_dims
+from ...equivariant_clamp import clamp_irrep_features, validate_clamp_mode
 
 
 class CGModel(torch.nn.Module):
@@ -367,7 +368,13 @@ class CGModel(torch.nn.Module):
             # overflows float32 and produces NaN scores. Opt-in via NAN_CLAMP env.
             _nan_clamp = os.environ.get("NAN_CLAMP")
             if _nan_clamp:
-                node_attr = torch.clamp(node_attr, min=-float(_nan_clamp), max=float(_nan_clamp))
+                mode = validate_clamp_mode(os.environ.get('NAN_CLAMP_MODE', 'componentwise'))
+                if mode == 'irrep_norm':
+                    node_attr = clamp_irrep_features(
+                        node_attr, self.conv_layers[l].out_irreps, float(_nan_clamp))
+                else:
+                    # Explicit legacy mode reproduces existing checkpoint semantics.
+                    node_attr = torch.clamp(node_attr, min=-float(_nan_clamp), max=float(_nan_clamp))
 
             if _nan_trace:
                 lig_na = node_attr[:len(lig_node_attr)]

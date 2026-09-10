@@ -46,7 +46,10 @@ os.chdir(_PROJECT_ROOT)
 # Featurization cache schema version. Bump whenever the geometry/frame handling
 # of the produced data changes, so stale on-disk caches (written before the
 # shared-reference-frame fix) are invalidated instead of silently reused.
-_FEATURIZE_CACHE_VERSION = 5
+# v6 fixes the directed k-NN convention and small-receptor self loops.
+# v7 also avoids distance cancellation for translated PDB coordinates.
+# v5 caches contain reversed directed receptor edges and cannot be reused.
+_FEATURIZE_CACHE_VERSION = 7
 
 
 def _featurize_signature(protein1, protein2, ligand_path, score_model_args):
