@@ -361,6 +361,16 @@ teacher 在 epoch 1/2/3 为 `0.014977/0.014733/0.014766`；legacy transported
 median `+0.000803`、mean `+0.001749`，分布更稳。该结果支持 rollout 有益，
 但 transported 的大均值仍需更多固定初始化和跨卡复验，不能只报平均数。
 
+扩展到采样 seed 12001--12006 后，每个候选有 48 个逐例配对。训练 seed 24002
+的 epoch 3 raw 统计为：legacy transported 36/48 改善，mean delta
+`+0.003833`、median `+0.000876`；gauge-transposed 37/48，mean
+`+0.002738`、median `+0.000944`；E3 endpoint 34/48，mean `+0.002275`；
+teacher 27/48，mean `+0.000538`。transported 的均值仍受最大 `+0.062522`
+病例影响，gauge 的胜率和中位数略高。两种 rollout 在 seed 12005 都约下降
+`0.0021`，但在其余五个 seed 的面板均值上均改善。当前最稳妥结论是短 rollout
+显著提高多数配对，gauge 与 legacy transport 尚无稳定胜负；下一步应增加训练
+seed，并分析 seed 12005 的状态/速度差异，而不是只扩大单次训练。
+
 机器可用物理 GPU 为 2--5；0、1、6 有其他任务，7 保留避让。新增结果位于
 `results/local_exact_gate/modelv2_*`、`results/modelv2_round1b_*` 和
 `results/paired_pilots/modelv2_*`。这些目录为运行产物，不提交到 Git。
