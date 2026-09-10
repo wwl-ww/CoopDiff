@@ -15,7 +15,7 @@ from typing import Any, Iterable
 
 
 DEFAULT_SOURCE = Path(
-    "/home/wl/workspace/CoopDiff/results/handoff_artifacts/results"
+    "results/handoff_artifacts/results"
 )
 DEFAULT_OUTPUT = Path("results/handoff_summary")
 CHECKPOINT_NAMES = {"best.pt", "latest.pt", "checkpoint.pt", "smoke_only.pt"}
