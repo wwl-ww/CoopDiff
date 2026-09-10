@@ -314,6 +314,14 @@ def main():
                 endpoint_translation_cap=runtime['endpoint_translation_cap'],
                 endpoint_rotation_cap=runtime['endpoint_rotation_cap'],
                 contract_mode=runtime['offpath_target'])
+        elif runtime.get('trajectory_objective') == 'differentiable_sdpi_trajectory_v1':
+            from tricoopdiff.trajectory_experiment import TrajectoryConsistencyTrainer
+            trainer_class = TrajectoryConsistencyTrainer
+            variant = dict(
+                trajectory_steps=runtime['trajectory_steps'],
+                trajectory_weight=runtime['trajectory_weight'],
+                trajectory_min_time=runtime['trajectory_min_time'],
+                contract_mode=runtime['trajectory_objective'])
         elif 'rollout_probability' in runtime:
             trainer_class = RolloutAugmentedTrainer
             variant = dict(rollout_probability=runtime['rollout_probability'],

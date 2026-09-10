@@ -563,3 +563,28 @@ endpoint/reflow，仍以同 seed teacher、raw 权重、固定初始化和 exact
 
 当前决定：停止扩大这三类 off-path target；下一项优先做能够直接约束整段自由轨迹
 方向的训练目标/损失设计，并在开训前定义跨初始化 seed 的 exact DockQ 门禁。
+
+### 三步可微轨迹损失（已完成小试）
+
+- 新增纯 Torch `differentiable_sdpi_step`，覆盖双分支 SE(3) 与顺序 torsion 更新，
+  并用可微 Kabsch 去除 torsion 引入的公共刚体分量。合成测试与生产
+  `SDPIFlow.step` 一致，两步反传后四个刚体速度和 torsion 均有有限非零梯度。
+- `TrajectoryConsistencyTrainer` 从解析 teacher path 状态出发，连续展开 3 个
+  `dt=1/20` 的模型步，每步对齐同 coupling 的下一解析状态；损失包含按 receptor
+  prior scale 归一化的 ligand/POI 坐标误差与 body matrix 误差。t<0.25 不启用，
+  固定 validation 暂时关闭该辅助项，checkpoint 使用独立 runtime contract。
+- weight=0.1、训练 seed 24004/24005 的三初始化 exact DockQ 相对同 seed teacher：
+  - 24004：seed 12001/12005/12006 为 `-0.000122/+0.000030/-0.000000`；
+    24 case mean/median delta 为 `-0.000031/+0.000004`，15/24 改善。
+  - 24005：为 `-0.000062/+0.000445/+0.000000`；mean/median 为
+    `+0.000128/+0.000004`，15/24 改善。
+- weight=1.0、训练 seed 24006 相对同 seed teacher 为
+  `-0.000017/+0.001018/-0.000042`；24 case mean/median 为
+  `+0.000320/+0.000092`，16/24 改善。面板级只有 seed 12005 改善，12001/12006
+  均略退化，未通过“多数固定初始化改善”的预设门禁。
+- 新增 baseline seed 12007 mean exact DockQ `0.0187896`，8-case operator
+  双跑和 velocity audit 重放均完全一致；继续证明初始化敏感性不是数值复现噪声。
+
+当前决定：保留可微 solver 作为后续研究基础，但不扩大当前三步坐标损失训练。
+若继续，应先分析 seed 12005 独有增益来自哪些 case/轨迹阶段，再决定是否改成
+分阶段 rotation/interface loss；不再仅通过增大 weight 或增加训练 seed 搜索结果。

@@ -66,7 +66,8 @@ def load_batches(artifacts, split, limit, device, score_args, exclude_pdb=()):
     return result
 
 
-def make_trainer(variant, model, flow, common):
+def make_trainer(variant, model, flow, common, *, trajectory_steps=3,
+                 trajectory_weight=.1):
     if variant == 'teacher':
         return RolloutAugmentedTrainer(model, flow, rollout_probability=0, rollout_steps=5, **common)
     if variant == 'coupling':
@@ -92,6 +93,12 @@ def make_trainer(variant, model, flow, common):
             rollout_min_time=.25, endpoint_blend=.25,
             endpoint_translation_cap=10., endpoint_rotation_cap=.5,
             **common)
+    if variant == 'trajectory':
+        from tricoopdiff.trajectory_experiment import TrajectoryConsistencyTrainer
+        return TrajectoryConsistencyTrainer(
+            model, flow, trajectory_steps=trajectory_steps,
+            trajectory_weight=trajectory_weight,
+            trajectory_min_time=.25, **common)
     raise ValueError(variant)
 
 
@@ -102,11 +109,13 @@ def main():
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--variant', choices=('teacher', 'coupling', 'e3_endpoint',
                                            'transported', 'gauge_transported',
-                                           'joint_endpoint'), required=True)
+                                           'joint_endpoint', 'trajectory'), required=True)
     ap.add_argument('--train-cases', type=int, default=32)
     ap.add_argument('--val-cases', type=int, default=8)
     ap.add_argument('--epochs', type=int, default=3)
     ap.add_argument('--seed', type=int, default=22001)
+    ap.add_argument('--trajectory-steps', type=int, default=3)
+    ap.add_argument('--trajectory-weight', type=float, default=.1)
     ap.add_argument('--save-every-epoch', action='store_true')
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
@@ -140,7 +149,10 @@ def main():
                   activation_clamp_mode=base['runtime_config']['activation_clamp_mode'],
                   residual_weight=base['runtime_config']['residual_weight'],
                   ema_decay=base['runtime_config']['ema_decay'])
-    trainer = make_trainer(args.variant, model, PairedTorsionFlow(), common)
+    trainer = make_trainer(
+        args.variant, model, PairedTorsionFlow(), common,
+        trajectory_steps=args.trajectory_steps,
+        trajectory_weight=args.trajectory_weight)
     original_training_state = trainer._training_state
     def paired_training_state(*state_args, **state_kwargs):
         # Rollout arms consume extra random numbers before the supervised
@@ -170,6 +182,7 @@ def main():
     for epoch in range(1, args.epochs + 1):
         order = rng.permutation(len(train))
         losses = []
+        trajectory_losses = []
         for position, index in enumerate(order):
             # Reset every mutable RNG at the example boundary. Variants may
             # consume different random counts internally, but the next example
@@ -178,25 +191,40 @@ def main():
             np.random.seed(step_seed % (2 ** 32))
             torch.manual_seed(step_seed)
             torch.cuda.manual_seed_all(step_seed)
-            losses.append(trainer.train_step(**copy.deepcopy(train[int(index)]))['loss_total'])
+            step_result = trainer.train_step(**copy.deepcopy(train[int(index)]))
+            losses.append(step_result['loss_total'])
+            if 'loss_trajectory' in step_result:
+                trajectory_losses.append(step_result['loss_trajectory'])
         raw_values, ema_values = [], []
         for use_ema, values in ((False, raw_values), (True, ema_values)):
             context = trainer.ema_parameters() if use_ema else torch.no_grad()
             with context, torch.no_grad():
                 model.eval()
-                old = trainer.rollout_probability
-                trainer.rollout_probability = 0
+                old_rollout = getattr(trainer, 'rollout_probability', None)
+                old_trajectory_weight = getattr(trainer, 'trajectory_weight', None)
+                if old_rollout is not None:
+                    trainer.rollout_probability = 0
+                if old_trajectory_weight is not None:
+                    trainer.trajectory_weight = 0
                 try:
                     for batch, coupling, time in fixed_validation:
                         values.append(float(trainer.compute_loss(
                             **copy.deepcopy(batch), coupling_override=coupling,
                             t_override=time)['loss_total']))
                 finally:
-                    trainer.rollout_probability = old
+                    if old_rollout is not None:
+                        trainer.rollout_probability = old_rollout
+                    if old_trajectory_weight is not None:
+                        trainer.trajectory_weight = old_trajectory_weight
         row = {'epoch': epoch, 'mean_train_loss': float(np.mean(losses)),
                'fixed_raw_val_loss': float(np.mean(raw_values)),
                'fixed_ema_val_loss': float(np.mean(ema_values)),
-               'rollout_augmented_states': trainer.rollout_augmented_states}
+               'rollout_augmented_states': getattr(
+                   trainer, 'rollout_augmented_states', 0),
+               'trajectory_augmented_states': getattr(
+                   trainer, 'trajectory_augmented_states', 0)}
+        if trajectory_losses:
+            row['mean_trajectory_loss'] = float(np.mean(trajectory_losses))
         history.append(row)
         if row['fixed_raw_val_loss'] < best:
             best = row['fixed_raw_val_loss']

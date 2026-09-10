@@ -452,3 +452,31 @@ transported、gauge 或 bounded joint 实验。
 因此该差异应作为真实初始化敏感性处理，而不是复现噪声。另补齐 3ZCB 固定状态拟合，
 loss 从 `7.1083` 降至 `0.002295`。后续若提出新的整轨迹约束，必须先定义跨多个固定
 初始化 seed 的 exact DockQ 门禁；单一 seed 的均值提升不再作为扩训依据。
+
+### 三步可微 SDPI 轨迹损失
+
+为避免现有 `SDPIFlow.step` 在 torsion 路径转 NumPy 后切断 autograd，新增实验性
+纯 Torch step。它复现双分支 SE(3) 组合、顺序 bond torsion 和 torsion 后的 Kabsch
+水平规范；合成坐标上与生产 step 数值一致，连续两步后 E3/POI 的 translation、
+rotation 以及 torsion 输入均收到有限非零梯度。该实现仍属于训练实验，不替换生产
+sampler。
+
+`TrajectoryConsistencyTrainer` 在解析 path 状态上展开 3 个 `dt=0.05` 的模型步，
+逐步和同 coupling 的解析下一状态比较。坐标误差按两个 receptor prior scale
+归一化，并加入相对 body matrix 误差；辅助项只在 t>=0.25 时启用。固定 validation
+关闭该项以保留原 teacher loss 可比性，checkpoint runtime contract 为
+`differentiable_sdpi_trajectory_v1`。
+
+固定 8 case、raw epoch 3 的 trajectory - 同训练 seed teacher exact DockQ：
+
+| 训练 seed / weight | seed 12001 | seed 12005 | seed 12006 | 24-case mean | median | wins |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 24004 / 0.1 | -0.000122 | +0.000030 | -0.000000 | -0.000031 | +0.000004 | 15/24 |
+| 24005 / 0.1 | -0.000062 | +0.000445 | +0.000000 | +0.000128 | +0.000004 | 15/24 |
+| 24006 / 1.0 | -0.000017 | +0.001018 | -0.000042 | +0.000320 | +0.000092 | 16/24 |
+
+增大权重后逐 case 分布略偏正，但三个初始化面板只有 seed 12005 改善；12001 和
+12006 均退化。它没有通过预先定义的“多数初始化改善”门禁，当前不扩大训练。
+baseline seed 12007 mean exact DockQ 为 `0.0187896`，其 operator 双跑与 velocity
+audit 重放也完全一致。下一步应定位 seed 12005 的增益集中于哪些 case 和轨迹阶段，
+再判断是否值得设计分阶段 rotation/interface loss，而不是继续盲调 trajectory weight。
