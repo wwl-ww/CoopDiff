@@ -69,6 +69,8 @@ def sample_single(
     t_anchor: float = None,
     translation_velocity_scale: float = 1.0,
     rotation_velocity_scale: float = 1.0,
+    velocity_transform=None,
+    return_rank_features: bool = False,
 ) -> dict:
     """
     Run one reverse-flow trajectory (single walker) from t=1 to t=0.
@@ -89,6 +91,11 @@ def sample_single(
             the PROTAC branch instead of running an extra ternary POI dynamics.
         init_mode: only ``sdpi`` is supported.
         t_anchor: must be 1.0 for the broad sdpi prior.
+        velocity_transform: optional diagnostic callback applied to physical
+            velocities immediately before integration. Production callers
+            leave this as ``None``.
+        return_rank_features: retain the final pre-update invariant consensus
+            context for separately supervised pose ranking.
 
     Returns:
         dict with 'ligand_coords' [N_lig, 3], 'poi_coords' [N_poi, 3] (CPU numpy),
@@ -108,6 +115,8 @@ def sample_single(
                         ("rotation_velocity_scale", rotation_velocity_scale)):
         if not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
             raise ValueError(f"{name} must be a finite non-negative number")
+    if velocity_transform is not None and not callable(velocity_transform):
+        raise TypeError("velocity_transform must be callable or None")
 
     # Clean templates (drop the B=1 dim).
     ligand_template = ligand_data["coords"][0].detach()  # [N_lig, 3]
@@ -148,6 +157,7 @@ def sample_single(
     trajectory = [] if return_trajectory else None
     trace = [] if return_trace else None
     nonfinite_score_steps = []
+    final_rank_features = None
 
     init_ligand_com = ligand_pos.mean(dim=1)[0]
     init_poi_com = poi_pos.mean(dim=1)[0]
@@ -220,6 +230,11 @@ def sample_single(
             receptor_crop_cutoff=receptor_crop_cutoff,
             diffusion_state=diffusion_state,
         )
+        if return_rank_features:
+            features = out.get('rank_features')
+            if features is None or features.ndim != 2 or features.shape[0] != 1:
+                raise ValueError('model did not return rank_features [1,D]')
+            final_rank_features = features[0].detach().cpu().numpy().copy()
         if return_trace:
             step0_probe = getattr(model, '_last_step0_probe', None)
             setattr(model, '_debug_step0_probe', False)
@@ -232,6 +247,12 @@ def sample_single(
                 velocities[branch]['tr'] * translation_velocity_scale)
             velocities[branch]['rot'] = (
                 velocities[branch]['rot'] * rotation_velocity_scale)
+        if velocity_transform is not None:
+            velocities = velocity_transform(
+                velocities, ligand_pos, poi_pos, r_e3_to_poi,
+                t_tr, dt_tr, ligand_data)
+            if not isinstance(velocities, dict):
+                raise TypeError("velocity_transform must return a velocity dictionary")
         interface_scores = velocities
         s_q = {}
         sanitized_components = []
@@ -345,6 +366,10 @@ def sample_single(
         result["trajectory"] = trajectory
     if return_trace:
         result["trace"] = trace
+    if return_rank_features:
+        if final_rank_features is None:
+            raise RuntimeError('no rank features were produced')
+        result['rank_features'] = final_rank_features
     return result
 
 
@@ -364,6 +389,7 @@ def sample_ensemble(
     t_anchor: float = None,
     translation_velocity_scale: float = 1.0,
     rotation_velocity_scale: float = 1.0,
+    return_rank_features: bool = False,
 ) -> list:
     """
     Run ``n_walkers`` independent reverse-flow trajectories.
@@ -394,6 +420,7 @@ def sample_ensemble(
                 t_anchor=t_anchor,
                 translation_velocity_scale=translation_velocity_scale,
                 rotation_velocity_scale=rotation_velocity_scale,
+                return_rank_features=return_rank_features,
             )
         )
     return results

@@ -138,7 +138,11 @@ def generate_esm_embeddings(protein_paths, device):
     from tricoopdiff.esm_embedder import ESMEmbedder
 
     print(f"Loading ESM2-650M on {device} via HF mirror...", flush=True)
-    embedder = ESMEmbedder(device=device)
+    local_model = os.environ.get("TRICOOPDIFF_ESM_MODEL")
+    embedder = (
+        ESMEmbedder(model_name=local_model, device=device)
+        if local_model else ESMEmbedder(device=device)
+    )
 
     print(f"Extracting sequences from {len(protein_paths)} proteins...", flush=True)
     seqs_list = get_sequences(protein_paths, [None] * len(protein_paths))

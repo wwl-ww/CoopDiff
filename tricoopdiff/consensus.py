@@ -94,6 +94,9 @@ class ConsensusFuse(nn.Module):
             for i in (0, 1)], dim=-1)
         return {
             'normalized_velocity': predictions,
+            # Invariant negotiated context reserved for a separately supervised
+            # pose ranker. It is not consumed by the diffusion loss.
+            'rank_features': context,
             'residual_penalty': residual_penalty,
             'consensus_diagnostics': {
                 'rigid_gates': gates.detach(), 'direction_disagreement': conflicts.detach(),

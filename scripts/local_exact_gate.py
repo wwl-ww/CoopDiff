@@ -66,8 +66,23 @@ def main():
     parser.add_argument('--deterministic', action='store_true',
                         help='Enable strict reproducibility before constructing CUDA models')
     parser.add_argument('--weights', choices=('ema', 'raw'), default='ema')
+    parser.add_argument(
+        '--oracle-rigid',
+        choices=('none', 'e3_tr', 'e3_rot', 'e3', 'poi_tr', 'poi_rot', 'poi',
+                 'translations', 'rotations', 'all_no_e3_tr', 'all_no_e3_rot',
+                 'all_no_poi_tr', 'all_no_poi_rot', 'all'),
+        default='none',
+        help='Native-reading endpoint oracle intervention for causal diagnostics only')
+    parser.add_argument(
+        '--audit-endpoint-velocities', action='store_true',
+        help='Record model-versus-native endpoint rigid velocity diagnostics')
+    parser.add_argument('--oracle-min-time', type=float, default=0.0)
+    parser.add_argument('--oracle-max-time', type=float, default=1.0)
+    parser.add_argument('--translation-velocity-scale', type=float, default=1.0)
     parser.add_argument('--out', type=Path, default=ROOT / 'results/local_exact_gate')
     args = parser.parse_args()
+    if not (0 <= args.oracle_min_time < args.oracle_max_time <= 1):
+        parser.error('oracle time window must satisfy 0 <= min < max <= 1')
     args.out = args.out.resolve()
     if not args.out.is_relative_to(ROOT / 'results/local_exact_gate'):
         raise ValueError('Output must remain under owned results/local_exact_gate')
@@ -125,6 +140,14 @@ def main():
     entries = {e['case']: e for e in json.loads(index.read_text())['entries']}
     report = dict(status='running', cases=args.cases, seed=args.seed, steps=args.steps,
                   model='ExperimentalConsensus', weights=args.weights, training_performed=False,
+                  oracle_rigid=args.oracle_rigid,
+                  oracle_scope=('disabled' if args.oracle_rigid == 'none' else
+                      'diagnostic native-reading per-step rigid endpoint intervention; '
+                      'model torsion retained; not blind inference'),
+                  oracle_time_window=[args.oracle_min_time, args.oracle_max_time],
+                  endpoint_velocity_audit=bool(args.audit_endpoint_velocities),
+                  endpoint_velocity_rows=[],
+                  translation_velocity_scale=args.translation_velocity_scale,
                   reproducibility=numerical_policy,
                   metric='DeepTernary/DockQ/dockq_util.py::cal_dockq',
                   metric_note='Full-atom contacts; upstream backbone iRMS/LRMS convention',
@@ -317,18 +340,80 @@ def main():
         elif runtime.get('trajectory_objective') in {
                 'differentiable_sdpi_trajectory_v1',
                 'differentiable_sdpi_staged_poi_v2',
-                'differentiable_sdpi_staged_poi_distance_v2'}:
+                'differentiable_sdpi_staged_poi_distance_v2',
+                'differentiable_sdpi_prior_replay_v1',
+                'differentiable_sdpi_prior_replay_eval_v2',
+                'differentiable_sdpi_prior_replay_joint_translation_v1',
+                'differentiable_sdpi_prior_replay_joint_translation_replace_v2',
+                'differentiable_sdpi_prior_replay_joint_translation_window_replace_v3',
+                'differentiable_sdpi_prior_replay_joint_translation_soft_time_v4',
+                'differentiable_sdpi_prior_replay_joint_translation_direction_v4',
+                'differentiable_sdpi_prior_replay_joint_translation_agreement_v4'}:
             from tricoopdiff.trajectory_experiment import (
-                StagedPOITrajectoryTrainer, TrajectoryConsistencyTrainer)
-            staged = runtime['trajectory_objective'] != 'differentiable_sdpi_trajectory_v1'
-            trainer_class = (StagedPOITrajectoryTrainer if staged
-                             else TrajectoryConsistencyTrainer)
+                DeterministicPriorReplayTrajectoryTrainer,
+                PriorReplayJointTranslationTrainer,
+                PriorReplayJointTranslationReplaceTrainer,
+                PriorReplayJointTranslationWindowReplaceTrainer,
+                PriorReplayJointTranslationSoftTimeTrainer,
+                PriorReplayJointTranslationDirectionTrainer,
+                PriorReplayJointTranslationAgreementTrainer,
+                PriorReplayTrajectoryTrainer, StagedPOITrajectoryTrainer,
+                TrajectoryConsistencyTrainer)
+            objective = runtime['trajectory_objective']
+            replay = objective == 'differentiable_sdpi_prior_replay_v1'
+            replay_eval = objective == 'differentiable_sdpi_prior_replay_eval_v2'
+            replay_translation = objective == (
+                'differentiable_sdpi_prior_replay_joint_translation_v1')
+            replay_translation_replace = objective == (
+                'differentiable_sdpi_prior_replay_joint_translation_replace_v2')
+            replay_translation_window = objective == (
+                'differentiable_sdpi_prior_replay_joint_translation_window_replace_v3')
+            replay_translation_soft_time = objective == (
+                'differentiable_sdpi_prior_replay_joint_translation_soft_time_v4')
+            replay_translation_direction = objective == (
+                'differentiable_sdpi_prior_replay_joint_translation_direction_v4')
+            replay_translation_agreement = objective == (
+                'differentiable_sdpi_prior_replay_joint_translation_agreement_v4')
+            staged = objective in {
+                'differentiable_sdpi_staged_poi_v2',
+                'differentiable_sdpi_staged_poi_distance_v2'}
+            if replay_translation_soft_time:
+                trainer_class = PriorReplayJointTranslationSoftTimeTrainer
+            elif replay_translation_direction:
+                trainer_class = PriorReplayJointTranslationDirectionTrainer
+            elif replay_translation_agreement:
+                trainer_class = PriorReplayJointTranslationAgreementTrainer
+            elif replay_translation_window:
+                trainer_class = PriorReplayJointTranslationWindowReplaceTrainer
+            elif replay_translation_replace:
+                trainer_class = PriorReplayJointTranslationReplaceTrainer
+            elif replay_translation:
+                trainer_class = PriorReplayJointTranslationTrainer
+            elif replay_eval:
+                trainer_class = DeterministicPriorReplayTrajectoryTrainer
+            elif replay:
+                trainer_class = PriorReplayTrajectoryTrainer
+            elif staged:
+                trainer_class = StagedPOITrajectoryTrainer
+            else:
+                trainer_class = TrajectoryConsistencyTrainer
             variant = dict(
                 trajectory_steps=runtime['trajectory_steps'],
                 trajectory_weight=runtime['trajectory_weight'],
                 trajectory_min_time=runtime['trajectory_min_time'],
-                contract_mode=runtime['trajectory_objective'])
-            if staged:
+                contract_mode=objective)
+            if (replay or replay_eval or replay_translation
+                    or replay_translation_replace or replay_translation_window
+                    or replay_translation_soft_time or replay_translation_direction
+                    or replay_translation_agreement):
+                variant['replay_max_steps'] = runtime['trajectory_replay_max_steps']
+                if replay_translation_window:
+                    variant['trajectory_max_time'] = runtime['trajectory_max_time']
+                elif replay_translation_soft_time:
+                    variant.update(
+                        endpoint_zero_time=runtime['trajectory_endpoint_zero_time'],
+                        endpoint_full_time=runtime['trajectory_endpoint_full_time'])
+            elif staged:
                 variant.update(
                     trajectory_max_time=runtime['trajectory_max_time'],
                     distance_weight_cap=runtime['trajectory_distance_weight_cap'])
@@ -375,6 +460,80 @@ def main():
                 self.initial = [x.detach().cpu().numpy().copy() for x in result[:3]]
                 return result
 
+        def endpoint_oracle(velocities, ligand, poi, body, current_time,
+                            step_dt, ligand_data):
+            """Replace selected rigid components with a native endpoint oracle."""
+            from tricoopdiff.joint_endpoint_experiment import (
+                joint_rigid_endpoint_targets,
+            )
+            targets, _ = joint_rigid_endpoint_targets(
+                ligand, poi, body,
+                ligand_data['coords'], current_batch['poi_data']['coords'],
+                current_time,
+                reject_near_pi=False,
+                exact_fit_tolerance=None,
+                body_tolerance=None)
+            if args.audit_endpoint_velocities:
+                row = {
+                    'case': current_case,
+                    'seed': args.seed,
+                    'time': float(current_time.item()),
+                    'components': {},
+                }
+                for branch in ('e3_ligand', 'poi_ligand'):
+                    for component in ('tr', 'rot'):
+                        prediction = velocities[branch][component].reshape(-1)
+                        target = targets[branch][component].reshape(-1)
+                        prediction_norm = torch.linalg.vector_norm(prediction)
+                        target_norm = torch.linalg.vector_norm(target)
+                        denominator = prediction_norm * target_norm
+                        cosine = (torch.dot(prediction, target) / denominator
+                                  if float(denominator) > 0 else prediction.new_tensor(0.))
+                        row['components'][f'{branch}.{component}'] = {
+                            'cosine': float(cosine),
+                            'prediction_norm': float(prediction_norm),
+                            'target_norm': float(target_norm),
+                            'norm_ratio': (float(prediction_norm / target_norm)
+                                           if float(target_norm) > 0 else None),
+                            'error_norm': float(torch.linalg.vector_norm(
+                                prediction - target)),
+                        }
+                report['endpoint_velocity_rows'].append(row)
+            if args.oracle_rigid == 'none':
+                return velocities
+            value = float(current_time.item())
+            if not (args.oracle_min_time <= value <= args.oracle_max_time):
+                return velocities
+            selected = {
+                'e3_tr': (('e3_ligand', 'tr'),),
+                'e3_rot': (('e3_ligand', 'rot'),),
+                'e3': (('e3_ligand', 'tr'), ('e3_ligand', 'rot')),
+                'poi_tr': (('poi_ligand', 'tr'),),
+                'poi_rot': (('poi_ligand', 'rot'),),
+                'poi': (('poi_ligand', 'tr'), ('poi_ligand', 'rot')),
+                'translations': (('e3_ligand', 'tr'), ('poi_ligand', 'tr')),
+                'rotations': (('e3_ligand', 'rot'), ('poi_ligand', 'rot')),
+                'all_no_e3_tr': (('e3_ligand', 'rot'),
+                                 ('poi_ligand', 'tr'), ('poi_ligand', 'rot')),
+                'all_no_e3_rot': (('e3_ligand', 'tr'),
+                                  ('poi_ligand', 'tr'), ('poi_ligand', 'rot')),
+                'all_no_poi_tr': (('e3_ligand', 'tr'), ('e3_ligand', 'rot'),
+                                  ('poi_ligand', 'rot')),
+                'all_no_poi_rot': (('e3_ligand', 'tr'), ('e3_ligand', 'rot'),
+                                   ('poi_ligand', 'tr')),
+                'all': (('e3_ligand', 'tr'), ('e3_ligand', 'rot'),
+                        ('poi_ligand', 'tr'), ('poi_ligand', 'rot')),
+            }[args.oracle_rigid]
+            result = {
+                branch: {name: value.clone() for name, value in components.items()}
+                for branch, components in velocities.items()
+                if branch != 'torsion'
+            }
+            result['torsion'] = velocities['torsion'].clone()
+            for branch, component in selected:
+                result[branch][component] = targets[branch][component]
+            return result
+
         weight_context = trainer.ema_parameters() if args.weights == 'ema' else nullcontext()
         with weight_context, torch.no_grad():
             model.eval()
@@ -382,10 +541,17 @@ def main():
                 started = time.monotonic()
                 print('ROLLOUT START', case, 'seed', args.seed, 'steps', args.steps, flush=True)
                 batch, info = batches[case], infos[case]
+                current_batch = batch
+                current_case = case
                 initializer = RecordingInitializer()
                 result = sample_single(model, trainer.diffusion, initializer,
                                        **batch, steps=args.steps, device='cuda',
-                                       seed=args.seed, return_trajectory=True)
+                                       seed=args.seed, return_trajectory=True,
+                                       translation_velocity_scale=(
+                                           args.translation_velocity_scale),
+                                       velocity_transform=(endpoint_oracle
+                                           if (args.oracle_rigid != 'none'
+                                               or args.audit_endpoint_velocities) else None))
                 folder = args.out / case
                 np.savez_compressed(folder / 'coordinates.npz',
                     initial_ligand=initializer.initial[0], initial_poi=initializer.initial[1],

@@ -36,6 +36,7 @@ def test_zero_residual_preserves_each_interface_prior():
         for component in ('tr', 'rot', 'tor'):
             assert torch.equal(proposals[branch][component], original[branch][component])
     assert result['residual_penalty'] == 0
+    assert result['rank_features'].shape == (1, 32)
 
 
 def test_nonzero_residual_is_se3_equivariant():
@@ -48,6 +49,7 @@ def test_nonzero_residual_is_se3_equivariant():
     moved_proposals = {b: {c: v @ rotation.T if c != 'tor' else v
                            for c, v in scores.items()} for b, scores in proposals.items()}
     moved = fuse(moved_graph, moved_proposals, state)
+    assert torch.allclose(base['rank_features'], moved['rank_features'], atol=2e-5)
     for b in BRANCHES:
         for c in ('tr', 'rot'):
             assert torch.allclose(moved['normalized_velocity'][b][c],

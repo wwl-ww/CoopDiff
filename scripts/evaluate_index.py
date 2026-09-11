@@ -42,6 +42,14 @@ def build_parser():
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--allow-nondeterministic", action="store_true",
                         help="Explicit legacy diagnostic control; never mix with deterministic results")
+    parser.add_argument(
+        "--allow-experimental-checkpoint", action="store_true",
+        help="Explicitly evaluate a validated frozen factorial-v1 checkpoint with EMA weights",
+    )
+    parser.add_argument(
+        "--save-rank-features", action="store_true",
+        help="Persist invariant final-step contexts for supervised ranking on non-benchmark data",
+    )
     parser.add_argument("--conformer-policy",
                         choices=["etkdgv3_random", "diffdock_v1_1"],
                         default="etkdgv3_random")
@@ -77,6 +85,8 @@ def main():
         "metric_template_root": args.metric_template_root,
         "deterministic_algorithms": not args.allow_nondeterministic,
         "conformer_policy": args.conformer_policy,
+        "allow_experimental_checkpoint": args.allow_experimental_checkpoint,
+        "rank_features_saved": args.save_rank_features,
     }
     (output / "evaluation_manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8",
@@ -86,6 +96,7 @@ def main():
         deepternary_root=args.deepternary_root,
         deterministic=not args.allow_nondeterministic,
         conformer_policy=args.conformer_policy,
+        allow_experimental_checkpoint=args.allow_experimental_checkpoint,
     )
     failures = []
     for position, entry in enumerate(entries, start=1):
@@ -120,6 +131,7 @@ def main():
                 "t_anchor": 1.0,
                 "dockq_source_sha256": sha256_file(runner.deepternary_root / 'DockQ/dockq_util.py'),
                 "dockq_binary_sha256": sha256_file(runner.deepternary_root / 'DockQ/fnat'),
+                "rank_features_saved": args.save_rank_features,
             }
             if not args.no_resume and completed_report(
                     report_path, case, checkpoint, expected_config,
@@ -131,6 +143,7 @@ def main():
                 case, paths, cache_dir=_PROJECT_ROOT / args.cache_dir,
                 native_complex_pdb=native,
                 n_walkers=args.n_walkers, steps=args.steps, seed=args.seed,
+                return_rank_features=args.save_rank_features,
             )
             write_report_atomic(report, report_path)
             ensemble = report['ensemble']
