@@ -65,15 +65,34 @@ windowed、soft-time、direction、agreement、prior-replay 和 joint-translatio
 ### 联合生成器
 
 `tricoopdiff/pose_anchors.py` 已提供 proper SE(3) 原语；
-`tricoopdiff/expert_anchors.py` 会从两个 frozen DiffDock 刚体 proposal bank 组合
+`tricoopdiff/expert_anchors.py` 会从两个 frozen DiffDock 刚体 proposal 集合组合
 共享 ligand 的 ternary anchor，并做无 native 的碰撞/双侧接触过滤。
 
 候选必须同时包含：接触位置、相对法向、切向/twist；只有距离或质心平移不够。
-单纯选择几何距离最优候选未过五例门禁。ternary-pose consensus 的独立五例门禁
-将 oracle mean `0.13383→0.19560`，但样本太小；当前用 20-case geometry 对照
-验证其泛化。即使通过，也应与 broad 混合，不能让 anchor 完全替代宽先验。
+早期五例的 geometry 选择不稳定，但扩大到 20-case seed 31000 后，`8×8`
+geometry-anchor 相对严格配对 broad x8 将 oracle mean/median
+`0.06717/0.06348→0.16487/0.12156`、acceptable `0/20→5/20`，case 为
+15 胜/3 平/2 负。这是首个通过扩大 DockQ 门禁的生成器改动，支持“联合位置+朝向
+多假设”根因判断。同面板 consensus-anchor mean/median 为 `0.12956/0.08772`、
+acceptable 5/20，弱于 geometry 但仍通过门禁，适合作为筛选特征或补充分支。
+最终应与 broad 混合，不能让 anchor 完全替代宽先验。
 
-### 几何 ranker
+替换 ligand 构象生成器不是主要修复：20-case DiffDock conformer 的 oracle
+mean/median 为 `0.10023/0.07406`，低于 ETKDG 的 `0.12059/0.08985`，且
+acceptable 为 0/20 对 3/20；该路线已关闭。
+
+### 确定性在线候选生成与两级 ranker
+
+下一代架构不是预存 pose bank，也不是继续线性增加完整 walker。正式推理只接收原始
+蛋白、ligand、公开固定 seed 和 frozen checkpoint，当场生成候选；候选生成代码路径
+禁止接收 native，正式测试禁止加载 pose cache。每侧各运行 M 个二元专家 pose，以约
+`2M` 次专家推理通过共享 ligand 对齐组成 `M²` 个 ternary anchor。候选可按预先冻结
+的比例覆盖不同 seed、twist、broad、geometry 和 consensus 模式，不允许按测试 case
+人工增删。native 只在预测封存后离线计算候选 oracle 上界。
+
+pre-ranker 先在无 native 的硬物理过滤后，从数百候选中选择少量跨姿态簇 top-K 进入
+CoopDiff；post-ranker 再从精修结果中输出可部署 top-1。两级选择都必须 diversity-aware，
+不能让一个高分错误模式占满预算。
 
 不要继续只喂 128 维 consensus context。下一版输入至少包括：
 
@@ -81,9 +100,12 @@ windowed、soft-time、direction、agreement、prior-replay 和 joint-translatio
 - 原子穿插与短程排斥；
 - 两侧配体接触是否平衡；
 - 界面面积和表面法向互补的代理量；
-- 模型自身速度残差或跨步稳定性，但不能使用 native 派生指标。
+- 二元专家分数/轨迹稳定性、候选簇密度和 conformer strain；
+- 模型自身速度残差或跨步稳定性，但部署特征不能使用 native 派生指标。
 
-训练和选择只使用内部 PDB-disjoint 32/8/10 split；MGD94 只作最终评估。
+训练使用 case 内 pairwise/listwise 排序并预测 DockQ 0.23/0.49 命中概率；数据只来自
+内部 PDB-disjoint 32/8/10 split，MGD94 只作最终评估。执行门禁依次是候选 oracle、
+pre-ranker retention、固定预算精修 coverage、post-ranker top-1；前一项不过则不扩张。
 
 ## 关键代码
 
@@ -99,9 +121,9 @@ windowed、soft-time、direction、agreement、prior-replay 和 joint-translatio
 
 1. 先读 `todo.md` 的当前四卡状态，不重跑已拒绝的 loss sweep。
 2. 检查每个任务的 `batch_status.json.complete`，再计算 paired metrics。
-3. 完成 deployable 几何特征及 PDB-disjoint ranker 门禁。
-4. 完成双专家 geometry/consensus 门禁；比较 broad、anchor、mixed 三种固定预算初始化。
-5. 只有内部 mean `+0.01`、median >0 且命中改善时，才跑新的 MGD94。
+3. 完成双专家 geometry/consensus 20-case 门禁。
+4. 实现确定性在线候选生成并先测候选 oracle 上界，再训练 PDB-disjoint 两级 ranker。
+5. 固定精修预算比较 broad、anchor 与 diversity-aware mixed；门禁通过才跑 MGD94。
 
 ## 报告边界
 

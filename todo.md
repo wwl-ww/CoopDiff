@@ -33,13 +33,17 @@
   38/94 与 37/94；两套 x64 池化为 43/94。再与两套 x32 池化后，统一的
   192-walker oracle-best mean/median 为 `0.30152/0.23137`，acceptable
   48/94、medium 17/94、high 1/94。增加样本能提高覆盖，但不替代生成器改进。
-- 双 DiffDock 刚体 anchor 证明联合位置/朝向候选可产生大幅正收益，也会产生大幅
-  负收益。单纯按碰撞和接触距离选择未过门禁；`8×8` ternary-pose consensus
-  在独立五例 seed 62000 上将 oracle mean `0.13383→0.19560`、acceptable
-  `1/5→2/5`，walker 为 25 胜/8 平/7 负。该结果仅是小门禁，正在扩到 20 例。
-- ligand conformer 暂时只表现为跨 seed 的互补覆盖：五例四 seed 池化时
-  DiffDock conformer acceptable 为 4/5，ETKDG 为 2/5；逐 run 配对均值反而
-  `-0.00390`，因此不能直接替换默认 conformer。
+- 双 DiffDock 刚体 anchor 已首次通过扩大门禁。20-case seed 31000 的 `8×8`
+  geometry-anchor 相对同 seed broad x8，将 oracle mean/median
+  `0.06717/0.06348→0.16487/0.12156`，acceptable `0/20→5/20`；case
+  15 胜/3 平/2 负，平均提升 `+0.09770`。这证明联合位置/朝向候选是有效生成器
+  改动；需在下一分支解决 92/160 几何接受后候选的筛选。
+- 同一 20-case 的 consensus-anchor 也通过：oracle mean/median
+  `0.12956/0.08772`，acceptable 5/20，case 15 胜/2 平/3 负；但弱于
+  geometry，应作为筛选特征或补充分支，而不是当前主选择器。
+- 20-case conformer 门禁已否决 DiffDock conformer：其 oracle mean/median
+  `0.10023/0.07406`，低于 ETKDG 的 `0.12059/0.08985`，acceptable 为
+  0/20 对 3/20；两者池化没有新增 acceptable case。
 - 现有 128 维 consensus context 不适合直接排序。首版 listwise ranker 在独立
   test 上 selected/oracle DockQ 为 `0.02436/0.05428`，保留率 44.1%；
   MGD 五例为 `0.02360/0.23112`，保留率 15.2%，低于 walker-0。
@@ -55,30 +59,27 @@ direction、agreement-gated、joint-translation 直接监督、长程 prior-repl
 或由单个 case 拉动。标准 teacher Reflow 只能做少步蒸馏，不能解决 prior-endpoint
 配对，继续后置。
 
-## 正在运行（每项占一张卡，不分片同一测试）
+## 分支收束
 
-- GPU2：恢复 MGD94 × 32 rank-feature 生成；已有 28/94 与正式 x32 逐项一致，
-  只补剩余 case：`results/mgd_followup/mgd94_x32_rankfeatures/`。
-- GPU3：20-case `8×8 geometry-anchor`：
-  `results/mgd_followup/anchor_geometry_a8_20cases_seed31000/`
-- GPU4：同协议的 `8×8 ternary-pose consensus-anchor`：
-  `results/mgd_followup/anchor_consensus_a8_20cases_seed31000/`
-- GPU5：20-case ETKDG/DiffDock conformer 泛化门禁：
-  `results/mgd_followup/conformer20_seed55000/`
+`investigate/model-v2-followup` 的使命已完成：排除实现错误和低收益 loss 路线，定位
+联合位置/朝向覆盖瓶颈，并用双专家 geometry-anchor 通过 20-case 门禁。所有未完成
+任务已停止，其 partial 产物不用于上述结论；下一分支集中把初始化条件做到最好。
 
-每 10 分钟检查一次。完成条件以 `batch_status.json` 的 `complete=true` 为准，
-不能把启动时生成的空 summary 当成最终结果。
+## 下一分支
 
-## 下一步
+1. 使用确定性在线候选生成，不发布或加载可人工编辑的 pose bank。正式评估从原始
+   输入、固定 seed 和 frozen checkpoint 当场生成候选；候选路径不得接收 native。
+2. 每侧在线生成 M 个二元 pose，以约 `2M` 次专家成本组合成 `M²` 个 ternary
+   anchor；可包含固定比例的 seed、twist、broad、geometry 和 consensus 模式。
+   首先离线测候选 oracle 上界，不增加最终 CoopDiff walker 预算。
+3. 构建两级 native-free 选择器：硬物理过滤后，由学习式 pre-ranker 选出跨簇的
+   diversity-aware top-K 进入 CoopDiff；精修后再由 post-ranker 输出 top-1。
+   特征包括专家分数/稳定性、候选共识、接触分布、穿插/排斥、界面互补、双侧平衡
+   和 conformer strain。只在 PDB-disjoint internal split 训练，MGD94 仅最终评估。
 
-1. 完成 20-case geometry/consensus anchor 配对门禁；若 consensus 仍满足 mean
-   `+0.01`、median > 0 且命中改善，才扩大到 MGD94，并保留 broad/anchor 混合预算。
-2. 完成 20-case conformer 门禁；只有跨 case 仍提供互补命中，才作为 ensemble
-   分支保留，不替换默认 ETKDG。
-3. 为 ranker 增加不依赖 native 的几何特征：蛋白-蛋白与蛋白-配体接触分布、
-   原子穿插/排斥、界面面积代理、两侧结合的平衡性；先做 label-blind 特征审计，
-   再在 PDB-disjoint internal train/val/test 上训练。
-4. oracle 覆盖稳定后解决非 oracle top-1；MGD94 不用于训练选择器。
+核心门禁顺序固定为：候选 oracle 上界提升 → pre-ranker oracle retention → 固定预算
+精修后的 coverage → post-ranker top-1。若在线候选集合本身没有更好的 oracle，停止训练
+ranker；若 ranker 只集中选择同一错误模式，强制按姿态簇分配 top-K。
 
 ## 数据与代码约束
 
