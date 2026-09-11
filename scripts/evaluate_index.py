@@ -37,6 +37,12 @@ def build_parser():
     parser.add_argument("--limit", type=int)
     parser.add_argument("--n-walkers", type=int, default=32)
     parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--init-mode", choices=["sdpi", "expert_anchor"],
+                        default="sdpi")
+    parser.add_argument("--binary-anchor-steps", type=int, default=5)
+    parser.add_argument("--anchor-proposal-attempts", type=int, default=4)
+    parser.add_argument("--anchor-selection", choices=["geometry", "consensus"],
+                        default="geometry")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-resume", action="store_true")
@@ -75,8 +81,18 @@ def main():
         "checkpoint": checkpoint,
         "checkpoint_sha256": sha256_file(checkpoint),
         "cases": [entry["case"] for entry in entries],
-        "init_mode": "sdpi",
-        "initialization_version": "sdpi_v1",
+        "init_mode": args.init_mode,
+        "initialization_version": (
+            ("dual_diffdock_rigid_anchor_consensus_v1"
+             if args.anchor_selection == "consensus"
+             else "dual_diffdock_rigid_anchor_v1")
+            if args.init_mode == "expert_anchor" else "sdpi_v1"),
+        "binary_anchor_steps": (args.binary_anchor_steps
+                                if args.init_mode == "expert_anchor" else None),
+        "anchor_proposal_attempts": (args.anchor_proposal_attempts
+                                     if args.init_mode == "expert_anchor" else None),
+        "anchor_selection": (args.anchor_selection
+                             if args.init_mode == "expert_anchor" else None),
         "generative_process": "sdpi_flow_v1",
         "seed": args.seed,
         "n_walkers": args.n_walkers,
@@ -115,8 +131,18 @@ def main():
             native = native if native.is_file() else None
             expected_config = {
                 **runner.reproducibility,
-                "init_mode": "sdpi",
-                "initialization_version": "sdpi_v1",
+                "init_mode": args.init_mode,
+                "initialization_version": (
+                    ("dual_diffdock_rigid_anchor_consensus_v1"
+                     if args.anchor_selection == "consensus"
+                     else "dual_diffdock_rigid_anchor_v1")
+                    if args.init_mode == "expert_anchor" else "sdpi_v1"),
+                "binary_anchor_steps": (args.binary_anchor_steps
+                                        if args.init_mode == "expert_anchor" else None),
+                "anchor_proposal_attempts": (args.anchor_proposal_attempts
+                                             if args.init_mode == "expert_anchor" else None),
+                "anchor_selection": (args.anchor_selection
+                                     if args.init_mode == "expert_anchor" else None),
                 "generative_process": "sdpi_flow_v1",
                 "seed": args.seed,
                 "n_walkers": args.n_walkers,
@@ -143,6 +169,10 @@ def main():
                 case, paths, cache_dir=_PROJECT_ROOT / args.cache_dir,
                 native_complex_pdb=native,
                 n_walkers=args.n_walkers, steps=args.steps, seed=args.seed,
+                init_mode=args.init_mode,
+                binary_anchor_steps=args.binary_anchor_steps,
+                anchor_proposal_attempts=args.anchor_proposal_attempts,
+                anchor_selection=args.anchor_selection,
                 return_rank_features=args.save_rank_features,
             )
             write_report_atomic(report, report_path)

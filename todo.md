@@ -29,6 +29,17 @@
   有效；oracle-best mean/median `0.21922/0.17427`，33/94 达到 0.23、
   7/94 达到 0.49、1/94 达到 0.8。walker mean 仅 `0.05397`。
   生成覆盖和排序是两个独立瓶颈，oracle-best 不是可部署 top-1。
+- 两套独立 MGD94 × 64 均已完整结束，单套 acceptable（DockQ >= 0.23）为
+  38/94 与 37/94；两套 x64 池化为 43/94。再与两套 x32 池化后，统一的
+  192-walker oracle-best mean/median 为 `0.30152/0.23137`，acceptable
+  48/94、medium 17/94、high 1/94。增加样本能提高覆盖，但不替代生成器改进。
+- 双 DiffDock 刚体 anchor 证明联合位置/朝向候选可产生大幅正收益，也会产生大幅
+  负收益。单纯按碰撞和接触距离选择未过门禁；`8×8` ternary-pose consensus
+  在独立五例 seed 62000 上将 oracle mean `0.13383→0.19560`、acceptable
+  `1/5→2/5`，walker 为 25 胜/8 平/7 负。该结果仅是小门禁，正在扩到 20 例。
+- ligand conformer 暂时只表现为跨 seed 的互补覆盖：五例四 seed 池化时
+  DiffDock conformer acceptable 为 4/5，ETKDG 为 2/5；逐 run 配对均值反而
+  `-0.00390`，因此不能直接替换默认 conformer。
 - 现有 128 维 consensus context 不适合直接排序。首版 listwise ranker 在独立
   test 上 selected/oracle DockQ 为 `0.02436/0.05428`，保留率 44.1%；
   MGD 五例为 `0.02360/0.23112`，保留率 15.2%，低于 walker-0。
@@ -46,29 +57,28 @@ direction、agreement-gated、joint-translation 直接监督、长程 prior-repl
 
 ## 正在运行（每项占一张卡，不分片同一测试）
 
-- GPU2：MGD94 × 32，保存 rank features：
-  `results/mgd_followup/mgd94_x32_rankfeatures/`
-- GPU3：MGD94 × 64，测 walker 数量与覆盖率：
-  `results/mgd_followup/mgd94_x64_seed31000/`
-- GPU4：base checkpoint 的 MGD94 × 32，对照 teacher 是否只改善少数 case：
-  `results/mgd_followup/mgd94_base_x32_seed0/`
-- GPU5：teacher 的第二初始化 MGD94 × 32，测随机覆盖稳定性：
-  `results/mgd_followup/mgd94_teacher_x32_seed32000/`
+- GPU2：恢复 MGD94 × 32 rank-feature 生成；已有 28/94 与正式 x32 逐项一致，
+  只补剩余 case：`results/mgd_followup/mgd94_x32_rankfeatures/`。
+- GPU3：20-case `8×8 geometry-anchor`：
+  `results/mgd_followup/anchor_geometry_a8_20cases_seed31000/`
+- GPU4：同协议的 `8×8 ternary-pose consensus-anchor`：
+  `results/mgd_followup/anchor_consensus_a8_20cases_seed31000/`
+- GPU5：20-case ETKDG/DiffDock conformer 泛化门禁：
+  `results/mgd_followup/conformer20_seed55000/`
 
 每 10 分钟检查一次。完成条件以 `batch_status.json` 的 `complete=true` 为准，
 不能把启动时生成的空 summary 当成最终结果。
 
 ## 下一步
 
-1. 汇总四个全量任务，报告覆盖率随 walker 数、checkpoint 和初始化 seed 的变化；
-   不用 MGD94 选择 checkpoint。
-2. 为 ranker 增加不依赖 native 的几何特征：蛋白-蛋白与蛋白-配体接触分布、
+1. 完成 20-case geometry/consensus anchor 配对门禁；若 consensus 仍满足 mean
+   `+0.01`、median > 0 且命中改善，才扩大到 MGD94，并保留 broad/anchor 混合预算。
+2. 完成 20-case conformer 门禁；只有跨 case 仍提供互补命中，才作为 ensemble
+   分支保留，不替换默认 ETKDG。
+3. 为 ranker 增加不依赖 native 的几何特征：蛋白-蛋白与蛋白-配体接触分布、
    原子穿插/排斥、界面面积代理、两侧结合的平衡性；先做 label-blind 特征审计，
    再在 PDB-disjoint internal train/val/test 上训练。
-3. 将 `tricoopdiff/pose_anchors.py` 的 proper SE(3) 原语接入 deployable 的蛋白表面
-   patch 候选；同一位置枚举多个 twist，形成联合 position+orientation hypotheses。
-4. 固定内部面板比较 broad SDPI、surface-anchor 与二者混合的 coverage/top-k；
-   只有过门禁才跑新的 MGD 全量测试。
+4. oracle 覆盖稳定后解决非 oracle top-1；MGD94 不用于训练选择器。
 
 ## 数据与代码约束
 

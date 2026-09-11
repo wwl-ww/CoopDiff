@@ -134,6 +134,8 @@ class EvaluationRunner:
     def evaluate_case(self, case, paths, cache_dir, native_complex_pdb=None,
                       n_walkers=32, steps=20, seed=0,
                       init_mode="sdpi", t_anchor=None, freeze_poi=False,
+                      binary_anchor_steps=5, anchor_proposal_attempts=4,
+                      anchor_selection="geometry",
                       debug_trace=False, debug_seed=0,
                       translation_velocity_scale=1.0,
                       rotation_velocity_scale=1.0,
@@ -148,9 +150,27 @@ class EvaluationRunner:
             cache_dir=str(cache_dir),
         )
         self._ensure_model(input_dim)
+        case_initializer = self.initializer
+        initialization_version = "sdpi_v1"
+        if init_mode == "expert_anchor":
+            from tricoopdiff.expert_anchors import (
+                DualExpertAnchorInitializer, EXPERT_ANCHOR_CONSENSUS_VERSION,
+                EXPERT_ANCHOR_VERSION,
+            )
+            case_initializer = DualExpertAnchorInitializer(
+                self.expert, e3_data, poi_data,
+                binary_steps=binary_anchor_steps,
+                proposal_attempts=anchor_proposal_attempts,
+                conformer_policy=self.initializer.conformer_policy,
+                selection=anchor_selection,
+            )
+            initialization_version = (
+                EXPERT_ANCHOR_CONSENSUS_VERSION
+                if anchor_selection == "consensus" else EXPERT_ANCHOR_VERSION
+            )
         report = evaluate_model(
             self.model, e3_data, poi_data, ligand_data, self.diffusion,
-            initializer=self.initializer, device=str(self.device),
+            initializer=case_initializer, device=str(self.device),
             n_walkers=n_walkers, steps=steps,
             seed=seed,
             native_complex_pdb=(str(native_complex_pdb)
@@ -181,7 +201,13 @@ class EvaluationRunner:
                       else self.diffusion.inference_steps),
             "freeze_poi": freeze_poi,
             "init_mode": init_mode,
-            "initialization_version": "sdpi_v1",
+            "initialization_version": initialization_version,
+            "binary_anchor_steps": (binary_anchor_steps
+                                      if init_mode == "expert_anchor" else None),
+            "anchor_proposal_attempts": (anchor_proposal_attempts
+                                          if init_mode == "expert_anchor" else None),
+            "anchor_selection": (anchor_selection
+                                  if init_mode == "expert_anchor" else None),
             "generative_process": "sdpi_flow_v1",
             "t_anchor": (t_anchor if t_anchor is not None else
                          1.0),

@@ -89,7 +89,7 @@ def sample_single(
             disable the SE3 reverse updates. This defines the strict zero-FiLM
             E3-L parity baseline: the sampler reduces to native-style DiffDock on
             the PROTAC branch instead of running an extra ternary POI dynamics.
-        init_mode: only ``sdpi`` is supported.
+        init_mode: ``sdpi`` or the native-free ``expert_anchor`` diagnostic.
         t_anchor: must be 1.0 for the broad sdpi prior.
         velocity_transform: optional diagnostic callback applied to physical
             velocities immediately before integration. Production callers
@@ -124,12 +124,12 @@ def sample_single(
     e3_coords = e3_data["coords"][0].detach()            # [N_e3, 3]
 
     e3_center = e3_coords.mean(dim=0, keepdim=True)
-    if init_mode != "sdpi":
-        raise ValueError(f"removed initialization mode: {init_mode}; use sdpi")
+    if init_mode not in {"sdpi", "expert_anchor"}:
+        raise ValueError(f"unsupported initialization mode: {init_mode}")
     if t_anchor is None:
         t_anchor = 1.0
     if t_anchor != 1.0:
-        raise ValueError("sdpi requires t_anchor=1")
+        raise ValueError("sampling requires t_anchor=1")
     if not isinstance(diffusion, SDPIFlow):
         raise ValueError('sampling requires SDPIFlow, not the legacy DSM process')
     if initializer.no_torsion != bool(getattr(model.expert.model, 'no_torsion', False)):

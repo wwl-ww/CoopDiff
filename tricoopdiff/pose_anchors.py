@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .rigid import apply_rigid
+
 
 def _normalize(vector, name, eps=1e-8):
     norm = torch.linalg.vector_norm(vector, dim=-1, keepdim=True)
@@ -21,6 +23,34 @@ def surface_frame(normal, tangent):
     x_axis = _normalize(tangent, "tangent")
     y_axis = torch.linalg.cross(z_axis, x_axis, dim=-1)
     return torch.stack((x_axis, y_axis, z_axis), dim=-2)
+
+
+def proper_rigid_fit(source, target):
+    """Return the proper least-squares row-coordinate transform source -> target."""
+    if (source.shape != target.shape or source.ndim not in (2, 3)
+            or source.shape[-1] != 3 or source.shape[-2] < 3):
+        raise ValueError("source and target must be matching [..., N, 3], N >= 3")
+    if not torch.isfinite(source).all() or not torch.isfinite(target).all():
+        raise ValueError("source and target must be finite")
+    source_center = source.mean(dim=-2)
+    target_center = target.mean(dim=-2)
+    x = source - source_center.unsqueeze(-2)
+    y = target - target_center.unsqueeze(-2)
+    covariance = x.transpose(-1, -2) @ y
+    u, singular, vh = torch.linalg.svd(covariance)
+    if bool((singular[..., 1] <= torch.finfo(source.dtype).eps
+             * singular[..., 0]).any()):
+        raise ValueError("rigid fit is underdetermined for collinear coordinates")
+    sign = torch.ones((*source.shape[:-2], 3), dtype=source.dtype,
+                      device=source.device)
+    sign[..., -1] = torch.det(vh.transpose(-1, -2) @ u.transpose(-1, -2))
+    rotation = vh.transpose(-1, -2) @ torch.diag_embed(sign) @ u.transpose(-1, -2)
+    translation = target_center - (
+        rotation @ source_center.unsqueeze(-1)
+    ).squeeze(-1)
+    fitted = apply_rigid(source, rotation, translation)
+    rmsd = (fitted - target).square().sum(-1).mean(-1).sqrt()
+    return rotation, translation, rmsd
 
 
 @dataclass(frozen=True)

@@ -49,6 +49,10 @@ DockQ 0.23；但全部 walker 的 mean 只有 `0.05397`。现有 consensus laten
 在独立 test 只保留 44.1% oracle，在 MGD 五例只保留 15.2%。这说明生成覆盖与
 top-1 选择必须分别解决。
 
+两套独立 x64 完成后，单套 acceptable 为 38/94 与 37/94，两套池化为
+43/94；再加入两套完整 x32 后，统一 192-walker oracle 达到 48/94，mean/median
+为 `0.30152/0.23137`。这是搜索覆盖上界，不是模型可部署成功率。
+
 ### 4. 小幅 loss 变体没有实际收益
 
 windowed、soft-time、direction、agreement、prior-replay 和 joint-translation
@@ -60,12 +64,14 @@ windowed、soft-time、direction、agreement、prior-replay 和 joint-translatio
 
 ### 联合生成器
 
-`tricoopdiff/pose_anchors.py` 已提供 proper rotation + translation 的 SE(3) anchor
-原语，并支持同一表面 patch 对枚举多个绕法向 twist。下一步需要 native-independent
-的蛋白表面 patch proposal，再把 anchor 作为 broad SDPI 之外的完整初始化假设。
+`tricoopdiff/pose_anchors.py` 已提供 proper SE(3) 原语；
+`tricoopdiff/expert_anchors.py` 会从两个 frozen DiffDock 刚体 proposal bank 组合
+共享 ligand 的 ternary anchor，并做无 native 的碰撞/双侧接触过滤。
 
 候选必须同时包含：接触位置、相对法向、切向/twist；只有距离或质心平移不够。
-先在内部 PDB-disjoint 面板验证 coverage，再接触 MGD94。
+单纯选择几何距离最优候选未过五例门禁。ternary-pose consensus 的独立五例门禁
+将 oracle mean `0.13383→0.19560`，但样本太小；当前用 20-case geometry 对照
+验证其泛化。即使通过，也应与 broad 混合，不能让 anchor 完全替代宽先验。
 
 ### 几何 ranker
 
@@ -94,7 +100,7 @@ windowed、soft-time、direction、agreement、prior-replay 和 joint-translatio
 1. 先读 `todo.md` 的当前四卡状态，不重跑已拒绝的 loss sweep。
 2. 检查每个任务的 `batch_status.json.complete`，再计算 paired metrics。
 3. 完成 deployable 几何特征及 PDB-disjoint ranker 门禁。
-4. 实现 protein-surface joint anchors；比较 broad、anchor、mixed 三种完整初始化。
+4. 完成双专家 geometry/consensus 门禁；比较 broad、anchor、mixed 三种固定预算初始化。
 5. 只有内部 mean `+0.01`、median >0 且命中改善时，才跑新的 MGD94。
 
 ## 报告边界
