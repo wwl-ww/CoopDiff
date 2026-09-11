@@ -107,19 +107,82 @@ def build(checkpoint, expert_dir):
     if runtime.get('trajectory_objective') in {
             'differentiable_sdpi_trajectory_v1',
             'differentiable_sdpi_staged_poi_v2',
-            'differentiable_sdpi_staged_poi_distance_v2'}:
+            'differentiable_sdpi_staged_poi_distance_v2',
+            'differentiable_sdpi_prior_replay_v1',
+            'differentiable_sdpi_prior_replay_eval_v2',
+            'differentiable_sdpi_prior_replay_joint_translation_v1',
+            'differentiable_sdpi_prior_replay_joint_translation_replace_v2',
+            'differentiable_sdpi_prior_replay_joint_translation_window_replace_v3',
+            'differentiable_sdpi_prior_replay_joint_translation_soft_time_v4',
+            'differentiable_sdpi_prior_replay_joint_translation_direction_v4',
+            'differentiable_sdpi_prior_replay_joint_translation_agreement_v4'}:
         from tricoopdiff.trajectory_experiment import (
-            StagedPOITrajectoryTrainer, TrajectoryConsistencyTrainer)
-        staged = runtime['trajectory_objective'] != 'differentiable_sdpi_trajectory_v1'
-        trainer_class = (StagedPOITrajectoryTrainer if staged
-                         else TrajectoryConsistencyTrainer)
+            DeterministicPriorReplayTrajectoryTrainer,
+            PriorReplayJointTranslationTrainer,
+            PriorReplayJointTranslationReplaceTrainer,
+            PriorReplayJointTranslationWindowReplaceTrainer,
+            PriorReplayJointTranslationSoftTimeTrainer,
+            PriorReplayJointTranslationDirectionTrainer,
+            PriorReplayJointTranslationAgreementTrainer,
+            PriorReplayTrajectoryTrainer, StagedPOITrajectoryTrainer,
+            TrajectoryConsistencyTrainer)
+        objective = runtime['trajectory_objective']
+        replay = objective == 'differentiable_sdpi_prior_replay_v1'
+        replay_eval = objective == 'differentiable_sdpi_prior_replay_eval_v2'
+        replay_translation = objective == (
+            'differentiable_sdpi_prior_replay_joint_translation_v1')
+        replay_translation_replace = objective == (
+            'differentiable_sdpi_prior_replay_joint_translation_replace_v2')
+        replay_translation_window = objective == (
+            'differentiable_sdpi_prior_replay_joint_translation_window_replace_v3')
+        replay_translation_soft_time = objective == (
+            'differentiable_sdpi_prior_replay_joint_translation_soft_time_v4')
+        replay_translation_direction = objective == (
+            'differentiable_sdpi_prior_replay_joint_translation_direction_v4')
+        replay_translation_agreement = objective == (
+            'differentiable_sdpi_prior_replay_joint_translation_agreement_v4')
+        staged = objective in {
+            'differentiable_sdpi_staged_poi_v2',
+            'differentiable_sdpi_staged_poi_distance_v2'}
+        if replay_translation_soft_time:
+            trainer_class = PriorReplayJointTranslationSoftTimeTrainer
+        elif replay_translation_direction:
+            trainer_class = PriorReplayJointTranslationDirectionTrainer
+        elif replay_translation_agreement:
+            trainer_class = PriorReplayJointTranslationAgreementTrainer
+        elif replay_translation_window:
+            trainer_class = PriorReplayJointTranslationWindowReplaceTrainer
+        elif replay_translation_replace:
+            trainer_class = PriorReplayJointTranslationReplaceTrainer
+        elif replay_translation:
+            trainer_class = PriorReplayJointTranslationTrainer
+        elif replay_eval:
+            trainer_class = DeterministicPriorReplayTrajectoryTrainer
+        elif replay:
+            trainer_class = PriorReplayTrajectoryTrainer
+        elif staged:
+            trainer_class = StagedPOITrajectoryTrainer
+        else:
+            trainer_class = TrajectoryConsistencyTrainer
         variant = {
             'trajectory_steps': runtime['trajectory_steps'],
             'trajectory_weight': runtime['trajectory_weight'],
             'trajectory_min_time': runtime['trajectory_min_time'],
-            'contract_mode': runtime['trajectory_objective'],
+            'contract_mode': objective,
         }
-        if staged:
+        if (replay or replay_eval or replay_translation
+                or replay_translation_replace or replay_translation_window
+                or replay_translation_soft_time or replay_translation_direction
+                or replay_translation_agreement):
+            variant['replay_max_steps'] = runtime['trajectory_replay_max_steps']
+            if replay_translation_window:
+                variant['trajectory_max_time'] = runtime['trajectory_max_time']
+            elif replay_translation_soft_time:
+                variant.update({
+                    'endpoint_zero_time': runtime['trajectory_endpoint_zero_time'],
+                    'endpoint_full_time': runtime['trajectory_endpoint_full_time'],
+                })
+        elif staged:
             variant.update({
                 'trajectory_max_time': runtime['trajectory_max_time'],
                 'distance_weight_cap': runtime['trajectory_distance_weight_cap'],

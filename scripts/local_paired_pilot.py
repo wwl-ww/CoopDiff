@@ -99,6 +99,63 @@ def make_trainer(variant, model, flow, common, *, trajectory_steps=3,
             model, flow, trajectory_steps=trajectory_steps,
             trajectory_weight=trajectory_weight,
             trajectory_min_time=.25, **common)
+    if variant == 'prior_replay':
+        from tricoopdiff.trajectory_experiment import PriorReplayTrajectoryTrainer
+        return PriorReplayTrajectoryTrainer(
+            model, flow, trajectory_steps=trajectory_steps,
+            trajectory_weight=trajectory_weight,
+            trajectory_min_time=.25, replay_max_steps=15, **common)
+    if variant == 'prior_replay_eval':
+        from tricoopdiff.trajectory_experiment import (
+            DeterministicPriorReplayTrajectoryTrainer)
+        return DeterministicPriorReplayTrajectoryTrainer(
+            model, flow, trajectory_steps=trajectory_steps,
+            trajectory_weight=trajectory_weight,
+            trajectory_min_time=.25, replay_max_steps=15, **common)
+    if variant == 'prior_replay_translation':
+        from tricoopdiff.trajectory_experiment import (
+            PriorReplayJointTranslationTrainer)
+        return PriorReplayJointTranslationTrainer(
+            model, flow, trajectory_steps=trajectory_steps,
+            trajectory_weight=trajectory_weight,
+            trajectory_min_time=.3, replay_max_steps=15, **common)
+    if variant == 'prior_replay_translation_replace':
+        from tricoopdiff.trajectory_experiment import (
+            PriorReplayJointTranslationReplaceTrainer)
+        return PriorReplayJointTranslationReplaceTrainer(
+            model, flow, trajectory_steps=trajectory_steps,
+            trajectory_weight=trajectory_weight,
+            trajectory_min_time=.3, replay_max_steps=15, **common)
+    if variant == 'prior_replay_translation_window_replace':
+        from tricoopdiff.trajectory_experiment import (
+            PriorReplayJointTranslationWindowReplaceTrainer)
+        return PriorReplayJointTranslationWindowReplaceTrainer(
+            model, flow, trajectory_steps=trajectory_steps,
+            trajectory_weight=trajectory_weight,
+            trajectory_min_time=.3, trajectory_max_time=.65,
+            replay_max_steps=15, **common)
+    if variant == 'prior_replay_translation_soft_time':
+        from tricoopdiff.trajectory_experiment import (
+            PriorReplayJointTranslationSoftTimeTrainer)
+        return PriorReplayJointTranslationSoftTimeTrainer(
+            model, flow, trajectory_steps=trajectory_steps,
+            trajectory_weight=trajectory_weight, trajectory_min_time=.3,
+            endpoint_zero_time=.8, endpoint_full_time=.3,
+            replay_max_steps=15, **common)
+    if variant == 'prior_replay_translation_direction':
+        from tricoopdiff.trajectory_experiment import (
+            PriorReplayJointTranslationDirectionTrainer)
+        return PriorReplayJointTranslationDirectionTrainer(
+            model, flow, trajectory_steps=trajectory_steps,
+            trajectory_weight=trajectory_weight,
+            trajectory_min_time=.3, replay_max_steps=15, **common)
+    if variant == 'prior_replay_translation_agreement':
+        from tricoopdiff.trajectory_experiment import (
+            PriorReplayJointTranslationAgreementTrainer)
+        return PriorReplayJointTranslationAgreementTrainer(
+            model, flow, trajectory_steps=trajectory_steps,
+            trajectory_weight=trajectory_weight,
+            trajectory_min_time=.3, replay_max_steps=15, **common)
     if variant in ('poi_stage', 'poi_stage_distance'):
         from tricoopdiff.trajectory_experiment import (
             DISTANCE_STAGED_POI_CONTRACT_MODE,
@@ -124,6 +181,13 @@ def main():
     ap.add_argument('--variant', choices=('teacher', 'coupling', 'e3_endpoint',
                                            'transported', 'gauge_transported',
                                            'joint_endpoint', 'trajectory',
+                                           'prior_replay', 'prior_replay_eval',
+                                           'prior_replay_translation',
+                                           'prior_replay_translation_replace',
+                                           'prior_replay_translation_window_replace',
+                                           'prior_replay_translation_soft_time',
+                                           'prior_replay_translation_direction',
+                                           'prior_replay_translation_agreement',
                                            'poi_stage', 'poi_stage_distance'), required=True)
     ap.add_argument('--train-cases', type=int, default=32)
     ap.add_argument('--val-cases', type=int, default=8)
@@ -131,8 +195,15 @@ def main():
     ap.add_argument('--seed', type=int, default=22001)
     ap.add_argument('--trajectory-steps', type=int, default=3)
     ap.add_argument('--trajectory-weight', type=float, default=.1)
+    ap.add_argument('--accumulation-steps', type=int, default=1)
+    ap.add_argument('--couplings-per-case', type=int, default=1,
+                    help='Adjacent random couplings exposed for each shuffled case')
     ap.add_argument('--save-every-epoch', action='store_true')
     args = ap.parse_args()
+    if args.accumulation_steps < 1:
+        raise ValueError('accumulation-steps must be positive')
+    if args.couplings_per_case < 1:
+        raise ValueError('couplings-per-case must be positive')
     args.out.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(4)
     torch.set_num_interop_threads(4)
@@ -156,6 +227,8 @@ def main():
                 'training': 'deterministic_paired_pilot_v2', 'variant': args.variant,
                 'rng_pairing': 'per_example_reset_and_supervised_forward_restore_v1',
                 'split_policy': 'train_excludes_validation_pdb_prefix_v1',
+                'gradient_accumulation_steps': args.accumulation_steps,
+                'couplings_per_case': args.couplings_per_case,
                 'seed': args.seed, 'base_checkpoint_sha256': sha256(args.base),
                 'train_cases': [b['case'] for b in train], 'val_cases': [b['case'] for b in val]}
     common = dict(device=device, experiment_contract=contract, lr=5e-5,
@@ -195,21 +268,72 @@ def main():
     np.random.set_state(numpy_state)
     history, best, best_ema = [], float('inf'), float('inf')
     for epoch in range(1, args.epochs + 1):
-        order = rng.permutation(len(train))
+        # Repetitions stay adjacent so an accumulation group can explicitly
+        # average several couplings of the same structure.  The default of one
+        # preserves the original example order and RNG schedule exactly.
+        order = np.repeat(rng.permutation(len(train)), args.couplings_per_case)
+        exposures_per_epoch = len(order)
         losses = []
         trajectory_losses = []
-        for position, index in enumerate(order):
-            # Reset every mutable RNG at the example boundary. Variants may
-            # consume different random counts internally, but the next example
-            # still receives the same coupling, time, and initial dropout stream.
-            step_seed = args.seed * 1_000_000 + epoch * len(train) + position
-            np.random.seed(step_seed % (2 ** 32))
-            torch.manual_seed(step_seed)
-            torch.cuda.manual_seed_all(step_seed)
-            step_result = trainer.train_step(**copy.deepcopy(train[int(index)]))
-            losses.append(step_result['loss_total'])
-            if 'loss_trajectory' in step_result:
-                trajectory_losses.append(step_result['loss_trajectory'])
+        trajectory_records = []
+        for group_start in range(0, len(order), args.accumulation_steps):
+            group = order[group_start:group_start + args.accumulation_steps]
+            if args.accumulation_steps == 1:
+                group_results = []
+                for offset, index in enumerate(group):
+                    position = group_start + offset
+                    step_seed = args.seed * 1_000_000 + epoch * exposures_per_epoch + position
+                    np.random.seed(step_seed % (2 ** 32))
+                    torch.manual_seed(step_seed)
+                    torch.cuda.manual_seed_all(step_seed)
+                    group_results.append(trainer.train_step(
+                        **copy.deepcopy(train[int(index)])))
+            else:
+                if model.experiment_lora_config:
+                    raise ValueError('accumulation pilot currently requires frozen experts')
+                trainer._set_lora_trainable(False)
+                trainer.model.train()
+                trainer.optimizer.zero_grad()
+                group_results = []
+                for offset, index in enumerate(group):
+                    position = group_start + offset
+                    step_seed = args.seed * 1_000_000 + epoch * exposures_per_epoch + position
+                    np.random.seed(step_seed % (2 ** 32))
+                    torch.manual_seed(step_seed)
+                    torch.cuda.manual_seed_all(step_seed)
+                    result = trainer.compute_loss(
+                        **copy.deepcopy(train[int(index)]))
+                    (result['loss_total'] / len(group)).backward()
+                    group_results.append({
+                        key: value.item() if torch.is_tensor(value) else value
+                        for key, value in result.items()
+                    })
+                trainable = [
+                    parameter for optimizer_group in trainer.optimizer.param_groups
+                    for parameter in optimizer_group['params']
+                    if parameter.requires_grad
+                ]
+                grad_norm = torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.)
+                if not torch.isfinite(grad_norm):
+                    raise FloatingPointError('non-finite accumulated gradient')
+                trainer.optimizer.step()
+                trainer.global_step += 1
+                with torch.no_grad():
+                    for name, value in trainer.model.trifuse.state_dict().items():
+                        if value.is_floating_point():
+                            trainer.ema[name].lerp_(value.detach(), 1 - trainer.ema_decay)
+                        else:
+                            trainer.ema[name].copy_(value)
+            for offset, step_result in enumerate(group_results):
+                index = group[offset]
+                losses.append(step_result['loss_total'])
+                if 'loss_trajectory' in step_result:
+                    trajectory_losses.append(step_result['loss_trajectory'])
+                    if step_result['loss_trajectory'] > 0:
+                        trajectory_records.append({
+                            'case': train[int(index)]['case'],
+                            'loss': step_result['loss_trajectory'],
+                        })
         raw_values, ema_values = [], []
         for use_ema, values in ((False, raw_values), (True, ema_values)):
             context = trainer.ema_parameters() if use_ema else torch.no_grad()
@@ -238,8 +362,21 @@ def main():
                    trainer, 'rollout_augmented_states', 0),
                'trajectory_augmented_states': getattr(
                    trainer, 'trajectory_augmented_states', 0)}
+        if hasattr(trainer, 'prior_replay_steps'):
+            row['prior_replay_steps'] = trainer.prior_replay_steps
         if trajectory_losses:
             row['mean_trajectory_loss'] = float(np.mean(trajectory_losses))
+        if trajectory_records:
+            values = np.array([record['loss'] for record in trajectory_records])
+            row['trajectory_loss_distribution'] = {
+                'nonzero_count': len(trajectory_records),
+                'p50': float(np.quantile(values, .5)),
+                'p90': float(np.quantile(values, .9)),
+                'max': float(values.max()),
+                'highest_cases': sorted(
+                    trajectory_records, key=lambda record: record['loss'],
+                    reverse=True)[:5],
+            }
         history.append(row)
         if row['fixed_raw_val_loss'] < best:
             best = row['fixed_raw_val_loss']

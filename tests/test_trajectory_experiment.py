@@ -11,11 +11,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.trajectory_experiment import (
     DISTANCE_STAGED_POI_CONTRACT_MODE,
+    PRIOR_REPLAY_CONTRACT_MODE,
+    PRIOR_REPLAY_EVAL_CONTRACT_MODE,
+    PRIOR_REPLAY_TRANSLATION_CONTRACT_MODE,
+    PRIOR_REPLAY_TRANSLATION_REPLACE_CONTRACT_MODE,
+    PRIOR_REPLAY_TRANSLATION_WINDOW_REPLACE_CONTRACT_MODE,
+    PRIOR_REPLAY_TRANSLATION_SOFT_TIME_CONTRACT_MODE,
+    PRIOR_REPLAY_TRANSLATION_DIRECTION_CONTRACT_MODE,
+    PRIOR_REPLAY_TRANSLATION_AGREEMENT_CONTRACT_MODE,
     STAGED_POI_CONTRACT_MODE,
     TRAJECTORY_CONTRACT_MODE,
+    DeterministicPriorReplayTrajectoryTrainer,
+    PriorReplayTrajectoryTrainer,
+    PriorReplayJointTranslationTrainer,
+    PriorReplayJointTranslationReplaceTrainer,
+    PriorReplayJointTranslationWindowReplaceTrainer,
+    PriorReplayJointTranslationSoftTimeTrainer,
+    PriorReplayJointTranslationDirectionTrainer,
+    PriorReplayJointTranslationAgreementTrainer,
     StagedPOITrajectoryTrainer,
     TrajectoryConsistencyTrainer,
     differentiable_sdpi_step,
+    joint_endpoint_translation_loss,
+    prior_replay_schedule,
     staged_poi_state_loss,
 )
 
@@ -156,6 +174,222 @@ def test_staged_poi_contracts_are_distinct_and_complete():
         assert contract['trajectory_max_time'] == .65
         assert contract['trajectory_distance_weighted'] is weighted
         assert contract['trajectory_distance_weight_cap'] == 3.
+
+
+def test_prior_replay_schedule_reaches_requested_time():
+    time = torch.tensor([.43], dtype=torch.float64)
+    count, step = prior_replay_schedule(
+        time, inference_steps=20, max_steps=15)
+    assert count == 12
+    assert torch.allclose(torch.ones_like(time) - count * step, time)
+    capped_count, capped_step = prior_replay_schedule(
+        time, inference_steps=20, max_steps=4)
+    assert capped_count == 4
+    assert torch.allclose(torch.ones_like(time) - capped_count * capped_step, time)
+    endpoint_count, endpoint_step = prior_replay_schedule(
+        torch.ones_like(time), inference_steps=20, max_steps=15)
+    assert endpoint_count == 0
+    assert torch.equal(endpoint_step, torch.zeros_like(time))
+
+
+def test_prior_replay_contract_records_exposure_policy():
+    trainer = PriorReplayTrajectoryTrainer.__new__(PriorReplayTrajectoryTrainer)
+    trainer.trajectory_contract_mode = PRIOR_REPLAY_CONTRACT_MODE
+    trainer.trajectory_steps = 3
+    trainer.trajectory_weight = 1.
+    trainer.trajectory_min_time = .25
+    trainer.replay_max_steps = 15
+    trainer.activation_clamp = 100.
+    trainer.activation_clamp_mode = 'irrep_norm'
+    trainer.residual_weight = 1e-3
+    trainer.ema_decay = .999
+    trainer.optimizer_config = {'trifuse': {'lr': 5e-5, 'weight_decay': 1e-4}}
+    contract = trainer.runtime_contract()
+    assert contract['trajectory_objective'] == PRIOR_REPLAY_CONTRACT_MODE
+    assert contract['trajectory_replay_start_time'] == 1.
+    assert contract['trajectory_replay_max_steps'] == 15
+    assert contract['trajectory_replay_gradients'] is False
+
+
+def test_deterministic_prior_replay_uses_eval_and_restores_training():
+    trainer = DeterministicPriorReplayTrajectoryTrainer.__new__(
+        DeterministicPriorReplayTrajectoryTrainer)
+    trainer.model = torch.nn.Sequential(torch.nn.Dropout(.5))
+    trainer.model.train()
+    with trainer._replay_context():
+        assert not trainer.model.training
+    assert trainer.model.training
+
+    trainer.trajectory_contract_mode = PRIOR_REPLAY_EVAL_CONTRACT_MODE
+    trainer.trajectory_steps = 3
+    trainer.trajectory_weight = 1.
+    trainer.trajectory_min_time = .25
+    trainer.replay_max_steps = 15
+    trainer.activation_clamp = 100.
+    trainer.activation_clamp_mode = 'irrep_norm'
+    trainer.residual_weight = 1e-3
+    trainer.ema_decay = .999
+    trainer.optimizer_config = {'trifuse': {'lr': 5e-5, 'weight_decay': 1e-4}}
+    contract = trainer.runtime_contract()
+    assert contract['trajectory_objective'] == PRIOR_REPLAY_EVAL_CONTRACT_MODE
+    assert contract['trajectory_replay_model_mode'] == 'eval'
+
+
+def test_joint_endpoint_translation_loss_only_differentiates_translations():
+    _, _, _, _, velocities = example()
+    targets = {}
+    leaves = []
+    for branch in ('e3_ligand', 'poi_ligand'):
+        targets[branch] = {}
+        for component in ('tr', 'rot'):
+            value = velocities[branch][component].clone().requires_grad_()
+            velocities[branch][component] = value
+            leaves.append((component, value))
+            targets[branch][component] = torch.zeros_like(value)
+    loss = joint_endpoint_translation_loss(
+        velocities, targets,
+        (torch.tensor(2., dtype=torch.float64),
+         torch.tensor(4., dtype=torch.float64)))
+    loss.backward()
+    for component, value in leaves:
+        if component == 'tr':
+            assert value.grad is not None
+            assert float(value.grad.abs().sum()) > 0
+        else:
+            assert value.grad is None
+
+
+def test_prior_replay_translation_contract_is_explicit():
+    trainer = PriorReplayJointTranslationTrainer.__new__(
+        PriorReplayJointTranslationTrainer)
+    trainer.trajectory_contract_mode = PRIOR_REPLAY_TRANSLATION_CONTRACT_MODE
+    trainer.trajectory_steps = 3
+    trainer.trajectory_weight = .1
+    trainer.trajectory_min_time = .3
+    trainer.replay_max_steps = 15
+    trainer.activation_clamp = 100.
+    trainer.activation_clamp_mode = 'irrep_norm'
+    trainer.residual_weight = 1e-3
+    trainer.ema_decay = .999
+    trainer.optimizer_config = {'trifuse': {'lr': 5e-5, 'weight_decay': 1e-4}}
+    contract = trainer.runtime_contract()
+    assert contract['trajectory_objective'] == PRIOR_REPLAY_TRANSLATION_CONTRACT_MODE
+    assert contract['trajectory_min_time'] == .3
+    assert contract['trajectory_auxiliary_branches'] == [
+        'e3_ligand.tr', 'poi_ligand.tr']
+    assert contract['trajectory_auxiliary_state_gradients'] is False
+    assert contract['trajectory_auxiliary_native_reading'] == 'training_only'
+    assert contract['trajectory_rotation_torsion_target'] == 'analytic_teacher_only'
+
+
+def test_prior_replay_translation_replacement_contract_is_explicit():
+    trainer = PriorReplayJointTranslationReplaceTrainer.__new__(
+        PriorReplayJointTranslationReplaceTrainer)
+    trainer.trajectory_contract_mode = PRIOR_REPLAY_TRANSLATION_REPLACE_CONTRACT_MODE
+    trainer.trajectory_steps = 3
+    trainer.trajectory_weight = 1.
+    trainer.trajectory_min_time = .3
+    trainer.replay_max_steps = 15
+    trainer.activation_clamp = 100.
+    trainer.activation_clamp_mode = 'irrep_norm'
+    trainer.residual_weight = 1e-3
+    trainer.ema_decay = .999
+    trainer.optimizer_config = {'trifuse': {'lr': 5e-5, 'weight_decay': 1e-4}}
+    contract = trainer.runtime_contract()
+    assert contract['trajectory_objective'] == (
+        PRIOR_REPLAY_TRANSLATION_REPLACE_CONTRACT_MODE)
+    assert contract['trajectory_translation_teacher_policy'] == (
+        'replace_when_prior_replay_target_available')
+
+
+def test_prior_replay_translation_window_contract_is_explicit():
+    trainer = PriorReplayJointTranslationWindowReplaceTrainer.__new__(
+        PriorReplayJointTranslationWindowReplaceTrainer)
+    trainer.trajectory_contract_mode = (
+        PRIOR_REPLAY_TRANSLATION_WINDOW_REPLACE_CONTRACT_MODE)
+    trainer.trajectory_steps = 3
+    trainer.trajectory_weight = 1.
+    trainer.trajectory_min_time = .3
+    trainer.trajectory_max_time = .65
+    trainer.replay_max_steps = 15
+    trainer.activation_clamp = 100.
+    trainer.activation_clamp_mode = 'irrep_norm'
+    trainer.residual_weight = 1e-3
+    trainer.ema_decay = .999
+    trainer.optimizer_config = {'trifuse': {'lr': 5e-5, 'weight_decay': 1e-4}}
+    contract = trainer.runtime_contract()
+    assert contract['trajectory_objective'] == (
+        PRIOR_REPLAY_TRANSLATION_WINDOW_REPLACE_CONTRACT_MODE)
+    assert contract['trajectory_min_time'] == .3
+    assert contract['trajectory_max_time'] == .65
+    assert contract['trajectory_translation_teacher_policy'] == (
+        'replace_only_inside_prior_replay_time_window')
+
+
+def test_prior_replay_translation_window_keeps_early_teacher_target():
+    trainer = PriorReplayJointTranslationWindowReplaceTrainer.__new__(
+        PriorReplayJointTranslationWindowReplaceTrainer)
+    trainer.trajectory_max_time = .65
+    trainer._translation_auxiliary_applied = True
+    time = torch.tensor([.8])
+    trainer._trajectory_context = (None, None, None, None, time, None, None)
+    loss = trainer._trajectory_loss()
+    assert loss.item() == 0
+    assert not loss.requires_grad
+    assert trainer._translation_auxiliary_applied is False
+
+
+def test_soft_time_translation_mix_has_expected_endpoints():
+    trainer = PriorReplayJointTranslationSoftTimeTrainer.__new__(
+        PriorReplayJointTranslationSoftTimeTrainer)
+    trainer.endpoint_zero_time = .8
+    trainer.endpoint_full_time = .3
+    for time, expected in ((.8, 0.), (.55, .5), (.3, 1.)):
+        trainer._trajectory_context = (
+            None, None, None, None, torch.tensor([time]), None, None)
+        assert torch.allclose(
+            trainer._translation_replacement_mix(), torch.tensor(expected))
+
+
+def test_direction_translation_uses_teacher_magnitude():
+    trainer = PriorReplayJointTranslationDirectionTrainer.__new__(
+        PriorReplayJointTranslationDirectionTrainer)
+    endpoint = torch.tensor([[0., 2., 0.]])
+    analytic = torch.tensor([[3., 0., 0.]])
+    prediction = torch.tensor([[0., 3., 0.]])
+    branches = ('e3_ligand', 'poi_ligand')
+    velocities = {branch: {'tr': prediction} for branch in branches}
+    endpoint_targets = {branch: {'tr': endpoint} for branch in branches}
+    analytic_targets = {branch: {'tr': analytic} for branch in branches}
+    loss = trainer._translation_loss(
+        velocities, endpoint_targets, (torch.ones(1), torch.ones(1)),
+        analytic_targets)
+    assert torch.allclose(loss, torch.zeros(()))
+
+
+def test_agreement_translation_falls_back_for_opposite_target():
+    trainer = PriorReplayJointTranslationAgreementTrainer.__new__(
+        PriorReplayJointTranslationAgreementTrainer)
+    endpoint = torch.tensor([[-2., 0., 0.]])
+    analytic = torch.tensor([[3., 0., 0.]])
+    branches = ('e3_ligand', 'poi_ligand')
+    velocities = {branch: {'tr': analytic} for branch in branches}
+    endpoint_targets = {branch: {'tr': endpoint} for branch in branches}
+    analytic_targets = {branch: {'tr': analytic} for branch in branches}
+    loss = trainer._translation_loss(
+        velocities, endpoint_targets, (torch.ones(1), torch.ones(1)),
+        analytic_targets)
+    assert torch.allclose(loss, torch.zeros(()))
+
+
+def test_new_translation_contract_names_are_distinct():
+    assert len({
+        PRIOR_REPLAY_TRANSLATION_REPLACE_CONTRACT_MODE,
+        PRIOR_REPLAY_TRANSLATION_WINDOW_REPLACE_CONTRACT_MODE,
+        PRIOR_REPLAY_TRANSLATION_SOFT_TIME_CONTRACT_MODE,
+        PRIOR_REPLAY_TRANSLATION_DIRECTION_CONTRACT_MODE,
+        PRIOR_REPLAY_TRANSLATION_AGREEMENT_CONTRACT_MODE,
+    }) == 5
 
 
 if __name__ == '__main__':
