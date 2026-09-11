@@ -16,7 +16,7 @@ PROJECT_ROOT="/data/run01/scwb792/mwj/CoopDiff"
 cd "$PROJECT_ROOT"
 mkdir -p logs results
 
-export HF_ENDPOINT=https://hf-mirror.com
+export HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 unset NAN_CLAMP

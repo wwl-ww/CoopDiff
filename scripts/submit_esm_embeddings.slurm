@@ -31,8 +31,8 @@ MODEL="facebook/esm2_t33_650M_UR50D"
 BATCH_SIZE=4
 
 # ---- Setup ----
-# Use HF mirror (huggingface.co is blocked from cluster)
-export HF_ENDPOINT="https://hf-mirror.com"
+# Use official Hugging Face endpoint by default; set HF_ENDPOINT explicitly if needed.
+export HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
 
 CONDA_BASE="/data/run01/scwb792/miniconda3"
 CONDA_ENV="tricoopdiff"

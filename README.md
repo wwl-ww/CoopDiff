@@ -57,13 +57,21 @@ the same `HF_HOME` when running evaluation.
 
 ```bash
 export HF_HOME=/path/to/persistent/huggingface
-hf download facebook/esm2_t33_650M_UR50D --cache-dir "$HF_HOME/hub"
-hf cache scan --dir "$HF_HOME/hub" | grep esm2_t33_650M_UR50D
+export HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
+
+python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    "facebook/esm2_t33_650M_UR50D",
+    cache_dir="/path/to/persistent/huggingface/hub",
+)
+PY
 ```
 
-The model is public, so authentication is normally unnecessary. If the cluster
+The model is public, so authentication is usually unnecessary. If the cluster
 cannot reach Hugging Face, download the cache on another machine and copy the
-entire cache directory without changing its internal layout.
+entire cache directory without changing its internal layout. Set `HF_ENDPOINT`
+explicitly if your environment requires `https://hf-mirror.com`.
 
 ## 5. Download DeepTernary code and structural data
 
