@@ -22,9 +22,9 @@ import torch.nn as nn
 from pathlib import Path
 from typing import List, Dict, Optional, Union
 
-# Use HF mirror for model download (huggingface.co blocked from cluster)
+# Use official Hugging Face endpoint by default; allow override via environment.
 if "HF_ENDPOINT" not in os.environ:
-    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+    os.environ["HF_ENDPOINT"] = "https://huggingface.co"
 
 from transformers import AutoTokenizer, AutoModel
 

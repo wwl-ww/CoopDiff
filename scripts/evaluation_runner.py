@@ -31,7 +31,8 @@ class EvaluationRunner:
                  model_dir="checkpoints/score_model",
                  expert_checkpoint="best_ema_inference_epoch_model.pt",
                  deepternary_root=None, deterministic=True,
-                 conformer_policy="etkdgv3_random"):
+                 conformer_policy="etkdgv3_random",
+                 allow_experimental_checkpoint=False):
         self.reproducibility = configure_inference_reproducibility(deterministic)
         self.reproducibility['torus_score_norm_version'] = SCORE_NORM_VERSION
         self.root = Path(project_root).resolve()
@@ -47,7 +48,28 @@ class EvaluationRunner:
             self.checkpoint_path = self.root / self.checkpoint_path
         self.checkpoint_sha256 = sha256_file(self.checkpoint_path)
         self.checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
-        validate_checkpoint_payload(self.checkpoint)
+        self.experimental_checkpoint = (
+            self.checkpoint.get('architecture') == 'residual_consensus_factorial_v1'
+        )
+        if self.experimental_checkpoint:
+            if not allow_experimental_checkpoint:
+                raise ValueError(
+                    'experimental factorial checkpoint requires explicit '
+                    'allow_experimental_checkpoint=True'
+                )
+            contract = self.checkpoint.get('experiment_contract', {})
+            if self.checkpoint.get('checkpoint_version') != 1:
+                raise ValueError('unsupported experimental checkpoint version')
+            if contract.get('chemistry') != 'ccd' or contract.get('torsion') != 'single_bond':
+                raise ValueError('experimental checkpoint chemistry/torsion contract differs')
+            if contract.get('adaptation') != 'frozen':
+                raise ValueError('only frozen-expert experimental checkpoints are supported')
+            if self.checkpoint.get('expert_lora_config') is not None:
+                raise ValueError('frozen experimental checkpoint unexpectedly contains expert LoRA')
+            if 'ema_trifuse_state_dict' not in self.checkpoint:
+                raise ValueError('experimental checkpoint has no EMA TriFuse weights')
+        else:
+            validate_checkpoint_payload(self.checkpoint)
         self.reproducibility['checkpoint_torus_score_norm_version'] = (
             validate_score_norm_version(self.checkpoint['runtime_config'])
         )
@@ -92,12 +114,19 @@ class EvaluationRunner:
         if self.checkpoint['model_config']['input_dim'] != input_dim:
             raise ValueError('checkpoint input feature dimension mismatch')
         trifuse = ConsensusFuse(**self.checkpoint['model_config'])
-        self.model = ConsensusCoopDiff(
-            frozen_expert=self.expert,
-            trifuse=trifuse,
-            num_conv_layers=self.expert.num_conv_layers,
-            use_film=False,
-        ).to(self.device)
+        if self.experimental_checkpoint:
+            from tricoopdiff.consensus_experiment import ExperimentalConsensus
+
+            self.model = ExperimentalConsensus(
+                self.expert, trifuse, self.checkpoint['expert_lora_config'],
+            ).to(self.device)
+        else:
+            self.model = ConsensusCoopDiff(
+                frozen_expert=self.expert,
+                trifuse=trifuse,
+                num_conv_layers=self.expert.num_conv_layers,
+                use_film=False,
+            ).to(self.device)
         self.model.trifuse.load_state_dict(self.checkpoint["ema_trifuse_state_dict"])
         self.model.eval()
         self.input_dim = input_dim
@@ -105,9 +134,12 @@ class EvaluationRunner:
     def evaluate_case(self, case, paths, cache_dir, native_complex_pdb=None,
                       n_walkers=32, steps=20, seed=0,
                       init_mode="sdpi", t_anchor=None, freeze_poi=False,
+                      binary_anchor_steps=5, anchor_proposal_attempts=4,
+                      anchor_selection="geometry",
                       debug_trace=False, debug_seed=0,
                       translation_velocity_scale=1.0,
-                      rotation_velocity_scale=1.0):
+                      rotation_velocity_scale=1.0,
+                      return_rank_features=False):
         """Featurize and evaluate one case with the resident model."""
         torch.manual_seed(seed)
         if self.device.type == "cuda":
@@ -118,9 +150,27 @@ class EvaluationRunner:
             cache_dir=str(cache_dir),
         )
         self._ensure_model(input_dim)
+        case_initializer = self.initializer
+        initialization_version = "sdpi_v1"
+        if init_mode == "expert_anchor":
+            from tricoopdiff.expert_anchors import (
+                DualExpertAnchorInitializer, EXPERT_ANCHOR_CONSENSUS_VERSION,
+                EXPERT_ANCHOR_VERSION,
+            )
+            case_initializer = DualExpertAnchorInitializer(
+                self.expert, e3_data, poi_data,
+                binary_steps=binary_anchor_steps,
+                proposal_attempts=anchor_proposal_attempts,
+                conformer_policy=self.initializer.conformer_policy,
+                selection=anchor_selection,
+            )
+            initialization_version = (
+                EXPERT_ANCHOR_CONSENSUS_VERSION
+                if anchor_selection == "consensus" else EXPERT_ANCHOR_VERSION
+            )
         report = evaluate_model(
             self.model, e3_data, poi_data, ligand_data, self.diffusion,
-            initializer=self.initializer, device=str(self.device),
+            initializer=case_initializer, device=str(self.device),
             n_walkers=n_walkers, steps=steps,
             seed=seed,
             native_complex_pdb=(str(native_complex_pdb)
@@ -129,6 +179,7 @@ class EvaluationRunner:
             debug_trace=debug_trace, debug_seed=debug_seed,
             translation_velocity_scale=translation_velocity_scale,
             rotation_velocity_scale=rotation_velocity_scale,
+            return_rank_features=return_rank_features,
             deepternary_dockq_paths={
                 "protein1_pdb": str(paths["protein1"]),
                 "protein2_pdb": str(paths["protein2"]),
@@ -150,11 +201,22 @@ class EvaluationRunner:
                       else self.diffusion.inference_steps),
             "freeze_poi": freeze_poi,
             "init_mode": init_mode,
-            "initialization_version": "sdpi_v1",
+            "initialization_version": initialization_version,
+            "binary_anchor_steps": (binary_anchor_steps
+                                      if init_mode == "expert_anchor" else None),
+            "anchor_proposal_attempts": (anchor_proposal_attempts
+                                          if init_mode == "expert_anchor" else None),
+            "anchor_selection": (anchor_selection
+                                  if init_mode == "expert_anchor" else None),
             "generative_process": "sdpi_flow_v1",
             "t_anchor": (t_anchor if t_anchor is not None else
                          1.0),
             "trifuse_checkpoint": str(self.checkpoint_path.resolve()),
+            "checkpoint_schema": (
+                "experimental_factorial_v1_ema" if self.experimental_checkpoint
+                else "production_v18_ema"
+            ),
+            "rank_features_saved": bool(return_rank_features),
             "checkpoint_sha256": self.checkpoint_sha256,
             "expert_checkpoint_sha256": self.expert.provenance["score_checkpoint_sha256"],
             "expert_config_sha256": self.expert_config_sha256,

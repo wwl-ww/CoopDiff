@@ -21,7 +21,8 @@ from typing import Dict, Mapping, Optional, Tuple, Union
 
 import torch
 
-from .rigid import apply_rigid, compose_rigid, invert_rigid
+from .pose_anchors import proper_rigid_fit
+from .rigid import compose_rigid, invert_rigid
 
 
 Tensor = torch.Tensor
@@ -35,27 +36,6 @@ def _validate_points(name: str, points: Tensor) -> Tensor:
             or not torch.is_floating_point(points) or not torch.isfinite(points).all()):
         raise ValueError(f'{name} must be finite floating-point [B, N, 3] with N >= 3')
     return points
-
-
-def _proper_rigid_fit(source: Tensor, target: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-    """Return the proper least-squares transform source -> target and RMSD."""
-    if source.shape != target.shape:
-        raise ValueError('current/native point clouds must have matching shapes and atom order')
-    source_center = source.mean(dim=-2)
-    target_center = target.mean(dim=-2)
-    x = source - source_center.unsqueeze(-2)
-    y = target - target_center.unsqueeze(-2)
-    covariance = x.transpose(-1, -2) @ y
-    u, singular, vh = torch.linalg.svd(covariance)
-    if bool((singular[..., 1] <= torch.finfo(source.dtype).eps * singular[..., 0]).any()):
-        raise ValueError('rigid fit is underdetermined for collinear coordinates')
-    sign = torch.ones((*source.shape[:-2], 3), dtype=source.dtype, device=source.device)
-    sign[..., -1] = torch.det(vh.transpose(-1, -2) @ u.transpose(-1, -2))
-    rotation = vh.transpose(-1, -2) @ torch.diag_embed(sign) @ u.transpose(-1, -2)
-    translation = target_center - (rotation @ source_center.unsqueeze(-1)).squeeze(-1)
-    fitted = apply_rigid(source, rotation, translation)
-    rmsd = (fitted - target).square().sum(-1).mean(-1).sqrt()
-    return rotation, translation, rmsd
 
 
 def stable_so3_log(rotation: Tensor, *, reject_near_pi: bool = False,
@@ -165,8 +145,8 @@ def joint_rigid_endpoint_targets(
     if teacher_targets is None and (blend != 1 or correction_cap is not None):
         raise ValueError('blend/correction_cap require teacher_targets')
 
-    ra, ta, ligand_fit_rmsd = _proper_rigid_fit(ligand, native_ligand)
-    rs, ts, poi_fit_rmsd = _proper_rigid_fit(poi, native_poi)
+    ra, ta, ligand_fit_rmsd = proper_rigid_fit(ligand, native_ligand)
+    rs, ts, poi_fit_rmsd = proper_rigid_fit(poi, native_poi)
     rs_inv, ts_inv = invert_rigid(rs, ts)
     rb, tb = compose_rigid(rs_inv, ts_inv, ra, ta)
     log_a = stable_so3_log(ra, reject_near_pi=reject_near_pi, pi_tolerance=pi_tolerance)

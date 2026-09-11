@@ -36,7 +36,12 @@ from factorial_arm import PairedTorsionFlow, restrict_non_single
 from featurize_common import _to_device_and_batch
 from train_entry import _load_score_model_args
 from tricoopdiff.consensus import ConsensusFuse
-from tricoopdiff.consensus_experiment import ExperimentalConsensus, ExperimentalConsensusTrainer
+from tricoopdiff.consensus_experiment import (
+    EndpointTranslationRolloutTrainer,
+    ExperimentalConsensus,
+    ExperimentalConsensusTrainer,
+    RolloutAugmentedTrainer,
+)
 from tricoopdiff.expert_factory import build_diffdock_expert
 from tricoopdiff.reproducibility import configure_inference_reproducibility
 
@@ -94,18 +99,147 @@ def load_batch(entry, plan, score_args):
 
 def build(checkpoint, expert_dir):
     saved = torch.load(checkpoint, map_location='cpu', weights_only=False)
-    assert saved['experiment_contract'] == {
-        'chemistry': 'ccd', 'torsion': 'single_bond', 'adaptation': 'frozen', 'seed': 1729}
     expert = build_diffdock_expert(str(expert_dir), 'cuda')
     model = ExperimentalConsensus(expert, ConsensusFuse(**saved['model_config']),
                                   saved['expert_lora_config'])
     runtime = saved['runtime_config']
-    trainer = ExperimentalConsensusTrainer(
+    variant = {}
+    if runtime.get('trajectory_objective') in {
+            'differentiable_sdpi_trajectory_v1',
+            'differentiable_sdpi_staged_poi_v2',
+            'differentiable_sdpi_staged_poi_distance_v2',
+            'differentiable_sdpi_prior_replay_v1',
+            'differentiable_sdpi_prior_replay_eval_v2',
+            'differentiable_sdpi_prior_replay_joint_translation_v1',
+            'differentiable_sdpi_prior_replay_joint_translation_replace_v2',
+            'differentiable_sdpi_prior_replay_joint_translation_window_replace_v3',
+            'differentiable_sdpi_prior_replay_joint_translation_soft_time_v4',
+            'differentiable_sdpi_prior_replay_joint_translation_direction_v4',
+            'differentiable_sdpi_prior_replay_joint_translation_agreement_v4'}:
+        from tricoopdiff.trajectory_experiment import (
+            DeterministicPriorReplayTrajectoryTrainer,
+            PriorReplayJointTranslationTrainer,
+            PriorReplayJointTranslationReplaceTrainer,
+            PriorReplayJointTranslationWindowReplaceTrainer,
+            PriorReplayJointTranslationSoftTimeTrainer,
+            PriorReplayJointTranslationDirectionTrainer,
+            PriorReplayJointTranslationAgreementTrainer,
+            PriorReplayTrajectoryTrainer, StagedPOITrajectoryTrainer,
+            TrajectoryConsistencyTrainer)
+        objective = runtime['trajectory_objective']
+        replay = objective == 'differentiable_sdpi_prior_replay_v1'
+        replay_eval = objective == 'differentiable_sdpi_prior_replay_eval_v2'
+        replay_translation = objective == (
+            'differentiable_sdpi_prior_replay_joint_translation_v1')
+        replay_translation_replace = objective == (
+            'differentiable_sdpi_prior_replay_joint_translation_replace_v2')
+        replay_translation_window = objective == (
+            'differentiable_sdpi_prior_replay_joint_translation_window_replace_v3')
+        replay_translation_soft_time = objective == (
+            'differentiable_sdpi_prior_replay_joint_translation_soft_time_v4')
+        replay_translation_direction = objective == (
+            'differentiable_sdpi_prior_replay_joint_translation_direction_v4')
+        replay_translation_agreement = objective == (
+            'differentiable_sdpi_prior_replay_joint_translation_agreement_v4')
+        staged = objective in {
+            'differentiable_sdpi_staged_poi_v2',
+            'differentiable_sdpi_staged_poi_distance_v2'}
+        if replay_translation_soft_time:
+            trainer_class = PriorReplayJointTranslationSoftTimeTrainer
+        elif replay_translation_direction:
+            trainer_class = PriorReplayJointTranslationDirectionTrainer
+        elif replay_translation_agreement:
+            trainer_class = PriorReplayJointTranslationAgreementTrainer
+        elif replay_translation_window:
+            trainer_class = PriorReplayJointTranslationWindowReplaceTrainer
+        elif replay_translation_replace:
+            trainer_class = PriorReplayJointTranslationReplaceTrainer
+        elif replay_translation:
+            trainer_class = PriorReplayJointTranslationTrainer
+        elif replay_eval:
+            trainer_class = DeterministicPriorReplayTrajectoryTrainer
+        elif replay:
+            trainer_class = PriorReplayTrajectoryTrainer
+        elif staged:
+            trainer_class = StagedPOITrajectoryTrainer
+        else:
+            trainer_class = TrajectoryConsistencyTrainer
+        variant = {
+            'trajectory_steps': runtime['trajectory_steps'],
+            'trajectory_weight': runtime['trajectory_weight'],
+            'trajectory_min_time': runtime['trajectory_min_time'],
+            'contract_mode': objective,
+        }
+        if (replay or replay_eval or replay_translation
+                or replay_translation_replace or replay_translation_window
+                or replay_translation_soft_time or replay_translation_direction
+                or replay_translation_agreement):
+            variant['replay_max_steps'] = runtime['trajectory_replay_max_steps']
+            if replay_translation_window:
+                variant['trajectory_max_time'] = runtime['trajectory_max_time']
+            elif replay_translation_soft_time:
+                variant.update({
+                    'endpoint_zero_time': runtime['trajectory_endpoint_zero_time'],
+                    'endpoint_full_time': runtime['trajectory_endpoint_full_time'],
+                })
+        elif staged:
+            variant.update({
+                'trajectory_max_time': runtime['trajectory_max_time'],
+                'distance_weight_cap': runtime['trajectory_distance_weight_cap'],
+            })
+    elif runtime.get('offpath_target') == 'e3_ligand_endpoint_translation_v1':
+        trainer_class = EndpointTranslationRolloutTrainer
+        variant = {
+            'rollout_probability': runtime['rollout_probability'],
+            'rollout_steps': runtime['rollout_steps'],
+            'rollout_min_time': runtime['rollout_min_time'],
+            'endpoint_blend': runtime['endpoint_blend'],
+            'endpoint_correction_ratio': runtime['endpoint_correction_ratio'],
+        }
+    elif runtime.get('offpath_target') in {
+            'poi_body_frame_transported_coupling_v1',
+            'poi_body_frame_transported_gauge_correct_v2',
+            'joint_rigid_endpoint_kabsch_bounded_v1'}:
+        from tricoopdiff.offpath_experiments import (
+            BodyFrameTransportRolloutTrainer,
+            BoundedJointEndpointRolloutTrainer,
+            GaugeCorrectBodyFrameTransportRolloutTrainer,
+        )
+        classes = {
+            'poi_body_frame_transported_coupling_v1': BodyFrameTransportRolloutTrainer,
+            'poi_body_frame_transported_gauge_correct_v2': (
+                GaugeCorrectBodyFrameTransportRolloutTrainer),
+            'joint_rigid_endpoint_kabsch_bounded_v1': BoundedJointEndpointRolloutTrainer,
+        }
+        trainer_class = classes[runtime['offpath_target']]
+        variant = {
+            'rollout_probability': runtime['rollout_probability'],
+            'rollout_steps': runtime['rollout_steps'],
+            'rollout_min_time': runtime['rollout_min_time'],
+            'contract_mode': runtime['offpath_target'],
+        }
+        if runtime['offpath_target'] == 'joint_rigid_endpoint_kabsch_bounded_v1':
+            variant.update({
+                'endpoint_blend': runtime['endpoint_blend'],
+                'endpoint_translation_cap': runtime['endpoint_translation_cap'],
+                'endpoint_rotation_cap': runtime['endpoint_rotation_cap'],
+            })
+    elif 'rollout_probability' in runtime:
+        trainer_class = RolloutAugmentedTrainer
+        variant = {
+            'rollout_probability': runtime['rollout_probability'],
+            'rollout_steps': runtime['rollout_steps'],
+        }
+    else:
+        trainer_class = ExperimentalConsensusTrainer
+    trainer = trainer_class(
         model, PairedTorsionFlow(), device='cuda',
-        experiment_contract=saved['experiment_contract'], lr=1e-4,
+        experiment_contract=saved['experiment_contract'],
+        lr=runtime['optimizer_groups']['trifuse']['lr'],
         lora_lr=1e-5, lora_early_lr=5e-6, lora_warmup_steps=0,
         **{key: runtime[key] for key in (
-            'activation_clamp', 'activation_clamp_mode', 'residual_weight', 'ema_decay')})
+            'activation_clamp', 'activation_clamp_mode', 'residual_weight', 'ema_decay')},
+        **variant)
     trainer.load_checkpoint(checkpoint)
     model.eval()
     return trainer, {key: saved[key] for key in (
@@ -192,23 +326,38 @@ def summarize(rows):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--repeat', action='store_true', help='Reload saved couplings for a repeat run')
+    parser.add_argument(
+        '--repeat', action='store_true',
+        help='Reload saved couplings for a repeat run')
     parser.add_argument('--out', type=Path, default=OUT)
+    parser.add_argument('--checkpoint', type=Path)
+    parser.add_argument('--cases', nargs='+')
+    parser.add_argument('--seeds', nargs='+', type=int)
     args = parser.parse_args()
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
+    previous = None
+    if args.repeat and (out / 'audit.json').is_file():
+        previous = json.loads((out / 'audit.json').read_text())
+    cases = args.cases or (previous['cases'] if previous else list(CASES))
+    seeds = args.seeds or (previous['seeds'] if previous else list(SEEDS))
     torch.set_num_threads(4)
     torch.set_num_interop_threads(4)
     reproducibility = configure_inference_reproducibility(True)
     assert torch.cuda.device_count() == 1
     assert str(ROOT) in sys.modules['tricoopdiff'].__file__
     plan = ARTIFACTS / 'results/overnight_root_cause_v3_plan'
-    checkpoint = ARTIFACTS / 'results/overnight_root_cause_v3_run04/ccd_single_bond_frozen_seed1729/best.pt'
+    default_checkpoint = (ARTIFACTS / 'results/'
+        'overnight_root_cause_v3_run04/ccd_single_bond_frozen_seed1729/best.pt')
+    checkpoint = args.checkpoint or (
+        Path(previous['checkpoint']) if previous else default_checkpoint)
     expert_dir = ARTIFACTS / 'checkpoints/score_model'
     entries = {e['case']: e for e in json.loads((plan / 'indexes/ternary_val_ccd.json').read_text())['entries']}
     score_args = _load_score_model_args(str(expert_dir))
     batches, provenance = [], []
-    for case in CASES:
+    if len(set(cases)) < 1 or len(set(seeds)) < 1:
+        parser.error('at least one case and seed are required')
+    for case in cases:
         batch, evidence = load_batch(entries[case], plan, score_args)
         batches.append(batch)
         provenance.append(evidence)
@@ -220,7 +369,7 @@ def main():
                    if args.repeat else {})
     pairs = []
     for batch in batches:
-        for seed in SEEDS:
+        for seed in seeds:
             key = f"{batch['case']}:{seed}"
             random.seed(seed)
             np.random.seed(seed)
@@ -284,7 +433,7 @@ def main():
         'limitations': 'Crystal-reference teacher t=1 start, not blind ETKDG inference. Conditional target cosine is not marginal-flow correctness. Drift is not proof the flow objective is wrong. No DockQ measured.',
         'units': {'translation': 'angstrom / unit time', 'rotation_and_torsion': 'radian / unit time'},
         'checkpoint': str(checkpoint), 'checkpoint_sha256': sha256(checkpoint),
-        'checkpoint_metadata': metadata, 'cases': CASES, 'seeds': SEEDS,
+        'checkpoint_metadata': metadata, 'cases': cases, 'seeds': seeds,
         'environment': {key: os.environ[key] for key in (
             'CUDA_VISIBLE_DEVICES', 'TRICOOPDIFF_CACHE_DIR', 'HF_HUB_CACHE',
             'HF_HUB_OFFLINE', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS')},

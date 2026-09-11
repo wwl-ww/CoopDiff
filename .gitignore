@@ -39,6 +39,11 @@ checkpoints/
 *.ckpt
 !checkpoints/.gitkeep
 
+# Local model/dependency caches and compatibility shims
+/hf_cache/
+/torch_cluster/
+/torch_scatter/
+
 # Data (large files)
 data/
 *.pdb

@@ -37,11 +37,25 @@ def build_parser():
     parser.add_argument("--limit", type=int)
     parser.add_argument("--n-walkers", type=int, default=32)
     parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--init-mode", choices=["sdpi", "expert_anchor"],
+                        default="sdpi")
+    parser.add_argument("--binary-anchor-steps", type=int, default=5)
+    parser.add_argument("--anchor-proposal-attempts", type=int, default=4)
+    parser.add_argument("--anchor-selection", choices=["geometry", "consensus"],
+                        default="geometry")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--allow-nondeterministic", action="store_true",
                         help="Explicit legacy diagnostic control; never mix with deterministic results")
+    parser.add_argument(
+        "--allow-experimental-checkpoint", action="store_true",
+        help="Explicitly evaluate a validated frozen factorial-v1 checkpoint with EMA weights",
+    )
+    parser.add_argument(
+        "--save-rank-features", action="store_true",
+        help="Persist invariant final-step contexts for supervised ranking on non-benchmark data",
+    )
     parser.add_argument("--conformer-policy",
                         choices=["etkdgv3_random", "diffdock_v1_1"],
                         default="etkdgv3_random")
@@ -67,8 +81,18 @@ def main():
         "checkpoint": checkpoint,
         "checkpoint_sha256": sha256_file(checkpoint),
         "cases": [entry["case"] for entry in entries],
-        "init_mode": "sdpi",
-        "initialization_version": "sdpi_v1",
+        "init_mode": args.init_mode,
+        "initialization_version": (
+            ("dual_diffdock_rigid_anchor_consensus_v1"
+             if args.anchor_selection == "consensus"
+             else "dual_diffdock_rigid_anchor_v1")
+            if args.init_mode == "expert_anchor" else "sdpi_v1"),
+        "binary_anchor_steps": (args.binary_anchor_steps
+                                if args.init_mode == "expert_anchor" else None),
+        "anchor_proposal_attempts": (args.anchor_proposal_attempts
+                                     if args.init_mode == "expert_anchor" else None),
+        "anchor_selection": (args.anchor_selection
+                             if args.init_mode == "expert_anchor" else None),
         "generative_process": "sdpi_flow_v1",
         "seed": args.seed,
         "n_walkers": args.n_walkers,
@@ -77,6 +101,8 @@ def main():
         "metric_template_root": args.metric_template_root,
         "deterministic_algorithms": not args.allow_nondeterministic,
         "conformer_policy": args.conformer_policy,
+        "allow_experimental_checkpoint": args.allow_experimental_checkpoint,
+        "rank_features_saved": args.save_rank_features,
     }
     (output / "evaluation_manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8",
@@ -86,6 +112,7 @@ def main():
         deepternary_root=args.deepternary_root,
         deterministic=not args.allow_nondeterministic,
         conformer_policy=args.conformer_policy,
+        allow_experimental_checkpoint=args.allow_experimental_checkpoint,
     )
     failures = []
     for position, entry in enumerate(entries, start=1):
@@ -104,8 +131,18 @@ def main():
             native = native if native.is_file() else None
             expected_config = {
                 **runner.reproducibility,
-                "init_mode": "sdpi",
-                "initialization_version": "sdpi_v1",
+                "init_mode": args.init_mode,
+                "initialization_version": (
+                    ("dual_diffdock_rigid_anchor_consensus_v1"
+                     if args.anchor_selection == "consensus"
+                     else "dual_diffdock_rigid_anchor_v1")
+                    if args.init_mode == "expert_anchor" else "sdpi_v1"),
+                "binary_anchor_steps": (args.binary_anchor_steps
+                                        if args.init_mode == "expert_anchor" else None),
+                "anchor_proposal_attempts": (args.anchor_proposal_attempts
+                                             if args.init_mode == "expert_anchor" else None),
+                "anchor_selection": (args.anchor_selection
+                                     if args.init_mode == "expert_anchor" else None),
                 "generative_process": "sdpi_flow_v1",
                 "seed": args.seed,
                 "n_walkers": args.n_walkers,
@@ -120,6 +157,7 @@ def main():
                 "t_anchor": 1.0,
                 "dockq_source_sha256": sha256_file(runner.deepternary_root / 'DockQ/dockq_util.py'),
                 "dockq_binary_sha256": sha256_file(runner.deepternary_root / 'DockQ/fnat'),
+                "rank_features_saved": args.save_rank_features,
             }
             if not args.no_resume and completed_report(
                     report_path, case, checkpoint, expected_config,
@@ -131,6 +169,11 @@ def main():
                 case, paths, cache_dir=_PROJECT_ROOT / args.cache_dir,
                 native_complex_pdb=native,
                 n_walkers=args.n_walkers, steps=args.steps, seed=args.seed,
+                init_mode=args.init_mode,
+                binary_anchor_steps=args.binary_anchor_steps,
+                anchor_proposal_attempts=args.anchor_proposal_attempts,
+                anchor_selection=args.anchor_selection,
+                return_rank_features=args.save_rank_features,
             )
             write_report_atomic(report, report_path)
             ensemble = report['ensemble']

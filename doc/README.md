@@ -1,96 +1,54 @@
 # TriCoopDiff 文档索引
 
-- [Phase 1 数据协议](./Phase%201%20数据协议.md)：正式联合训练池、cluster
-  切分/采样规则及 PROTAC/Molecular Glue benchmark 协议。
+代码、测试和 `results/` 中的完整报告优先于文档。本文只负责路由，不重复保存实验
+流水账；一次性运行状态见仓库根目录 [`todo.md`](../todo.md)。
 
-本目录只保留长期有效的设计、验证和运行文档。代码、测试与最新结果始终优先于文档；实验产物位于 `results/`，不要把临时日志或 agent 交接稿放入 `doc/`。
+## 当前阅读顺序
 
-## 阅读顺序
+1. [低 DockQ 根因排查交接](低DockQ根因排查交接.md)：model-v2 已完成的根因证据、
+   MGD94 oracle、双专家 anchor 门禁，以及下一分支的在线初始化方向。
+2. [初始化方案](初始化方案_gpt6.md)：现有 SDPI 初始化、共享 ligand 构象和精确刚体
+   装配契约。该文档描述当前基线；下一分支需补充确定性在线 anchor 生成。
+3. [TriCoopDiff 模型架构图](TriCoopDiff%20模型架构图.md)：当前模块和坐标更新关系。
+4. [Phase 1 数据协议](Phase%201%20数据协议.md)：训练池、cluster split 和 benchmark
+   防泄漏规则。
+5. [训练入口与 smoke](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md)：环境、
+   缓存、SLURM 和训练入口。
 
-[夜间实验编排](夜间实验编排.md)：十小时顺序执行器、验收报告和故障停止契约。
-默认 `overnight_v2.json` 已接入单状态 v2 实际验收、限时训练和评估；
-双构象历史模板仍拒绝启动，不属于本分支的实验职责。
+## 专题参考
 
-独立二元对照的实测结果与 DockQ 小分子指标定义见
-[独立 DiffDock 小分子评估](独立DiffDock小分子评估.md)。
-
-当前 `model-v2` 入口使用冻结专家后的残差共识模型，设计动机见
-[`sug_gpt6.md`](../sug_gpt6.md)。下表中 `trifuse_v13`、FiLM 和旧训练
-交接文档是历史参考，不是 v2 的运行配置；旧 SLURM 的 LoRA 参数仍需迁移。
-
-### 当前代码导航
-
-- `tricoopdiff/consensus.py`：冻结专家调用、门控与残差速度场。
-- `tricoopdiff/geometry_encoders.py`：配体化学特征、逐键上下文和三元几何编码。
-- `tricoopdiff/consensus_layers.py`：token 协商、共享 torsion 与预留输出头。
-- `tricoopdiff/expert_time.py`：独立二元对照与协同模型共用的 DiffDock 时间输入。
-- `tricoopdiff/consensus_train.py`：残差正则、EMA 和 v2 checkpoint；目前复用
-  `train.py` 的训练循环。`model.py`、`trifuse.py` 保留旧 FiLM 模型及兼容导出。
-- `scripts/evaluation_runner.py`：训练权重的统一 EMA 评估；
-  `evaluate_entry.py --allow-zero-init` 仅是未训练共识诊断，不是原生 DiffDock 对照。
-
-公共层拆分不更改 `state_dict` 键或数值计算。回归入口为
-`python tests/test_model_build.py`、`python tests/test_consensus.py` 和
-`python tests/test_module_boundaries.py`；最后一项检查兼容导出及新旧模块隔离。
-
-| 文档 | 用途 | 何时阅读 |
+| 文档 | 用途 | 状态 |
 |---|---|---|
-| [TriCoopDiff 模型架构图.md](TriCoopDiff%20模型架构图.md) | 完整 Mermaid 模型图、模块职责与单步坐标更新 | 快速查看当前整体架构时 |
-| [TriFuse 架构与审计.md](TriFuse%20架构与审计.md) | `trifuse_v13` 数据流、参考系、训练契约与已知边界 | 快速理解或审计当前模型时 |
-| [TriCoopDiff 模型交接文档.md](TriCoopDiff%20模型交接文档.md) | `trifuse_v13` 架构、FiLM、训练和采样 | 修改核心模型前 |
-| [双DiffDock界面协同修正方案.md](双DiffDock界面协同修正方案.md) | 双 expert 的界面职责与刚体更新顺序 | 修改坐标动力学时 |
-| [双二元强先验接入方案.md](双二元强先验接入方案.md) | 双端点、双口袋与局部 frame 的输入契约，以及继续训练/从头训练两条路线 | 对齐 DeepTernary 的预测先验时 |
-| [DeepTernary与TriCoopDiff训练推理初始化对照.md](DeepTernary与TriCoopDiff训练推理初始化对照.md) | 当前初始化与 DeepTernary 不同入口的输入条件差异 | 设计公平对照实验时 |
-| [初始化方案_gpt6.md](初始化方案_gpt6.md) | 唯一 `sdpi` 初始化、共享构象、精确装配与验收 | 修改采样或初始化时 |
-| [训练入口 SLURM 与 Phase1 smoke 交接文档.md](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md) | 环境预检、SLURM、缓存和训练入口 | 提交训练前 |
-| [DiffDock 审计文档.md](DiffDock%20审计文档.md) | 冻结二体专家的结构和扩散实现 | 修改 expert 集成时 |
-| [低DockQ根因排查交接.md](低DockQ根因排查交接.md) | 化学、初始化、建图、rollout/endpoint 试验、证据局限与接手步骤 | 接手低 DockQ 排查时 |
-| [公式推导参考.md](公式推导参考.md) | SO(3)、DSM、Tweedie 和物理项推导 | 核对数学约定时 |
+| [DiffDock 审计](DiffDock%20审计文档.md) | frozen 二元专家、扩散和 checkpoint | 当前参考 |
+| [公式推导](公式推导参考.md) | SO(3)、DSM、Tweedie 与物理项 | 当前参考 |
+| [TriFuse 架构与审计](TriFuse%20架构与审计.md) | 旧 `trifuse_v13`/FiLM 数据流 | 历史参考 |
+| [TriCoopDiff 模型交接](TriCoopDiff%20模型交接文档.md) | 旧模型训练与采样契约 | 历史参考 |
+| [双 DiffDock 界面协同](双DiffDock界面协同修正方案.md) | 双专家职责与刚体更新 | 设计背景 |
+| [双二元强先验](双二元强先验接入方案.md) | 双端点和口袋先验设想 | 未实现设计 |
+| [DeepTernary 初始化对照](DeepTernary与TriCoopDiff训练推理初始化对照.md) | 不同输入条件的公平性 | 对照参考 |
+| [独立 DiffDock 评估](独立DiffDock小分子评估.md) | 二元对照和指标定义 | 对照参考 |
+| [夜间实验编排](夜间实验编排.md) | 已结束的夜间执行协议 | 历史记录 |
 
-## 当前权威结论
+## 当前事实边界
 
-- 历史 [DeepTernary 审计产物](../results/audit_sota_metrics.json) 记录 mean oracle-best DockQ 0.6588（22 cases × 40 seeds）；不是当前模型结果或 model-ranked top-1，比较前须核对入口与输入先验。
-- 与 DeepTernary 横向比较时，主指标必须调用其完整原子 `DockQ/dockq_util.py::cal_dockq`；Cα 或接触恢复近似值只能作为诊断指标。
-- E3 固定；动态状态是 E3–Ligand 与 POI–Ligand 两个相对刚体界面以及共享 Ligand torsion。
-- 推理唯一支持 `sdpi`：从完整化学图生成一次构象并采样一次 torsion，分别使用两侧受体 RMS radius 计算平移尺度，再精确逆装配；旧 `native`、`coupled5a`、`anchor_local` 和固定 Å 初始化均已删除。
-- 初始化审计显示，原有上游一致性测试只覆盖固定共享构象、关闭 torsion 后的
-  刚体核。39 个缓存盲初始化中，ETKDG+torsion 构象与训练晶体构象 Kabsch
-  RMSD 平均 2.73 Å；冻结专家的配对平移输出方向余弦中位数为 0.998，旋转和
-  torsion 仅为 0.300/0.177。这是当前旋转学习不稳的主要候选根因，训练端应
-  增加与盲推理同分布的内部构象对照。
-- `TernaryInitializer(conformer_policy="diffdock_v1_1")` 提供上游
-  ETKDGv2 默认优先、三次失败后随机坐标加 MMFF 的显式诊断策略。它在 21 个
-  二元 case 上将 ODE ligand RMSD 平均降低 1.27 Å，但 3 个三元 case 的小样本
-  DockQ/RMSD 结果混合，因此生产默认仍为 `etkdgv3_random`。
-- 两个 rigid proposal 从同一个旧 Ligand 生成；Ligand 采用 `sub1` proposal，POI 接收将 `sub2` proposal 对齐到 `sub1` proposal 的精确刚体变换。
-- v2 在冻结专家完成推理后生成门控先验与等变残差，协调共享 torsion；
-  不向专家内部注入 FiLM、LoRA 或逐层 bridge。历史 `trifuse_v13` 才使用 FiLM。
-- 生产训练使用 `SDPIFlow` 条件速度匹配，采样反向积分同一速度场；不再使用
-  native DSM target 或经验温度 SDE。可动自由度终端与 SDPI 对齐，内部几何差异
-  仍是已知近似；原始晶体监督不投影。数学契约见[初始化规范 §8](初始化方案_gpt6.md)。
-- v2 checkpoint 必须是 version 18、`architecture=residual_consensus_v2`、
-  `generative_process=sdpi_flow_v1`；评估使用 EMA。version 17 仅供旧模型参考，
-  不能作为 v2 续训权重。运行配置记录 activation clamp、残差正则、EMA decay
-  和 torus score norm 版本，并校验冻结专家身份。
-- 新训练按每个不可约表示副本的模长限幅 (`activation_clamp_mode=irrep_norm`)，
-  以保持冻结专家的旋转等变性。旧 checkpoint 缺少该字段时仍解释为
-  `componentwise`；续训须显式传 `--activation-clamp-mode componentwise`。
-  评估按 checkpoint 恢复模式，不能静默改变旧权重的运行语义。
-- 配体 PDB 的距离连通性检查不能恢复键级、芳香性或电荷。
-  `scripts/restore_ligand_chemistry.py --pdb ... --ccd ... --out ...` 可使用离线
-  CCD 恢复完整组分，保留重原子顺序与坐标；缺原子、未知修饰必须另行审查。
-  此工具不自动替换训练索引，也不自动删除未恢复案例。
-- 受体图使用 neighbor→query 的 kNN 约定且不含自环；特征缓存版本为 7，
-  修改图构建后应重建缓存。旧缓存不可直接复用。
-- 动态 radius fallback 按 torch_cluster 1.6.3 CUDA 的严格半径及源索引扫描
-  顺序截断邻域；CPU 原生实现的饱和邻居选择可以不同。radius_graph 保留该
-  版本先取 cap+1 再去自环的约定，饱和且未选中自身时可剩 cap+1 条边。
-- v2 已有构建、梯度、EMA 恢复及短轨迹检查，尚无充分训练后的质量结论。
-- 当前只定义 Phase 1；`judge_head/state_head` 缺少监督标签，因此保持冻结，不能用无损失的“Phase 2”假装完成微调。
-- Phase 1 使用 PROTAC/Molecular Glue 官方训练成员的去 benchmark 同 PDB
-  交集（7,198 cases、653 merged clusters），并按 cluster 留出内部 validation。
-- `binary_prior` sidecar 和 prior adapter 仅有设计，尚未实现；不属于 `sdpi`。已合并重复的三分子初始化文档，以初始化规范为唯一入口。
+- MGD 是当前主目标；PROTAC 后续会加入 warhead/口袋信息。
+- 完整原子 DeepTernary DockQ 是主指标；近似 DockQ 只作诊断。
+- model-v2 的核心瓶颈是联合位置与朝向的搜索覆盖，不是单一实现错误或小幅 loss。
+- `sdpi` 是生产基线；`expert_anchor` 是已通过 20-case 门禁的实验初始化，不能静默
+  替换生产协议。
+- 下一分支必须从原始输入在线生成 anchor，禁止候选路径读取 native 或加载可人工
+  编辑的 pose cache；MGD94 不参与 selector 训练。
+- oracle-best、native-reading oracle 和 model-ranked top-1 必须分别报告。
+
+## 代码导航
+
+- `tricoopdiff/initialization.py`、`tricoopdiff/sampler.py`：基线初始化与采样。
+- `tricoopdiff/pose_anchors.py`：统一 proper SE(3) 拟合和表面 anchor 原语。
+- `tricoopdiff/expert_anchors.py`：双专家 geometry/consensus anchor。
+- `tricoopdiff/consensus.py`：冻结专家与残差共识模型。
+- `scripts/evaluation_runner.py`、`scripts/evaluate_index.py`：可恢复评估和协议清单。
 
 ## 维护规则
 
-每份主题只保留一个权威文档。新结论直接更新对应文档，不再创建“交接 v2”“最终版”或一次性任务 brief。命令必须从仓库根目录运行；结果路径只作示例，不作为永久证据。删除过时文档前，将仍有效的结论合并到上表对应文件。
+每个主题只保留一个权威入口。新结论替换旧状态，不创建“最终版”“交接 v2”或一次性
+brief。删除历史文档前，先把仍有效的契约合并到当前文档；不得把生成结果提交为源码。
