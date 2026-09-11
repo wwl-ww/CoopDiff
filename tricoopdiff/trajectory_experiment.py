@@ -8,10 +8,8 @@ import math
 import torch
 
 from .consensus_experiment import ExperimentalConsensusTrainer
-from .joint_endpoint_experiment import (
-    _proper_rigid_fit,
-    joint_rigid_endpoint_targets,
-)
+from .joint_endpoint_experiment import joint_rigid_endpoint_targets
+from .pose_anchors import proper_rigid_fit
 from .rigid import apply_rigid, assemble_interface_pair
 from .sdpi_flow import _rotation_exp
 
@@ -81,7 +79,7 @@ def differentiable_sdpi_step(ligand, poi, body, velocities, dt, ligand_data):
         moved = (raw - pivot) @ rotation.transpose(-1, -2) + pivot
         raw = torch.where(masks[index][None, :, None], moved, raw)
     if len(bonds):
-        rotation, translation, _ = _proper_rigid_fit(raw, rigid)
+        rotation, translation, _ = proper_rigid_fit(raw, rigid)
         rigid = apply_rigid(raw, rotation, translation)
     return rigid, poi, body
 

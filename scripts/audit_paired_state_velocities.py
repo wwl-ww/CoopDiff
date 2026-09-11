@@ -17,7 +17,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 from compare_rollout_trajectories import trajectory_rows
 from local_velocity_audit import ARTIFACTS, build, load_batch
 from train_entry import _load_score_model_args
-from tricoopdiff.joint_endpoint_experiment import _proper_rigid_fit
+from tricoopdiff.pose_anchors import proper_rigid_fit
 from tricoopdiff.reproducibility import configure_inference_reproducibility
 
 
@@ -40,7 +40,7 @@ def load_state(folder, case, step, device):
 
 
 def state_body(native_poi, current_poi):
-    rotation, _, rmsd = _proper_rigid_fit(native_poi, current_poi)
+    rotation, _, rmsd = proper_rigid_fit(native_poi, current_poi)
     if bool((rmsd > 1e-3).any()):
         raise ValueError(f'POI state is not rigid: RMSD={rmsd.tolist()}')
     return rotation
