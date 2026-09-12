@@ -5,7 +5,7 @@ import torch
 from tricoopdiff.pose_anchors import (
     joint_surface_anchors, proper_rigid_fit, surface_frame,
 )
-from tricoopdiff.expert_anchors import select_pose_consensus
+from tricoopdiff.expert_anchors import select_balanced_pairs, select_pose_consensus
 
 
 def test_surface_frame_is_right_handed_and_orthonormal():
@@ -79,3 +79,13 @@ def test_pose_consensus_selects_dense_ternary_mode():
     selected = select_pose_consensus(candidates, distance_threshold=1.0)
     assert any(selected is candidate for candidate in candidates[:3])
     assert selected["consensus_neighbors_10A"] == 3
+
+
+def test_balanced_pair_subsampling_has_equal_marginal_degree():
+    for size, count in ((64, 256), (16, 64), (4, 16)):
+        pairs = select_balanced_pairs(size, count, seed=31_000)
+        assert pairs == select_balanced_pairs(size, count, seed=31_000)
+        assert len(pairs) == len(set(pairs)) == count
+        degree = count // size
+        assert [sum(left == i for left, _ in pairs) for i in range(size)] == [degree] * size
+        assert [sum(right == i for _, right in pairs) for i in range(size)] == [degree] * size

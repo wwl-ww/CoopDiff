@@ -17,6 +17,23 @@ EXPERT_ANCHOR_VERSION = "dual_diffdock_rigid_anchor_v1"
 EXPERT_ANCHOR_CONSENSUS_VERSION = "dual_diffdock_rigid_anchor_consensus_v1"
 
 
+def select_balanced_pairs(size, count, seed):
+    """Select unique Cartesian pairs with equal use of every marginal pose."""
+    if size < 1 or count < 1 or count > size ** 2 or count % size:
+        raise ValueError("balanced pair count must be a positive multiple of size")
+    degree = count // size
+    rng = np.random.RandomState(int(seed) % (2**32))
+    permutation = rng.permutation(size)
+    shifts = rng.choice(size, degree, replace=False)
+    pairs = [
+        (left, int(permutation[(left + shift) % size]))
+        for shift in shifts for left in range(size)
+    ]
+    if len(set(pairs)) != count:
+        raise AssertionError("balanced pair selector produced duplicates")
+    return pairs
+
+
 def select_pose_consensus(candidates, distance_threshold=10.0):
     """Select the medoid of the densest native-free ternary-pose cluster."""
     if not candidates:
@@ -70,6 +87,11 @@ class DualExpertAnchorInitializer:
         )
         self.process = InterfaceDiffusion(inference_steps=self.binary_steps)
 
+    @staticmethod
+    def _conformer_seed(seed, conformer_index):
+        """Derive stable independent conformer seeds without Python hashing."""
+        return (int(seed) + int(conformer_index) * 100_000_007) % (2**31 - 1)
+
     @torch.no_grad()
     def _dock_rigid(self, receptor, ligand_data, position, seed):
         """Run native DiffDock rigid updates while preserving shared ligand torsions."""
@@ -119,59 +141,120 @@ class DualExpertAnchorInitializer:
         return pos
 
     @torch.no_grad()
-    def initialize(self, e3_coords, poi_coords, ligand_data, seed=None):
-        if seed is None:
-            raise ValueError("expert-anchor initialization requires an explicit seed")
-        broad_ligand, broad_poi, broad_rotation, base_metadata = self.base.initialize(
-            e3_coords, poi_coords, ligand_data, seed=seed,
-        )
-        dtype, device = broad_ligand.dtype, broad_ligand.device
-        sides = base_metadata["sides"]
-        rotation_e3 = torch.as_tensor(
-            sides["e3"]["rotation"], dtype=dtype, device=device,
-        )
-        translation_e3 = torch.as_tensor(
-            sides["e3"]["translation"], dtype=dtype, device=device,
-        )
-        rotation_poi = torch.as_tensor(
-            sides["poi"]["rotation"], dtype=dtype, device=device,
-        )
-        translation_poi = torch.as_tensor(
-            sides["poi"]["translation"], dtype=dtype, device=device,
-        )
-        shared = (broad_ligand[0] - translation_e3) @ rotation_e3
-        initial_poi = apply_rigid(
-            shared, rotation_poi, translation_poi,
-        ).unsqueeze(0)
-        banks = []
-        for branch_index, (receptor_data, receptor_coords, initial_pose) in enumerate((
-                (self.e3_data, e3_coords, broad_ligand),
-                (self.poi_data, poi_coords, initial_poi))):
-            bank = []
-            for attempt in range(self.proposal_attempts):
-                if attempt == 0:
-                    pose = initial_pose
-                else:
-                    pose_seed = int(seed) + attempt * 10_007 + branch_index * 1_000_003
-                    random.seed(pose_seed)
-                    np.random.seed(pose_seed)
-                    torch.manual_seed(pose_seed)
-                    rotation0, translation0, _ = sample_binary_pose(
-                        shared, receptor_coords,
-                    )
-                    pose = apply_rigid(
-                        shared, rotation0, translation0,
-                    ).unsqueeze(0)
-                bank.append(self._dock_rigid(
-                    receptor_data, ligand_data, pose,
-                    int(seed) + (branch_index + 1) * 1_000_003
-                    + attempt * 10_007,
-                ))
-            banks.append(bank)
+    def generate_candidates(self, e3_coords, poi_coords, ligand_data, seed=None,
+                            conformer_count=1, candidate_budget=None,
+                            binary_retry_limit=4):
+        """Generate one geometry-relaxed ternary proposal per binary-pose pair.
 
+        Each conformer has independent ETKDG/torsion randomness. Both binary
+        experts start from that same conformer, and pairs never cross conformers.
+        Native coordinates and quality labels are not read here.
+        """
+        if seed is None:
+            raise ValueError("expert-anchor generation requires an explicit seed")
+        if conformer_count < 1:
+            raise ValueError("conformer_count must be positive")
+        if binary_retry_limit < 1:
+            raise ValueError("binary_retry_limit must be positive")
+        potential_count = int(conformer_count) * self.proposal_attempts ** 2
+        if candidate_budget is None:
+            candidate_budget = potential_count
+        if (candidate_budget < 1 or candidate_budget > potential_count
+                or candidate_budget % int(conformer_count)):
+            raise ValueError(
+                "candidate_budget must divide evenly across conformers and not "
+                "exceed their Cartesian product"
+            )
+        pairs_per_conformer = candidate_budget // int(conformer_count)
+        pair_indexes = select_balanced_pairs(
+            self.proposal_attempts, pairs_per_conformer, seed,
+        )
         candidates = []
-        for e3_index, anchored_e3 in enumerate(banks[0]):
-            for poi_index, anchored_poi in enumerate(banks[1]):
+        conformers = []
+        first_broad = None
+        for conformer_index in range(int(conformer_count)):
+            conformer_seed = self._conformer_seed(seed, conformer_index)
+            broad_ligand, broad_poi, broad_rotation, base_metadata = self.base.initialize(
+                e3_coords, poi_coords, ligand_data, seed=conformer_seed,
+            )
+            if first_broad is None:
+                first_broad = (broad_ligand, broad_poi, broad_rotation, base_metadata)
+            dtype, device = broad_ligand.dtype, broad_ligand.device
+            sides = base_metadata["sides"]
+            rotation_e3 = torch.as_tensor(
+                sides["e3"]["rotation"], dtype=dtype, device=device,
+            )
+            translation_e3 = torch.as_tensor(
+                sides["e3"]["translation"], dtype=dtype, device=device,
+            )
+            rotation_poi = torch.as_tensor(
+                sides["poi"]["rotation"], dtype=dtype, device=device,
+            )
+            translation_poi = torch.as_tensor(
+                sides["poi"]["translation"], dtype=dtype, device=device,
+            )
+            shared = (broad_ligand[0] - translation_e3) @ rotation_e3
+            initial_poi = apply_rigid(
+                shared, rotation_poi, translation_poi,
+            ).unsqueeze(0)
+            banks = []
+            retry_counts = []
+            draw_counts = []
+            for branch_index, (receptor_data, receptor_coords, initial_pose) in enumerate((
+                    (self.e3_data, e3_coords, broad_ligand),
+                    (self.poi_data, poi_coords, initial_poi))):
+                bank = []
+                branch_retries = []
+                failures_since_success = 0
+                max_draws = self.proposal_attempts * int(binary_retry_limit)
+                draws = 0
+                while len(bank) < self.proposal_attempts and draws < max_draws:
+                    draw_index = draws
+                    draws += 1
+                    pose_seed = (conformer_seed + draw_index * 10_007
+                                 + branch_index * 1_000_003)
+                    if draw_index == 0:
+                        pose = initial_pose
+                    else:
+                        random.seed(pose_seed)
+                        np.random.seed(pose_seed % (2**32))
+                        torch.manual_seed(pose_seed)
+                        rotation0, translation0, _ = sample_binary_pose(
+                            shared, receptor_coords,
+                        )
+                        pose = apply_rigid(
+                            shared, rotation0, translation0,
+                        ).unsqueeze(0)
+                    try:
+                        docked = self._dock_rigid(
+                            receptor_data, ligand_data, pose,
+                            pose_seed + 1_000_003,
+                        )
+                    except FloatingPointError:
+                        failures_since_success += 1
+                        continue
+                    bank.append(docked)
+                    branch_retries.append(failures_since_success)
+                    failures_since_success = 0
+                if len(bank) != self.proposal_attempts:
+                    raise FloatingPointError(
+                        f"collected {len(bank)}/{self.proposal_attempts} valid "
+                        f"binary poses after {draws} deterministic draws"
+                    )
+                banks.append(bank)
+                retry_counts.append(branch_retries)
+                draw_counts.append(draws)
+
+            conformers.append({
+                "conformer_index": conformer_index,
+                "seed": conformer_seed,
+                "metadata": base_metadata["conformer"],
+                "binary_retry_counts": retry_counts,
+                "binary_draw_counts": draw_counts,
+            })
+            for e3_index, poi_index in pair_indexes:
+                anchored_e3 = banks[0][e3_index]
+                anchored_poi = banks[1][poi_index]
                 rotation, translation, fit_rmsd = proper_rigid_fit(
                     anchored_poi[0], anchored_e3[0],
                 )
@@ -179,6 +262,7 @@ class DualExpertAnchorInitializer:
                 outward = raw_poi.mean(0) - e3_coords.mean(0)
                 outward = outward / torch.linalg.vector_norm(outward).clamp_min(1e-8)
                 e3_ligand_distances = torch.cdist(e3_coords, anchored_e3[0])
+                variants = []
                 for separation_step in range(13):
                     separation = 0.5 * separation_step
                     placed_poi = raw_poi + separation * outward
@@ -205,13 +289,30 @@ class DualExpertAnchorInitializer:
                         + abs(geometry["minimum_protein_ca_distance"] - 5.0),
                         separation,
                     )
-                    candidates.append({
+                    variants.append({
                         "penalty": penalty, "ligand": anchored_e3,
                         "poi": placed_poi.unsqueeze(0),
                         "rotation": rotation.unsqueeze(0),
                         "fit_rmsd": float(fit_rmsd), "geometry": geometry,
-                        "attempt": [e3_index, poi_index], "acceptable": acceptable,
+                        "attempt": [e3_index, poi_index],
+                        "conformer_index": conformer_index,
+                        "candidate_id": [conformer_index, e3_index, poi_index],
+                        "acceptable": acceptable,
                     })
+                candidates.append(min(variants, key=lambda item: item["penalty"]))
+        expected = int(candidate_budget)
+        if len(candidates) != expected:
+            raise AssertionError(f"generated {len(candidates)} candidates, expected {expected}")
+        return candidates, conformers, first_broad
+
+    @torch.no_grad()
+    def initialize(self, e3_coords, poi_coords, ligand_data, seed=None):
+        if seed is None:
+            raise ValueError("expert-anchor initialization requires an explicit seed")
+        candidates, _, first_broad = self.generate_candidates(
+            e3_coords, poi_coords, ligand_data, seed=seed, conformer_count=1,
+        )
+        broad_ligand, broad_poi, broad_rotation, base_metadata = first_broad
         if self.selection == "consensus":
             pair_best = {}
             for candidate in candidates:
