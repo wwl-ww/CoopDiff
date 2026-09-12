@@ -83,6 +83,11 @@ acceptable 为 0/20 对 3/20；该路线已关闭。
 
 ### 确定性在线候选生成与两级 ranker
 
+该在线初始化模块现正式命名为 **BiTSeed**（Conformer-Diverse Binary-to-Ternary
+Basin Seeding）；与 CoopDiff 精修组成系统时称为 **BiTSeed-CoopDiff**。当前 A1/B1/
+C1/A2/B2 proposal-oracle 配置、v4 补采语义和产物路径以根目录 `ablation.md` 为准。
+BiTSeed 名称只覆盖 native-free 候选生成，不包含 oracle、selector 或 post-ranker。
+
 下一代架构不是预存 pose bank，也不是继续线性增加完整 walker。正式推理只接收原始
 蛋白、ligand、公开固定 seed 和 frozen checkpoint，当场生成候选；候选生成代码路径
 禁止接收 native，正式测试禁止加载 pose cache。每侧各运行 M 个二元专家 pose，以约
@@ -103,9 +108,11 @@ CoopDiff；post-ranker 再从精修结果中输出可部署 top-1。两级选择
 - 二元专家分数/轨迹稳定性、候选簇密度和 conformer strain；
 - 模型自身速度残差或跨步稳定性，但部署特征不能使用 native 派生指标。
 
-训练使用 case 内 pairwise/listwise 排序并预测 DockQ 0.23/0.49 命中概率；数据只来自
-内部 PDB-disjoint 32/8/10 split，MGD94 只作最终评估。执行门禁依次是候选 oracle、
-pre-ranker retention、固定预算精修 coverage、post-ranker top-1；前一项不过则不扩张。
+训练使用 case 内 pairwise/listwise 排序并预测 DockQ 0.23/0.49 命中概率；监督数据只
+来自内部 PDB-disjoint 32/8/10 split。MGD94 已用于 BiTSeed development oracle ablation，
+不能再称未触碰的 zero-shot holdout，也不得提供 selector 监督标签。执行门禁依次是候选
+oracle、pre-ranker retention、固定预算精修 coverage、post-ranker top-1；前一项不过则
+不扩张。
 
 ## 关键代码
 

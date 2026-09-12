@@ -7,12 +7,14 @@
 
 1. [低 DockQ 根因排查交接](低DockQ根因排查交接.md)：model-v2 已完成的根因证据、
    MGD94 oracle、双专家 anchor 门禁，以及下一分支的在线初始化方向。
-2. [初始化方案](初始化方案_gpt6.md)：现有 SDPI 初始化、共享 ligand 构象和精确刚体
-   装配契约。该文档描述当前基线；下一分支需补充确定性在线 anchor 生成。
-3. [TriCoopDiff 模型架构图](TriCoopDiff%20模型架构图.md)：当前模块和坐标更新关系。
-4. [Phase 1 数据协议](Phase%201%20数据协议.md)：训练池、cluster split 和 benchmark
+2. [BiTSeed oracle 消融](../ablation.md)：当前 Conformer-Diverse
+   Binary-to-Ternary Basin Seeding 定义、A1/B1/C1/A2/B2 配置、v4 补采协议和运行路径。
+3. [初始化方案](初始化方案_gpt6.md)：现有 SDPI 初始化、共享 ligand 构象和精确刚体
+   装配契约。该文档描述 SDPI 基线；当前 BiTSeed 实现与协议以 `ablation.md` 为准。
+4. [TriCoopDiff 模型架构图](TriCoopDiff%20模型架构图.md)：当前模块和坐标更新关系。
+5. [Phase 1 数据协议](Phase%201%20数据协议.md)：训练池、cluster split 和 benchmark
    防泄漏规则。
-5. [训练入口与 smoke](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md)：环境、
+6. [训练入口与 smoke](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md)：环境、
    缓存、SLURM 和训练入口。
 
 ## 专题参考
@@ -34,6 +36,8 @@
 - MGD 是当前主目标；PROTAC 后续会加入 warhead/口袋信息。
 - 完整原子 DeepTernary DockQ 是主指标；近似 DockQ 只作诊断。
 - model-v2 的核心瓶颈是联合位置与朝向的搜索覆盖，不是单一实现错误或小幅 loss。
+- 当前在线候选初始化正式命名为 **BiTSeed**；完整 search–select–refine 系统称为
+  **BiTSeed-CoopDiff**。BiTSeed 本身不包含 oracle、selector 或 ranker。
 - `sdpi` 是生产基线；`expert_anchor` 是已通过 20-case 门禁的实验初始化，不能静默
   替换生产协议。
 - 下一分支必须从原始输入在线生成 anchor，禁止候选路径读取 native 或加载可人工
@@ -45,6 +49,8 @@
 - `tricoopdiff/initialization.py`、`tricoopdiff/sampler.py`：基线初始化与采样。
 - `tricoopdiff/pose_anchors.py`：统一 proper SE(3) 拟合和表面 anchor 原语。
 - `tricoopdiff/expert_anchors.py`：双专家 geometry/consensus anchor。
+- `scripts/evaluate_proposal_oracle.py`：BiTSeed 固定候选预算的 native-reading oracle
+  消融入口；不是部署评估。
 - `tricoopdiff/consensus.py`：冻结专家与残差共识模型。
 - `scripts/evaluation_runner.py`、`scripts/evaluate_index.py`：可恢复评估和协议清单。
 

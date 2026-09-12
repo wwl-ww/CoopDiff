@@ -1,13 +1,16 @@
 # CoopDiff 接手清单
 
-更新时间：2026-09-11。本文是新负责人唯一需要先读的执行入口；历史解释见
+更新时间：2026-09-12。本文是新负责人唯一需要先读的执行入口；历史解释见
 [`doc/低DockQ根因排查交接.md`](doc/低DockQ根因排查交接.md)，文档状态见
 [`doc/README.md`](doc/README.md)。实验事实以 `results/` 中完整报告为准。
 
 ## 当前状态
 
-- 当前分支：`model-v2`；交接前远端同步点为 merge commit `3753c4e`。
-- 工作区在本文修改前干净；本项目没有训练或评估进程，GPU 2–5 均已释放。
+- 当前开发分支：`feat/deterministic-online-anchors`，从 `model-v2` 的 `0d7bd67`
+  创建；交接前远端同步点为 merge commit `3753c4e`。
+- 当前正在 GPU 2/3/4 后台执行 BiTSeed v4 的 MGD94 proposal-oracle 消融；A1→A2、
+  B1→B2 串行，C1/C2 共用一次结果。运行配置、日志和结果路径见根目录
+  [`ablation.md`](ablation.md)，不要启动重复任务或混入已停止的 v3 结果。
 - 已结束分支：`investigate/model-v2-followup`。不要继续该分支的 loss sweep。
 - 主目标是 Molecular Glue（MGD）。PROTAC 后续会加入 warhead/口袋信息，不能用
   PROTAC 的容易提升替代 MGD 的真实困难。
@@ -16,9 +19,10 @@
 ## 一句话结论
 
 低 DockQ 的核心是从宽 SDPI prior 搜索正确的联合位置与朝向，而不是一个隐藏实现
-错误或 `0.000x` 级 loss 差异。当前最有效的改动是双 frozen DiffDock 专家生成完整
-SE(3) geometry-anchor，再由 CoopDiff 精修；下一阶段应把初始化条件做到最好，并开发
-严格无 native 的在线候选筛选，而不是继续长训旧目标。
+错误或 `0.000x` 级 loss 差异。当前路线统一为“广泛生成 → 智能筛选 → 昂贵精修 →
+最终排序”：**BiTSeed**（Conformer-Diverse Binary-to-Ternary Basin Seeding）用双
+frozen DiffDock 专家负责搜索完整 SE(3) basin，native-free selector
+选择值得投入计算的初始化，再由 CoopDiff 精修；不继续长训旧目标。
 
 ## 已完成且可引用的结果
 
@@ -65,12 +69,17 @@ SE(3) geometry-anchor，再由 CoopDiff 精修；下一阶段应把初始化条�
   分别进行 E3–ligand 与 POI–ligand rigid-only DiffDock，Cartesian 组合后用 proper
   Kabsch 对齐共享 ligand；做蛋白碰撞、双侧接触和 POI outward relaxation，无可接受
   候选时显式回退 broad SDPI。
+- 同文件的 `generate_candidates()` 是 BiTSeed 当前在线候选入口：支持多 conformer、
+  conformer 内配对、确定性均衡 pair 子采样，以及持续补采直到每侧收集满 `M` 个有效
+  binary poses。`binary_retry_limit=4` 表示每个 conformer/side 最多 `4M` 次 draws。
 - `tricoopdiff/pose_anchors.py`：统一 proper rigid fit 和 joint surface SE(3) 原语。
 - `scripts/evaluation_runner.py`、`scripts/evaluate_index.py`：支持
   `--init-mode expert_anchor`、`--binary-anchor-steps`、
   `--anchor-proposal-attempts`、`--anchor-selection geometry|consensus`，并记录 provenance。
 - 当前 initializer 是实验验证版：每个 walker 都重新生成 proposal，尚未实现下一节的
-  case 内确定性在线候选集合和学习式选择器。
+  case 内确定性在线临时候选集、集合感知选择器和 32/64 walker 一一映射。
+- `scripts/evaluate_proposal_oracle.py` 只评估 BiTSeed 初始化的 native-reading oracle，
+  不运行 CoopDiff、不训练 ranker，也不能当作部署 top-1。
 
 ## 关键本地产物
 
@@ -85,38 +94,87 @@ SE(3) geometry-anchor，再由 CoopDiff 精修；下一阶段应把初始化条�
 - anchor 20-case：`results/mgd_followup/anchor_geometry_a8_20cases_seed31000/`、
   `results/mgd_followup/anchor_consensus_a8_20cases_seed31000/`
 - conformer 20-case：`results/mgd_followup/conformer20_seed55000/`
+- BiTSeed 配置与协议：`ablation.md`
+- BiTSeed v4：`results/proposal_oracle_ablation_20260912/`；正式目录后缀为 `_v4`，
+  `recovery_smoke_v4` 仅作补采逻辑 smoke，所有 `_v3` 目录均已停止。
 
 只有存在 `batch_status.json` 且 `complete=true` 的目录可进入正式汇总。以下任务被主动
 停止，只能用于调试：`mgd94_x32_rankfeatures/` 为 74/94，
 `anchor_geometry_a8_20cases_seed32000/` 为 6/20；二者没有完成状态。
 
-## 下一负责人第一项任务
+## 当前统一方案：BiTSeed → select → CoopDiff → rank
 
-建议从 `model-v2` 新建一个综合初始化分支，不创建 worktree。先实现“确定性在线候选
-生成”，不要建立或加载可人工编辑的 pose bank：
+当前分支实现确定性在线多假设搜索，不建立或加载可人工编辑、可跨 case 复用的 pose
+bank。正式推理从原始输入一条命令运行到底；中间候选仅在内存中存在，允许保存数量、
+特征摘要和坐标 hash 作审计，默认不落盘全部结构。
 
-1. 正式推理只接收原始蛋白、ligand、固定 seed 和 frozen checkpoint；候选生成函数
-   不得接收 native 路径，正式评估禁用 pose cache。
-2. 每侧在线生成 M 个二元 pose，以约 `2M` 次专家推理组成 `M²` 个 ternary anchor。
-   候选配额、seed 推导、twist、geometry/consensus/broad 比例必须在测试前冻结。
-3. 先在 PDB-disjoint internal split 比较当前 64 候选与扩大后的 256 候选 oracle；
-   native 只能由候选封存后的独立评估进程读取。最终 CoopDiff top-K 预算保持不变。
-4. 若候选 oracle 没有明显提升，停止做 ranker 并增加新的生成模式；若提升，再构建
-   native-free pre-ranker，并按姿态簇选择 diversity-aware top-K 进入 CoopDiff。
-5. pre-ranker 特征至少包含专家分数/轨迹稳定性、候选共识、三类接触距离分布、穿插
-   与排斥、界面互补、双侧平衡和 conformer strain。只用 internal 32/8/10
-   PDB-disjoint split 训练，MGD94 不参与训练或超参数选择。
-6. 精修后再训练 post-ranker 输出 top-1。门禁顺序固定为：候选 oracle 上界 →
-   pre-ranker oracle retention → 固定预算 coverage → post-ranker top-1。
+其中在线搜索模块正式命名为 **BiTSeed**；与精修模型组成完整系统时写作
+**BiTSeed-CoopDiff**。名称不覆盖 selector/ranker，oracle 也不是 BiTSeed 的部署组件。
 
-验收门禁：短面板 paired mean DockQ 至少 `+0.01`、median > 0、没有稳定坏亚组，
-并改善 DockQ `>=0.23` 或 top-k 命中；`0.000x`、单 case 拉动和只改善训练 loss
-均不算进展。必须同时报告二元专家调用数、原始/过滤后候选数、CoopDiff 精修数和 GPU
-时间，避免用隐藏计算预算制造优势。
+### 1. 在线联合生成
+
+1. 正式生成器只接收原始 E3、POI、完整 ligand、固定 seed、frozen DiffDock checkpoint
+   和冻结配置；函数签名不得包含 native、DockQ 或人工候选路径，正式评估禁用 pose cache。
+2. 对每个 `etkdgv3_random` ligand conformer，两侧各生成 `M` 个完整 ligand binary
+   poses，仅在同一 conformer 内配对。当前固定256候选消融比较 `C1M16`、`C4M8`、
+   `C16M4`，compute-matched 消融比较 `C1M64`、`C4M16`、`C16M4`；正式映射和 seed
+   协议以 `ablation.md` 为准。
+3. `q(E,P|L)=q_E(E|L)q_P(P|L)` 仅是扩大覆盖的 proposal 分布，不声称真实 ternary
+   条件分布可因子分解；后续 ternary compatibility 专门修正 binary-to-ternary gap。
+4. 候选顺序、seed 派生、expert 调用数、outward relaxation、twist 与 broad 比例必须
+   在 benchmark 前冻结。若 anchor 数不足，按固定规则回退 broad SDPI，禁止人工补选。
+
+### 2. 物理过滤、聚类与 pre-ranker
+
+筛选顺序为 hard filter → cluster/context → set-aware pre-ranker → diversity-constrained
+Top-W。hard filter 只删除明确不可能的姿态，包括非有限坐标、严重蛋白穿插、ligand
+完全脱离任一侧和刚体拟合失败；边界可疑项保留为软特征，避免过滤掉新 basin。
+
+聚类先建立 basin 结构，但不能仅凭几何 medoid 过早把每簇压成一个候选。为每个候选
+记录簇大小、局部密度、簇内/medoid 距离，再由 pre-ranker 判断簇内质量；最终用每簇
+配额或确定性 MMR 防止一个高分错误模式占满 walker。pre-ranker 输入分为：
+
+- **binary evidence**：两侧 expert 分数、逐步位移和轨迹稳定性，但不把 binary top-1
+  当作 ternary 真值；
+- **ternary compatibility**：E3–POI、E3–ligand、POI–ligand 多阈值接触/距离分位数、
+  穿插与短程排斥、双侧平衡及界面互补；
+- **candidate-set context**：共识密度、姿态簇、离群程度和与已选 basin 的距离。
+
+模型优先使用小型 Set Transformer/DeepSets 或等价集合感知结构，不原样重训旧 128 维
+latent MLP。当前单 conformer 下 strain 可能不具区分力；PROTAC warhead 距离/linker
+strain 只有在可靠端点 mask 接入后才能使用，不能在当前 MGD 完整 ligand 模式中伪造。
+
+### 3. 固定预算精修与最终排序
+
+Top-W 必须恰好映射到 `W=32` 或 `W=64` 条 CoopDiff walker，而不是将正常预算缩成
+8 条。初始探索配额建议为 x32 的 24 anchor + 8 broad、x64 的 48 anchor + 16 broad；
+具体比例只在 internal split 消融一次并冻结。pre-ranker 决定哪些 basin 值得投入计算，
+post-ranker 则在精修后的 32/64 个结构中输出部署用 top-1、top-k 和可信度，两者不合并。
+
+### 4. 训练、门禁与报告
+
+两个 DiffDock experts 始终冻结。当前 BiTSeed 生成模式直接在 MGD94 上做已声明的
+development oracle ablation；该 benchmark 过去已反复用于方案比较，不再声称是未触碰的
+zero-shot holdout。native 只由评分阶段读取，不进入生成器。后续 selector 仍只能用
+internal 32/8/10 PDB-disjoint split 训练，不得用 MGD94 DockQ 作监督标签。门禁顺序固定为：
+
+1. hard-filter 好姿态召回率与候选 oracle 上界；
+2. pre-ranker oracle retention@32/64；
+3. 固定预算 CoopDiff coverage；
+4. post-ranker ranked top-1/top-k；
+5. 在明确标注为 development benchmark 的完整 MGD94 上报告结果，并另寻未参与设计的
+   外部数据作最终独立验证。
+
+验收仍要求短面板 paired mean DockQ 至少 `+0.01`、median > 0、没有稳定坏亚组，并改善
+DockQ `>=0.23` 或 top-k 命中；`0.000x`、单 case 拉动和只改善训练 loss 均不算进展。
+同时报告二元专家调用数、原始/过滤/聚类后候选数、CoopDiff walker 数和 GPU 时间，避免
+用隐藏计算预算制造优势。论文贡献定位为 native-free 的 ternary
+search–select–refine framework，而不是“更大的 diffusion model”。
 
 ## 不可破坏的协议
 
-- MGD94 只作最终评估；oracle-best、native-reading oracle、ranked top-1 分开报告。
+- MGD94 已是开发 benchmark，不得再称独立 zero-shot 测试；oracle-best、native-reading
+  oracle、ranked top-1 仍必须分开报告。
 - MGD94 的 94 例分母固定；`3IQV_A_P_FSC` 使用显式 `pdb_inferred_fallback`。
 - 实验 factorial-v1 checkpoint 必须显式 `--allow-experimental-checkpoint`，继续校验
   frozen expert、无 LoRA、expert identity 与 EMA。
