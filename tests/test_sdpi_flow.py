@@ -41,6 +41,20 @@ def test_flow_clean_and_prior_endpoints():
     assert torch.allclose(torch.cdist(poi, poi), torch.cdist(b, b), atol=1e-10)
 
 
+def test_truncated_clock_is_refinement_only():
+    flow = SDPIFlow()
+    try:
+        flow.get_inference_schedule(5, t_start=0.25)
+    except ValueError as error:
+        assert "prior endpoint" in str(error)
+    else:
+        raise AssertionError("ordinary SDPI inference accepted a truncated clock")
+    schedule = flow.get_refinement_schedule(5, t_start=0.25)
+    assert np.allclose(schedule["tr_schedule"], np.linspace(0.25, 0.0, 6))
+    assert np.allclose(schedule["rot_schedule"], schedule["tr_schedule"])
+    assert np.allclose(schedule["tor_schedule"], schedule["tr_schedule"])
+
+
 def test_flow_complete_cartesian_tangent_and_step_convergence():
     # Both interfaces, mixed torsions, and nontrivial body frames must agree.
     for smiles in ('CCCOCC', 'CC1CCCCC1', 'c1ccccc1'):

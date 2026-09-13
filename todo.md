@@ -8,9 +8,9 @@
 
 - 当前开发分支：`feat/deterministic-online-anchors`，从 `model-v2` 的 `0d7bd67`
   创建；交接前远端同步点为 merge commit `3753c4e`。
-- 当前正在 GPU 2/3/4 后台执行 BiTSeed v4 的 MGD94 proposal-oracle 消融；A1→A2、
-  B1→B2 串行，C1/C2 共用一次结果。运行配置、日志和结果路径见根目录
-  [`ablation.md`](ablation.md)，不要启动重复任务或混入已停止的 v3 结果。
+- BiTSeed v4 和 SDPI-256 的 MGD94 proposal-oracle 已完成扫描。正式下一步为
+  [`BiTSeed-Hybrid 在线初始化规格`](doc/BiTSeed-Hybrid在线初始化规格.md) 中待审计的
+  `192 BiTSeed + 64 SDPI`；当前尚未实现固定比例混合和 per-conformer 缺口补位。
 - 已结束分支：`investigate/model-v2-followup`。不要继续该分支的 loss sweep。
 - 主目标是 Molecular Glue（MGD）。PROTAC 后续会加入 warhead/口袋信息，不能用
   PROTAC 的容易提升替代 MGD 的真实困难。
@@ -35,6 +35,10 @@ frozen DiffDock 专家负责搜索完整 SE(3) basin，native-free selector
   192-walker oracle mean/median 为 `0.30152/0.23137`，acceptable/medium/high
   为 `48/94、17/94、1/94`。
 - 以上全是 native 事后选择的 oracle，不是 model-ranked top-1。
+- 新的固定256 proposal oracle 中，纯 SDPI-256 为 mean/median `0.25722/0.20901`，
+  DockQ `>=0.23/0.49/0.80` 为 `39/10/0`。B1 (`C4M8`) 加 case-level SDPI fallback
+  为 `0.31310/0.30885`、`61/12/0`；C1 (`C16M4`) 为 `0.31488/0.30885`、
+  `64/12/0`，但 binary 成本是 B1 两倍。
 
 ### 根因与生成器门禁
 
@@ -78,6 +82,8 @@ frozen DiffDock 专家负责搜索完整 SE(3) basin，native-free selector
   `--anchor-proposal-attempts`、`--anchor-selection geometry|consensus`，并记录 provenance。
 - 当前 initializer 是实验验证版：每个 walker 都重新生成 proposal，尚未实现下一节的
   case 内确定性在线临时候选集、集合感知选择器和 32/64 walker 一一映射。
+- binary expert 整例失败时回退 `sdpi_v1`、纯 SDPI-256 proposal 生成及其 CLI 已实现；
+  部分 conformer 失败时保留成功 anchors 并只补齐缺口的逻辑尚未实现。
 - `scripts/evaluate_proposal_oracle.py` 只评估 BiTSeed 初始化的 native-reading oracle，
   不运行 CoopDiff、不训练 ranker，也不能当作部署 top-1。
 
@@ -103,6 +109,16 @@ frozen DiffDock 专家负责搜索完整 SE(3) basin，native-free selector
 `anchor_geometry_a8_20cases_seed32000/` 为 6/20；二者没有完成状态。
 
 ## 当前统一方案：BiTSeed → select → CoopDiff → rank
+
+### 初始化协议冻结任务（2026-09-13）
+
+- [x] 实现固定256候选的 Hybrid-192/64、`2M`短补采、连续3次失败截断、部分pose池保留和
+  按缺口SDPI补位。
+- [x] 实现固定E3 frame的 ligand/POI RMSD聚类、x32的24/8配额和x64的48/16配额。
+- [x] 完成PROTAC22的SDPI-256、224/32、192/64、128/128 exact proposal oracle；四组
+  均22/22零失败，候选比例预冻结为192/64。
+- [ ] 完成PROTAC22的192/64 selector retention@32/64 exact审计。
+- [ ] 对冻结配置做候选坐标hash复跑和小规模CoopDiff接线smoke，再锁定协议版本。
 
 当前分支实现确定性在线多假设搜索，不建立或加载可人工编辑、可跨 case 复用的 pose
 bank。正式推理从原始输入一条命令运行到底；中间候选仅在内存中存在，允许保存数量、

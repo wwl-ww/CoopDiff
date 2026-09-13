@@ -136,3 +136,25 @@ A2/B2 watcher 以“前项进程结束且已写出 `batch_status.json`”作为�
 约10.4小时；实际时间随补采数增加。只有每个独立任务的 `batch_status.json` 均为
 `complete=true` 且94例齐全时，才能进入正式汇总。旧 v3 目录使用固定-slot 重试语义，
 已停止且不得与 v4 混合汇总。
+
+## 完成结果与 Hybrid 后续
+
+v4 对94例完成扫描，但 frozen DiffDock 的非有限输出使 A1/A2 只有59例生成成功，
+B1/B2/C1只有57例成功。随后以256个确定性 `sdpi_v1` proposals 补齐缺失 case，并另行
+完成全94例 SDPI-256 直接对照。完整 exact oracle 如下；`fallback` 只由 binary expert
+是否成功触发，不读取 native。
+
+| 方法 | mean | median | DockQ≥0.23 | DockQ≥0.49 |
+|---|---:|---:|---:|---:|
+| SDPI-256 | 0.25722 | 0.20901 | 39/94 | 10/94 |
+| A1 + fallback | 0.29622 | 0.25258 | 56/94 | 12/94 |
+| B1 + fallback | 0.31310 | 0.30885 | 61/94 | 12/94 |
+| C1/C2 + fallback | 0.31488 | 0.30885 | 64/94 | 12/94 |
+| A2 + fallback | 0.30156 | 0.26388 | 59/94 | 10/94 |
+| B2 + fallback | 0.31230 | 0.28991 | 63/94 | 14/94 |
+
+在 DiffDock 成功的57例上，B1 与同例 SDPI mean 分别为 `0.26969/0.17753`，但 SDPI
+仍赢16例；C1相对B1仅增加 `0.00294`，不抵偿两倍 binary 轨迹。因此下一轮不做 LoRA，
+采用 B1 作为结构化分支，并测试固定256预算的在线混合：`224/32`、`192/64`、
+`128/128`（BiTSeed/SDPI）。待审计默认值为 `192/64`，完整生成、fallback、聚类和
+walker 配额见 [`doc/BiTSeed-Hybrid在线初始化规格.md`](doc/BiTSeed-Hybrid在线初始化规格.md)。

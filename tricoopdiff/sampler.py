@@ -89,7 +89,8 @@ def sample_single(
             disable the SE3 reverse updates. This defines the strict zero-FiLM
             E3-L parity baseline: the sampler reduces to native-style DiffDock on
             the PROTAC branch instead of running an extra ternary POI dynamics.
-        init_mode: ``sdpi`` or the native-free ``expert_anchor`` diagnostic.
+        init_mode: ``sdpi``, ``expert_anchor``, or a preselected native-free
+            ``fixed_candidate`` proposal used by controlled refinement audits.
         t_anchor: must be 1.0 for the broad sdpi prior.
         velocity_transform: optional diagnostic callback applied to physical
             velocities immediately before integration. Production callers
@@ -124,12 +125,14 @@ def sample_single(
     e3_coords = e3_data["coords"][0].detach()            # [N_e3, 3]
 
     e3_center = e3_coords.mean(dim=0, keepdim=True)
-    if init_mode not in {"sdpi", "expert_anchor"}:
+    if init_mode not in {"sdpi", "expert_anchor", "fixed_candidate"}:
         raise ValueError(f"unsupported initialization mode: {init_mode}")
     if t_anchor is None:
         t_anchor = 1.0
-    if t_anchor != 1.0:
-        raise ValueError("sampling requires t_anchor=1")
+    if init_mode != "fixed_candidate" and t_anchor != 1.0:
+        raise ValueError("broad-prior sampling requires t_anchor=1")
+    if init_mode == "fixed_candidate" and not 0.0 < float(t_anchor) <= 1.0:
+        raise ValueError("fixed-candidate refinement requires t_anchor in (0, 1]")
     if not isinstance(diffusion, SDPIFlow):
         raise ValueError('sampling requires SDPIFlow, not the legacy DSM process')
     if initializer.no_torsion != bool(getattr(model.expert.model, 'no_torsion', False)):
@@ -153,7 +156,11 @@ def sample_single(
         "minimum_poi_ca_ligand_distance": float(torch.cdist(poi_pos[0], ligand_pos[0]).min()),
     }
 
-    schedule = diffusion.get_inference_schedule(steps, t_start=t_anchor)
+    schedule = (
+        diffusion.get_refinement_schedule(steps, t_start=t_anchor)
+        if init_mode == "fixed_candidate"
+        else diffusion.get_inference_schedule(steps, t_start=t_anchor)
+    )
     trajectory = [] if return_trajectory else None
     trace = [] if return_trace else None
     nonfinite_score_steps = []

@@ -15,6 +15,38 @@ from .rigid import apply_rigid
 
 EXPERT_ANCHOR_VERSION = "dual_diffdock_rigid_anchor_v1"
 EXPERT_ANCHOR_CONSENSUS_VERSION = "dual_diffdock_rigid_anchor_consensus_v1"
+FIXED_CANDIDATE_VERSION = "fixed_native_free_candidate_v1"
+
+
+class FixedCandidateInitializer:
+    """Replay one already generated native-free proposal for refinement."""
+
+    def __init__(self, candidate, *, no_torsion):
+        if not _valid_candidate(candidate):
+            raise ValueError("fixed initializer requires one finite proposal candidate")
+        self.candidate = candidate
+        self.no_torsion = bool(no_torsion)
+
+    def initialize(self, e3_coords, poi_coords, ligand_data, seed=None):
+        """Return cloned coordinates so reverse sampling cannot mutate the pool."""
+        candidate = self.candidate
+        source = _candidate_source(candidate)
+        metadata = {
+            "init_mode": "fixed_candidate",
+            "version": FIXED_CANDIDATE_VERSION,
+            "native_information_used": False,
+            "candidate_id": candidate["candidate_id"],
+            "candidate_source": source,
+            "candidate_geometry": candidate.get("geometry"),
+            "candidate_acceptable": bool(candidate.get("acceptable", False)),
+            "diffusion_seed": seed,
+        }
+        return (
+            candidate["ligand"].detach().clone(),
+            candidate["poi"].detach().clone(),
+            candidate["rotation"].detach().clone(),
+            metadata,
+        )
 
 
 def select_balanced_pairs(size, count, seed):
@@ -32,6 +64,40 @@ def select_balanced_pairs(size, count, seed):
     if len(set(pairs)) != count:
         raise AssertionError("balanced pair selector produced duplicates")
     return pairs
+
+
+def select_partial_pairs(left_size, right_size, count, seed):
+    """Select deterministic, marginally diverse pairs from a rectangular pool."""
+    left_size, right_size, count = int(left_size), int(right_size), int(count)
+    if (left_size < 1 or right_size < 1 or count < 1
+            or count > left_size * right_size):
+        raise ValueError("partial pair count must fit a non-empty Cartesian pool")
+    if left_size == right_size and count % left_size == 0:
+        return select_balanced_pairs(left_size, count, seed)
+    rng = np.random.RandomState(int(seed) % (2**32))
+    pairs = [(left, right) for left in range(left_size) for right in range(right_size)]
+    random_rank = {
+        pairs[index]: rank
+        for rank, index in enumerate(rng.permutation(len(pairs)))
+    }
+    left_degree = [0] * left_size
+    right_degree = [0] * right_size
+    selected = []
+    remaining = set(pairs)
+    while len(selected) < count:
+        pair = min(
+            remaining,
+            key=lambda item: (
+                left_degree[item[0]] + right_degree[item[1]],
+                max(left_degree[item[0]], right_degree[item[1]]),
+                random_rank[item],
+            ),
+        )
+        selected.append(pair)
+        remaining.remove(pair)
+        left_degree[pair[0]] += 1
+        right_degree[pair[1]] += 1
+    return selected
 
 
 def select_pose_consensus(candidates, distance_threshold=10.0):
@@ -60,6 +126,343 @@ def select_pose_consensus(candidates, distance_threshold=10.0):
     selected["consensus_neighbors_10A"] = int(neighbor_counts[best_index])
     selected["consensus_mean_5nn_rmsd"] = float(nearest_means[best_index])
     return selected
+
+
+def _selection_key(candidate):
+    return tuple(candidate["penalty"]), repr(candidate["candidate_id"])
+
+
+def _candidate_source(candidate):
+    candidate_id = candidate.get("candidate_id", ())
+    if candidate_id and candidate_id[0] == "sdpi":
+        return "sdpi"
+    return "bitseed"
+
+
+def _valid_candidate(candidate):
+    tensors = (candidate.get("ligand"), candidate.get("poi"), candidate.get("rotation"))
+    expected = ((1, None, 3), (1, None, 3), (1, 3, 3))
+    for tensor, shape in zip(tensors, expected):
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim != 3:
+            return False
+        if tensor.shape[0] != shape[0] or tensor.shape[-1] != shape[-1]:
+            return False
+        if shape[1] is not None and tensor.shape[1] != shape[1]:
+            return False
+        if not bool(torch.isfinite(tensor).all()):
+            return False
+    return tensors[0].shape[1] > 0 and tensors[1].shape[1] > 0
+
+
+def _fixed_frame_rmsd(left, right):
+    if left.shape != right.shape:
+        return float("inf")
+    return float(torch.sqrt(torch.mean(torch.sum((left - right) ** 2, dim=-1))))
+
+
+@torch.no_grad()
+def select_hybrid_walkers(candidates, walker_count, *, bitseed_quota=None,
+                          ligand_rmsd_cutoff=2.0, poi_rmsd_cutoff=5.0,
+                          use_diversity=True, protect_sources=True,
+                          random_seed=None):
+    """Select a deterministic, source-protected set of diverse initial walkers.
+
+    Clusters are formed greedily in native-free geometry-penalty order in the
+    fixed E3 frame. SDPI's smaller quota is allocated first so structured
+    candidates cannot consume every cross-source basin. If either source or
+    the independent-cluster count is insufficient, globally ranked unused
+    clusters and finally duplicate-cluster candidates fill the exact budget.
+    """
+    walker_count = int(walker_count)
+    if walker_count < 1:
+        raise ValueError("walker_count must be positive")
+    if bitseed_quota is None:
+        if walker_count not in (32, 64):
+            raise ValueError("provide bitseed_quota outside the 32/64 protocol")
+        bitseed_quota = 3 * walker_count // 4
+    quotas = {
+        "bitseed": int(bitseed_quota),
+        "sdpi": walker_count - int(bitseed_quota),
+    }
+    if min(quotas.values()) < 0:
+        raise ValueError("source quota must fit walker_count")
+    valid = [candidate for candidate in candidates if _valid_candidate(candidate)]
+    if len(valid) < walker_count:
+        raise ValueError(
+            f"only {len(valid)} hard-valid candidates for {walker_count} walkers"
+        )
+    ranked = sorted(valid, key=_selection_key)
+    if random_seed is not None:
+        rng = np.random.RandomState(int(random_seed) % (2**32))
+        ranked = [ranked[index] for index in rng.permutation(len(ranked))]
+    clusters = []
+    if use_diversity:
+        ligand_flat = torch.stack([
+            candidate["ligand"].reshape(-1) for candidate in ranked
+        ])
+        poi_flat = torch.stack([
+            candidate["poi"].reshape(-1) for candidate in ranked
+        ])
+        ligand_rmsd = (
+            torch.cdist(ligand_flat, ligand_flat)
+            / np.sqrt(ligand_flat.shape[1] / 3)
+        ).detach().cpu().numpy()
+        poi_rmsd = (
+            torch.cdist(poi_flat, poi_flat)
+            / np.sqrt(poi_flat.shape[1] / 3)
+        ).detach().cpu().numpy()
+        cluster_indices = []
+        for candidate_index, candidate in enumerate(ranked):
+            assigned = False
+            for cluster in cluster_indices:
+                representative_index = cluster[0]
+                if (ligand_rmsd[candidate_index, representative_index]
+                        < ligand_rmsd_cutoff
+                        and poi_rmsd[candidate_index, representative_index]
+                        < poi_rmsd_cutoff):
+                    cluster.append(candidate_index)
+                    assigned = True
+                    break
+            if not assigned:
+                cluster_indices.append([candidate_index])
+        clusters = [
+            [ranked[index] for index in cluster] for cluster in cluster_indices
+        ]
+    else:
+        for candidate in ranked:
+            clusters.append([candidate])
+
+    selected = []
+    selected_ids = set()
+    used_clusters = set()
+
+    def take(candidate, cluster_index):
+        key = repr(candidate["candidate_id"])
+        if key in selected_ids:
+            return False
+        selected.append(candidate)
+        selected_ids.add(key)
+        used_clusters.add(cluster_index)
+        return True
+
+    if protect_sources:
+        # Protect the smaller broad branch before allocating structured walkers.
+        for source in sorted(quotas, key=lambda item: (quotas[item], item)):
+            options = []
+            for cluster_index, cluster in enumerate(clusters):
+                source_members = [
+                    candidate for candidate in cluster
+                    if _candidate_source(candidate) == source
+                ]
+                if source_members:
+                    options.append((source_members[0], cluster_index))
+            if random_seed is None:
+                options.sort(key=lambda item: _selection_key(item[0]))
+            needed = quotas[source]
+            for candidate, cluster_index in options:
+                if needed == 0:
+                    break
+                if cluster_index not in used_clusters and take(candidate, cluster_index):
+                    needed -= 1
+
+    # Prefer a new basin over rigidly enforcing a quota when one source lacks it.
+    for cluster_index, cluster in enumerate(clusters):
+        if len(selected) == walker_count:
+            break
+        if cluster_index not in used_clusters:
+            take(cluster[0], cluster_index)
+    # The second pass fills the exact walker budget with ranked basin duplicates.
+    if len(selected) < walker_count:
+        cluster_lookup = {
+            repr(candidate["candidate_id"]): cluster_index
+            for cluster_index, cluster in enumerate(clusters)
+            for candidate in cluster
+        }
+        for candidate in ranked:
+            if len(selected) == walker_count:
+                break
+            take(candidate, cluster_lookup[repr(candidate["candidate_id"])])
+    if len(selected) != walker_count:
+        raise AssertionError(f"selected {len(selected)} walkers, expected {walker_count}")
+    source_counts = {
+        source: sum(_candidate_source(candidate) == source for candidate in selected)
+        for source in quotas
+    }
+    return selected, {
+        "walker_count": walker_count,
+        "requested_source_quotas": quotas,
+        "actual_source_counts": source_counts,
+        "hard_invalid_count": len(candidates) - len(valid),
+        "cluster_count": len(clusters),
+        "unique_clusters_selected": len(used_clusters),
+        "ligand_rmsd_cutoff": float(ligand_rmsd_cutoff),
+        "poi_rmsd_cutoff": float(poi_rmsd_cutoff),
+        "use_diversity": bool(use_diversity),
+        "protect_sources": bool(protect_sources),
+        "random_seed": random_seed,
+        "selected_candidate_ids": [candidate["candidate_id"] for candidate in selected],
+    }
+
+
+def _proposal_geometry(e3_coords, poi_coords, ligand, separation=0.0):
+    """Return the native-free geometry gate used by anchor and SDPI proposals."""
+    protein_distances = torch.cdist(e3_coords, poi_coords)
+    e3_ligand_distances = torch.cdist(e3_coords, ligand)
+    poi_ligand_distances = torch.cdist(poi_coords, ligand)
+    geometry = {
+        "protein_ca_pairs_below_3A": int((protein_distances < 3.0).sum()),
+        "minimum_protein_ca_distance": float(protein_distances.min()),
+        "minimum_e3_ca_ligand_distance": float(e3_ligand_distances.min()),
+        "minimum_poi_ca_ligand_distance": float(poi_ligand_distances.min()),
+        "poi_outward_separation": float(separation),
+    }
+    acceptable = (
+        geometry["protein_ca_pairs_below_3A"] == 0
+        and 1.5 <= geometry["minimum_e3_ca_ligand_distance"] <= 8.0
+        and 1.5 <= geometry["minimum_poi_ca_ligand_distance"] <= 8.0
+        and 3.0 <= geometry["minimum_protein_ca_distance"] <= 15.0
+    )
+    penalty = (
+        0 if acceptable else 1,
+        geometry["protein_ca_pairs_below_3A"],
+        abs(geometry["minimum_e3_ca_ligand_distance"] - 3.5)
+        + abs(geometry["minimum_poi_ca_ligand_distance"] - 3.5)
+        + abs(geometry["minimum_protein_ca_distance"] - 5.0),
+        float(separation),
+    )
+    return geometry, acceptable, penalty
+
+
+@torch.no_grad()
+def generate_sdpi_candidates(initializer, e3_coords, poi_coords, ligand_data,
+                             count, seed, seed_stride=100_000_007):
+    """Generate deterministic independent proposals from the default SDPI prior."""
+    candidates, records = [], []
+    for index in range(int(count)):
+        proposal_seed = (int(seed) + index * int(seed_stride)) % (2**31 - 1)
+        ligand, poi, body_rotation, metadata = initializer.initialize(
+            e3_coords, poi_coords, ligand_data, seed=proposal_seed,
+        )
+        geometry, acceptable, penalty = _proposal_geometry(
+            e3_coords, poi[0], ligand[0],
+        )
+        candidates.append({
+            "penalty": penalty,
+            "ligand": ligand,
+            "poi": poi,
+            "rotation": body_rotation,
+            "fit_rmsd": None,
+            "geometry": geometry,
+            "attempt": ["sdpi", index],
+            "conformer_index": None,
+            "candidate_id": ["sdpi", index],
+            "acceptable": acceptable,
+            "fallback": "sdpi_v1",
+        })
+        records.append({
+            "candidate_index": index,
+            "seed": proposal_seed,
+            "metadata": metadata,
+        })
+    return candidates, records
+
+
+@torch.no_grad()
+def generate_hybrid_candidates(initializer, e3_coords, poi_coords, ligand_data,
+                               seed, conformer_count=4,
+                               bitseed_candidate_budget=192,
+                               sdpi_candidate_budget=64,
+                               binary_retry_limit=2,
+                               binary_consecutive_failure_limit=3):
+    """Generate a fixed-budget BiTSeed/SDPI mixture with conformer fallback."""
+    conformer_count = int(conformer_count)
+    bitseed_candidate_budget = int(bitseed_candidate_budget)
+    sdpi_candidate_budget = int(sdpi_candidate_budget)
+    if conformer_count < 1 or bitseed_candidate_budget < 0 or sdpi_candidate_budget < 0:
+        raise ValueError("hybrid counts must be non-negative and conformers positive")
+    if bitseed_candidate_budget % conformer_count:
+        raise ValueError("BiTSeed candidate budget must divide evenly across conformers")
+    pairs_per_conformer = bitseed_candidate_budget // conformer_count
+    size = int(initializer.proposal_attempts)
+    if pairs_per_conformer > size ** 2:
+        raise ValueError("per-conformer BiTSeed budget exceeds its Cartesian product")
+    candidates, conformers, failures, partial = [], [], [], []
+    for conformer_index in range(conformer_count):
+        conformer_seed = initializer._conformer_seed(seed, conformer_index)
+        try:
+            generated, records, _ = initializer.generate_candidates(
+                e3_coords, poi_coords, ligand_data, seed=conformer_seed,
+                conformer_count=1, candidate_budget=size ** 2,
+                binary_retry_limit=binary_retry_limit,
+                binary_consecutive_failure_limit=binary_consecutive_failure_limit,
+                allow_partial=True,
+            )
+        except FloatingPointError as error:
+            failures.append({
+                "conformer_index": conformer_index,
+                "seed": conformer_seed,
+                "error": f"{type(error).__name__}: {error}",
+                "replacement": "sdpi_v1",
+                "replacement_count": pairs_per_conformer,
+            })
+            continue
+        record = dict(records[0])
+        record["conformer_index"] = conformer_index
+        conformers.append(record)
+        valid_left, valid_right = record["binary_valid_pose_counts"]
+        retained_count = min(pairs_per_conformer, valid_left * valid_right)
+        if retained_count:
+            selected_pairs = set(select_partial_pairs(
+                valid_left, valid_right, retained_count, seed,
+            ))
+        else:
+            selected_pairs = set()
+        for candidate in generated:
+            if tuple(candidate["attempt"]) not in selected_pairs:
+                continue
+            candidate = dict(candidate)
+            candidate["conformer_index"] = conformer_index
+            candidate["candidate_id"] = [
+                "bitseed", conformer_index, *candidate["attempt"],
+            ]
+            candidates.append(candidate)
+        if retained_count < pairs_per_conformer:
+            event = {
+                "conformer_index": conformer_index,
+                "seed": conformer_seed,
+                "valid_pose_counts": [valid_left, valid_right],
+                "available_pair_count": valid_left * valid_right,
+                "retained_pair_count": retained_count,
+                "replacement": "sdpi_v1",
+                "replacement_count": pairs_per_conformer - retained_count,
+            }
+            partial.append(event)
+            if retained_count == 0:
+                failures.append(event)
+    missing_bitseed = bitseed_candidate_budget - len(candidates)
+    fallback_count = sdpi_candidate_budget + missing_bitseed
+    sdpi, sdpi_records = generate_sdpi_candidates(
+        initializer.base, e3_coords, poi_coords, ligand_data,
+        fallback_count, int(seed) + 1_000_000, seed_stride=1,
+    )
+    candidates.extend(sdpi)
+    expected = bitseed_candidate_budget + sdpi_candidate_budget
+    if len(candidates) != expected:
+        raise AssertionError(f"generated {len(candidates)} hybrid candidates, expected {expected}")
+    metadata = {
+        "requested_bitseed": bitseed_candidate_budget,
+        "actual_bitseed": bitseed_candidate_budget - missing_bitseed,
+        "requested_sdpi": sdpi_candidate_budget,
+        "actual_sdpi": fallback_count,
+        "successful_conformers": conformers,
+        "failed_conformers": failures,
+        "partial_conformers": partial,
+        "fallback_events": partial + [
+            event for event in failures if event not in partial
+        ],
+        "sdpi_candidates": sdpi_records,
+    }
+    return candidates, metadata
 
 
 class DualExpertAnchorInitializer:
@@ -143,7 +546,9 @@ class DualExpertAnchorInitializer:
     @torch.no_grad()
     def generate_candidates(self, e3_coords, poi_coords, ligand_data, seed=None,
                             conformer_count=1, candidate_budget=None,
-                            binary_retry_limit=4):
+                            binary_retry_limit=2,
+                            binary_consecutive_failure_limit=3,
+                            allow_partial=False):
         """Generate one geometry-relaxed ternary proposal per binary-pose pair.
 
         Each conformer has independent ETKDG/torsion randomness. Both binary
@@ -156,6 +561,8 @@ class DualExpertAnchorInitializer:
             raise ValueError("conformer_count must be positive")
         if binary_retry_limit < 1:
             raise ValueError("binary_retry_limit must be positive")
+        if binary_consecutive_failure_limit < 1:
+            raise ValueError("binary_consecutive_failure_limit must be positive")
         potential_count = int(conformer_count) * self.proposal_attempts ** 2
         if candidate_budget is None:
             candidate_budget = potential_count
@@ -166,9 +573,6 @@ class DualExpertAnchorInitializer:
                 "exceed their Cartesian product"
             )
         pairs_per_conformer = candidate_budget // int(conformer_count)
-        pair_indexes = select_balanced_pairs(
-            self.proposal_attempts, pairs_per_conformer, seed,
-        )
         candidates = []
         conformers = []
         first_broad = None
@@ -208,7 +612,8 @@ class DualExpertAnchorInitializer:
                 failures_since_success = 0
                 max_draws = self.proposal_attempts * int(binary_retry_limit)
                 draws = 0
-                while len(bank) < self.proposal_attempts and draws < max_draws:
+                while (len(bank) < self.proposal_attempts and draws < max_draws
+                       and failures_since_success < binary_consecutive_failure_limit):
                     draw_index = draws
                     draws += 1
                     pose_seed = (conformer_seed + draw_index * 10_007
@@ -236,7 +641,7 @@ class DualExpertAnchorInitializer:
                     bank.append(docked)
                     branch_retries.append(failures_since_success)
                     failures_since_success = 0
-                if len(bank) != self.proposal_attempts:
+                if len(bank) != self.proposal_attempts and not allow_partial:
                     raise FloatingPointError(
                         f"collected {len(bank)}/{self.proposal_attempts} valid "
                         f"binary poses after {draws} deterministic draws"
@@ -245,13 +650,40 @@ class DualExpertAnchorInitializer:
                 retry_counts.append(branch_retries)
                 draw_counts.append(draws)
 
+            valid_pose_counts = [len(bank) for bank in banks]
+            failure_counts = [
+                draws - valid for draws, valid in zip(draw_counts, valid_pose_counts)
+            ]
+            stop_reasons = []
+            for valid, draws, retries in zip(
+                    valid_pose_counts, draw_counts, retry_counts):
+                trailing_failures = draws - valid - sum(retries)
+                if valid == self.proposal_attempts:
+                    stop_reasons.append("complete")
+                elif trailing_failures >= binary_consecutive_failure_limit:
+                    stop_reasons.append("consecutive_nan_limit")
+                else:
+                    stop_reasons.append("draw_limit")
             conformers.append({
                 "conformer_index": conformer_index,
                 "seed": conformer_seed,
                 "metadata": base_metadata["conformer"],
                 "binary_retry_counts": retry_counts,
                 "binary_draw_counts": draw_counts,
+                "binary_failure_counts": failure_counts,
+                "binary_valid_pose_counts": valid_pose_counts,
+                "binary_stop_reasons": stop_reasons,
             })
+            if allow_partial:
+                pair_indexes = [
+                    (left, right)
+                    for left in range(valid_pose_counts[0])
+                    for right in range(valid_pose_counts[1])
+                ]
+            else:
+                pair_indexes = select_balanced_pairs(
+                    self.proposal_attempts, pairs_per_conformer, seed,
+                )
             for e3_index, poi_index in pair_indexes:
                 anchored_e3 = banks[0][e3_index]
                 anchored_poi = banks[1][poi_index]
@@ -300,7 +732,7 @@ class DualExpertAnchorInitializer:
                         "acceptable": acceptable,
                     })
                 candidates.append(min(variants, key=lambda item: item["penalty"]))
-        expected = int(candidate_budget)
+        expected = (len(candidates) if allow_partial else int(candidate_budget))
         if len(candidates) != expected:
             raise AssertionError(f"generated {len(candidates)} candidates, expected {expected}")
         return candidates, conformers, first_broad
@@ -309,9 +741,25 @@ class DualExpertAnchorInitializer:
     def initialize(self, e3_coords, poi_coords, ligand_data, seed=None):
         if seed is None:
             raise ValueError("expert-anchor initialization requires an explicit seed")
-        candidates, _, first_broad = self.generate_candidates(
-            e3_coords, poi_coords, ligand_data, seed=seed, conformer_count=1,
-        )
+        try:
+            candidates, _, first_broad = self.generate_candidates(
+                e3_coords, poi_coords, ligand_data, seed=seed, conformer_count=1,
+            )
+        except FloatingPointError as error:
+            ligand, placed_poi, body_rotation, base_metadata = self.base.initialize(
+                e3_coords, poi_coords, ligand_data, seed=seed,
+            )
+            return ligand, placed_poi, body_rotation, {
+                **base_metadata,
+                "init_mode": "expert_anchor",
+                "version": EXPERT_ANCHOR_VERSION,
+                "native_information_used": False,
+                "binary_steps": self.binary_steps,
+                "proposal_attempts": self.proposal_attempts,
+                "anchor_accepted": False,
+                "fallback": "sdpi_v1_binary_expert_failure",
+                "fallback_reason": str(error),
+            }
         broad_ligand, broad_poi, broad_rotation, base_metadata = first_broad
         if self.selection == "consensus":
             pair_best = {}
