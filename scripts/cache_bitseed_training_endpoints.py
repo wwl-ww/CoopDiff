@@ -47,6 +47,12 @@ def parser():
     result.add_argument("--seed", type=int, default=41_000)
     result.add_argument("--limit", type=int)
     result.add_argument("--limit-per-index", type=int)
+    result.add_argument("--case-shard-count", type=int, default=1,
+                        help="Deterministically split cases by global index")
+    result.add_argument("--case-shard-index", type=int, default=0,
+                        help="Zero-based case shard assigned to this process")
+    result.add_argument("--shard-dir",
+                        help="Shared resumable per-case shard directory")
     result.add_argument("--exact-atol", type=float, default=1e-3)
     return result
 
@@ -74,6 +80,10 @@ def atomic_torch_save(payload, destination):
 
 def main():
     args = parser().parse_args()
+    if args.case_shard_count < 1:
+        raise ValueError("--case-shard-count must be positive")
+    if not 0 <= args.case_shard_index < args.case_shard_count:
+        raise ValueError("--case-shard-index must be in [0, case-shard-count)")
     index_paths = [Path(value).resolve() for value in args.index]
     indexed_entries = []
     for index_path in index_paths:
@@ -103,7 +113,8 @@ def main():
     }
     destination = Path(args.out)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shard_dir = Path(str(destination) + ".cases")
+    shard_dir = (Path(args.shard_dir) if args.shard_dir
+                 else Path(str(destination) + ".cases"))
     shard_dir.mkdir(parents=True, exist_ok=True)
     with (model_dir / "model_parameters.yml").open() as handle:
         from argparse import Namespace
@@ -115,6 +126,8 @@ def main():
     flow = SDPIFlow()
     records = []
     for case_index, (entry, input_root, source_index) in enumerate(indexed_entries):
+        if case_index % args.case_shard_count != args.case_shard_index:
+            continue
         case = entry["case"]
         shard = shard_dir / f"{case_index:06d}_{case}.pt"
         if shard.is_file():
@@ -223,6 +236,11 @@ def main():
         "cache_version": DUAL_INIT_CACHE_VERSION,
         "indexes": [str(path) for path in index_paths],
         "generation_protocol": protocol,
+        "case_partition": {
+            "count": args.case_shard_count,
+            "index": args.case_shard_index,
+            "total_cases": len(indexed_entries),
+        },
         "entries": records,
     }
     validate_endpoint_cache(payload)
