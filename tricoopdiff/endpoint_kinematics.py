@@ -37,7 +37,8 @@ def _undirected_bonds(edge_index, atom_count):
     if edges.shape[1:] != (2,):
         raise ValueError("edge_index must have shape [2, E] or [E, 2]")
     bonds = sorted({tuple(sorted(map(int, edge))) for edge in edges})
-    if (not bonds or any(u == v or u < 0 or v >= atom_count for u, v in bonds)):
+    if ((not bonds and atom_count > 1)
+            or any(u == v or u < 0 or v >= atom_count for u, v in bonds)):
         raise ValueError("edge_index contains an invalid or empty bond map")
     return bonds
 
@@ -114,11 +115,35 @@ def _mask_array(mask_rotate, bond_count, atom_count):
 
 
 def _fit_numpy_rigid(source, target):
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
+        raise ValueError("rigid-fit coordinates must have matching [N,3] shapes")
+    centered_source = source - source.mean(0)
+    centered_target = target - target.mean(0)
+    underdetermined = (len(source) < 3
+                       or np.linalg.matrix_rank(centered_source, tol=1e-10) < 2)
+    if underdetermined:
+        source_norms = np.linalg.norm(centered_source, axis=1)
+        target_norms = np.linalg.norm(centered_target, axis=1)
+        if source_norms.max() < 1e-10 or target_norms.max() < 1e-10:
+            rotation = np.eye(3)
+        else:
+            source_vector = centered_source[int(np.argmax(source_norms))]
+            target_vector = centered_target[int(np.argmax(target_norms))]
+            rotation, _ = Rotation.align_vectors(
+                target_vector[None], source_vector[None],
+            )
+            rotation = rotation.as_matrix()
+        translation = target.mean(0) - rotation @ source.mean(0)
+        fitted = source @ rotation.T + translation
+        rmsd = float(np.sqrt(np.mean(np.sum((fitted - target) ** 2, axis=1))))
+        return rotation, translation, rmsd, True
     dtype = torch.float64
     rotation, translation, rmsd = proper_rigid_fit(
         torch.as_tensor(source, dtype=dtype), torch.as_tensor(target, dtype=dtype),
     )
-    return (rotation.numpy(), translation.numpy(), float(rmsd))
+    return (rotation.numpy(), translation.numpy(), float(rmsd), False)
 
 
 def project_endpoint_coupling(ligand_data, native_poi, endpoint_ligand,
@@ -157,7 +182,7 @@ def project_endpoint_coupling(ligand_data, native_poi, endpoint_ligand,
 
     def residual(angles):
         shape = _raw_torsions(native_ligand, bonds, masks, angles)
-        rotation, translation, _ = _fit_numpy_rigid(shape, endpoint_ligand)
+        rotation, translation, _, _ = _fit_numpy_rigid(shape, endpoint_ligand)
         fitted = shape @ rotation.T + translation
         return (fitted - endpoint_ligand).reshape(-1)
 
@@ -177,9 +202,13 @@ def project_endpoint_coupling(ligand_data, native_poi, endpoint_ligand,
         }
     shape = _raw_torsions(native_ligand, bonds, masks, angles)
     shape += native_ligand.mean(0) - shape.mean(0)
-    rotation_a, offset_a, ligand_rmsd = _fit_numpy_rigid(shape, endpoint_ligand)
+    rotation_a, offset_a, ligand_rmsd, ligand_underdetermined = _fit_numpy_rigid(
+        shape, endpoint_ligand,
+    )
     projected_ligand = shape @ rotation_a.T + offset_a
-    rotation_poi, offset_poi, poi_rmsd = _fit_numpy_rigid(native_poi, endpoint_poi)
+    rotation_poi, offset_poi, poi_rmsd, poi_underdetermined = _fit_numpy_rigid(
+        native_poi, endpoint_poi,
+    )
 
     # assemble_interface_pair applies D_a o inverse(D_b). Solve D_b from the
     # fitted native-POI -> endpoint-POI transform and the fitted ligand D_a.
@@ -202,6 +231,8 @@ def project_endpoint_coupling(ligand_data, native_poi, endpoint_ligand,
         "contract": ENDPOINT_PROJECTION_VERSION,
         "ligand_projection_rmsd_angstrom": ligand_rmsd,
         "poi_rigid_fit_rmsd_angstrom": poi_rmsd,
+        "ligand_orientation_underdetermined": ligand_underdetermined,
+        "poi_orientation_underdetermined": poi_underdetermined,
         "exact_atol_angstrom": float(exact_atol),
         "endpoint_exactly_represented": bool(
             ligand_rmsd <= exact_atol and poi_rmsd <= exact_atol

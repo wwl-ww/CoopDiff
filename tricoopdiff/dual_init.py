@@ -79,9 +79,9 @@ class CachedEndpointStore:
         self.payload = payload
         self.by_case = {}
         for record in payload["entries"]:
-            if record["actual_source"] == "bitseed":
-                self.by_case.setdefault(record["case"], []).append(record)
-        if not self.by_case:
+            self.by_case.setdefault(record["case"], []).append(record)
+        if not any(record["actual_source"] == "bitseed"
+                   for records in self.by_case.values() for record in records):
             raise ValueError("cache contains no actual BiTSeed endpoints")
 
     def coupling(self, case, occurrence=0):
@@ -89,10 +89,11 @@ class CachedEndpointStore:
         if not records:
             raise KeyError(f"case {case!r} has no cached BiTSeed endpoint")
         record = records[int(occurrence) % len(records)]
-        return {
+        coupling = {
             name: np.asarray(value).copy()
             for name, value in record["coupling"].items()
-        }, record
+        }
+        return coupling, record
 
 
 def mixed_source_for_step(global_step):

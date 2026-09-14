@@ -68,6 +68,11 @@ def test_fallback_cannot_be_relabelled_as_bitseed():
         raise AssertionError('fallback endpoint must retain its actual SDPI source')
 
 
+def test_ood_expert_failure_is_a_valid_sdpi_fallback_record():
+    value = payload(source='sdpi', fallback='sdpi_v1')
+    validate_endpoint_cache(value)
+
+
 if __name__ == '__main__':
     for name, function in list(globals().items()):
         if name.startswith('test_'):

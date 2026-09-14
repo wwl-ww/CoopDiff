@@ -19,10 +19,12 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from evaluation_common import resolve_entry_paths  # noqa: E402
 from featurize_common import featurize_complex  # noqa: E402
 from tricoopdiff.dual_init import (  # noqa: E402
-    DUAL_INIT_CACHE_VERSION, validate_endpoint_cache,
+    DUAL_INIT_CACHE_VERSION, validate_endpoint_cache, validate_endpoint_record,
 )
 from tricoopdiff.endpoint_kinematics import project_endpoint_coupling  # noqa: E402
-from tricoopdiff.expert_anchors import DualExpertAnchorInitializer  # noqa: E402
+from tricoopdiff.expert_anchors import (  # noqa: E402
+    DualExpertAnchorInitializer, generate_hybrid_candidates,
+)
 from tricoopdiff.expert_factory import build_diffdock_expert  # noqa: E402
 from tricoopdiff.sdpi_flow import SDPIFlow  # noqa: E402
 
@@ -63,6 +65,13 @@ def cpu_array(value):
     return value
 
 
+def atomic_torch_save(payload, destination):
+    destination = Path(destination)
+    temporary = destination.with_suffix(destination.suffix + f".tmp.{os.getpid()}")
+    torch.save(payload, temporary)
+    os.replace(temporary, destination)
+
+
 def main():
     args = parser().parse_args()
     index_paths = [Path(value).resolve() for value in args.index]
@@ -83,6 +92,19 @@ def main():
     if not model_dir.is_absolute():
         model_dir = ROOT / model_dir
     checkpoint = model_dir / args.expert_checkpoint
+    protocol = {
+        "version": "online_bitseed_frozen_binary_v1",
+        "binary_steps": args.binary_steps,
+        "poses_per_side": args.poses_per_side,
+        "conformers": args.conformers,
+        "selection": "native_free_geometry_penalty_with_sdpi_ood_fallback",
+        "frozen_expert_checkpoint": str(checkpoint.resolve()),
+        "frozen_expert_checkpoint_sha256": sha256(checkpoint),
+    }
+    destination = Path(args.out)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shard_dir = Path(str(destination) + ".cases")
+    shard_dir.mkdir(parents=True, exist_ok=True)
     with (model_dir / "model_parameters.yml").open() as handle:
         from argparse import Namespace
         model_args = Namespace(**yaml.full_load(handle))
@@ -94,6 +116,19 @@ def main():
     records = []
     for case_index, (entry, input_root, source_index) in enumerate(indexed_entries):
         case = entry["case"]
+        shard = shard_dir / f"{case_index:06d}_{case}.pt"
+        if shard.is_file():
+            cached = torch.load(shard, map_location="cpu", weights_only=False)
+            if cached.get("generation_protocol") != protocol or cached.get("case") != case:
+                raise ValueError(f"{case}: cached endpoint shard contract mismatch")
+            for record in cached.get("entries", ()):
+                validate_endpoint_record(record)
+            if not cached.get("entries"):
+                raise ValueError(f"{case}: cached endpoint shard is empty")
+            records.extend(cached["entries"])
+            print(f"[cache] SKIP {case}: {len(cached['entries'])} cached endpoints",
+                  flush=True)
+            continue
         paths = resolve_entry_paths(entry, input_root)
         e3, poi, ligand, _ = featurize_complex(
             case, str(paths["protein1"]), str(paths["protein2"]),
@@ -107,15 +142,23 @@ def main():
         )
         case_seed = args.seed + case_index * 1009
         budget = args.conformers * args.poses_per_side ** 2
-        candidates, conformers, _ = initializer.generate_candidates(
+        candidates, generation = generate_hybrid_candidates(
+            initializer,
             e3["coords"][0], poi["coords"][0], ligand,
             seed=case_seed, conformer_count=args.conformers,
-            candidate_budget=budget,
+            bitseed_candidate_budget=budget, sdpi_candidate_budget=0,
         )
+        bitseed = [candidate for candidate in candidates
+                   if candidate["candidate_id"][0] == "bitseed"]
+        selectable = bitseed or [candidate for candidate in candidates
+                                 if candidate["candidate_id"][0] == "sdpi"]
         selected = sorted(
-            candidates, key=lambda item: (tuple(item["penalty"]), repr(item["candidate_id"])),
+            selectable,
+            key=lambda item: (tuple(item["penalty"]), repr(item["candidate_id"])),
         )[:args.endpoints_per_case]
+        case_records = []
         for candidate in selected:
+            actual_source = candidate["candidate_id"][0]
             coupling, projected, projection = project_endpoint_coupling(
                 ligand, poi["coords"], candidate["ligand"], candidate["poi"],
                 no_torsion=initializer.no_torsion, exact_atol=args.exact_atol,
@@ -130,13 +173,18 @@ def main():
             if (not np.allclose(cpu_array(ligand_one[0]), projected["ligand"], atol=1e-5)
                     or not np.allclose(cpu_array(poi_one[0]), projected["poi"], atol=1e-5)):
                 raise AssertionError(f"{case}: projected endpoint failed t=1 round-trip")
-            conformer_index = int(candidate["conformer_index"])
-            records.append({
+            conformer_index = candidate["conformer_index"]
+            if conformer_index is not None:
+                conformer_index = int(conformer_index)
+            case_records.append({
                 "case": case,
                 "source_index": source_index,
-                "actual_source": "bitseed",
-                "candidate_id": ["bitseed", *candidate["candidate_id"]],
-                "conformer_seed": initializer._conformer_seed(case_seed, conformer_index),
+                "actual_source": actual_source,
+                "candidate_id": candidate["candidate_id"],
+                "conformer_seed": (
+                    initializer._conformer_seed(case_seed, conformer_index)
+                    if conformer_index is not None else None
+                ),
                 "binary_pose_ids": list(candidate["attempt"]),
                 "fallback": candidate.get("fallback"),
                 "native_used_in_candidate_generation": False,
@@ -156,32 +204,29 @@ def main():
                 "projection": projection,
                 "generation": {
                     "case_seed": case_seed,
-                    "conformer": conformers[conformer_index],
+                    "conformer": next((item for item in generation["successful_conformers"]
+                                       if item["conformer_index"] == conformer_index), None),
+                    "fallback_events": generation["fallback_events"],
                     "geometry": candidate["geometry"],
                     "fit_rmsd": candidate["fit_rmsd"],
                 },
             })
-        print(f"[cache] {case}: {len(selected)} endpoints", flush=True)
+        for record in case_records:
+            validate_endpoint_record(record)
+        atomic_torch_save({
+            "case": case, "generation_protocol": protocol,
+            "entries": case_records,
+        }, shard)
+        records.extend(case_records)
+        print(f"[cache] {case}: {len(case_records)} endpoints", flush=True)
     payload = {
         "cache_version": DUAL_INIT_CACHE_VERSION,
         "indexes": [str(path) for path in index_paths],
-        "generation_protocol": {
-            "version": "online_bitseed_frozen_binary_v1",
-            "binary_steps": args.binary_steps,
-            "poses_per_side": args.poses_per_side,
-            "conformers": args.conformers,
-            "selection": "native_free_geometry_penalty",
-            "frozen_expert_checkpoint": str(checkpoint.resolve()),
-            "frozen_expert_checkpoint_sha256": sha256(checkpoint),
-        },
+        "generation_protocol": protocol,
         "entries": records,
     }
     validate_endpoint_cache(payload)
-    destination = Path(args.out)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(destination.suffix + f".tmp.{os.getpid()}")
-    torch.save(payload, temporary)
-    os.replace(temporary, destination)
+    atomic_torch_save(payload, destination)
     print(f"[cache] wrote {len(records)} endpoints to {destination}", flush=True)
 
 

@@ -498,10 +498,11 @@ def prepare_source_batch(batch, global_step, training_arm, endpoint_store):
         return {**batch, 'source': 0}
     if endpoint_store is None:
         raise ValueError('mixed training requires an endpoint store')
-    coupling, _ = endpoint_store.coupling(
+    coupling, record = endpoint_store.coupling(
         batch['case'], occurrence=global_step // 2,
     )
-    return {**batch, 'source': 1, 'coupling_override': coupling}
+    actual_source = 1 if record['actual_source'] == 'bitseed' else 0
+    return {**batch, 'source': actual_source, 'coupling_override': coupling}
 
 
 def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None):
@@ -518,6 +519,7 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
             np.random.seed(0)
             trainer.model.eval()
             losses = {'sdpi': [], 'bitseed': []}
+            fallback_count = 0
 
             for batch in val_loader:
                 try:
@@ -533,21 +535,25 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
                 if training_arm in ('B', 'C'):
                     if endpoint_store is None:
                         raise ValueError('mixed validation requires an endpoint store')
-                    coupling, _ = endpoint_store.coupling(batch['case'])
+                    coupling, record = endpoint_store.coupling(batch['case'])
+                    actual_source = record['actual_source']
                     try:
-                        bitseed = trainer.validate_step(**{
-                            **batch, 'source': 1, 'coupling_override': coupling,
+                        endpoint_loss = trainer.validate_step(**{
+                            **batch,
+                            'source': 1 if actual_source == 'bitseed' else 0,
+                            'coupling_override': coupling,
                         })
                     except FloatingPointError as error:
                         raise RuntimeError(
                             f"BiTSeed validation failed: {error}"
                         ) from error
-                    if not np.isfinite(bitseed['loss_total']):
+                    if not np.isfinite(endpoint_loss['loss_total']):
                         raise RuntimeError(
                             f"validation failed: case={batch.get('case', 'unknown')} "
                             "produced a non-finite BiTSeed loss"
                         )
-                    losses['bitseed'].append(bitseed['loss_total'])
+                    losses[actual_source].append(endpoint_loss['loss_total'])
+                    fallback_count += int(actual_source == 'sdpi')
     finally:
         np.random.set_state(numpy_state)
         trainer.model.train()
@@ -556,7 +562,11 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
         for source, values in losses.items() if values
     }
     selection = float(np.mean(list(by_source.values()))) if by_source else float('nan')
-    return {'selection_loss': selection, 'by_source': by_source}
+    return {
+        'selection_loss': selection, 'by_source': by_source,
+        'source_counts': {source: len(values) for source, values in losses.items()},
+        'bitseed_fallback_count': fallback_count,
+    }
 
 
 class TernaryDataLoader:

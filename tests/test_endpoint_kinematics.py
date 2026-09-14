@@ -141,6 +141,33 @@ def test_projected_torsion_endpoint_roundtrips_at_flow_time_one():
     assert torch.allclose(poi, endpoint_poi, atol=1e-8)
 
 
+def test_single_atom_fallback_has_translation_only_roundtrip():
+    native_ligand = torch.tensor([[[0.0, 0.0, 0.0]]], dtype=torch.float64)
+    endpoint_ligand = torch.tensor([[[4.0, -2.0, 7.0]]], dtype=torch.float64)
+    native_poi = torch.tensor([[
+        [0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
+    ]], dtype=torch.float64)
+    endpoint_poi = native_poi + torch.tensor([[[2.0, 3.0, 4.0]]])
+    ligand_data = {
+        'coords': native_ligand,
+        'edge_index': torch.empty((2, 0), dtype=torch.long),
+        'edge_mask': torch.empty(0, dtype=torch.bool),
+        'mask_rotate': np.zeros((0, 1), dtype=bool),
+    }
+    coupling, _, report = project_endpoint_coupling(
+        ligand_data, native_poi, endpoint_ligand, endpoint_poi,
+        no_torsion=True,
+    )
+    ligand, poi, _, _ = SDPIFlow().path(
+        ligand_data, native_poi, coupling, torch.ones(1, dtype=torch.float64),
+    )
+    assert report['ligand_orientation_underdetermined']
+    assert report['endpoint_exactly_represented']
+    assert torch.allclose(ligand, endpoint_ligand, atol=1e-8)
+    assert torch.allclose(poi, endpoint_poi, atol=1e-8)
+
+
 if __name__ == "__main__":
     for name, function in list(globals().items()):
         if name.startswith("test_"):

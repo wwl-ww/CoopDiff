@@ -109,7 +109,8 @@ def test_legacy_clamp_mode_is_explicitly_selectable():
 def test_mixed_arms_share_exact_source_and_endpoint_sequence():
     class Store:
         def coupling(self, case, occurrence=0):
-            return {'case_marker': case, 'occurrence': occurrence}, {}
+            return ({'case_marker': case, 'occurrence': occurrence},
+                    {'actual_source': 'bitseed'})
 
     batch = {'case': 'case-a'}
     for step in range(6):
@@ -137,6 +138,16 @@ def test_sampler_conditions_on_actual_fallback_source():
     ) == 'bitseed'
 
 
+def test_mixed_training_relabels_ood_expert_fallback_as_sdpi():
+    class Store:
+        def coupling(self, case, occurrence=0):
+            return {'cached': True}, {'actual_source': 'sdpi'}
+
+    batch = prepare_source_batch({'case': 'ood'}, 1, 'C', Store())
+    assert batch['source'] == 0
+    assert batch['coupling_override'] == {'cached': True}
+
+
 def test_consensus_builder_rejects_lora_before_loading_expert():
     with patch('tricoopdiff.expert_factory.build_diffdock_expert') as expert:
         try:
@@ -159,4 +170,5 @@ if __name__ == "__main__":
     test_mixed_arms_share_exact_source_and_endpoint_sequence()
     test_a1_never_consumes_cached_endpoint()
     test_sampler_conditions_on_actual_fallback_source()
+    test_mixed_training_relabels_ood_expert_fallback_as_sdpi()
     print("Training-contract tests passed")
