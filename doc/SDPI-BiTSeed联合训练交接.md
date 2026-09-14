@@ -143,6 +143,9 @@ checkpoint SHA256。以下命令生成 train+validation cache：
 sbatch scripts/cache_bitseed_training_endpoints.slurm
 ```
 
+若本 worktree 不复制大型数据和 expert checkpoint，提交时设置
+`ASSET_ROOT=/mnt/disk/wl/MoRE-tri/CoopDiff`；输出仍保留在当前 worktree。
+
 短 GPU smoke 已覆盖 A1/B/C 各 2 step；SDPI 与 BiTSeed loss 均 finite，C 的 source
 embedding 有梯度，checkpoint v19 记录 source/time/mix 合同，且不含 expert adapter。
 单例 smoke 中 BiTSeed validation loss 远高于 SDPI，因此这些数值只证明训练路径可执行，

@@ -10,14 +10,15 @@
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-$SLURM_SUBMIT_DIR}"
+ASSET_ROOT="${ASSET_ROOT:-$PROJECT_ROOT}"
 cd "$PROJECT_ROOT"
 mkdir -p logs results/dual_init
 echo "pid=$$ gpu=${CUDA_VISIBLE_DEVICES:-slurm} commit=$(git rev-parse HEAD)"
 
 /home/wl/micromamba/envs/tricoopdiff/bin/python scripts/cache_bitseed_training_endpoints.py \
-    --index data/ternary_train.json data/ternary_val.json \
+    --index "$ASSET_ROOT/data/ternary_train.json" "$ASSET_ROOT/data/ternary_val.json" \
     --out results/dual_init/bitseed_train_val_endpoints.pt \
-    --model-dir checkpoints/score_model \
+    --model-dir "$ASSET_ROOT/checkpoints/score_model" \
     --cache-dir results/featurize_cache_dual_init \
     --binary-steps 20 \
     --poses-per-side 8 \
