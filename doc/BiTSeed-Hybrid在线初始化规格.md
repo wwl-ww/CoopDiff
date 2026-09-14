@@ -1,140 +1,108 @@
-# BiTSeed-Hybrid 在线初始化规格
+# BiTSeed-Hybrid 在线初始化与实验协议
 
-更新时间：2026-09-14。本文件定义在线生成和选择协议。`192/64` 已作为当前固定预算的
-候选池默认值，但不是已经证明全局最优的超参数；64-walker selector 尚未冻结。整个生成路径必须
-native-free、在线且确定性；不使用 LoRA、人工 pose bank 或 MGD94 DockQ 进行选择。
+更新：2026-09-14。BiTSeed = **Conformer-Diverse Binary-to-Ternary Basin Seeding**，只命名初始化模块，不包含 selector、CoopDiff 或 post-ranker。
 
-## 默认预算
+## 已确定与尚未确定
 
-每例先生成恰好256个 proposals，再选择32或64个 CoopDiff walkers。
+当前工作候选池为 **192 BiTSeed + 64 SDPI = 256**，在线、native-free、固定配置生成，不用人工 pose bank 或 LoRA。它是后续实验的统一基准，不是已证明全局最优的比例。
 
-| 来源 | 配置 | 原始计算 | 进入候选集 |
-|---|---|---:|---:|
-| BiTSeed | `C=4, M=8` | 两侧共64条 frozen DiffDock trajectories | 192 |
-| broad SDPI | 64个独立 `sdpi_v1` samples | 不调用 DiffDock | 64 |
+64-walker selector 尚未冻结：并列保留 Geometry-64、Diversity-64、Hybrid-48/16。新联合训练权重须重新验证；旧模型下的名次不能直接移植。
 
-BiTSeed 对每个 ETKDGv3 conformer 生成 `8×8=64` 个同构象 binary-pose 组合，再用
-确定性均衡配对保留48个；每个 marginal pose 恰好出现6次，四个 conformer 共192个。
-DiffDock 使用20点 schedule（19次更新）、rigid-only 更新和冻结 checkpoint
-`checkpoints/score_model/best_ema_inference_epoch_model.pt`。SDPI 的每个 proposal 独立
-采样 conformer、torsion、双侧 Haar rotation 和受体尺度自适应 translation。
+## 候选生成与预算
 
-基础 seed 为 `S=31000`。BiTSeed 继续使用现有 conformer/trajectory seed 公式；所有
-消融组的 SDPI 候选 `k` 共享独立命名空间 `S + 1,000,000 + k`，因此32/64/128/256
-预算严格构成同一候选池的前缀。候选 ID 必须带来源：
-`("bitseed", conformer, e3_pose, poi_pose)` 或 `("sdpi", k)`。
+| 来源 | 配置 | 无失败时的二元轨迹数 | 候选数 |
+| --- | --- | ---: | ---: |
+| BiTSeed | C=4 conformers，每侧 M=8 poses | 2CM=64 | 192 |
+| SDPI | 独立完整初态 | 0 | 64 |
 
-## 确定性失败处理
+每个 conformer 两侧共享同一完整 ligand 内部构象，分别做 frozen DiffDock rigid-only 采样；20点 schedule 对应19次二元更新。每侧8个 pose 组成8×8=64对，确定性均衡保留48对，每个 marginal pose出现6次；四个 conformer共192。这里64条**二元**轨迹不是64条完整 CoopDiff walker。
 
-1. 单条 binary trajectory 出现 NaN/Inf 时换新 seed 短补采；每个 conformer/side
-   最多尝试 `2M` 次，连续3次失败则提前停止。
-2. 不强制收满 `M×M`：保留两侧部分成功 pose 的笛卡尔积，用确定性边际均衡规则最多
-   选48个；若不足48个，仅以同数目的新 SDPI proposals 补齐缺口。
-3. 所有 conformer 均失败时，退化为256个 SDPI proposals。
-4. SDPI 也按固定 seed 顺序补采；达到请求数四倍仍不足时才允许 case 失败。
+基础 seed S=31000；conformer stride为100000007，具体 binary seed计算以 [expert_anchors.py](../tricoopdiff/expert_anchors.py) 为准。Hybrid中的 SDPI候选 k 使用 `(S+1000000+k) mod (2³¹−1)`，因此同一配置下 broad 预算共享前缀；不要套用独立 `generate_sdpi_candidates` 的默认 stride。ID为 `["bitseed",c,i,j]` 或 `["sdpi",k]`。
 
-任何补位都必须记录失败阶段、draw 数、异常类型、来源计数和最终候选数。禁止读取 native
-决定是否 fallback。当前候选生成和 oracle CLI 已实现纯 SDPI-256、Hybrid-192/64、
-保留成功 conformer 并按缺口补位，以及所有 conformer 失败时的整例 SDPI fallback。
+从原始输入在线生成和实验审计缓存要区分：缓存仅用于固定候选反事实对照，不能人工筛选内容后冒充在线预测。
 
-## 过滤、去重与 Walker 选择
+## 失败与补位：当前代码的确切行为
 
-硬过滤只删除非有限坐标、形状/atom-map 错误和确定无效的刚体变换。现有
-`acceptable` 几何标记暂作软排序特征，未经好姿态召回审计不得直接 hard reject。
+每个 conformer/side 最多尝试2M条 binary trajectory，连续3次失败提前停止；失败重采消耗额外计算。保留部分成功 pose，从可用笛卡尔积均衡选取最多48对，不要求先收满8×8。
 
-所有候选在固定 E3 坐标系中全局聚类，不额外对齐。若两个候选同时满足 ligand
-heavy-atom RMSD `<2 Å` 和 POI Cα RMSD `<5 Å`，暂视作同一 basin。阈值必须在 internal
-split 上审计并冻结，不得依据 MGD94 调整。簇内按现有 native-free geometry penalty
-选代表，再按簇轮询选择，避免一个高密度模式占满预算。原预注册固定配额基线为：
+缺额由新的 SDPI候选补齐；全部 BiTSeed失败时可退化成256 SDPI。实际来源可能不是192/64，须记录 partial/failed conformers、draw次数、异常和实际来源。
 
-| CoopDiff walkers | BiTSeed | SDPI |
-|---:|---:|---:|
-| 32 | 24 | 8 |
-| 64 | 48 | 16 |
+**SDPI proposal生成没有“四倍预算重试”的循环**：当前实现逐个调用基础 initializer；SDPI本身失败或未被捕获的输入/化学异常仍可使 case失败。不能承诺任何错误都自动补成256个有限候选。二元补采不足不必整例退出，但fallback也不是通用异常吞掉机制。
 
-若某来源或独立簇不足，按确定性顺序由另一来源补齐；最终 walker 数必须保持32或64。
-MGD94 full-pool refinement 后，48/16 继续作为配额基线，但不再视为已冻结默认 selector。
-当前 checkpoint 下必须并列报告无固定配额的 Geometry-64、Diversity-64 和 Hybrid-48/16；
-新的 dual-init 模型完成后，在 internal validation 比较无配额、SDPI 最低保留量和固定配额，
-然后一次性冻结。
+## Selector：数值过滤、几何排序、去重与回填
 
-该确定性 selector 已在 `tricoopdiff/expert_anchors.py` 实现。5T35真实回归得到188个
-独立簇；x32与x64分别严格选择24/8和48/16个 BiTSeed/SDPI 候选，全部来自不同簇且
-无 hard-invalid 候选。该例的 approximate oracle retention 为0.832，未命中全池最佳，
-因此只能证明实现正确，不能证明筛选质量达标。
+`_valid_candidate` 仅检查 ligand/POI/rotation tensor形状、非空坐标与有限性；不额外验证 atom map、RᵀR或det(R)。这些更强校验是生成/输入契约与后续审计要求，不冒充已实现过滤。
 
-## 现有证据与待验证项
+几何排序是字典序：先 `acceptable`，再蛋白 Cα<3 Å对数，再两侧最小Cα–ligand距离偏离3.5 Å及蛋白最小Cα距离偏离5 Å的和，之后separation与candidate ID。它不是学习 rank模型。`acceptable` 要求：
 
-MGD94 的 exact proposal oracle 显示：纯 SDPI-256 为 mean/median `0.257/0.209`，
-DockQ `>=0.23/0.49` 为 `39/10`；B1 (`C4M8`) 加 case-level SDPI fallback 为
-`0.313/0.309`、`61/12`。C1 (`C16M4`) 仅提高到 mean `0.315`、`64/12`，却使用两倍
-binary trajectories，因此选择 B1 作为结构化分支。DiffDock 成功的57例上 B1 mean
-`0.270`，同例 SDPI mean `0.178`；但 SDPI 仍逐例赢16例，支持保留 broad 分支。
+- 蛋白间无Cα<3 Å；
+- 两侧最小Cα–ligand距离均在[1.5,8] Å；
+- 蛋白间最小Cα距离在[3,15] Å。
 
-`B1∪SDPI-256` 的512候选 oracle 为 mean `0.328`、DockQ `>=0.23/0.49` 为 `65/13`，
-只证明互补性，不证明固定256预算下的最佳比例。实现前后必须比较 `224/32`、`192/64`、
-`128/128`，保持256候选、相同 seed 和 exact DockQ；默认值只有在 oracle coverage、去重后
-basin 数和后续 retention@32/64 均不过度退化时才能冻结。
+不满足者**仍可入选**，不是hard reject。Diversity按该顺序在固定E3 frame贪心聚类，不额外对齐；相对簇代表同时满足ligand RMSD<2 Å、POI Cα RMSD<5 Å时归入同簇，不是连通分量聚类。
 
-### PROTAC22 unbound 三例 smoke-test
+有配额时先保护较小来源配额、优先不同簇；随后用未选簇代表补位，最后才用重复簇候选补满。来源/簇不足时实际配额可以偏离请求。有限候选总数不足walker预算则报错。代码默认32请求24/8、64请求48/16，不等于科学上已冻结默认selector。
 
-2026-09-13 使用 `5T35_D_A_759`、`6BN7_B_C_RN3`、`7KHH_C_D_WEP` 做固定256候选的
-exact proposal oracle。网络只读取 unbound 蛋白和 ligand；同目录 bound 蛋白仅作为
-DeepTernary 原生方式的全原子 DockQ 计分模板。
+| 榜单名称 | 从同一256池如何选64 |
+| --- | --- |
+| SDPI-64 | 使用该池64个broad SDPI初态 |
+| Geometry-64 | 无来源配额，无RMSD去重，按几何排序 |
+| Diversity-64 | 无来源配额，有RMSD去重 |
+| Hybrid-48/16 | 有去重，请求48 BiTSeed +16 SDPI |
+| Hybrid-56/8 | 有去重，请求56 BiTSeed +8 SDPI |
+| BiTSeed-only-64 | 只从BiTSeed分支做diversity选择 |
 
-| 方法 | exact DockQ（三例） | mean | DockQ >=0.23 | `acceptable` 总数 |
-|---|---|---:|---:|---:|
-| SDPI-256 | 0.249 / 0.128 / 0.284 | 0.220 | 2/3 | 34 |
-| Hybrid-192/64 | 0.247 / 0.421 / 0.286 | 0.318 | 3/3 | 127 |
+这里 Geometry-64 **不是**历史 Geometry-A8×64；Consensus-64也不在这张selector榜中。不要混用旧anchor初始化方法和当前选择器名称。
 
-6BN7 的一个 conformer 在32次 draw 后只得到6/8个有效 binary poses；该 conformer 的
-48个名额被自动替换为 SDPI，case 未失败。该三例 pilot 的纯 SDPI 使用历史 seed schedule，
-因此只作功能性证据；正式比例消融改用上述共享前缀 seed。此结果验证了 PROTAC 输入兼容性、局部 fallback
-和候选密度收益；由于只有三例且提升主要由6BN7驱动，不能据此冻结192/64比例或宣称总体
-精度提升。
+## MGD94 全池精修：主要证据
 
-2026-09-13 完成完整 PROTAC22 exact oracle。四组固定256候选、共享 SDPI seed 前缀，
-并使用 `2M`/连续3次失败的短补采协议；全部22例完成且零失败。
+固定bound MGD94、seed31000、上述256池、20步CoopDiff、同一frozen factorial EMA checkpoint。全池每个候选精修一次，各selector只离线选相同轨迹子集；94例、24,064条全部数值有效，18,048 BiTSeed/6,016 SDPI，无记录失败。
 
-| 候选比例 | mean | median | DockQ >=0.23 | 相对SDPI win/tie/loss |
-|---|---:|---:|---:|---:|
-| SDPI-256 | 0.1868 | 0.1726 | 4/22 | — |
-| BiTSeed/SDPI 224/32 | 0.3381 | 0.3223 | 20/22 | 20/2/0 |
-| BiTSeed/SDPI 192/64 | 0.3341 | 0.3125 | 20/22 | 20/2/0 |
-| BiTSeed/SDPI 128/128 | 0.2991 | 0.2837 | 18/22 | 16/5/1 |
+主产物：`results/mgd_full_pool_refinement_20260913/summary_v1.json`，精确case清单见 `integrity.case_files`；配置与复跑见[运行指南](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md)。
 
-224/32与192/64在21/22例的oracle完全相同，仅7Q2J由224/32额外保留的一个配对提高
-0.0887；总体mean差0.0040且命中数相同。考虑MGD94上SDPI逐例互补证据，候选比例预冻结
-为192/64；128/128已显示结构化候选预算不足，不再作为默认值。
+下表为每例所选集合的最大真实DockQ，再对94例平均。Initial/Final可以由不同候选取得；Union=max(Initial,Final)，不含中间步，**全都是oracle，不是部署top-1**。
 
-另在 GPU 5 运行 Hybrid-192/64 的完整22例 x32/x64 native-free selector exact
-retention 审计。初始化协议只在以下条件同时满足后冻结：完整比例消融无失败；192/64
-相对224/32没有实质 oracle coverage 退化且优于128/128；x64 selected-oracle/full-oracle
-的逐例平均比值至少0.90、x32至少0.80；来源配额、候选总数和确定性复跑全部通过。
-若 retention 门禁失败，只修改 selector，不回看 native 调整候选生成或聚类阈值。
-GPU 7另行运行共享同一候选与exact标签的预注册selector套件，包括组件、配额、RMSD阈值
-和10个确定性随机配额基线；该测试用于解释默认规则，不按PROTAC22逐例结果连续调参。
+| 方案 | Initial | Final | Union |
+| --- | ---: | ---: | ---: |
+| SDPI-64 | 0.2077 | 0.2515 | 0.2602 |
+| Geometry-64 | 0.2376 | 0.2665 | 0.2862 |
+| Diversity-64 | 0.2414 | 0.2668 | 0.2887 |
+| Hybrid-48/16 | 0.2445 | 0.2624 | 0.2867 |
+| Hybrid-56/8 | 0.2406 | 0.2472 | 0.2740 |
+| BiTSeed-only-64 | 0.2380 | 0.2367 | 0.2636 |
+| 全池256上界 | 0.3044 | 0.3097 | 0.3412 |
 
-### MGD94 full-pool refinement
+Geometry与Diversity有90/94例Final相同，均值差0.00029，不据此认定Diversity显著更好。相对SDPI的均值提升是描述性结果，不能省略配对不确定性。56/8与纯BiTSeed-64在当前权重下不作优先方案，不宣称其在新模型必然失败。
 
-2026-09-14 完成94例统一池全部24,064条trajectory。当前 checkpoint 的 Final mean 为：
-SDPI-64 `0.2515`、Geometry-64 `0.2665`、Diversity-64 `0.2668`、Hybrid-48/16
-`0.2624`、Hybrid-56/8 `0.2472`。Geometry 与 Diversity 在90/94例 Final 完全相同，
-均值只差0.00029；它们与48/16也在绝大多数 case 选择相同赢家。因此现有证据支持淘汰
-56/8，却不足以在前三者中宣称唯一最佳。
+Geometry / Diversity / Hybrid48 的最终逐例平均retention为83.32% /83.49% /82.54%，exact oracle候选保留34/31/30例；初态与末态全池赢家ID仅25/94相同。因此初始化oracle改善并不自动解决最终选择问题。
 
-当前 `acceptable` 将 steric hard safety 与接触距离混为一体。native sanity check 为
-92/94通过，两个失败均来自 POI–ligand `>8 Å`；所有 native 都没有蛋白 CA `<3 Å`。
-下一版 selector 应在 internal validation 中把蛋白 CA `<3 Å`、ligand `<1.5 Å` 作为
-hard safety，将 `>8 Å` 接触不足和蛋白分离作为 soft compatibility。逐候选机器可读汇总
-保存在 `results/mgd_full_pool_refinement_20260913/summary_v1.json`，不作为源码提交。
+## 来源收益与几何限制
 
-## 审计清单
+全部BiTSeed-192的每例best均值从0.2726降至0.2631，SDPI-64从0.2077升至0.2515。但单候选均值分别从0.03979→0.04479、0.03531→0.05649，提升比例75.2%与86.7%。“BiTSeed最好初态被破坏”和“多数BiTSeed候选改善”可以同时成立。
 
-- 生成函数签名和 trace 中不存在 native、DockQ 或外部候选路径。
-- 两类 seed 空间无碰撞；重复运行候选坐标 hash 完全一致。
-- BiTSeed 同 conformer 配对、48/64均衡边际度和 frozen expert 身份可验证。
-- 任一失败路径最终仍生成256个有限候选，并准确记录实际来源比例。
-- 去重在固定 E3 frame 中执行，聚类阈值未从 MGD94 调参。
-- 32/64 walker 配额、回填顺序和 tie-break 均确定性且与 native 无关。
-- 分开报告 proposal oracle、selector retention、refined oracle 和 ranked top-1。
+Geometry/Diversity实际平均来源约40.6/23.4、39.4/24.6，不能只由这些计数断言“多选SDPI导致更高分”；候选身份与质量也不同。
+
+初态acceptable仅2,306/24,064（9.58%），native sanity为92/94通过。该Cα代理没有验证末态的全原子物理合理性；不能说未通过初态gate的最终赢家无效，也不能据此把所有近距阈值直接升级为hard safety。先在内部验证审计初/末态几何与高质量候选召回，再修改规则。
+
+## 历史候选比例证据及边界
+
+MGD94早期proposal-oracle：SDPI-256 mean约0.257；B1(C4M8)带case-level fallback约0.313，C1(C16M4)约0.315但二元轨迹翻倍；B1∪SDPI共512候选约0.328。它们支持互补性，但预算、seed及fallback版本不同，不与上表直接作配对增益。
+
+PROTAC22完整unbound exact proposal oracle，固定256候选及共享SDPI前缀，四组均22例完成：
+
+| BiTSeed/SDPI比例 | Initial oracle mean | DockQ≥0.23 |
+| --- | ---: | ---: |
+| 0/256 | 0.1868 | 4/22 |
+| 224/32 | 0.3381 | 20/22 |
+| 192/64 | 0.3341 | 20/22 |
+| 128/128 | 0.2991 | 18/22 |
+
+224/32与192/64在21/22例oracle相同，仅7Q2J驱动差异；据此并结合MGD互补性保留192/64作工作配置。它不是MGD固定预算比例最优的证明，也不反映精修后优劣。早期三例smoke与83.2%的单例**近似**retention已不作为完整审计的替代证据。
+
+历史proposal/比例产物与旧脚本从[当前工作](../todo.md)和Git归档追溯。完整22例selector审计的具体结果若引用，必须附对应报告；不再保留“正在GPU5运行”等过期状态。
+
+## 后续冻结门禁
+
+候选生成、selector和精修分别版本化。内部验证固定同一池/初态，比较旧模型与dual-init共享模型；检查两来源能力、initial/final retention、几何有效性、实际配额及失败分母。通过后才冻结selector。旧0.90/0.80 retention目标是研究验收目标，不是当前已达标事实。
+
+最终部署仍需不读取native的top-1规则。MGD94和已用于决策的PROTAC22不能再充当未触碰holdout。
