@@ -42,7 +42,9 @@ class ExperimentalConsensusTrainer(ConsensusTrainer):
     """Train and serialize both consensus and adapter EMAs without base weights."""
     def __init__(self, *args, experiment_contract, **kwargs):
         self.experiment_contract = dict(experiment_contract)
+        lora_warmup_steps = int(kwargs.get('lora_warmup_steps', 0))
         super().__init__(*args, **kwargs)
+        self.lora_warmup_steps = lora_warmup_steps
         self.ema_lora = clone_state(expert_lora_state_dict(self.model.expert))
 
     def train_step(self, **batch):
@@ -75,6 +77,7 @@ class ExperimentalConsensusTrainer(ConsensusTrainer):
         return dict(activation_clamp=self.activation_clamp,
                     activation_clamp_mode=self.activation_clamp_mode,
                     residual_weight=self.residual_weight, ema_decay=self.ema_decay,
+                    lora_warmup_steps=self.lora_warmup_steps,
                     optimizer_groups=self.optimizer_config)
 
     def save_checkpoint(self, path, epoch=0, best_val_loss=float('inf')):

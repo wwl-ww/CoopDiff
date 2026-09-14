@@ -155,3 +155,23 @@ checkpoint v20 记录 source/time/mix 及 `online_bitseed_training_c1_m1_v1` 合
 ```bash
 scripts/launch_dual_init_factorial_local.sh 5 6 7 /mnt/disk/wl/MoRE-tri/CoopDiff
 ```
+
+## LoRA 接续阶段（已准备，尚未启动）
+
+`scripts/run_dual_init_lora_arm_local.sh` 可在 frozen arm 完整结束后，从该 arm 的
+EMA `best_model.pt` 初始化 TriFuse，并零初始化两套 branch-specific LoRA。DiffDock
+base 权重始终冻结；训练前向分别启用 `sub1/sub2` adapter，而 lazy BiTSeed endpoint
+生成会临时旁路 LoRA，继续使用固定 pretrained base，避免缓存随训练漂移。LoRA 与
+TriFuse 均保存 raw/EMA 权重，parent checkpoint SHA256 写入隔离的实验合同。
+
+两个前台终端分别运行：
+
+```bash
+scripts/run_dual_init_lora_arm_local.sh B 5 /mnt/disk/wl/MoRE-tri/CoopDiff
+scripts/run_dual_init_lora_arm_local.sh C 7 /mnt/disk/wl/MoRE-tri/CoopDiff
+```
+
+默认配置为 late rank/alpha `4/8`、前四层 rank/alpha `2/4`、LoRA LR
+`1e-5`（前层 `5e-6`）、EMA `0.999`、100 epochs。脚本要求 parent 的最终完成标志
+`tricoopdiff_zero.pt` 存在，拒绝覆盖已有输出。正式启动前仍需在空闲 GPU 上完成真实
+单 batch backward、base 无梯度和 LoRA checkpoint round-trip gate。
