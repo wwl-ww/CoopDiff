@@ -204,6 +204,14 @@ def seed_training(seed, device):
         torch.cuda.manual_seed_all(seed)
 
 
+def append_metric(output_dir, payload):
+    """Append one flush-safe structured training or validation event."""
+    path = Path(output_dir) / 'metrics.jsonl'
+    with path.open('a', encoding='utf-8') as handle:
+        handle.write(json.dumps(payload, allow_nan=False) + '\n')
+        handle.flush()
+
+
 def main():
     args = parse_args()
     args.generative_process = 'sdpi_flow_v1'
@@ -319,6 +327,12 @@ def main():
             )
             loss_dict = _guarded_train_step(trainer, batch)
             train_losses.append(loss_dict)
+            append_metric(args.output_dir, {
+                'event': 'train_step', 'epoch': epoch,
+                'global_step': trainer.global_step, 'case': batch['case'],
+                'source': ('bitseed' if batch['source'] == 1 else 'sdpi'),
+                **loss_dict,
+            })
 
             if batch_idx % args.log_interval == 0:
                 print(f"  Epoch {epoch} | Batch {batch_idx} | "
@@ -344,6 +358,10 @@ def main():
             trainer, val_loader, device, args.training_arm, endpoint_store,
         )
         val_loss = validation['selection_loss']
+        append_metric(args.output_dir, {
+            'event': 'validation', 'epoch': epoch,
+            'global_step': trainer.global_step, **validation,
+        })
         if not np.isfinite(val_loss):
             raise RuntimeError(
                 f"epoch {epoch}: validation produced no finite batches; "
