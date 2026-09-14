@@ -139,12 +139,12 @@ native-free geometry 选择，再将外部 endpoint 投影到现有 torsion+SE(3
 保存原始 endpoint、训练 endpoint、投影残差、conformer seed、双侧 pose id、协议和 expert
 checkpoint SHA256。以下命令生成 train+validation cache：
 
-```bash
-sbatch scripts/cache_bitseed_training_endpoints.slurm
-```
+本机是直接 GPU 环境，不使用 SLURM。下面的 launcher 用 `nohup` 持久化进程，并分别
+记录 PID 和日志；第二个参数指定只读的大型资产目录，输出仍保留在当前 worktree：
 
-若本 worktree 不复制大型数据和 expert checkpoint，提交时设置
-`ASSET_ROOT=/mnt/disk/wl/MoRE-tri/CoopDiff`；输出仍保留在当前 worktree。
+```bash
+scripts/launch_bitseed_cache_local.sh 5 /mnt/disk/wl/MoRE-tri/CoopDiff
+```
 
 短 GPU smoke 已覆盖 A1/B/C 各 2 step；SDPI 与 BiTSeed loss 均 finite，C 的 source
 embedding 有梯度，checkpoint v19 记录 source/time/mix 合同，且不含 expert adapter。
@@ -153,5 +153,5 @@ embedding 有梯度，checkpoint v19 记录 source/time/mix 合同，且不含 e
 审核投影残差后，可用固定 array 配置启动同预算三臂：
 
 ```bash
-sbatch scripts/train_dual_init_factorial.slurm
+scripts/launch_dual_init_factorial_local.sh 5 6 7 /mnt/disk/wl/MoRE-tri/CoopDiff
 ```
