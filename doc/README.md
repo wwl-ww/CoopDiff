@@ -9,14 +9,16 @@
    MGD94 oracle、双专家 anchor 门禁，以及下一分支的在线初始化方向。
 2. [BiTSeed-Hybrid 在线初始化规格](BiTSeed-Hybrid在线初始化规格.md)：拟定的
    `192 BiTSeed + 64 SDPI` 固定预算、失败补位、去重、walker 配额和审计清单。
-3. [BiTSeed oracle 消融](../ablation.md)：当前 Conformer-Diverse
+3. [BiTSeed MGD94 全池精修审计](BiTSeed-MGD94全池精修审计.md)：统一 256 池全部
+   trajectory 的 Initial/Final/Union 榜单、selector retention 和 hard/soft gate 审计。
+4. [BiTSeed oracle 消融](../ablation.md)：当前 Conformer-Diverse
    Binary-to-Ternary Basin Seeding 定义、A1/B1/C1/A2/B2 配置、v4 补采协议和运行路径。
-4. [初始化方案](初始化方案_gpt6.md)：现有 SDPI 初始化、共享 ligand 构象和精确刚体
+5. [初始化方案](初始化方案_gpt6.md)：现有 SDPI 初始化、共享 ligand 构象和精确刚体
    装配契约。该文档描述 SDPI 基线；当前 BiTSeed 实现与协议以 `ablation.md` 为准。
-5. [TriCoopDiff 模型架构图](TriCoopDiff%20模型架构图.md)：当前模块和坐标更新关系。
-6. [Phase 1 数据协议](Phase%201%20数据协议.md)：训练池、cluster split 和 benchmark
+6. [TriCoopDiff 模型架构图](TriCoopDiff%20模型架构图.md)：当前模块和坐标更新关系。
+7. [Phase 1 数据协议](Phase%201%20数据协议.md)：训练池、cluster split 和 benchmark
    防泄漏规则。
-7. [训练入口与 smoke](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md)：环境、
+8. [训练入口与 smoke](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md)：环境、
    缓存、SLURM 和训练入口。
 
 ## 专题参考
@@ -53,6 +55,8 @@
 - `tricoopdiff/expert_anchors.py`：双专家 geometry/consensus anchor。
 - `scripts/evaluate_proposal_oracle.py`：BiTSeed 固定候选预算的 native-reading oracle
   消融入口；不是部署评估。
+- `scripts/summarize_full_pool_refinement.py`：合并 full-pool 分片并复算三张榜单、来源、
+  selector retention、proposal gate 与 native gate sanity check。
 - `tricoopdiff/consensus.py`：冻结专家与残差共识模型。
 - `scripts/evaluation_runner.py`、`scripts/evaluate_index.py`：可恢复评估和协议清单。
 

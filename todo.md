@@ -1,6 +1,6 @@
 # CoopDiff 接手清单
 
-更新时间：2026-09-12。本文是新负责人唯一需要先读的执行入口；历史解释见
+更新时间：2026-09-14。本文是新负责人唯一需要先读的执行入口；历史解释见
 [`doc/低DockQ根因排查交接.md`](doc/低DockQ根因排查交接.md)，文档状态见
 [`doc/README.md`](doc/README.md)。实验事实以 `results/` 中完整报告为准。
 
@@ -8,9 +8,9 @@
 
 - 当前开发分支：`feat/deterministic-online-anchors`，从 `model-v2` 的 `0d7bd67`
   创建；交接前远端同步点为 merge commit `3753c4e`。
-- BiTSeed v4 和 SDPI-256 的 MGD94 proposal-oracle 已完成扫描。正式下一步为
-  [`BiTSeed-Hybrid 在线初始化规格`](doc/BiTSeed-Hybrid在线初始化规格.md) 中待审计的
-  `192 BiTSeed + 64 SDPI`；当前尚未实现固定比例混合和 per-conformer 缺口补位。
+- `192 BiTSeed + 64 SDPI` 固定池、per-conformer 缺口补位、统一 selector 和
+  full-pool refinement 已实现；MGD94 为 94/94、24,064/24,064 trajectory、零失败。
+  正式汇总见 [`BiTSeed MGD94 全池精修审计`](doc/BiTSeed-MGD94全池精修审计.md)。
 - 已结束分支：`investigate/model-v2-followup`。不要继续该分支的 loss sweep。
 - 主目标是 Molecular Glue（MGD）。PROTAC 后续会加入 warhead/口袋信息，不能用
   PROTAC 的容易提升替代 MGD 的真实困难。
@@ -117,8 +117,11 @@ frozen DiffDock 专家负责搜索完整 SE(3) basin，native-free selector
 - [x] 实现固定E3 frame的 ligand/POI RMSD聚类、x32的24/8配额和x64的48/16配额。
 - [x] 完成PROTAC22的SDPI-256、224/32、192/64、128/128 exact proposal oracle；四组
   均22/22零失败，候选比例预冻结为192/64。
-- [ ] 完成PROTAC22的192/64 selector retention@32/64 exact审计。
-- [ ] 对冻结配置做候选坐标hash复跑和小规模CoopDiff接线smoke，再锁定协议版本。
+- [x] 完成PROTAC22的192/64 selector retention@32/64 exact审计。
+- [x] 完成MGD94统一256池的全部 Initial/Final/Union 与 selector retention 审计。
+- [x] 完成proposal `acceptable` 拒绝原因和native 94例 sanity check；生产阈值尚未改变。
+- [ ] 在internal validation固定hard safety与soft compatibility拆分，并重算refined几何。
+- [ ] 对冻结配置做候选坐标hash复跑，再锁定协议版本。
 
 当前分支实现确定性在线多假设搜索，不建立或加载可人工编辑、可跨 case 复用的 pose
 bank。正式推理从原始输入一条命令运行到底；中间候选仅在内存中存在，允许保存数量、
