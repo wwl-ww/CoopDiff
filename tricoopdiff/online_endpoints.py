@@ -151,9 +151,24 @@ class LazyTrainingEndpointStore:
                 "fit_rmsd": candidate["fit_rmsd"],
             },
         }
-        if (not np.allclose(_cpu_array(ligand_one[0]), projected["ligand"], atol=1e-5)
-                or not np.allclose(_cpu_array(poi_one[0]), projected["poi"], atol=1e-5)):
-            raise AssertionError(f"{case}: projected endpoint failed t=1 round-trip")
+        ligand_roundtrip_error = float(np.max(np.abs(
+            _cpu_array(ligand_one[0]) - projected["ligand"]
+        )))
+        poi_roundtrip_error = float(np.max(np.abs(
+            _cpu_array(poi_one[0]) - projected["poi"]
+        )))
+        roundtrip_error = max(ligand_roundtrip_error, poi_roundtrip_error)
+        projection["flow_t1_max_abs_error_angstrom"] = roundtrip_error
+        # ``projected`` is assembled in float64 while the production flow uses
+        # the model coordinate dtype (normally float32).  Large complexes can
+        # therefore exceed a fixed 1e-5 comparison solely from dtype rounding.
+        # Keep the check tied to the projection contract's 1e-3 Angstrom
+        # representability tolerance so genuine chart mismatches still abort.
+        if roundtrip_error > projection["exact_atol_angstrom"]:
+            raise AssertionError(
+                f"{case}: projected endpoint failed t=1 round-trip "
+                f"(max_abs_error={roundtrip_error:.6g} Angstrom)"
+            )
         validate_endpoint_record(record)
         _atomic_save({"case": case, "protocol": self.protocol, "record": record},
                      self._path(case))
