@@ -16,7 +16,7 @@ source=1: BiTSeed 初始化
 工作位置：
 
 - worktree：`/mnt/disk/wl/MoRE-tri/CoopDiff-bitseed-mixed-path-repro`
-- branch：`exp/bitseed-mixed-path-repro`
+- branch：`exp/dual-init`
 - base：`30af27a`
 - Python：`/home/wl/micromamba/envs/tricoopdiff/bin/python`
 - 提议原文：主工作区 `/mnt/disk/wl/MoRE-tri/CoopDiff/hh.md`
