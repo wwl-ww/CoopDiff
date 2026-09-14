@@ -1,7 +1,7 @@
 # BiTSeed-Hybrid 在线初始化规格
 
-更新时间：2026-09-13。本文件定义下一轮实现和审计的候选协议；在固定预算比例消融通过
-前，`192/64` 是**待审计默认值**，不是已经证明最优的最终超参数。整个生成路径必须
+更新时间：2026-09-14。本文件定义在线生成和选择协议。`192/64` 已作为当前固定预算的
+候选池默认值，但不是已经证明全局最优的超参数；64-walker selector 尚未冻结。整个生成路径必须
 native-free、在线且确定性；不使用 LoRA、人工 pose bank 或 MGD94 DockQ 进行选择。
 
 ## 默认预算
@@ -45,7 +45,7 @@ DiffDock 使用20点 schedule（19次更新）、rigid-only 更新和冻结 chec
 所有候选在固定 E3 坐标系中全局聚类，不额外对齐。若两个候选同时满足 ligand
 heavy-atom RMSD `<2 Å` 和 POI Cα RMSD `<5 Å`，暂视作同一 basin。阈值必须在 internal
 split 上审计并冻结，不得依据 MGD94 调整。簇内按现有 native-free geometry penalty
-选代表，再按簇轮询选择，避免一个高密度模式占满预算。没有 learned ranker 时固定配额为：
+选代表，再按簇轮询选择，避免一个高密度模式占满预算。原预注册固定配额基线为：
 
 | CoopDiff walkers | BiTSeed | SDPI |
 |---:|---:|---:|
@@ -53,6 +53,10 @@ split 上审计并冻结，不得依据 MGD94 调整。簇内按现有 native-fr
 | 64 | 48 | 16 |
 
 若某来源或独立簇不足，按确定性顺序由另一来源补齐；最终 walker 数必须保持32或64。
+MGD94 full-pool refinement 后，48/16 继续作为配额基线，但不再视为已冻结默认 selector。
+当前 checkpoint 下必须并列报告无固定配额的 Geometry-64、Diversity-64 和 Hybrid-48/16；
+新的 dual-init 模型完成后，在 internal validation 比较无配额、SDPI 最低保留量和固定配额，
+然后一次性冻结。
 
 该确定性 selector 已在 `tricoopdiff/expert_anchors.py` 实现。5T35真实回归得到188个
 独立簇；x32与x64分别严格选择24/8和48/16个 BiTSeed/SDPI 候选，全部来自不同簇且
@@ -110,6 +114,20 @@ retention 审计。初始化协议只在以下条件同时满足后冻结：完�
 若 retention 门禁失败，只修改 selector，不回看 native 调整候选生成或聚类阈值。
 GPU 7另行运行共享同一候选与exact标签的预注册selector套件，包括组件、配额、RMSD阈值
 和10个确定性随机配额基线；该测试用于解释默认规则，不按PROTAC22逐例结果连续调参。
+
+### MGD94 full-pool refinement
+
+2026-09-14 完成94例统一池全部24,064条trajectory。当前 checkpoint 的 Final mean 为：
+SDPI-64 `0.2515`、Geometry-64 `0.2665`、Diversity-64 `0.2668`、Hybrid-48/16
+`0.2624`、Hybrid-56/8 `0.2472`。Geometry 与 Diversity 在90/94例 Final 完全相同，
+均值只差0.00029；它们与48/16也在绝大多数 case 选择相同赢家。因此现有证据支持淘汰
+56/8，却不足以在前三者中宣称唯一最佳。
+
+当前 `acceptable` 将 steric hard safety 与接触距离混为一体。native sanity check 为
+92/94通过，两个失败均来自 POI–ligand `>8 Å`；所有 native 都没有蛋白 CA `<3 Å`。
+下一版 selector 应在 internal validation 中把蛋白 CA `<3 Å`、ligand `<1.5 Å` 作为
+hard safety，将 `>8 Å` 接触不足和蛋白分离作为 soft compatibility。完整证据见
+[`BiTSeed MGD94 全池精修审计`](BiTSeed-MGD94全池精修审计.md)。
 
 ## 审计清单
 
