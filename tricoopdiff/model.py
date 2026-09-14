@@ -67,6 +67,7 @@ class TriCoopDiff(nn.Module):
         r_e3_to_poi: torch.Tensor = None,
         receptor_crop_cutoff: torch.Tensor = None,
         diffusion_state: torch.Tensor = None,
+        source=0,
     ) -> dict:
         """
         Single diffusion step forward pass.
@@ -89,6 +90,8 @@ class TriCoopDiff(nn.Module):
                 receptor residues within this cutoff of the current ligand pose
                 (with a nearest-residue fallback), mirroring DiffDock's
                 step-level ``crop_beyond(tr_sigma * 3 + 20)`` driver behavior.
+            source: Candidate-source class retained for the shared model API.
+                Legacy TriFuse checkpoints do not consume this value.
 
         Returns:
             dict with:

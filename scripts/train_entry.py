@@ -132,6 +132,14 @@ def parse_args(argv=None):
     p.add_argument("--save_interval", type=int, default=10)
     p.add_argument("--seed", type=int, default=0,
                    help="Random seed for model initialization, shuffling, and diffusion noise")
+    p.add_argument(
+        "--training-arm", choices=("A1", "B", "C"), default="A1",
+        help="A1=SDPI only, B=mixed without source embedding, C=mixed with it",
+    )
+    p.add_argument(
+        "--bitseed-endpoint-cache", default=None,
+        help="Required native-free endpoint cache for mixed arms B/C",
+    )
 
     return p.parse_args(argv)
 
@@ -148,6 +156,7 @@ def _load_index(data_json):
     """Read an index and resolve portable or stale-checkout input paths."""
     with open(data_json) as f:
         index = json.load(f)
+    index_root = Path(data_json).resolve().parent.parent
     entries = index.get("entries", []) if isinstance(index, dict) else index
     resolved = []
     for raw_entry in entries:
@@ -155,7 +164,9 @@ def _load_index(data_json):
         for key in ("protein1", "protein2", "ligand"):
             path = Path(entry[key])
             if not path.is_absolute():
-                path = _PROJECT_ROOT / path
+                local_path = _PROJECT_ROOT / path
+                index_path = index_root / path
+                path = local_path if local_path.is_file() else index_path
             if not path.is_file():
                 # Backward compatibility for indices created in another clone:
                 # reconstruct the canonical in-repo case path from stable fields.
@@ -200,6 +211,18 @@ def main():
         raise SystemExit("FATAL: --nan-clamp must be positive")
     os.environ["NAN_CLAMP"] = str(args.nan_clamp)
     device = torch.device(args.device)
+    endpoint_store = None
+    if args.training_arm in ("B", "C"):
+        if args.random_flip_proteins:
+            raise SystemExit(
+                "FATAL: mixed endpoint caches require --no-random-flip-proteins"
+            )
+        if not args.bitseed_endpoint_cache:
+            raise SystemExit("FATAL: arms B/C require --bitseed-endpoint-cache")
+        from tricoopdiff.dual_init import CachedEndpointStore
+        endpoint_store = CachedEndpointStore(args.bitseed_endpoint_cache)
+    elif args.bitseed_endpoint_cache:
+        raise SystemExit("FATAL: arm A1 must not consume a BiTSeed endpoint cache")
 
     seed_training(args.seed, device)
 
@@ -291,6 +314,9 @@ def main():
         n_skipped = 0
         t0 = time.time()
         for batch_idx, batch in enumerate(train_loader):
+            batch = prepare_source_batch(
+                batch, trainer.global_step, args.training_arm, endpoint_store,
+            )
             loss_dict = _guarded_train_step(trainer, batch)
             train_losses.append(loss_dict)
 
@@ -314,7 +340,10 @@ def main():
             raise RuntimeError(f"epoch {epoch}: training loader produced no batches")
 
         # Validate
-        val_loss = validate(trainer, val_loader, device)
+        validation = validate(
+            trainer, val_loader, device, args.training_arm, endpoint_store,
+        )
+        val_loss = validation['selection_loss']
         if not np.isfinite(val_loss):
             raise RuntimeError(
                 f"epoch {epoch}: validation produced no finite batches; "
@@ -339,6 +368,7 @@ def main():
               f"skipped={n_skipped} | "
               f"lr={trainer.optimizer.param_groups[0]['lr']:.2e} | "
               f"time={dt:.1f}s")
+        print(f"  validation_by_source={validation['by_source']}")
 
         # Save best & periodic
         if val_loss < best_val_loss:
@@ -392,11 +422,13 @@ def build_trainer(args, device, input_dim=None):
         print(f"[warn] input_dim not provided; defaulting to node_dim={input_dim}")
 
     # Consensus learns after expert inference; no FiLM dimensions are needed.
-    trifuse = ConsensusFuse(
-        node_dim=args.node_dim,
-        input_dim=input_dim,
-        num_transformer_layers=args.num_transformer_layers,
-    )
+    model_config = {
+        'node_dim': args.node_dim, 'input_dim': input_dim,
+        'num_transformer_layers': args.num_transformer_layers,
+    }
+    if getattr(args, 'training_arm', 'A1') == 'C':
+        model_config['source_conditioning'] = True
+    trifuse = ConsensusFuse(**model_config)
 
     model = ConsensusCoopDiff(frozen_expert, trifuse, num_conv_layers=num_conv_layers)
 
@@ -418,6 +450,10 @@ def build_trainer(args, device, input_dim=None):
         lora_warmup_steps=args.lora_warmup_steps,
         residual_weight=args.residual_weight,
         ema_decay=args.ema_decay,
+        training_source_mix=(
+            'sdpi_only' if getattr(args, 'training_arm', 'A1') == 'A1'
+            else 'sdpi_bitseed_1_1'
+        ),
         device=device,
     )
 
@@ -434,7 +470,23 @@ def _guarded_train_step(trainer, batch):
         raise RuntimeError(f"training aborted on first non-finite batch: {error}") from error
 
 
-def validate(trainer, val_loader, device):
+def prepare_source_batch(batch, global_step, training_arm, endpoint_store):
+    """Attach the actual source and matching coupling for one training step."""
+    if training_arm == 'A1':
+        return {**batch, 'source': 0}
+    from tricoopdiff.dual_init import mixed_source_for_step
+    source = mixed_source_for_step(global_step)
+    if source == 0:
+        return {**batch, 'source': 0}
+    if endpoint_store is None:
+        raise ValueError('mixed training requires an endpoint store')
+    coupling, _ = endpoint_store.coupling(
+        batch['case'], occurrence=global_step // 2,
+    )
+    return {**batch, 'source': 1, 'coupling_override': coupling}
+
+
+def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None):
     """Run a deterministic validation pass without perturbing training RNG."""
     cuda_devices = []
     if device.type == 'cuda':
@@ -447,12 +499,11 @@ def validate(trainer, val_loader, device):
                 torch.cuda.manual_seed_all(0)
             np.random.seed(0)
             trainer.model.eval()
-            total_loss = 0.0
-            n_batches = 0
+            losses = {'sdpi': [], 'bitseed': []}
 
             for batch in val_loader:
                 try:
-                    loss_dict = trainer.validate_step(**batch)
+                    loss_dict = trainer.validate_step(**{**batch, 'source': 0})
                 except FloatingPointError as error:
                     raise RuntimeError(f"validation failed: {error}") from error
                 if not np.isfinite(loss_dict['loss_total']):
@@ -460,12 +511,34 @@ def validate(trainer, val_loader, device):
                         f"validation failed: case={batch.get('case', 'unknown')} "
                         "produced a non-finite loss"
                     )
-                total_loss += loss_dict['loss_total']
-                n_batches += 1
+                losses['sdpi'].append(loss_dict['loss_total'])
+                if training_arm in ('B', 'C'):
+                    if endpoint_store is None:
+                        raise ValueError('mixed validation requires an endpoint store')
+                    coupling, _ = endpoint_store.coupling(batch['case'])
+                    try:
+                        bitseed = trainer.validate_step(**{
+                            **batch, 'source': 1, 'coupling_override': coupling,
+                        })
+                    except FloatingPointError as error:
+                        raise RuntimeError(
+                            f"BiTSeed validation failed: {error}"
+                        ) from error
+                    if not np.isfinite(bitseed['loss_total']):
+                        raise RuntimeError(
+                            f"validation failed: case={batch.get('case', 'unknown')} "
+                            "produced a non-finite BiTSeed loss"
+                        )
+                    losses['bitseed'].append(bitseed['loss_total'])
     finally:
         np.random.set_state(numpy_state)
         trainer.model.train()
-    return total_loss / n_batches if n_batches else float('nan')
+    by_source = {
+        source: float(np.mean(values))
+        for source, values in losses.items() if values
+    }
+    selection = float(np.mean(list(by_source.values()))) if by_source else float('nan')
+    return {'selection_loss': selection, 'by_source': by_source}
 
 
 class TernaryDataLoader:

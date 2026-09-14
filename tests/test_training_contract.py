@@ -13,7 +13,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from tricoopdiff.train import TriCoopDiffTrainer
 from tricoopdiff.sdpi_flow import SDPIFlow
-from train_entry import build_trainer, parse_args, swap_protein_reference
+from tricoopdiff.sampler import actual_candidate_source
+from train_entry import (
+    build_trainer, parse_args, prepare_source_batch, swap_protein_reference,
+)
 
 
 def _head():
@@ -103,6 +106,37 @@ def test_legacy_clamp_mode_is_explicitly_selectable():
     assert args.activation_clamp_mode == 'componentwise'
 
 
+def test_mixed_arms_share_exact_source_and_endpoint_sequence():
+    class Store:
+        def coupling(self, case, occurrence=0):
+            return {'case_marker': case, 'occurrence': occurrence}, {}
+
+    batch = {'case': 'case-a'}
+    for step in range(6):
+        arm_b = prepare_source_batch(batch, step, 'B', Store())
+        arm_c = prepare_source_batch(batch, step, 'C', Store())
+        assert arm_b == arm_c
+        assert arm_b['source'] == step % 2
+        if step % 2:
+            assert arm_b['coupling_override']['occurrence'] == step // 2
+
+
+def test_a1_never_consumes_cached_endpoint():
+    batch = prepare_source_batch({'case': 'case-a'}, 3, 'A1', None)
+    assert batch == {'case': 'case-a', 'source': 0}
+
+
+def test_sampler_conditions_on_actual_fallback_source():
+    assert actual_candidate_source('sdpi', {}) == 'sdpi'
+    assert actual_candidate_source('expert_anchor', {'fallback': None}) == 'bitseed'
+    assert actual_candidate_source(
+        'expert_anchor', {'fallback': 'broad_sdpi_clash_filter'},
+    ) == 'sdpi'
+    assert actual_candidate_source(
+        'fixed_candidate', {'candidate_source': 'bitseed'},
+    ) == 'bitseed'
+
+
 def test_consensus_builder_rejects_lora_before_loading_expert():
     with patch('tricoopdiff.expert_factory.build_diffdock_expert') as expert:
         try:
@@ -122,4 +156,7 @@ if __name__ == "__main__":
     test_consensus_builder_passes_only_active_model_dimensions()
     test_consensus_builder_rejects_lora_before_loading_expert()
     test_legacy_clamp_mode_is_explicitly_selectable()
+    test_mixed_arms_share_exact_source_and_endpoint_sequence()
+    test_a1_never_consumes_cached_endpoint()
+    test_sampler_conditions_on_actual_fallback_source()
     print("Training-contract tests passed")

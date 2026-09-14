@@ -7,7 +7,10 @@ import os
 import torch
 
 from .checkpoint_contract import expert_base_identity, validate_expert_base_identity
-from .consensus import ARCHITECTURE, CONSENSUS_CHECKPOINT_VERSION
+from .consensus import (
+    ARCHITECTURE, CONSENSUS_CHECKPOINT_VERSION,
+    LEGACY_CONSENSUS_CHECKPOINT_VERSION, SOURCE_CONTRACT_VERSION,
+)
 from .diffdock.utils.torus import SCORE_NORM_VERSION, validate_score_norm_version
 from .sdpi_flow import FLOW_VERSION
 from .equivariant_clamp import validate_clamp_mode
@@ -15,8 +18,10 @@ from .train import TriCoopDiffTrainer
 
 
 def validate_consensus_checkpoint(payload):
-    if payload.get('checkpoint_version') != CONSENSUS_CHECKPOINT_VERSION:
-        raise ValueError('model-v2 requires checkpoint_version=18; old weights are not a resume')
+    version = payload.get('checkpoint_version')
+    if version not in (LEGACY_CONSENSUS_CHECKPOINT_VERSION,
+                       CONSENSUS_CHECKPOINT_VERSION):
+        raise ValueError('model-v2 requires checkpoint_version=18 or 19')
     if payload.get('architecture') != ARCHITECTURE or payload.get('generative_process') != FLOW_VERSION:
         raise ValueError('checkpoint does not describe residual consensus with SDPI flow')
     if payload.get('expert_lora_config') or payload.get('expert_lora_state_dict'):
@@ -33,11 +38,19 @@ def validate_consensus_checkpoint(payload):
     if config['activation_clamp'] <= 0 or config['residual_weight'] < 0 or not 0 <= config['ema_decay'] < 1:
         raise ValueError('invalid consensus runtime range')
     validate_score_norm_version(config)
+    if version == CONSENSUS_CHECKPOINT_VERSION:
+        if config.get('flow_time_contract') != 'shared_flow_expert_clock_v1':
+            raise ValueError('checkpoint has an unknown flow/expert time contract')
+        if config.get('candidate_source_contract') != SOURCE_CONTRACT_VERSION:
+            raise ValueError('checkpoint has an unknown candidate source contract')
+        if config.get('training_source_mix') not in ('sdpi_only', 'sdpi_bitseed_1_1'):
+            raise ValueError('checkpoint has an invalid training source mix')
 
 
 class ConsensusTrainer(TriCoopDiffTrainer):
     def __init__(self, *args, residual_weight=1e-3, ema_decay=0.999,
-                 activation_clamp_mode='irrep_norm', **kwargs):
+                 activation_clamp_mode='irrep_norm',
+                 training_source_mix='sdpi_only', **kwargs):
         if not math.isfinite(residual_weight) or residual_weight < 0 or not 0 <= ema_decay < 1:
             raise ValueError('invalid residual regularization or EMA decay')
         kwargs['torsion_expert_aux_weight'] = 0.0
@@ -47,6 +60,9 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         os.environ['NAN_CLAMP_MODE'] = self.activation_clamp_mode
         self.residual_weight = float(residual_weight)
         self.ema_decay = float(ema_decay)
+        if training_source_mix not in ('sdpi_only', 'sdpi_bitseed_1_1'):
+            raise ValueError('training_source_mix must be sdpi_only or sdpi_bitseed_1_1')
+        self.training_source_mix = training_source_mix
         self.set_phase(1)
         self.ema = {name: value.detach().clone() for name, value in self.model.trifuse.state_dict().items()}
 
@@ -86,6 +102,9 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 'activation_clamp_mode': self.activation_clamp_mode,
                 'residual_weight': self.residual_weight, 'ema_decay': self.ema_decay,
                 'optimizer_groups': self.optimizer_config,
+                'flow_time_contract': 'shared_flow_expert_clock_v1',
+                'candidate_source_contract': SOURCE_CONTRACT_VERSION,
+                'training_source_mix': self.training_source_mix,
             },
             'trifuse_state_dict': self.model.trifuse.state_dict(),
             'ema_trifuse_state_dict': self.ema,
@@ -103,7 +122,10 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         payload = torch.load(path, map_location=self.device, weights_only=False)
         validate_consensus_checkpoint(payload)
         validate_expert_base_identity(payload, self.model.expert)
-        if payload['model_config'] != self.model.trifuse.config:
+        saved_model_config = dict(payload['model_config'])
+        if payload['checkpoint_version'] == LEGACY_CONSENSUS_CHECKPOINT_VERSION:
+            saved_model_config.setdefault('source_conditioning', False)
+        if saved_model_config != self.model.trifuse.config:
             raise ValueError('consensus model configuration differs from checkpoint')
         saved_mode = payload['runtime_config'].get('activation_clamp_mode', 'componentwise')
         if saved_mode != self.activation_clamp_mode:
@@ -112,6 +134,12 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         expected = {'activation_clamp': self.activation_clamp,
                     'residual_weight': self.residual_weight, 'ema_decay': self.ema_decay,
                     'optimizer_groups': self.optimizer_config}
+        if payload['checkpoint_version'] == CONSENSUS_CHECKPOINT_VERSION:
+            expected.update({
+                'flow_time_contract': 'shared_flow_expert_clock_v1',
+                'candidate_source_contract': SOURCE_CONTRACT_VERSION,
+                'training_source_mix': self.training_source_mix,
+            })
         for key, value in expected.items():
             if payload['runtime_config'].get(key) != value:
                 raise ValueError(f'consensus checkpoint runtime mismatch: {key}')
