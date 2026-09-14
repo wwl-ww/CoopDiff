@@ -126,3 +126,29 @@ source 条件必须沿整条 trajectory 保持不变。由 fallback 实际生成
 - 每次交接必须给出 commit、命令、日志路径、GPU/PID、已通过 gate 和下一步。
 
 本分支允许并期望进行训练，但必须在路径、条件、梯度和短训练 smoke 通过后再投入正式 GPU 预算。
+
+## 当前实现状态
+
+本分支已实现第一版共享时钟合同 `shared_flow_expert_clock_v1`：`tau_flow` 同时传给
+frozen expert，后续校准 expert 时钟仍须单独消融。`ConsensusFuse` 可选两类 source
+embedding；source 专属参数使用隔离 RNG 初始化，确保 B/C 的全部共享参数逐 tensor
+同初值。采样器依据实际初始化结果固定 source，BiTSeed fallback 始终标为 SDPI。
+
+`scripts/cache_bitseed_training_endpoints.py` 从 frozen binary expert 在线生成候选，只按
+native-free geometry 选择，再将外部 endpoint 投影到现有 torsion+SE(3) chart。cache 同时
+保存原始 endpoint、训练 endpoint、投影残差、conformer seed、双侧 pose id、协议和 expert
+checkpoint SHA256。以下命令生成 train+validation cache：
+
+```bash
+sbatch scripts/cache_bitseed_training_endpoints.slurm
+```
+
+短 GPU smoke 已覆盖 A1/B/C 各 2 step；SDPI 与 BiTSeed loss 均 finite，C 的 source
+embedding 有梯度，checkpoint v19 记录 source/time/mix 合同，且不含 expert adapter。
+单例 smoke 中 BiTSeed validation loss 远高于 SDPI，因此这些数值只证明训练路径可执行，
+不构成质量结论。完整 cache、正式训练和内部 validation DockQ 评价尚未运行。cache 完成并
+审核投影残差后，可用固定 array 配置启动同预算三臂：
+
+```bash
+sbatch scripts/train_dual_init_factorial.slurm
+```
