@@ -10,14 +10,9 @@ fi
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ASSET_ROOT="${4:-$PROJECT_ROOT}"
 PYTHON_BIN="${PYTHON_BIN:-/home/wl/micromamba/envs/tricoopdiff/bin/python}"
-CACHE="$PROJECT_ROOT/results/dual_init/bitseed_train_val_endpoints.pt"
 ARMS=(A1 B C)
 GPUS=("$1" "$2" "$3")
 
-if [[ ! -f "$CACHE" ]]; then
-    echo "FATAL: endpoint cache is missing: $CACHE" >&2
-    exit 2
-fi
 if [[ "${GPUS[0]}" == "${GPUS[1]}" || "${GPUS[0]}" == "${GPUS[2]}" \
         || "${GPUS[1]}" == "${GPUS[2]}" ]]; then
     echo "FATAL: A1/B/C require three distinct GPU IDs" >&2
@@ -36,16 +31,11 @@ for INDEX in 0 1 2; do
         echo "FATAL: output or PID file exists for arm $ARM" >&2
         exit 2
     fi
-    CACHE_ARGS=()
-    if [[ "$ARM" != A1 ]]; then
-        CACHE_ARGS=(--bitseed-endpoint-cache "$CACHE")
-    fi
     nohup env CUDA_VISIBLE_DEVICES="$GPU_ID" "$PYTHON_BIN" scripts/train_entry.py \
         --train_data "$ASSET_ROOT/data/ternary_train.json" \
         --val_data "$ASSET_ROOT/data/ternary_val.json" \
         --output_dir "$OUTPUT" \
         --training-arm "$ARM" \
-        "${CACHE_ARGS[@]}" \
         --no-random-flip-proteins \
         --epochs 100 \
         --batch_size 1 \

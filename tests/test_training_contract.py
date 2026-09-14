@@ -96,6 +96,24 @@ def test_consensus_builder_passes_only_active_model_dimensions():
         assert result is model.return_value
         assert trained is trainer.return_value
         assert trainer.call_args.kwargs['activation_clamp_mode'] == 'irrep_norm'
+        assert trainer.call_args.kwargs['training_endpoint_protocol'] == 'none'
+
+
+def test_c_builder_records_online_single_pair_endpoint_protocol():
+    args = parse_args([
+        '--train_data', 'unused.json', '--val_data', 'unused.json',
+        '--output_dir', 'unused', '--training-arm', 'C',
+    ])
+    args.training_endpoint_protocol = 'online_bitseed_training_c1_m1_v1'
+    expert = SimpleNamespace(num_conv_layers=11)
+    with patch('tricoopdiff.expert_factory.build_diffdock_expert', return_value=expert), \
+            patch('tricoopdiff.consensus.ConsensusFuse'), \
+            patch('tricoopdiff.consensus.ConsensusCoopDiff'), \
+            patch('tricoopdiff.consensus_train.ConsensusTrainer') as trainer:
+        build_trainer(args, 'cpu', input_dim=1281)
+        assert trainer.call_args.kwargs['training_endpoint_protocol'] == (
+            'online_bitseed_training_c1_m1_v1'
+        )
 
 
 def test_legacy_clamp_mode_is_explicitly_selectable():
@@ -165,6 +183,7 @@ if __name__ == "__main__":
     test_protein_role_swap_changes_reference_without_changing_geometry()
     test_trainer_owns_recorded_activation_clamp_runtime()
     test_consensus_builder_passes_only_active_model_dimensions()
+    test_c_builder_records_online_single_pair_endpoint_protocol()
     test_consensus_builder_rejects_lora_before_loading_expert()
     test_legacy_clamp_mode_is_explicitly_selectable()
     test_mixed_arms_share_exact_source_and_endpoint_sequence()

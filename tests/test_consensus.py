@@ -129,12 +129,14 @@ def _checkpoint_payload(version):
         'residual_weight': 1e-3, 'ema_decay': 0.999,
         'torus_score_norm_version': SCORE_NORM_VERSION,
     }
-    if version == 19:
+    if version in (19, 20):
         runtime.update({
             'flow_time_contract': 'shared_flow_expert_clock_v1',
             'candidate_source_contract': 'candidate_source_conditioning_v1',
             'training_source_mix': 'sdpi_bitseed_1_1',
         })
+    if version == 20:
+        runtime['training_endpoint_protocol'] = 'online_bitseed_training_c1_m1_v1'
     return {
         'checkpoint_version': version,
         'architecture': 'residual_consensus_v2',
@@ -148,9 +150,10 @@ def _checkpoint_payload(version):
     }
 
 
-def test_checkpoint_contract_accepts_legacy_v18_and_explicit_v19():
+def test_checkpoint_contract_accepts_v18_v19_and_explicit_v20():
     validate_consensus_checkpoint(_checkpoint_payload(18))
     validate_consensus_checkpoint(_checkpoint_payload(19))
+    validate_consensus_checkpoint(_checkpoint_payload(20))
 
 
 def test_v19_checkpoint_requires_explicit_source_and_time_contracts():
@@ -162,6 +165,17 @@ def test_v19_checkpoint_requires_explicit_source_and_time_contracts():
         assert 'source contract' in str(error)
     else:
         raise AssertionError('v19 must record its candidate source contract')
+
+
+def test_v20_checkpoint_requires_online_c1m1_for_mixed_training():
+    payload = _checkpoint_payload(20)
+    payload['runtime_config']['training_endpoint_protocol'] = 'full_pool_c4_m8'
+    try:
+        validate_consensus_checkpoint(payload)
+    except ValueError as error:
+        assert 'endpoint protocol' in str(error)
+    else:
+        raise AssertionError('mixed v20 must record online C=1/M=1 generation')
 
 
 def test_no_torsion_has_finite_empty_output():

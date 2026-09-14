@@ -138,7 +138,11 @@ def parse_args(argv=None):
     )
     p.add_argument(
         "--bitseed-endpoint-cache", default=None,
-        help="Required native-free endpoint cache for mixed arms B/C",
+        help="Retired full-pool cache option; mixed training now generates lazily",
+    )
+    p.add_argument(
+        "--bitseed-lazy-cache-dir", default=None,
+        help="Per-case C=1/M=1 endpoint cache (defaults inside output_dir)",
     )
 
     return p.parse_args(argv)
@@ -225,12 +229,21 @@ def main():
             raise SystemExit(
                 "FATAL: mixed endpoint caches require --no-random-flip-proteins"
             )
-        if not args.bitseed_endpoint_cache:
-            raise SystemExit("FATAL: arms B/C require --bitseed-endpoint-cache")
-        from tricoopdiff.dual_init import CachedEndpointStore
-        endpoint_store = CachedEndpointStore(args.bitseed_endpoint_cache)
-    elif args.bitseed_endpoint_cache:
-        raise SystemExit("FATAL: arm A1 must not consume a BiTSeed endpoint cache")
+        if args.bitseed_endpoint_cache:
+            raise SystemExit(
+                "FATAL: full-pool endpoint caches are retired for arms B/C; "
+                "use --bitseed-lazy-cache-dir"
+            )
+        if args.bitseed_lazy_cache_dir is None:
+            args.bitseed_lazy_cache_dir = str(
+                Path(args.output_dir).resolve() / "bitseed_c1m1_cache"
+            )
+        from tricoopdiff.online_endpoints import ONLINE_TRAINING_ENDPOINT_PROTOCOL
+        args.training_endpoint_protocol = ONLINE_TRAINING_ENDPOINT_PROTOCOL
+    else:
+        if args.bitseed_endpoint_cache or args.bitseed_lazy_cache_dir:
+            raise SystemExit("FATAL: arm A1 must not consume a BiTSeed endpoint cache")
+        args.training_endpoint_protocol = "none"
 
     seed_training(args.seed, device)
 
@@ -276,6 +289,11 @@ def main():
     # ----------------------------------------------------------------
     print("[1/6] Building model...")
     model, diffusion, trainer = build_trainer(args, device, input_dim=input_dim)
+    if args.training_arm in ("B", "C"):
+        from tricoopdiff.online_endpoints import LazyTrainingEndpointStore
+        endpoint_store = LazyTrainingEndpointStore(
+            args.bitseed_lazy_cache_dir, model.expert,
+        )
 
     # ----------------------------------------------------------------
     # 2. Load data
@@ -472,6 +490,9 @@ def build_trainer(args, device, input_dim=None):
             'sdpi_only' if getattr(args, 'training_arm', 'A1') == 'A1'
             else 'sdpi_bitseed_1_1'
         ),
+        training_endpoint_protocol=getattr(
+            args, 'training_endpoint_protocol', 'none',
+        ),
         device=device,
     )
 
@@ -500,6 +521,7 @@ def prepare_source_batch(batch, global_step, training_arm, endpoint_store):
         raise ValueError('mixed training requires an endpoint store')
     coupling, record = endpoint_store.coupling(
         batch['case'], occurrence=global_step // 2,
+        **({'batch': batch} if getattr(endpoint_store, 'lazy', False) else {}),
     )
     actual_source = 1 if record['actual_source'] == 'bitseed' else 0
     return {**batch, 'source': actual_source, 'coupling_override': coupling}
@@ -535,7 +557,11 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
                 if training_arm in ('B', 'C'):
                     if endpoint_store is None:
                         raise ValueError('mixed validation requires an endpoint store')
-                    coupling, record = endpoint_store.coupling(batch['case'])
+                    coupling, record = endpoint_store.coupling(
+                        batch['case'],
+                        **({'batch': batch} if getattr(endpoint_store, 'lazy', False)
+                           else {}),
+                    )
                     actual_source = record['actual_source']
                     try:
                         endpoint_loss = trainer.validate_step(**{

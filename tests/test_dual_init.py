@@ -12,6 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tricoopdiff.dual_init import (  # noqa: E402
     CachedEndpointStore, DUAL_INIT_CACHE_VERSION, validate_endpoint_cache,
 )
+from tricoopdiff.online_endpoints import (  # noqa: E402
+    LazyTrainingEndpointStore, ONLINE_TRAINING_ENDPOINT_PROTOCOL,
+)
 
 
 def payload(source='bitseed', fallback=None):
@@ -71,6 +74,26 @@ def test_fallback_cannot_be_relabelled_as_bitseed():
 def test_ood_expert_failure_is_a_valid_sdpi_fallback_record():
     value = payload(source='sdpi', fallback='sdpi_v1')
     validate_endpoint_cache(value)
+
+
+def test_lazy_training_protocol_is_exactly_one_pose_per_expert():
+    expert = type('Expert', (), {'provenance': {
+        'diffdock_commit': 'test', 'score_checkpoint_sha256': 'abc',
+        'no_torsion': False,
+    }})()
+    with tempfile.TemporaryDirectory() as directory:
+        store = LazyTrainingEndpointStore(directory, expert)
+        assert store.protocol == {
+            'version': ONLINE_TRAINING_ENDPOINT_PROTOCOL,
+            'conformers': 1, 'poses_per_side': 1, 'binary_steps': 20,
+            'binary_retry_limit': 1, 'selection': 'single_pair_no_ranking',
+            'fallback': 'sdpi_v1_on_any_invalid_expert_side',
+            'base_seed': 41000,
+            'frozen_expert': {
+                'diffdock_commit': 'test', 'score_checkpoint_sha256': 'abc',
+                'no_torsion': False,
+            },
+        }
 
 
 if __name__ == '__main__':

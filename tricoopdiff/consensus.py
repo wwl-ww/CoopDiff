@@ -17,8 +17,9 @@ from .consensus_layers import JudgeHead, StateHead, TokenNegotiator, TorsionCoor
 
 
 ARCHITECTURE = 'residual_consensus_v2'
-CONSENSUS_CHECKPOINT_VERSION = 19
+CONSENSUS_CHECKPOINT_VERSION = 20
 LEGACY_CONSENSUS_CHECKPOINT_VERSION = 18
+PREVIOUS_CONSENSUS_CHECKPOINT_VERSION = 19
 BRANCHES = ('e3_ligand', 'poi_ligand')
 SOURCE_NAMES = ('sdpi', 'bitseed')
 SOURCE_CONTRACT_VERSION = 'candidate_source_conditioning_v1'

@@ -54,7 +54,14 @@ source 条件必须沿整条 trajectory 保持不变。由 fallback 实际生成
 
 ### BiTSeed 路径
 
-训练时使用与推理一致的 frozen binary DiffDock experts 产生 native-free BiTSeed endpoint。不得使用 native DockQ 对 endpoint 进行选择。为了可复现和控制训练成本，优先离线缓存以下内容：
+训练时使用 frozen binary DiffDock experts 产生 native-free BiTSeed endpoint，但不复制
+推理阶段的候选搜索预算。训练协议固定为 `C=1, M=1`：生成一个 ETKDGv3 conformer，
+E3–ligand 与 POI–ligand expert 各运行一条 20-step trajectory，不重试、不排序。两侧都
+有效时组合成唯一 endpoint；任一侧无效时整例回退 SDPI，实际来源记为 `source=0`。
+不得使用 native DockQ 选择 endpoint。
+
+endpoint 在训练时首次访问案例时生成，随后按 case 与固定 seed 原子缓存并跨 epoch
+复用。训练缓存记录：
 
 - case、conformer seed、两侧 binary pose id；
 - ligand、POI、body-frame endpoint 坐标；
@@ -134,23 +141,16 @@ frozen expert，后续校准 expert 时钟仍须单独消融。`ConsensusFuse` �
 embedding；source 专属参数使用隔离 RNG 初始化，确保 B/C 的全部共享参数逐 tensor
 同初值。采样器依据实际初始化结果固定 source，BiTSeed fallback 始终标为 SDPI。
 
-`scripts/cache_bitseed_training_endpoints.py` 从 frozen binary expert 在线生成候选，只按
-native-free geometry 选择，再将外部 endpoint 投影到现有 torsion+SE(3) chart。cache 同时
-保存原始 endpoint、训练 endpoint、投影残差、conformer seed、双侧 pose id、协议和 expert
-checkpoint SHA256。以下命令生成 train+validation cache：
+`tricoopdiff/online_endpoints.py` 实现训练内 lazy endpoint：只生成唯一两专家组合，
+将外部 endpoint 投影到现有 torsion+SE(3) chart，并保存原始 endpoint、训练 endpoint、
+投影残差、seed、实际来源、fallback 和 frozen expert 身份。B/C 使用同一 case-seed 公式，
+且各自 cache 可逐案例审计；A1 不构造该 store。推理仍可使用 `C=4, M=8` 提高覆盖率，
+不得把推理预算重新带入训练。
 
-本机是直接 GPU 环境，不使用 SLURM。下面的 launcher 用 `nohup` 持久化进程，并分别
-记录 PID 和日志；第二个参数指定只读的大型资产目录，输出仍保留在当前 worktree：
-
-```bash
-scripts/launch_bitseed_cache_local.sh 5 /mnt/disk/wl/MoRE-tri/CoopDiff
-```
-
-短 GPU smoke 已覆盖 A1/B/C 各 2 step；SDPI 与 BiTSeed loss 均 finite，C 的 source
-embedding 有梯度，checkpoint v19 记录 source/time/mix 合同，且不含 expert adapter。
-单例 smoke 中 BiTSeed validation loss 远高于 SDPI，因此这些数值只证明训练路径可执行，
-不构成质量结论。完整 cache、正式训练和内部 validation DockQ 评价尚未运行。cache 完成并
-审核投影残差后，可用固定 array 配置启动同预算三臂：
+GPU 7 的真实两步 C smoke 已覆盖 SDPI→BiTSeed 交替、lazy 首次生成/复用和 validation；
+checkpoint v20 记录 source/time/mix 及 `online_bitseed_training_c1_m1_v1` 合同。已知 OOD
+案例 `1ALX_A_B_MOH` 恰好产生两条 NaN 诊断（每侧一次），随后合法回退 SDPI。正式训练
+和内部 validation DockQ 评价尚未运行。本机为直接 GPU 环境，不使用 SLURM；三臂命令为：
 
 ```bash
 scripts/launch_dual_init_factorial_local.sh 5 6 7 /mnt/disk/wl/MoRE-tri/CoopDiff

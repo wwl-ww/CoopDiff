@@ -42,6 +42,8 @@
 - model-v2 的核心瓶颈是联合位置与朝向的搜索覆盖，不是单一实现错误或小幅 loss。
 - 当前在线候选初始化正式命名为 **BiTSeed**；完整 search–select–refine 系统称为
   **BiTSeed-CoopDiff**。BiTSeed 本身不包含 oracle、selector 或 ranker。
+- 联合训练的 BiTSeed 固定为 lazy `C=1, M=1`：两个 binary expert 各运行一次，结果按
+  case 缓存；推理阶段的 `C=4, M=8` 只用于候选覆盖，不构成训练数据扩增。
 - `sdpi` 是生产基线；`expert_anchor` 是已通过 20-case 门禁的实验初始化，不能静默
   替换生产协议。
 - 下一分支必须从原始输入在线生成 anchor，禁止候选路径读取 native 或加载可人工
