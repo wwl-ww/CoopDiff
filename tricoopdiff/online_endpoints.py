@@ -11,7 +11,10 @@ import torch
 from .checkpoint_contract import expert_base_identity
 from .dual_init import validate_endpoint_record
 from .endpoint_kinematics import project_endpoint_coupling
-from .expert_anchors import DualExpertAnchorInitializer, generate_hybrid_candidates
+from .expert_anchors import (
+    DualExpertAnchorInitializer, generate_hybrid_candidates,
+    generate_sdpi_candidates,
+)
 from .sdpi_flow import SDPIFlow
 
 
@@ -96,12 +99,40 @@ class LazyTrainingEndpointStore:
                 torch.manual_seed(seed)
                 if devices:
                     torch.cuda.manual_seed_all(seed)
-                candidates, generation = generate_hybrid_candidates(
-                    initializer, e3["coords"][0], poi["coords"][0], ligand,
-                    seed=seed, conformer_count=1, bitseed_candidate_budget=1,
-                    sdpi_candidate_budget=0, binary_retry_limit=1,
-                    binary_consecutive_failure_limit=1,
-                )
+                try:
+                    candidates, generation = generate_hybrid_candidates(
+                        initializer, e3["coords"][0], poi["coords"][0], ligand,
+                        seed=seed, conformer_count=1, bitseed_candidate_budget=1,
+                        sdpi_candidate_budget=0, binary_retry_limit=1,
+                        binary_consecutive_failure_limit=1,
+                    )
+                except Exception as error:
+                    # Frozen experts are allowed to be undefined on OOD inputs.
+                    # Training must retain the case and use an SDPI endpoint no
+                    # matter which ordinary exception the expert path raises.
+                    candidates, sdpi_records = generate_sdpi_candidates(
+                        initializer.base, e3["coords"][0], poi["coords"][0],
+                        ligand, count=1, seed=seed + 1_000_000,
+                        seed_stride=1,
+                    )
+                    event = {
+                        "conformer_index": 0,
+                        "seed": initializer._conformer_seed(seed, 0),
+                        "error": f"{type(error).__name__}: {error}",
+                        "replacement": "sdpi_v1",
+                        "replacement_count": 1,
+                    }
+                    generation = {
+                        "requested_bitseed": 1,
+                        "actual_bitseed": 0,
+                        "requested_sdpi": 0,
+                        "actual_sdpi": 1,
+                        "successful_conformers": [],
+                        "failed_conformers": [event],
+                        "partial_conformers": [],
+                        "fallback_events": [event],
+                        "sdpi_candidates": sdpi_records,
+                    }
         finally:
             random.setstate(python_state)
             np.random.set_state(numpy_state)

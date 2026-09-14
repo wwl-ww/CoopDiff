@@ -258,6 +258,35 @@ def test_hybrid_replaces_only_failed_conformer_with_sdpi():
                for candidate in candidates) == 3
 
 
+def test_hybrid_replaces_unfittable_conformer_with_sdpi():
+    class StubBase:
+        def initialize(self, e3, poi, ligand_data, seed):
+            coords = torch.tensor([[[4.0, 0.0, 0.0]]])
+            return coords, coords + 4, torch.eye(3).unsqueeze(0), {"seed": seed}
+
+    class StubDual:
+        proposal_attempts = 1
+        base = StubBase()
+
+        @staticmethod
+        def _conformer_seed(seed, index):
+            return seed + index
+
+        def generate_candidates(self, *args, **kwargs):
+            raise ValueError("rigid fit requires at least three points")
+
+    candidates, metadata = generate_hybrid_candidates(
+        StubDual(), torch.zeros(1, 3), torch.ones(1, 3), {}, seed=10,
+        conformer_count=1, bitseed_candidate_budget=1,
+        sdpi_candidate_budget=0,
+    )
+    assert len(candidates) == 1
+    assert candidates[0]["candidate_id"] == ["sdpi", 0]
+    assert metadata["actual_bitseed"] == 0
+    assert metadata["actual_sdpi"] == 1
+    assert metadata["failed_conformers"][0]["error"].startswith("ValueError:")
+
+
 def test_hybrid_keeps_partial_pairs_and_fills_only_the_deficit():
     class StubBase:
         def initialize(self, e3, poi, ligand_data, seed):
