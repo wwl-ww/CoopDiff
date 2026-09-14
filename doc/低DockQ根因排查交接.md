@@ -85,7 +85,8 @@ acceptable 为 0/20 对 3/20；该路线已关闭。
 
 该在线初始化模块现正式命名为 **BiTSeed**（Conformer-Diverse Binary-to-Ternary
 Basin Seeding）；与 CoopDiff 精修组成系统时称为 **BiTSeed-CoopDiff**。当前 A1/B1/
-C1/A2/B2 proposal-oracle 配置、v4 补采语义和产物路径以根目录 `ablation.md` 为准。
+C1/A2/B2 proposal-oracle 的当前结论、v4 补采语义和正式协议以
+[`BiTSeed-Hybrid 在线初始化规格`](BiTSeed-Hybrid在线初始化规格.md)为准。
 BiTSeed 名称只覆盖 native-free 候选生成，不包含 oracle、selector 或 post-ranker。
 
 下一代架构不是预存 pose bank，也不是继续线性增加完整 walker。正式推理只接收原始

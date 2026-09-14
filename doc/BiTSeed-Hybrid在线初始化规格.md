@@ -126,8 +126,8 @@ SDPI-64 `0.2515`、Geometry-64 `0.2665`、Diversity-64 `0.2668`、Hybrid-48/16
 当前 `acceptable` 将 steric hard safety 与接触距离混为一体。native sanity check 为
 92/94通过，两个失败均来自 POI–ligand `>8 Å`；所有 native 都没有蛋白 CA `<3 Å`。
 下一版 selector 应在 internal validation 中把蛋白 CA `<3 Å`、ligand `<1.5 Å` 作为
-hard safety，将 `>8 Å` 接触不足和蛋白分离作为 soft compatibility。完整证据见
-[`BiTSeed MGD94 全池精修审计`](BiTSeed-MGD94全池精修审计.md)。
+hard safety，将 `>8 Å` 接触不足和蛋白分离作为 soft compatibility。逐候选机器可读汇总
+保存在 `results/mgd_full_pool_refinement_20260913/summary_v1.json`，不作为源码提交。
 
 ## 审计清单
 

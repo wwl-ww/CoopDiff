@@ -10,7 +10,7 @@
   创建；交接前远端同步点为 merge commit `3753c4e`。
 - `192 BiTSeed + 64 SDPI` 固定池、per-conformer 缺口补位、统一 selector 和
   full-pool refinement 已实现；MGD94 为 94/94、24,064/24,064 trajectory、零失败。
-  正式汇总见 [`BiTSeed MGD94 全池精修审计`](doc/BiTSeed-MGD94全池精修审计.md)。
+  正式结论已合并进 [`BiTSeed-Hybrid 在线初始化规格`](doc/BiTSeed-Hybrid在线初始化规格.md)。
 - 已结束分支：`investigate/model-v2-followup`。不要继续该分支的 loss sweep。
 - 主目标是 Molecular Glue（MGD）。PROTAC 后续会加入 warhead/口袋信息，不能用
   PROTAC 的容易提升替代 MGD 的真实困难。
@@ -84,8 +84,8 @@ frozen DiffDock 专家负责搜索完整 SE(3) basin，native-free selector
   case 内确定性在线临时候选集、集合感知选择器和 32/64 walker 一一映射。
 - binary expert 整例失败时回退 `sdpi_v1`、纯 SDPI-256 proposal 生成及其 CLI 已实现；
   部分 conformer 失败时保留成功 anchors 并只补齐缺口的逻辑尚未实现。
-- `scripts/evaluate_proposal_oracle.py` 只评估 BiTSeed 初始化的 native-reading oracle，
-  不运行 CoopDiff、不训练 ranker，也不能当作部署 top-1。
+- `scripts/evaluate_selected_refinement.py` 统一评估候选 Initial/Final/Union；native 指标只
+  用于事后审计，不能当作部署 top-1。
 
 ## 关键本地产物
 
@@ -100,7 +100,7 @@ frozen DiffDock 专家负责搜索完整 SE(3) basin，native-free selector
 - anchor 20-case：`results/mgd_followup/anchor_geometry_a8_20cases_seed31000/`、
   `results/mgd_followup/anchor_consensus_a8_20cases_seed31000/`
 - conformer 20-case：`results/mgd_followup/conformer20_seed55000/`
-- BiTSeed 配置与协议：`ablation.md`
+- BiTSeed 配置与协议：`doc/BiTSeed-Hybrid在线初始化规格.md`
 - BiTSeed v4：`results/proposal_oracle_ablation_20260912/`；正式目录后缀为 `_v4`，
   `recovery_smoke_v4` 仅作补采逻辑 smoke，所有 `_v3` 目录均已停止。
 
@@ -136,8 +136,8 @@ bank。正式推理从原始输入一条命令运行到底；中间候选仅在�
    和冻结配置；函数签名不得包含 native、DockQ 或人工候选路径，正式评估禁用 pose cache。
 2. 对每个 `etkdgv3_random` ligand conformer，两侧各生成 `M` 个完整 ligand binary
    poses，仅在同一 conformer 内配对。当前固定256候选消融比较 `C1M16`、`C4M8`、
-   `C16M4`，compute-matched 消融比较 `C1M64`、`C4M16`、`C16M4`；正式映射和 seed
-   协议以 `ablation.md` 为准。
+  `C16M4`，compute-matched 消融比较 `C1M64`、`C4M16`、`C16M4`；正式映射和 seed
+   协议以 `doc/BiTSeed-Hybrid在线初始化规格.md` 为准。
 3. `q(E,P|L)=q_E(E|L)q_P(P|L)` 仅是扩大覆盖的 proposal 分布，不声称真实 ternary
    条件分布可因子分解；后续 ternary compatibility 专门修正 binary-to-ternary gap。
 4. 候选顺序、seed 派生、expert 调用数、outward relaxation、twist 与 broad 比例必须
