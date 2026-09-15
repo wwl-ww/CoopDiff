@@ -13,8 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 GPU3 = "GPU-3ac265b1-130f-cf53-b680-8730370a5881"
 RUN = Path(os.environ.get("FACTORIAL_RUN_DIR",
                           "/tmp/coopdiff/results/overnight_root_cause_v3_run01"))
-ARMS = [(c, t, a) for c in ("old", "ccd") for t in ("legacy", "single_bond")
-        for a in ("frozen", "lora")]
+ARMS = [(c, t, "frozen") for c in ("old", "ccd")
+        for t in ("legacy", "single_bond")]
 
 
 def write_status(payload):
@@ -46,7 +46,6 @@ def main():
     # First seed covers the full 2x2x2 factorial. Two preregistered main arms get seed 2.
     jobs = [(arm, 1729) for arm in ARMS] + [
         (("ccd", "legacy", "frozen"), 2718),
-        (("ccd", "legacy", "lora"), 2718),
     ]
     for index, ((chemistry, torsion, adaptation), seed) in enumerate(jobs):
         remaining = hard_deadline - time.monotonic()

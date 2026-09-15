@@ -177,5 +177,5 @@ results/dual_init/arm_C_online_c1m1_seed73/best_model.pt
 LoRA 虽改善 SDPI 分项，却持续损伤 BiTSeed 分项，综合指标变差。
 
 因此本分支最终决定：**不交付、不继续训练 LoRA 版本**。正式 `train_entry.py` 不暴露
-LoRA 参数；两个 DiffDock experts 全程冻结。LoRA 实验产物仅保留在忽略的 `results/`
+LoRA 参数，可训练 adapter 实现与实验调度入口已删除；两个 DiffDock experts 全程冻结。LoRA 实验产物仅保留在忽略的 `results/`
 和 `logs/` 中用于审计，不得作为正式 checkpoint。

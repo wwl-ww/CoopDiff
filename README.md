@@ -3,8 +3,9 @@
 TriCoopDiff predicts protein–ligand–protein ternary complexes with two immutable
 DiffDock experts and a cooperative residual TriFuse module. The selected model
 uses source-conditioned mixed SDPI/BiTSeed training; LoRA expert adaptation was
-tested and rejected because it worsened combined validation loss. Run all
-commands from the repository root in the direct local GPU environment.
+tested and rejected because it worsened combined validation loss, and its
+trainable implementation has been removed from this branch. Run all commands
+from the repository root in the direct local GPU environment.
 
 ## 1. Clone the validated branch
 

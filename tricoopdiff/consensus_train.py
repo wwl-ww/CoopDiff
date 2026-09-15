@@ -64,7 +64,6 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         if not math.isfinite(residual_weight) or residual_weight < 0 or not 0 <= ema_decay < 1:
             raise ValueError('invalid residual regularization or EMA decay')
         kwargs['torsion_expert_aux_weight'] = 0.0
-        kwargs['lora_warmup_steps'] = 0
         super().__init__(*args, **kwargs)
         self.activation_clamp_mode = validate_clamp_mode(activation_clamp_mode)
         os.environ['NAN_CLAMP_MODE'] = self.activation_clamp_mode

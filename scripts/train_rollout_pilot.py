@@ -66,7 +66,7 @@ def main():
     expert = build_diffdock_expert(expert_dir, 'cuda')
     fuse = ConsensusFuse(**checkpoint['model_config'])
     fuse.load_state_dict(checkpoint['ema_trifuse_state_dict'])
-    model = ExperimentalConsensus(expert, fuse, checkpoint['expert_lora_config'])
+    model = ExperimentalConsensus(expert, fuse)
     contract = {
         'chemistry': 'ccd', 'torsion': 'single_bond', 'adaptation': 'frozen',
         'seed': args.seed, 'training': 'rollout_augmentation',
@@ -88,8 +88,7 @@ def main():
     } if trainer_class is EndpointTranslationRolloutTrainer else {})
     trainer = trainer_class(
         model, PairedTorsionFlow(), device='cuda', experiment_contract=contract,
-        lr=5e-5, lora_lr=1e-5, lora_early_lr=5e-6,
-        lora_warmup_steps=0, activation_clamp_mode='irrep_norm',
+        lr=5e-5, activation_clamp_mode='irrep_norm',
         rollout_probability=args.rollout_probability,
         rollout_steps=args.rollout_steps, **endpoint_args)
 

@@ -85,7 +85,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--chemistry", choices=("old", "ccd"), required=True)
     ap.add_argument("--torsion", choices=("legacy", "single_bond"), required=True)
-    ap.add_argument("--adaptation", choices=("frozen", "lora"), required=True)
+    ap.add_argument("--adaptation", choices=("frozen",), required=True)
     ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--seconds", type=int, required=True)
     ap.add_argument("--out", type=Path, required=True)
@@ -113,15 +113,12 @@ def main():
     np.random.seed(args.seed)
     expert = build_diffdock_expert(expert_dir, "cuda")
     fuse = ConsensusFuse(input_dim=first["e3_data"]["features"].shape[-1])
-    lora = (dict(rank=4, alpha=8., start_layer=0, early_layers=4,
-                 early_rank=2, early_alpha=4.) if args.adaptation == "lora" else None)
     contract = {"chemistry": args.chemistry, "torsion": args.torsion,
                 "adaptation": args.adaptation, "seed": args.seed}
-    model = ExperimentalConsensus(expert, fuse, lora)
+    model = ExperimentalConsensus(expert, fuse)
     trainer = ExperimentalConsensusTrainer(
         model, PairedTorsionFlow(), device="cuda", experiment_contract=contract,
-        lr=1e-4, lora_lr=1e-5, lora_early_lr=5e-6,
-        lora_warmup_steps=0, activation_clamp_mode="irrep_norm")
+        lr=1e-4, activation_clamp_mode="irrep_norm")
     val_batches = [transform(batch) for batch in val]
     # Model/adapter construction and first-time featurization consume random
     # numbers. Reset here so every arm sees identical cluster ordering, flow

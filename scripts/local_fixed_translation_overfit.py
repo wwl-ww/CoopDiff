@@ -97,10 +97,10 @@ def build_trainer(base, expert, device):
     """Build a fresh optimizer/model at the common baseline EMA."""
     fuse = ConsensusFuse(**base['model_config']).to(device)
     fuse.load_state_dict(base['ema_trifuse_state_dict'])
-    model = ExperimentalConsensus(expert, fuse, base['expert_lora_config'])
+    model = ExperimentalConsensus(expert, fuse)
     common = dict(
         device=device, experiment_contract={'training': 'fixed_translation_overfit_v1'},
-        lr=5e-5, lora_lr=1e-5, lora_early_lr=5e-6, lora_warmup_steps=0,
+        lr=5e-5,
         activation_clamp=base['runtime_config']['activation_clamp'],
         activation_clamp_mode=base['runtime_config']['activation_clamp_mode'],
         residual_weight=base['runtime_config']['residual_weight'],

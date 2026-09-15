@@ -46,13 +46,12 @@ def main():
             batches.append(batch)
         expert = build_diffdock_expert(expert_dir, "cuda")
         fuse = ConsensusFuse(**checkpoint["model_config"])
-        model = ExperimentalConsensus(expert, fuse, checkpoint["expert_lora_config"])
+        model = ExperimentalConsensus(expert, fuse)
         runtime = checkpoint["runtime_config"]
         trainer = ExperimentalConsensusTrainer(
             model, PairedTorsionFlow(), device="cuda",
             experiment_contract=checkpoint["experiment_contract"],
-            lr=1e-4, lora_lr=1e-5, lora_early_lr=5e-6,
-            lora_warmup_steps=0,
+            lr=1e-4,
             activation_clamp=runtime["activation_clamp"],
             activation_clamp_mode=runtime["activation_clamp_mode"],
             residual_weight=runtime["residual_weight"],

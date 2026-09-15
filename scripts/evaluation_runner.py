@@ -65,7 +65,7 @@ class EvaluationRunner:
             if contract.get('adaptation') != 'frozen':
                 raise ValueError('only frozen-expert experimental checkpoints are supported')
             if self.checkpoint.get('expert_lora_config') is not None:
-                raise ValueError('frozen experimental checkpoint unexpectedly contains expert LoRA')
+                raise ValueError('adapted-expert experimental checkpoints are unsupported')
             if 'ema_trifuse_state_dict' not in self.checkpoint:
                 raise ValueError('experimental checkpoint has no EMA TriFuse weights')
         else:
@@ -117,9 +117,7 @@ class EvaluationRunner:
         if self.experimental_checkpoint:
             from tricoopdiff.consensus_experiment import ExperimentalConsensus
 
-            self.model = ExperimentalConsensus(
-                self.expert, trifuse, self.checkpoint['expert_lora_config'],
-            ).to(self.device)
+            self.model = ExperimentalConsensus(self.expert, trifuse).to(self.device)
         else:
             self.model = ConsensusCoopDiff(
                 frozen_expert=self.expert,

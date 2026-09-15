@@ -108,15 +108,13 @@ def load_baseline(path, artifacts):
     assert payload['checkpoint_version'] == 1
     assert payload['architecture'] == 'residual_consensus_factorial_v1'
     assert payload['experiment_contract'] == dict(chemistry='ccd', torsion='single_bond', adaptation='frozen', seed=1729)
-    assert payload['expert_lora_config'] is None
-    assert not payload['ema_expert_lora_state_dict']
     runtime = payload['runtime_config']
     os.environ['NAN_CLAMP'] = str(runtime['activation_clamp'])
     os.environ['NAN_CLAMP_MODE'] = runtime['activation_clamp_mode']
     expert = build_diffdock_expert(str(artifacts / 'checkpoints/score_model'), 'cuda')
     identity = validate_expert_base_identity(payload, expert)
     fuse = ConsensusFuse(**payload['model_config'])
-    model = ExperimentalConsensus(expert, fuse, None).to('cuda')
+    model = ExperimentalConsensus(expert, fuse).to('cuda')
     model.trifuse.load_state_dict(payload['ema_trifuse_state_dict'], strict=True)
     model.eval()
     return model, {'sha256': sha(path), 'path': str(path), 'weights': 'EMA',

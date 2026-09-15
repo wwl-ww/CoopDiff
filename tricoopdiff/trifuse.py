@@ -99,7 +99,7 @@ class TriFuse(nn.Module):
     two equivariant DiffDock experts; TriFuse no longer predicts an unrelated
     Cartesian POI score.
 
-    Expert LoRA adapters are trainable alongside this coordinator.
+    The binary experts remain frozen; this coordinator owns trainable fusion.
     """
 
     def __init__(

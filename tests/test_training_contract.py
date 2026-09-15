@@ -69,13 +69,11 @@ def test_trainer_owns_recorded_activation_clamp_runtime():
             self.trifuse = torch.nn.Linear(2, 2)
             self.expert = torch.nn.Module()
 
-    with patch('tricoopdiff.lora.expert_lora_parameter_groups',
-               return_value={'early': [], 'late': []}):
-        with patch.dict(os.environ, {}, clear=True):
-            trainer = TriCoopDiffTrainer(
-                DummyModel(), SDPIFlow(), device='cpu', activation_clamp=37)
-            assert trainer.activation_clamp == 37
-            assert os.environ['NAN_CLAMP'] == '37.0'
+    with patch.dict('os.environ', {}, clear=True):
+        trainer = TriCoopDiffTrainer(
+            DummyModel(), SDPIFlow(), device='cpu', activation_clamp=37)
+        assert trainer.activation_clamp == 37
+        assert os.environ['NAN_CLAMP'] == '37.0'
 
 
 def test_consensus_builder_passes_only_active_model_dimensions():
