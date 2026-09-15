@@ -1,5 +1,8 @@
 # TriFuse v13 架构与审计
 
+> 历史文档：本文保留旧 LoRA/FiLM 设计用于审计，不代表当前交付架构。当前模型冻结
+> 两个 DiffDock experts，LoRA 消融未带来收益，已明确不采用。
+
 ## 模型架构
 
 ```mermaid

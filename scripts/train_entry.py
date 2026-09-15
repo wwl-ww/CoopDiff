@@ -2,7 +2,7 @@
 TriCoopDiff training entry point.
 
 Supervised training:
-  Phase 1: SDPI conditional velocity matching (TriFuse + expert LoRA).
+  Phase 1: SDPI conditional velocity matching with frozen experts.
   Auxiliary confidence/state training is intentionally unavailable until the
   dataset and loss expose explicit labels.
 
@@ -24,7 +24,6 @@ Usage:
 """
 
 import argparse
-import hashlib
 import json
 import os
 import sys
@@ -89,28 +88,10 @@ def parse_args(argv=None):
     )
     p.add_argument('--residual-weight', type=float, default=1e-3)
     p.add_argument('--ema-decay', type=float, default=0.999)
-    p.add_argument("--lora_rank", type=int, default=0,
-                   help="Rank of independent sub1/sub2 expert adapters; 0 disables LoRA")
-    p.add_argument("--lora_alpha", type=float, default=8.0)
-    p.add_argument("--lora_start_layer", type=int, default=0)
-    p.add_argument("--lora_early_layers", type=int, default=4)
-    p.add_argument("--lora_early_rank", type=int, default=2)
-    p.add_argument("--lora_early_alpha", type=float, default=4.0)
-    p.add_argument("--lora_lr", type=float, default=1e-5)
-    p.add_argument("--lora_early_lr", type=float, default=5e-6)
-    p.add_argument(
-        "--lora-warmup-steps", type=int, default=100,
-        help="Train TriFuse alone before enabling expert LoRA adapters",
-    )
-
     # Phase
     p.add_argument("--phase", type=int, default=1, choices=[1],
                    help="SDPI velocity matching (the only defined phase)")
     p.add_argument("--resume", default=None, help="Resume from checkpoint")
-    p.add_argument(
-        "--init-frozen-checkpoint", default=None,
-        help="Initialize an experimental LoRA run from a frozen v20 EMA checkpoint",
-    )
 
     # Model config
     # TriFuse params
@@ -223,10 +204,6 @@ def append_metric(output_dir, payload):
 
 def main():
     args = parse_args()
-    if args.resume and args.init_frozen_checkpoint:
-        raise SystemExit("FATAL: --resume and --init-frozen-checkpoint are mutually exclusive")
-    if args.init_frozen_checkpoint and args.lora_rank <= 0:
-        raise SystemExit("FATAL: --init-frozen-checkpoint requires --lora_rank > 0")
     args.generative_process = 'sdpi_flow_v1'
     if args.nan_clamp <= 0:
         raise SystemExit("FATAL: --nan-clamp must be positive")
@@ -326,11 +303,6 @@ def main():
     if args.resume:
         print(f"[3/6] Resuming from {args.resume}...")
         trainer.load_checkpoint(args.resume)
-    elif args.init_frozen_checkpoint:
-        print(f"[3/6] Initializing LoRA stage from {args.init_frozen_checkpoint}...")
-        initialize_lora_from_frozen_checkpoint(
-            trainer, args.init_frozen_checkpoint,
-        )
     else:
         print("[3/6] Training from scratch...")
 
@@ -478,60 +450,20 @@ def build_trainer(args, device, input_dim=None):
         model_config['source_conditioning'] = True
     trifuse = ConsensusFuse(**model_config)
 
-    if args.lora_rank > 0:
-        from tricoopdiff.consensus_experiment import ExperimentalConsensus
-        lora_config = {
-            'rank': args.lora_rank, 'alpha': args.lora_alpha,
-            'start_layer': args.lora_start_layer,
-            'early_layers': args.lora_early_layers,
-            'early_rank': args.lora_early_rank,
-            'early_alpha': args.lora_early_alpha,
-        }
-        model = ExperimentalConsensus(frozen_expert, trifuse, lora_config)
-    else:
-        model = ConsensusCoopDiff(
-            frozen_expert, trifuse, num_conv_layers=num_conv_layers,
-        )
+    model = ConsensusCoopDiff(frozen_expert, trifuse, num_conv_layers=num_conv_layers)
 
     # Build diffusion
     diffusion = SDPIFlow(inference_steps=20)
 
     # Build trainer
-    trainer_class = ConsensusTrainer
-    extra_trainer_args = {}
-    if args.lora_rank > 0:
-        from tricoopdiff.consensus_experiment import ExperimentalConsensusTrainer
-        trainer_class = ExperimentalConsensusTrainer
-        parent_hash = None
-        if args.init_frozen_checkpoint:
-            digest = hashlib.sha256()
-            with open(args.init_frozen_checkpoint, 'rb') as handle:
-                for block in iter(lambda: handle.read(1024 * 1024), b''):
-                    digest.update(block)
-            parent_hash = digest.hexdigest()
-        extra_trainer_args['experiment_contract'] = {
-            'version': 'dual_init_lora_stage_v1',
-            'training_arm': args.training_arm,
-            'training_source_mix': (
-                'sdpi_only' if args.training_arm == 'A1'
-                else 'sdpi_bitseed_1_1'
-            ),
-            'training_endpoint_protocol': args.training_endpoint_protocol,
-            'flow_time_contract': 'shared_flow_expert_clock_v1',
-            'parent_frozen_checkpoint_sha256': parent_hash,
-        }
-    trainer = trainer_class(
+    trainer = ConsensusTrainer(
         model=model,
         diffusion=diffusion,
         lr=args.lr,
         weight_decay=args.weight_decay,
-        lora_lr=getattr(args, 'lora_lr', 1e-5),
-        lora_early_lr=getattr(args, 'lora_early_lr', 5e-6),
-        lora_early_layers=getattr(args, 'lora_early_layers', 4),
         activation_clamp=args.nan_clamp,
         activation_clamp_mode=args.activation_clamp_mode,
         torsion_expert_aux_weight=args.torsion_expert_aux_weight,
-        lora_warmup_steps=args.lora_warmup_steps,
         residual_weight=args.residual_weight,
         ema_decay=args.ema_decay,
         training_source_mix=(
@@ -542,25 +474,9 @@ def build_trainer(args, device, input_dim=None):
             args, 'training_endpoint_protocol', 'none',
         ),
         device=device,
-        **extra_trainer_args,
     )
 
     return model, diffusion, trainer
-
-
-def initialize_lora_from_frozen_checkpoint(trainer, checkpoint_path):
-    """Start a zero-adapter LoRA stage from a frozen run's EMA TriFuse."""
-    from tricoopdiff.checkpoint_contract import validate_expert_base_identity
-    from tricoopdiff.consensus_train import validate_consensus_checkpoint
-
-    payload = torch.load(checkpoint_path, map_location=trainer.device, weights_only=False)
-    validate_consensus_checkpoint(payload)
-    validate_expert_base_identity(payload, trainer.model.expert)
-    if payload['model_config'] != trainer.model.trifuse.config:
-        raise ValueError('frozen parent and LoRA child TriFuse configurations differ')
-    state = payload['ema_trifuse_state_dict']
-    trainer.model.trifuse.load_state_dict(state)
-    trainer.ema = {name: value.detach().clone() for name, value in state.items()}
 
 
 def _guarded_train_step(trainer, batch):

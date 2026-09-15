@@ -18,8 +18,8 @@
 6. [TriCoopDiff 模型架构图](TriCoopDiff%20模型架构图.md)：当前模块和坐标更新关系。
 7. [Phase 1 数据协议](Phase%201%20数据协议.md)：训练池、cluster split 和 benchmark
    防泄漏规则。
-8. [训练入口与 smoke](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md)：环境、
-   缓存、SLURM 和训练入口。
+8. [训练入口与 smoke](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md)：旧集群
+   运行记录，仅作历史参考；本分支使用本地 GPU 入口。
 
 ## 专题参考
 
@@ -44,6 +44,10 @@
   **BiTSeed-CoopDiff**。BiTSeed 本身不包含 oracle、selector 或 ranker。
 - 联合训练的 BiTSeed 固定为 lazy `C=1, M=1`：两个 binary expert 各运行一次，结果按
   case 缓存；推理阶段的 `C=4, M=8` 只用于候选覆盖，不构成训练数据扩增。
+- B/C 均已完成 100 epochs；最终选择带 source conditioning 的 C epoch 81 EMA，内部
+  validation loss 为 `3.1384998601`。
+- DiffDock experts 在正式模型中保持冻结。scratch 与 best-checkpoint LoRA 微调均未超过
+  各自无 LoRA 父模型，已停止且不属于交付模型。
 - `sdpi` 是生产基线；`expert_anchor` 是已通过 20-case 门禁的实验初始化，不能静默
   替换生产协议。
 - 下一分支必须从原始输入在线生成 anchor，禁止候选路径读取 native 或加载可人工
@@ -57,7 +61,7 @@
 - `tricoopdiff/expert_anchors.py`：双专家 geometry/consensus anchor。
 - `scripts/evaluate_proposal_oracle.py`：BiTSeed 固定候选预算的 native-reading oracle
   消融入口；不是部署评估。
-- `tricoopdiff/consensus.py`：冻结专家与残差共识模型。
+- `tricoopdiff/consensus.py`：冻结专家、source conditioning 与残差共识模型。
 - `scripts/evaluation_runner.py`、`scripts/evaluate_index.py`：可恢复评估和协议清单。
 
 ## 维护规则

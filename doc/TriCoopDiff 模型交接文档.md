@@ -1,5 +1,9 @@
 # TriCoopDiff 模型交接文档
 
+> 历史文档：本文描述旧 `trifuse_v13`/LoRA/FiLM 架构，不是当前
+> `residual_consensus_v2` 交付模型。当前模型与实验结论以
+> [SDPI–BiTSeed 联合训练交接](SDPI-BiTSeed联合训练交接.md)为准。
+
 ## 模型定位
 
 TriCoopDiff 用两个带 branch-specific LoRA/FiLM 的冻结 DiffDock expert，分别生成 E3–Ligand 与 POI–Ligand 界面 proposal。模型直接在两个界面相对坐标上扩散，再通过精确 SE(3) 组合重建三元复合物；它不是两个 Ligand score 的融合器。

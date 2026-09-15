@@ -31,16 +31,7 @@ class ExperimentalConsensus(ConsensusCoopDiff):
 
     def _expert_context(self):
         # Respect outer no_grad during evaluation; never force enable_grad.
-        if not self.experiment_lora_config:
-            return torch.no_grad()
-        if self.training and torch.is_grad_enabled():
-            # Full-expert LoRA needs gradients through the immutable DiffDock
-            # base. Large ternary graphs otherwise retain roughly 30 GiB of
-            # CUDA activations and can exceed a 32 GiB card. Moving tensors
-            # saved for backward to pinned CPU memory preserves the full-layer
-            # experiment while bounding its CUDA activation footprint.
-            return torch.autograd.graph.save_on_cpu(pin_memory=True)
-        return nullcontext()
+        return nullcontext() if self.experiment_lora_config else torch.no_grad()
 
     def _select_expert_branch(self, index):
         if self.experiment_lora_config:
@@ -51,9 +42,7 @@ class ExperimentalConsensusTrainer(ConsensusTrainer):
     """Train and serialize both consensus and adapter EMAs without base weights."""
     def __init__(self, *args, experiment_contract, **kwargs):
         self.experiment_contract = dict(experiment_contract)
-        lora_warmup_steps = int(kwargs.get('lora_warmup_steps', 0))
         super().__init__(*args, **kwargs)
-        self.lora_warmup_steps = lora_warmup_steps
         self.ema_lora = clone_state(expert_lora_state_dict(self.model.expert))
 
     def train_step(self, **batch):
@@ -86,7 +75,6 @@ class ExperimentalConsensusTrainer(ConsensusTrainer):
         return dict(activation_clamp=self.activation_clamp,
                     activation_clamp_mode=self.activation_clamp_mode,
                     residual_weight=self.residual_weight, ema_decay=self.ema_decay,
-                    lora_warmup_steps=self.lora_warmup_steps,
                     optimizer_groups=self.optimizer_config)
 
     def save_checkpoint(self, path, epoch=0, best_val_loss=float('inf')):

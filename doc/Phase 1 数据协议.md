@@ -38,5 +38,5 @@ model-ranked top-1。旧的 23-case bound、70-case 或 791-case representative
 ## 可复现性门禁
 
 `scripts/make_deepternary_index.py` 会验证联合池计数，并在任一结构无法拆分时
-终止。正式 wrapper 记录 Git commit、索引与专家权重 SHA256，先在同一 GPU
-allocation 内完成跨越 LoRA warmup 的 smoke，再从头启动正式训练。
+终止。正式入口记录 Git commit、索引与专家权重 SHA256，并在本地 GPU 上先完成
+冻结专家的 smoke，再从头启动正式训练。当前交付模型不训练 DiffDock 或 LoRA。

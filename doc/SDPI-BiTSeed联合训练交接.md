@@ -147,31 +147,35 @@ embedding；source 专属参数使用隔离 RNG 初始化，确保 B/C 的全部
 且各自 cache 可逐案例审计；A1 不构造该 store。推理仍可使用 `C=4, M=8` 提高覆盖率，
 不得把推理预算重新带入训练。
 
-GPU 7 的真实两步 C smoke 已覆盖 SDPI→BiTSeed 交替、lazy 首次生成/复用和 validation；
-checkpoint v20 记录 source/time/mix 及 `online_bitseed_training_c1_m1_v1` 合同。已知 OOD
-案例 `1ALX_A_B_MOH` 恰好产生两条 NaN 诊断（每侧一次），随后合法回退 SDPI。正式训练
-和内部 validation DockQ 评价尚未运行。本机为直接 GPU 环境，不使用 SLURM；三臂命令为：
+真实 C smoke 已覆盖 SDPI→BiTSeed 交替、lazy 首次生成/复用和 validation；checkpoint
+v20 记录 source/time/mix 及 `online_bitseed_training_c1_m1_v1` 合同。冻结专家允许在
+OOD 输入上失败，此时整例回退 SDPI，不丢弃训练样本。本机为直接 GPU 环境，不使用
+SLURM。
 
-```bash
-scripts/launch_dual_init_factorial_local.sh 5 6 7 /mnt/disk/wl/MoRE-tri/CoopDiff
+## 完成结果与模型选择
+
+B（混合训练、无 source flag）和 C（混合训练、有 source flag）均以 seed 73 完成
+100 epochs。验证集固定包含 65 个 SDPI 与 65 个 BiTSeed 路径：
+
+| Arm | 最佳 epoch | 最佳 validation loss | SDPI | BiTSeed |
+|---|---:|---:|---:|---:|
+| B | 55 | 3.1975951768 | 3.2574911439 | 3.1376992097 |
+| C | 81 | **3.1384998601** | 3.1899146282 | 3.0870850921 |
+
+最终选择 C epoch 81 的 `best_model.pt`。checkpoint 同时保存 raw 与 EMA TriFuse；正式
+验证和推理使用 EMA：
+
+```text
+results/dual_init/arm_C_online_c1m1_seed73/best_model.pt
 ```
 
-## LoRA 接续阶段（已准备，尚未启动）
+## LoRA 消融结论
 
-`scripts/run_dual_init_lora_arm_local.sh` 可在 frozen arm 完整结束后，从该 arm 的
-EMA `best_model.pt` 初始化 TriFuse，并零初始化两套 branch-specific LoRA。DiffDock
-base 权重始终冻结；训练前向分别启用 `sub1/sub2` adapter，而 lazy BiTSeed endpoint
-生成会临时旁路 LoRA，继续使用固定 pretrained base，避免缓存随训练漂移。LoRA 与
-TriFuse 均保存 raw/EMA 权重，parent checkpoint SHA256 写入隔离的实验合同。
+已经分别测试从头训练 LoRA，以及从 B/C 无 LoRA 最佳 EMA 开始微调。两种方式都未超过
+对应父模型。best-checkpoint 微调中，B 的最佳 loss 为 `3.2104554951`（父模型
+`3.1975951768`）；C 的最佳 loss 为 `3.1467125544`（父模型 `3.1384998601`）。C 的
+LoRA 虽改善 SDPI 分项，却持续损伤 BiTSeed 分项，综合指标变差。
 
-两个前台终端分别运行：
-
-```bash
-scripts/run_dual_init_lora_arm_local.sh B 5 /mnt/disk/wl/MoRE-tri/CoopDiff
-scripts/run_dual_init_lora_arm_local.sh C 7 /mnt/disk/wl/MoRE-tri/CoopDiff
-```
-
-默认配置为 late rank/alpha `4/8`、前四层 rank/alpha `2/4`、LoRA LR
-`1e-5`（前层 `5e-6`）、EMA `0.999`、100 epochs。脚本要求 parent 的最终完成标志
-`tricoopdiff_zero.pt` 存在，拒绝覆盖已有输出。正式启动前仍需在空闲 GPU 上完成真实
-单 batch backward、base 无梯度和 LoRA checkpoint round-trip gate。
+因此本分支最终决定：**不交付、不继续训练 LoRA 版本**。正式 `train_entry.py` 不暴露
+LoRA 参数；两个 DiffDock experts 全程冻结。LoRA 实验产物仅保留在忽略的 `results/`
+和 `logs/` 中用于审计，不得作为正式 checkpoint。

@@ -166,30 +166,16 @@ def test_mixed_training_relabels_ood_expert_fallback_as_sdpi():
     assert batch['coupling_override'] == {'cached': True}
 
 
-def test_lora_builder_uses_isolated_experimental_checkpoint_contract():
-    args = parse_args([
-        '--train_data', 'unused.json', '--val_data', 'unused.json',
-        '--output_dir', 'unused', '--training-arm', 'C', '--lora_rank', '4',
-    ])
-    args.training_endpoint_protocol = 'online_bitseed_training_c1_m1_v1'
-    expert = SimpleNamespace(num_conv_layers=11)
-    with patch('tricoopdiff.expert_factory.build_diffdock_expert', return_value=expert), \
-            patch('tricoopdiff.consensus.ConsensusFuse'), \
-            patch('tricoopdiff.consensus_experiment.ExperimentalConsensus') as model, \
-            patch('tricoopdiff.consensus_experiment.ExperimentalConsensusTrainer') as trainer:
-        built, _, trained = build_trainer(args, 'cpu', input_dim=1281)
-        assert built is model.return_value
-        assert trained is trainer.return_value
-        assert model.call_args.args[2] == {
-            'rank': 4, 'alpha': 8.0, 'start_layer': 0,
-            'early_layers': 4, 'early_rank': 2, 'early_alpha': 4.0,
-        }
-        contract = trainer.call_args.kwargs['experiment_contract']
-        assert contract['training_arm'] == 'C'
-        assert contract['training_source_mix'] == 'sdpi_bitseed_1_1'
-        assert contract['training_endpoint_protocol'] == (
-            'online_bitseed_training_c1_m1_v1'
-        )
+def test_training_entry_has_no_lora_configuration():
+    try:
+        parse_args([
+            '--train_data', 'unused.json', '--val_data', 'unused.json',
+            '--output_dir', 'unused', '--lora_rank', '4',
+        ])
+    except SystemExit as error:
+        assert error.code == 2
+    else:
+        raise AssertionError('the production entry must not expose LoRA')
 
 
 if __name__ == "__main__":
@@ -199,7 +185,7 @@ if __name__ == "__main__":
     test_trainer_owns_recorded_activation_clamp_runtime()
     test_consensus_builder_passes_only_active_model_dimensions()
     test_c_builder_records_online_single_pair_endpoint_protocol()
-    test_lora_builder_uses_isolated_experimental_checkpoint_contract()
+    test_training_entry_has_no_lora_configuration()
     test_legacy_clamp_mode_is_explicitly_selectable()
     test_mixed_arms_share_exact_source_and_endpoint_sequence()
     test_a1_never_consumes_cached_endpoint()

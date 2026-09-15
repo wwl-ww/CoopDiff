@@ -1,6 +1,5 @@
 """Branch-specific LoRA adapters for the shared DiffDock expert."""
 
-from contextlib import contextmanager
 import math
 
 import torch
@@ -30,8 +29,6 @@ class DualBranchLoRALinear(nn.Module):
             nn.init.zeros_(self.lora_b[branch].weight)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        if self.active_branch is None:
-            return self.base(inputs)
         update = self.lora_b[self.active_branch](self.lora_a[self.active_branch](inputs))
         return self.base(inputs) + update * self.scale
 
@@ -80,27 +77,12 @@ def inject_expert_lora(expert, rank: int = 4, alpha: float = 8.0,
     return count
 
 
-def set_expert_lora_branch(expert, branch: str | None) -> None:
+def set_expert_lora_branch(expert, branch: str) -> None:
     """Select the adapter used by subsequent calls through the shared expert."""
-    if branch not in ("sub1", "sub2", None):
+    if branch not in ("sub1", "sub2"):
         raise ValueError(f"unknown LoRA branch: {branch}")
     for module in expert.modules():
         if isinstance(module, DualBranchLoRALinear):
-            module.active_branch = branch
-
-
-@contextmanager
-def without_expert_lora(expert):
-    """Temporarily run the immutable pretrained base without either adapter."""
-    modules = [module for module in expert.modules()
-               if isinstance(module, DualBranchLoRALinear)]
-    branches = [module.active_branch for module in modules]
-    try:
-        for module in modules:
-            module.active_branch = None
-        yield
-    finally:
-        for module, branch in zip(modules, branches):
             module.active_branch = branch
 
 

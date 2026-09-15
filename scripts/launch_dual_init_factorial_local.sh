@@ -45,7 +45,6 @@ for INDEX in 0 1 2; do
         --nan-clamp 100 \
         --expert_model_dir "$ASSET_ROOT/checkpoints/score_model" \
         --cache_dir "$ASSET_ROOT/results/featurize_cache_proposal_oracle" \
-        --lora_rank 0 \
         --log_interval 25 \
         --save_interval 5 \
         --device cuda \

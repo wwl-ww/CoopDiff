@@ -1,21 +1,20 @@
 # TriCoopDiff
 
-TriCoopDiff predicts protein–ligand–protein ternary complexes with two frozen
-DiffDock experts, independent LoRA adapters, and a cooperative TriFuse module.
-This document is the handoff entry point for reproducing Phase 1 inference and
-evaluation. Run all commands from the repository root. Do not import PyTorch or
-load models on a shared cluster login node; use a GPU compute environment.
+TriCoopDiff predicts protein–ligand–protein ternary complexes with two immutable
+DiffDock experts and a cooperative residual TriFuse module. The selected model
+uses source-conditioned mixed SDPI/BiTSeed training; LoRA expert adaptation was
+tested and rejected because it worsened combined validation loss. Run all
+commands from the repository root in the direct local GPU environment.
 
 ## 1. Clone the validated branch
 
 ```bash
-git clone --branch phase1-run https://github.com/wwl-ww/CoopDiff.git
+git clone --branch exp/dual-init https://github.com/wwl-ww/CoopDiff.git
 cd CoopDiff
 git rev-parse HEAD
 ```
 
-Record the commit together with every result. The current handoff must include
-commit `1c5d230` or a documented descendant.
+Record the exact commit together with every result.
 
 ## 2. Create the software environment
 
@@ -118,21 +117,22 @@ python scripts/check_phase1_readiness.py \
 The index command must report 7,198 cases and 653 merged clusters. See
 [`doc/Phase 1 数据协议.md`](doc/Phase%201%20数据协议.md) for split and leakage rules.
 
-## 6. Install the trained TriCoopDiff checkpoint
+## 6. Install the selected dual-initialization checkpoint
 
 The Phase 1 checkpoint is not stored in Git. Obtain `best_model.pt` directly
 from the project owner and keep its supplied SHA256 alongside it:
 
 ```bash
-mkdir -p checkpoints/phase1_joint
-cp /path/from/handoff/best_model.pt checkpoints/phase1_joint/best_model.pt
-sha256sum checkpoints/phase1_joint/best_model.pt
+mkdir -p checkpoints/dual_init
+cp /path/from/handoff/best_model.pt checkpoints/dual_init/best_model.pt
+sha256sum checkpoints/dual_init/best_model.pt
 ```
 
-Use the exact advertised digest; a filename alone is not provenance. A valid
-checkpoint has `checkpoint_version=16`, `architecture=trifuse_v13`, 336 LoRA
-tensors, and an `expert_lora_config`. Do not use the old `checkpoints/phase1/`
-smoke checkpoints for formal evaluation.
+Use the exact advertised digest; a filename alone is not provenance. The
+selected run is source-conditioned arm C at epoch 81 with validation loss
+`3.1384998601`. A valid checkpoint has `checkpoint_version=20`, architecture
+`residual_consensus_v2`, empty expert-adapter state, and both raw and EMA
+TriFuse weights. Do not use LoRA experiment checkpoints for formal evaluation.
 
 ## 7. First validation gate
 
@@ -149,7 +149,7 @@ python scripts/evaluate_entry.py \
   --case 5T35_D_A_759 \
   --n-walkers 1 \
   --steps 20 \
-  --trifuse-ckpt checkpoints/phase1_joint/best_model.pt \
+  --trifuse-ckpt checkpoints/dual_init/best_model.pt \
   --out results/gate_5T35.json
 ```
 

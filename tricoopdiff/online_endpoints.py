@@ -15,7 +15,6 @@ from .expert_anchors import (
     DualExpertAnchorInitializer, generate_hybrid_candidates,
     generate_sdpi_candidates,
 )
-from .lora import without_expert_lora
 from .sdpi_flow import SDPIFlow
 
 
@@ -101,13 +100,12 @@ class LazyTrainingEndpointStore:
                 if devices:
                     torch.cuda.manual_seed_all(seed)
                 try:
-                    with without_expert_lora(self.expert):
-                        candidates, generation = generate_hybrid_candidates(
-                            initializer, e3["coords"][0], poi["coords"][0], ligand,
-                            seed=seed, conformer_count=1, bitseed_candidate_budget=1,
-                            sdpi_candidate_budget=0, binary_retry_limit=1,
-                            binary_consecutive_failure_limit=1,
-                        )
+                    candidates, generation = generate_hybrid_candidates(
+                        initializer, e3["coords"][0], poi["coords"][0], ligand,
+                        seed=seed, conformer_count=1, bitseed_candidate_budget=1,
+                        sdpi_candidate_budget=0, binary_retry_limit=1,
+                        binary_consecutive_failure_limit=1,
+                    )
                 except Exception as error:
                     # Frozen experts are allowed to be undefined on OOD inputs.
                     # Training must retain the case and use an SDPI endpoint no
