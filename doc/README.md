@@ -15,15 +15,16 @@
 | [运行指南](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md) | 环境、入口、复跑与验收；SLURM 仅为历史记录 |
 | [问题账本](../Q.md) | 已修复缺陷、未解决限制和证据路径 |
 | [独立二元评估](独立DiffDock小分子评估.md) | 历史两案例对照、小分子 LRMSD/DockQ 口径 |
+| [Ranking与PROTAC条件调研](../RANKING_PROTAC_RESEARCH.md) | 2026-09-15研究提案、C40/C81完整对照、原始资料与后续实验；不是已实现协议 |
 
 `AGENTS.md` 为贡献约定。`hh.md` 是用户原始讨论稿，非现行实现规格。
 
 ## 当前事实边界
 
-- B/C 均已完成 100 epochs；最终选择 source-conditioned C epoch 81 EMA，内部 validation loss `3.1384998601`。
+- B/C 均已完成 100 epochs；训练分支按 validation loss 交付 C81 EMA（`3.1384998601`），本分支 PROTAC 精修工作基线仍为 C40 EMA。完整22例 Final/Union差异见[配对结果](../RANKING_PROTAC_RESEARCH.md)。
 - 正式模型使用冻结 DiffDock experts。LoRA 从头训练与 best-checkpoint 微调均未超过父模型，已停止并删除可训练实现。
 - 联合训练 BiTSeed 固定 lazy `C=1, M=1`；两个二元专家各运行一次，任一失败时回退 SDPI。
-- MGD 是当前主目标；完整原子 DeepTernary DockQ 是主指标，近似 DockQ 只作诊断。
+- MGD94与PROTAC22按各自输入协议分别报告；当前还在研究PROTAC额外条件，不能混比两种数据。完整原子 DeepTernary DockQ 是主指标，近似 DockQ 只作诊断。
 - BiTSeed 本身不包含 oracle、selector 或 ranker。
 
 ## 维护规则

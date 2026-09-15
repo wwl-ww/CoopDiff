@@ -1,6 +1,6 @@
 # 运行、复现与后台作业
 
-更新：2026-09-14。以下是操作参考，不自动授权启动训练或占用 GPU。
+更新：2026-09-15。以下是操作参考，不自动授权启动训练或占用 GPU。文件名中的 SLURM 是历史命名，本机不使用 SLURM。
 
 ## 环境与资产预检
 
@@ -60,12 +60,12 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python scripts/evaluate_selected_refinem
 
 `bash scripts/gpu_status.sh` 一次显示所有卡；结合用户、完整命令、PPID、会话和日志确定所属任务。PPID=1 仅表示重新托管，不能单独证明断线安全。
 
-SLURM 站点按实际分区提交 wrapper，不在登录节点跑 GPU；本机仅使用用户授权的卡。旧 wrapper 的 GPU 编号、环境路径和训练配置是站点示例，不是当前运行状态。持久作业由 SLURM 或已配置的 tmux/独立会话管理，日志重定向到运行目录；断开终端后复查任务和输出仍更新。
+本机直接使用用户授权的物理 GPU，持久作业使用已配置的 tmux/独立会话，日志重定向到运行目录；断开终端后复查任务和输出仍更新。旧 SLURM wrapper 仅为历史参考，不作为当前启动入口。tmux 若遇到环境中的 libtinfo 冲突，可只对 tmux 命令使用 `env -u LD_LIBRARY_PATH tmux ...`，不修改全局运行环境。
 
 多 worker 使用互斥 case 划分或真正带原子认领的队列，单独日志；不要让两个进程同时写同一 case/manifest。显存够不保证 1.5–2 倍加速，记录吞吐、峰值显存和失败率。更改并发不改变 candidate ID、seed 或科学配置。
 
 ## 训练与交付门禁
 
-当前联合训练归 `exp/dual-init` 管理。旧 `train_deepternary_phase1.slurm` 的 v13/LoRA smoke 不能替代 Consensus/factorial 或双来源训练验收。旧夜间 `overnight_dual.json` 的双状态设想也不等于本次单模型双初始化目标。
+联合训练实现已从 `exp/dual-init` 合入当前分支，原工作树及训练产物仍独立保留；合并代码不迁移checkpoint/cache。历史 v13/LoRA smoke 不能替代当前 Consensus/factorial 或双来源训练验收。旧夜间 `overnight_dual.json` 的双状态设想也不等于本次单模型双初始化目标。
 
 训练前审计实际 PDB-disjoint split；随后检查 finite forward/backward、预期可训练参数更新、专家冻结、保存恢复、独立验证和双来源能力。固定一例降 loss 不是泛化证据。checkpoint 记录架构/配置/数据/数值身份，结果记录命令、commit、seed、进程或 job ID。不要覆盖旧权重，也不随文档清理删除数据或日志。

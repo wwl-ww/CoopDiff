@@ -1,5 +1,7 @@
 # SDPI–BiTSeed 联合训练交接
 
+2026-09-15：实现已通过 `6e26621` 合入主工作分支。下述目标/执行顺序保留训练交接背景，不构成再次启动训练的指令；训练loss最佳与下游DockQ基线的区别见“完成结果与模型选择”。
+
 ## 最终目标
 
 本分支的唯一目标是：**训练一个共享的 TriCoopDiff checkpoint，使同一个模型同时兼容 SDPI 与 BiTSeed 两种初始化。**
@@ -34,7 +36,7 @@ MGD94 full-pool 结果已经说明训练新模型的必要性：
 
 ## 目标方案
 
-共享一个 `TriCoopDiff` 主模型和运动输出，不增加第二套模型。第一版增加一个两类可学习 source embedding，并将它接入 **TriFuse 的条件/FiLM 路径**。冻结 DiffDock base，不直接改 vendored DiffDock 的原生 time embedding。
+共享一个 `TriCoopDiff` 主模型和运动输出，不增加第二套模型。已实现的两类 source embedding 接入 **ConsensusFuse 的 evidence/context 与 source gate 路径**，不是专家层间 FiLM。冻结 DiffDock base，不直接改 vendored DiffDock 的原生 time embedding。
 
 形式上：
 
@@ -67,6 +69,12 @@ endpoint 在训练时首次访问案例时生成，随后按 case 与固定 seed
 - ligand、POI、body-frame endpoint 坐标；
 - 实际来源与 fallback 元数据；
 - 生成协议版本及 frozen expert checkpoint hash。
+
+2026-09-15 合并审计补救：在线训练缓存新增 `input_signature`，逐次读取时核对
+E3、POI、ligand 的坐标、原子顺序、化学数据与图特征，包括内存命中路径。
+旧缓存缺少指纹或输入不匹配时明确报错；请指定新的 `--bitseed-lazy-cache-dir`，不得
+给旧缓存手工补签名或覆盖旧实验。生成协议与 checkpoint 格式不变，这不是重新训练
+或重跑已有结果的指令。
 
 必须为这个实际 endpoint 构造到 native target 的合法条件 flow/velocity target。先完成 endpoint round-trip：在刚体、POI body frame 和可旋转键自由度允许的误差内，路径 `t=1` 必须重建缓存的 BiTSeed endpoint。若外部 conformer 含当前 torsion+rigid 参数化无法表达的内部形变，应明确投影并记录残差，不能静默假定精确。
 
@@ -162,12 +170,15 @@ B（混合训练、无 source flag）和 C（混合训练、有 source flag）�
 | B | 55 | 3.1975951768 | 3.2574911439 | 3.1376992097 |
 | C | 81 | **3.1384998601** | 3.1899146282 | 3.0870850921 |
 
-最终选择 C epoch 81 的 `best_model.pt`。checkpoint 同时保存 raw 与 EMA TriFuse；正式
-验证和推理使用 EMA：
+训练分支按 validation loss 选择 C epoch 81 的 `best_model.pt`。checkpoint 同时保存 raw 与 EMA TriFuse；本轮对照使用 EMA。下列路径相对于原训练工作树（Git合并不复制忽略的权重）：
 
 ```text
 results/dual_init/arm_C_online_c1m1_seed73/best_model.pt
 ```
+
+合入后的完整 PROTAC22 全池评估显示：C40 的五组 Final 均值均高于 C81，例如 Hybrid-56/8 为 `0.3066 vs 0.2957`；但该组 Union 为 `0.3188 vs 0.3280`，C81更高。因此本分支暂保留 **C40 EMA作为精修工作基线**，C81仍是validation-loss最佳对照，不将两者概括为同一个“最终最佳”。两组均22例/5632有效轨迹，初态与seed完全配对。
+
+本工作树的封存权重分别为 `results/protac22_dual_init_e40_20260914/c40_gpu7/checkpoint_epoch40.pt` 与 `results/protac22_cbest_e81_20260915/best_model_epoch81.pt`；完整表和oracle边界见[研究文档第2节](../RANKING_PROTAC_RESEARCH.md)。这不证明其在MGD上的新旧模型优劣。
 
 ## LoRA 消融结论
 

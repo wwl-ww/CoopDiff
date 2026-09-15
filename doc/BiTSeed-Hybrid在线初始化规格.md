@@ -1,12 +1,12 @@
 # BiTSeed-Hybrid 在线初始化与实验协议
 
-更新：2026-09-14。BiTSeed = **Conformer-Diverse Binary-to-Ternary Basin Seeding**，只命名初始化模块，不包含 selector、CoopDiff 或 post-ranker。
+更新：2026-09-15。BiTSeed = **Conformer-Diverse Binary-to-Ternary Basin Seeding**，只命名初始化模块，不包含 selector、CoopDiff 或 post-ranker。
 
 ## 已确定与尚未确定
 
 当前工作候选池为 **192 BiTSeed + 64 SDPI = 256**，在线、native-free、固定配置生成，不用人工 pose bank 或 LoRA。它是后续实验的统一基准，不是已证明全局最优的比例。
 
-64-walker selector 尚未冻结：并列保留 Geometry-64、Diversity-64、Hybrid-48/16。新联合训练权重须重新验证；旧模型下的名次不能直接移植。
+64-walker selector 尚未冻结：保留 Geometry-64、Diversity-64、Hybrid-48/16和Hybrid-56/8。B40/C40及C81在PROTAC22上的全池对照均已完成，完整表与retention见[研究文档第2节](../RANKING_PROTAC_RESEARCH.md)；MGD94下表仍是旧factorial模型结果，不能移植为C组成绩。当前PROTAC精修工作基线保留C40 EMA，C81为训练validation-loss最佳对照。
 
 ## 候选生成与预算
 

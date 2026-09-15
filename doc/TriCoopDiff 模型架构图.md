@@ -27,7 +27,7 @@
 | 标准 Consensus | `residual_consensus_v2` | 18–20 | 当前 B/C 模型；v20 记录双来源端点协议 |
 | factorial 实验 | `residual_consensus_factorial_v1` | 1 | 冻结专家实验加载器 |
 
-最终选择 source-conditioned C arm epoch 81 EMA，内部 validation loss `3.1384998601`。Checkpoint v20 同时保存 raw 与 EMA TriFuse，并用空 expert-adapter 字段证明冻结契约。
+训练分支的 validation-loss 最佳模型为 source-conditioned C epoch 81 EMA（`3.1384998601`）；当前 PROTAC 精修工作基线为 C40 EMA，不能将模型版本与最优训练轮次混为一谈。Checkpoint v20 同时保存 raw 与 EMA TriFuse，并用空 expert-adapter 字段记录冻结契约。下游选择依据见[完整配对结果](../RANKING_PROTAC_RESEARCH.md)。
 
 ## 参考系与一步更新
 

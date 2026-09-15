@@ -14,7 +14,7 @@
 
 B/C 训练以 `SDPI:BiTSeed = 1:1` 交替取样，验证集固定包含 65 个 SDPI 与 65 个 BiTSeed 路径。BiTSeed endpoint 在首次访问 case 时在线生成，固定 `C=1, M=1`：一个 ETKDGv3 conformer，两个冻结专家各生成一次。任一专家在 OOD 输入上失败时整例回退 SDPI，实际来源记为 SDPI，不丢弃样本。
 
-结果选择 source-conditioned C epoch 81 EMA，内部 validation loss `3.1384998601`。详细协议和分项 loss 见 [SDPI–BiTSeed 联合训练交接](SDPI-BiTSeed联合训练交接.md)。
+训练分支按内部 validation loss 选择 source-conditioned C epoch 81 EMA（`3.1384998601`），不等于 DockQ 最优。PROTAC22 完整配对评估后，本分支以 C40 EMA 为精修工作基线，C81作为验证loss最佳的对照。详细协议和分项 loss 见 [SDPI–BiTSeed 联合训练交接](SDPI-BiTSeed联合训练交接.md)，下游结果见[调研第2节](../RANKING_PROTAC_RESEARCH.md)。
 
 ## 当前输入口径
 
