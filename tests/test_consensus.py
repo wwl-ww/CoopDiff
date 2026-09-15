@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tricoopdiff.consensus import ConsensusFuse, BRANCHES
 from tricoopdiff.consensus_train import validate_consensus_checkpoint
 from tricoopdiff.diffusion import so3_exp
+from tricoopdiff.diffdock.utils.torus import SCORE_NORM_VERSION
 
 
 def fixture():
@@ -70,6 +71,49 @@ def test_residual_heads_and_gates_receive_supervision():
         assert torch.isfinite(module.weight.grad).all()
 
 
+def test_source_conditioning_distinguishes_paths_and_receives_gradient():
+    _, graph, proposals, state = fixture()
+    fuse = ConsensusFuse(
+        node_dim=32, input_dim=16, num_transformer_layers=1,
+        dropout=0, source_conditioning=True,
+    ).eval()
+    sdpi = fuse(graph, proposals, state, source='sdpi')
+    bitseed = fuse(graph, proposals, state, source='bitseed')
+    assert not torch.allclose(sdpi['rank_features'], bitseed['rank_features'])
+    loss = sum(value.square().mean() for branch in BRANCHES
+               for value in bitseed['normalized_velocity'][branch].values())
+    loss = loss + bitseed['normalized_velocity']['torsion'].square().mean()
+    loss.backward()
+    gradient = fuse.source_embedding.weight.grad
+    assert gradient is not None and torch.isfinite(gradient).all()
+    assert gradient[1].abs().sum() > 0
+    assert gradient[0].abs().sum() == 0
+
+
+def test_unconditioned_arm_accepts_both_source_labels_without_changing_output():
+    fuse, graph, proposals, state = fixture()
+    sdpi = fuse(graph, proposals, state, source=0)
+    bitseed = fuse(graph, proposals, state, source=1)
+    assert torch.equal(sdpi['rank_features'], bitseed['rank_features'])
+
+
+def test_b_and_c_share_identical_common_parameter_initialization():
+    torch.manual_seed(991)
+    arm_b = ConsensusFuse(
+        node_dim=32, input_dim=16, num_transformer_layers=1, dropout=0,
+        source_conditioning=False,
+    )
+    torch.manual_seed(991)
+    arm_c = ConsensusFuse(
+        node_dim=32, input_dim=16, num_transformer_layers=1, dropout=0,
+        source_conditioning=True,
+    )
+    state_b, state_c = arm_b.state_dict(), arm_c.state_dict()
+    common = [name for name in state_b if not name.startswith('source_')]
+    assert common
+    assert all(torch.equal(state_b[name], state_c[name]) for name in common)
+
+
 def test_legacy_checkpoint_rejected():
     try:
         validate_consensus_checkpoint({'checkpoint_version': 17})
@@ -77,6 +121,61 @@ def test_legacy_checkpoint_rejected():
         assert '18' in str(error)
     else:
         raise AssertionError('legacy weights must not masquerade as model-v2')
+
+
+def _checkpoint_payload(version):
+    runtime = {
+        'activation_clamp': 100.0, 'activation_clamp_mode': 'irrep_norm',
+        'residual_weight': 1e-3, 'ema_decay': 0.999,
+        'torus_score_norm_version': SCORE_NORM_VERSION,
+    }
+    if version in (19, 20):
+        runtime.update({
+            'flow_time_contract': 'shared_flow_expert_clock_v1',
+            'candidate_source_contract': 'candidate_source_conditioning_v1',
+            'training_source_mix': 'sdpi_bitseed_1_1',
+        })
+    if version == 20:
+        runtime['training_endpoint_protocol'] = 'online_bitseed_training_c1_m1_v1'
+    return {
+        'checkpoint_version': version,
+        'architecture': 'residual_consensus_v2',
+        'generative_process': 'sdpi_flow_v1',
+        'expert_lora_config': None, 'expert_lora_state_dict': {},
+        'trifuse_state_dict': {'weight': torch.ones(1)},
+        'ema_trifuse_state_dict': {'weight': torch.ones(1)},
+        'model_config': {'node_dim': 32},
+        'expert_base_identity': {'sha256': 'test'},
+        'runtime_config': runtime,
+    }
+
+
+def test_checkpoint_contract_accepts_v18_v19_and_explicit_v20():
+    validate_consensus_checkpoint(_checkpoint_payload(18))
+    validate_consensus_checkpoint(_checkpoint_payload(19))
+    validate_consensus_checkpoint(_checkpoint_payload(20))
+
+
+def test_v19_checkpoint_requires_explicit_source_and_time_contracts():
+    payload = _checkpoint_payload(19)
+    del payload['runtime_config']['candidate_source_contract']
+    try:
+        validate_consensus_checkpoint(payload)
+    except ValueError as error:
+        assert 'source contract' in str(error)
+    else:
+        raise AssertionError('v19 must record its candidate source contract')
+
+
+def test_v20_checkpoint_requires_online_c1m1_for_mixed_training():
+    payload = _checkpoint_payload(20)
+    payload['runtime_config']['training_endpoint_protocol'] = 'full_pool_c4_m8'
+    try:
+        validate_consensus_checkpoint(payload)
+    except ValueError as error:
+        assert 'endpoint protocol' in str(error)
+    else:
+        raise AssertionError('mixed v20 must record online C=1/M=1 generation')
 
 
 def test_no_torsion_has_finite_empty_output():

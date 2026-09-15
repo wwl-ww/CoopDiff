@@ -397,7 +397,7 @@ def generate_hybrid_candidates(initializer, e3_coords, poi_coords, ligand_data,
                 binary_consecutive_failure_limit=binary_consecutive_failure_limit,
                 allow_partial=True,
             )
-        except FloatingPointError as error:
+        except (FloatingPointError, ValueError) as error:
             failures.append({
                 "conformer_index": conformer_index,
                 "seed": conformer_seed,

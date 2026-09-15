@@ -13,7 +13,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from tricoopdiff.train import TriCoopDiffTrainer
 from tricoopdiff.sdpi_flow import SDPIFlow
-from train_entry import build_trainer, parse_args, swap_protein_reference
+from tricoopdiff.sampler import actual_candidate_source
+from train_entry import (
+    build_trainer, parse_args, prepare_source_batch, swap_protein_reference,
+)
 
 
 def _head():
@@ -66,13 +69,11 @@ def test_trainer_owns_recorded_activation_clamp_runtime():
             self.trifuse = torch.nn.Linear(2, 2)
             self.expert = torch.nn.Module()
 
-    with patch('tricoopdiff.lora.expert_lora_parameter_groups',
-               return_value={'early': [], 'late': []}):
-        with patch.dict(os.environ, {}, clear=True):
-            trainer = TriCoopDiffTrainer(
-                DummyModel(), SDPIFlow(), device='cpu', activation_clamp=37)
-            assert trainer.activation_clamp == 37
-            assert os.environ['NAN_CLAMP'] == '37.0'
+    with patch.dict('os.environ', {}, clear=True):
+        trainer = TriCoopDiffTrainer(
+            DummyModel(), SDPIFlow(), device='cpu', activation_clamp=37)
+        assert trainer.activation_clamp == 37
+        assert os.environ['NAN_CLAMP'] == '37.0'
 
 
 def test_consensus_builder_passes_only_active_model_dimensions():
@@ -93,6 +94,24 @@ def test_consensus_builder_passes_only_active_model_dimensions():
         assert result is model.return_value
         assert trained is trainer.return_value
         assert trainer.call_args.kwargs['activation_clamp_mode'] == 'irrep_norm'
+        assert trainer.call_args.kwargs['training_endpoint_protocol'] == 'none'
+
+
+def test_c_builder_records_online_single_pair_endpoint_protocol():
+    args = parse_args([
+        '--train_data', 'unused.json', '--val_data', 'unused.json',
+        '--output_dir', 'unused', '--training-arm', 'C',
+    ])
+    args.training_endpoint_protocol = 'online_bitseed_training_c1_m1_v1'
+    expert = SimpleNamespace(num_conv_layers=11)
+    with patch('tricoopdiff.expert_factory.build_diffdock_expert', return_value=expert), \
+            patch('tricoopdiff.consensus.ConsensusFuse'), \
+            patch('tricoopdiff.consensus.ConsensusCoopDiff'), \
+            patch('tricoopdiff.consensus_train.ConsensusTrainer') as trainer:
+        build_trainer(args, 'cpu', input_dim=1281)
+        assert trainer.call_args.kwargs['training_endpoint_protocol'] == (
+            'online_bitseed_training_c1_m1_v1'
+        )
 
 
 def test_legacy_clamp_mode_is_explicitly_selectable():
@@ -103,15 +122,58 @@ def test_legacy_clamp_mode_is_explicitly_selectable():
     assert args.activation_clamp_mode == 'componentwise'
 
 
-def test_consensus_builder_rejects_lora_before_loading_expert():
-    with patch('tricoopdiff.expert_factory.build_diffdock_expert') as expert:
-        try:
-            build_trainer(SimpleNamespace(lora_rank=4), 'cpu')
-        except ValueError as error:
-            assert 'freezes native experts' in str(error)
-        else:
-            raise AssertionError('v2 must reject expert adapters')
-        expert.assert_not_called()
+def test_mixed_arms_share_exact_source_and_endpoint_sequence():
+    class Store:
+        def coupling(self, case, occurrence=0):
+            return ({'case_marker': case, 'occurrence': occurrence},
+                    {'actual_source': 'bitseed'})
+
+    batch = {'case': 'case-a'}
+    for step in range(6):
+        arm_b = prepare_source_batch(batch, step, 'B', Store())
+        arm_c = prepare_source_batch(batch, step, 'C', Store())
+        assert arm_b == arm_c
+        assert arm_b['source'] == step % 2
+        if step % 2:
+            assert arm_b['coupling_override']['occurrence'] == step // 2
+
+
+def test_a1_never_consumes_cached_endpoint():
+    batch = prepare_source_batch({'case': 'case-a'}, 3, 'A1', None)
+    assert batch == {'case': 'case-a', 'source': 0}
+
+
+def test_sampler_conditions_on_actual_fallback_source():
+    assert actual_candidate_source('sdpi', {}) == 'sdpi'
+    assert actual_candidate_source('expert_anchor', {'fallback': None}) == 'bitseed'
+    assert actual_candidate_source(
+        'expert_anchor', {'fallback': 'broad_sdpi_clash_filter'},
+    ) == 'sdpi'
+    assert actual_candidate_source(
+        'fixed_candidate', {'candidate_source': 'bitseed'},
+    ) == 'bitseed'
+
+
+def test_mixed_training_relabels_ood_expert_fallback_as_sdpi():
+    class Store:
+        def coupling(self, case, occurrence=0):
+            return {'cached': True}, {'actual_source': 'sdpi'}
+
+    batch = prepare_source_batch({'case': 'ood'}, 1, 'C', Store())
+    assert batch['source'] == 0
+    assert batch['coupling_override'] == {'cached': True}
+
+
+def test_training_entry_has_no_lora_configuration():
+    try:
+        parse_args([
+            '--train_data', 'unused.json', '--val_data', 'unused.json',
+            '--output_dir', 'unused', '--lora_rank', '4',
+        ])
+    except SystemExit as error:
+        assert error.code == 2
+    else:
+        raise AssertionError('the production entry must not expose LoRA')
 
 
 if __name__ == "__main__":
@@ -120,6 +182,11 @@ if __name__ == "__main__":
     test_protein_role_swap_changes_reference_without_changing_geometry()
     test_trainer_owns_recorded_activation_clamp_runtime()
     test_consensus_builder_passes_only_active_model_dimensions()
-    test_consensus_builder_rejects_lora_before_loading_expert()
+    test_c_builder_records_online_single_pair_endpoint_protocol()
+    test_training_entry_has_no_lora_configuration()
     test_legacy_clamp_mode_is_explicitly_selectable()
+    test_mixed_arms_share_exact_source_and_endpoint_sequence()
+    test_a1_never_consumes_cached_endpoint()
+    test_sampler_conditions_on_actual_fallback_source()
+    test_mixed_training_relabels_ood_expert_fallback_as_sdpi()
     print("Training-contract tests passed")

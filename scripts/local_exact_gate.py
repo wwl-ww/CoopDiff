@@ -300,8 +300,7 @@ def main():
                 'checkpoint chemistry/torsion contract differs')
         require(contract['adaptation'] == 'frozen', 'checkpoint expert is not frozen')
         expert = build_diffdock_expert(str(expert_dir), 'cuda')
-        model = ExperimentalConsensus(expert, ConsensusFuse(**payload['model_config']),
-                                      payload['expert_lora_config'])
+        model = ExperimentalConsensus(expert, ConsensusFuse(**payload['model_config']))
         runtime = payload['runtime_config']
         if runtime.get('offpath_target') == 'e3_ligand_endpoint_translation_v1':
             trainer_class = EndpointTranslationRolloutTrainer
@@ -427,8 +426,7 @@ def main():
         trainer = trainer_class(
             model, SDPIFlow(), device='cuda',
             experiment_contract=contract,
-            lr=runtime['optimizer_groups']['trifuse']['lr'], lora_lr=1e-5,
-            lora_early_lr=5e-6, lora_warmup_steps=0,
+            lr=runtime['optimizer_groups']['trifuse']['lr'],
             activation_clamp=runtime['activation_clamp'],
             activation_clamp_mode=runtime['activation_clamp_mode'],
             residual_weight=runtime['residual_weight'], ema_decay=runtime['ema_decay'],

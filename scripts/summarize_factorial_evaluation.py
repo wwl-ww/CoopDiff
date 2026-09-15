@@ -22,16 +22,6 @@ def main():
          ("old", "single_bond", "frozen", 1729)),
         ("ccd_single_bond_frozen", ("old", "legacy", "frozen", 1729),
          ("ccd", "single_bond", "frozen", 1729)),
-        ("lora_old_legacy", ("old", "legacy", "frozen", 1729),
-         ("old", "legacy", "lora", 1729)),
-        ("lora_old_single", ("old", "single_bond", "frozen", 1729),
-         ("old", "single_bond", "lora", 1729)),
-        ("lora_ccd_legacy_seed1729", ("ccd", "legacy", "frozen", 1729),
-         ("ccd", "legacy", "lora", 1729)),
-        ("lora_ccd_legacy_seed2718", ("ccd", "legacy", "frozen", 2718),
-         ("ccd", "legacy", "lora", 2718)),
-        ("lora_ccd_single", ("ccd", "single_bond", "frozen", 1729),
-         ("ccd", "single_bond", "lora", 1729)),
     ]
     output = []
     rng = np.random.default_rng(20260909)

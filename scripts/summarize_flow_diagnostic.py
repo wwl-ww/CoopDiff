@@ -31,7 +31,6 @@ def main():
         ('case', lambda r: r.get('case', 'fixed')),
         ('time_bin', lambda r: min(int(r.get('time', .5) * 5), 4)),
         ('torsion_count', lambda r: r.get('n_torsions', 'fixed')),
-        ('lora_enabled', lambda r: r['lora_enabled']),
     ):
         groups = defaultdict(list)
         for row in rows:

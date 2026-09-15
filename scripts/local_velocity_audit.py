@@ -100,8 +100,7 @@ def load_batch(entry, plan, score_args):
 def build(checkpoint, expert_dir):
     saved = torch.load(checkpoint, map_location='cpu', weights_only=False)
     expert = build_diffdock_expert(str(expert_dir), 'cuda')
-    model = ExperimentalConsensus(expert, ConsensusFuse(**saved['model_config']),
-                                  saved['expert_lora_config'])
+    model = ExperimentalConsensus(expert, ConsensusFuse(**saved['model_config']))
     runtime = saved['runtime_config']
     variant = {}
     if runtime.get('trajectory_objective') in {
@@ -236,7 +235,6 @@ def build(checkpoint, expert_dir):
         model, PairedTorsionFlow(), device='cuda',
         experiment_contract=saved['experiment_contract'],
         lr=runtime['optimizer_groups']['trifuse']['lr'],
-        lora_lr=1e-5, lora_early_lr=5e-6, lora_warmup_steps=0,
         **{key: runtime[key] for key in (
             'activation_clamp', 'activation_clamp_mode', 'residual_weight', 'ema_decay')},
         **variant)

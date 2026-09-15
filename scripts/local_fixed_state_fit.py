@@ -42,7 +42,7 @@ def main():
     validate_expert_base_identity(saved, expert)
     fuse = ConsensusFuse(**saved['model_config']).cuda().eval()
     fuse.load_state_dict(saved['ema_trifuse_state_dict'])
-    model = ExperimentalConsensus(expert, fuse, saved['expert_lora_config']).cuda().eval()
+    model = ExperimentalConsensus(expert, fuse).cuda().eval()
     cache = root / f'results/overnight_root_cause_v3_plan/cache_ccd/{args.case}.pt'
     batch = torch.load(cache, map_location='cuda', weights_only=False)
     assert batch['cache_version'] == 7

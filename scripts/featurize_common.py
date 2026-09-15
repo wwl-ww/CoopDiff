@@ -368,7 +368,13 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
             'cache_version': _FEATURIZE_CACHE_VERSION,
             'source_signature': cache_signature,
         }
-        temporary_path = cache_path.with_suffix(cache_path.suffix + '.tmp')
+        # B/C training processes intentionally share this cache.  A fixed
+        # ``.tmp`` name lets one process move the other process's in-progress
+        # file, causing the loser to fail at os.replace.  Per-process names
+        # preserve atomic publication without cross-process collisions.
+        temporary_path = cache_path.with_suffix(
+            cache_path.suffix + f'.tmp.{os.getpid()}'
+        )
         torch.save(payload, temporary_path)
         os.replace(temporary_path, cache_path)
 

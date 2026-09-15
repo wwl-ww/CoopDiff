@@ -189,8 +189,22 @@ def apply_patches():
 
     Idempotent. MUST be called before `models.cg_model` is imported.
     """
-    import torch_cluster
-    import torch_scatter
+    import sys
+    from importlib.machinery import ModuleSpec
+    from types import ModuleType
+
+    try:
+        import torch_cluster
+    except ModuleNotFoundError:
+        torch_cluster = ModuleType('torch_cluster')
+        torch_cluster.__spec__ = ModuleSpec('torch_cluster', loader=None)
+        sys.modules['torch_cluster'] = torch_cluster
+    try:
+        import torch_scatter
+    except ModuleNotFoundError:
+        torch_scatter = ModuleType('torch_scatter')
+        torch_scatter.__spec__ = ModuleSpec('torch_scatter', loader=None)
+        sys.modules['torch_scatter'] = torch_scatter
     torch_cluster.radius = _radius_pytorch
     torch_cluster.radius_graph = _radius_graph_pytorch
     torch_cluster.knn_graph = _knn_graph_pytorch

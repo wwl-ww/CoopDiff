@@ -17,8 +17,24 @@ from .consensus_layers import JudgeHead, StateHead, TokenNegotiator, TorsionCoor
 
 
 ARCHITECTURE = 'residual_consensus_v2'
-CONSENSUS_CHECKPOINT_VERSION = 18
+CONSENSUS_CHECKPOINT_VERSION = 20
+LEGACY_CONSENSUS_CHECKPOINT_VERSION = 18
+PREVIOUS_CONSENSUS_CHECKPOINT_VERSION = 19
 BRANCHES = ('e3_ligand', 'poi_ligand')
+SOURCE_NAMES = ('sdpi', 'bitseed')
+SOURCE_CONTRACT_VERSION = 'candidate_source_conditioning_v1'
+
+
+def candidate_source_tensor(source, reference):
+    """Normalize one immutable trajectory source to a ``[1]`` class tensor."""
+    if isinstance(source, str):
+        if source not in SOURCE_NAMES:
+            raise ValueError(f'unknown candidate source: {source!r}')
+        source = SOURCE_NAMES.index(source)
+    value = torch.as_tensor(source, device=reference.device, dtype=torch.long).reshape(-1)
+    if value.shape != (1,) or not bool(((value >= 0) & (value < len(SOURCE_NAMES))).all()):
+        raise ValueError('candidate source must be one SDPI/BiTSeed class')
+    return value
 
 
 def bounded_vector(value):
@@ -30,14 +46,28 @@ class ConsensusFuse(nn.Module):
     """Read proposals after expert inference; decide all executable DOFs."""
 
     def __init__(self, node_dim=128, input_dim=None, num_transformer_layers=3,
-                 dropout=0.1, **unused_legacy_dimensions):
+                 dropout=0.1, source_conditioning=False,
+                 **unused_legacy_dimensions):
         super().__init__()
         self.config = dict(node_dim=node_dim, input_dim=input_dim or node_dim,
-                           num_transformer_layers=num_transformer_layers, dropout=dropout)
+                           num_transformer_layers=num_transformer_layers, dropout=dropout,
+                           source_conditioning=bool(source_conditioning))
         self.pooling = TernaryGeometryEncoder(self.config['input_dim'], node_dim)
         self.transformer = TokenNegotiator(node_dim, num_transformer_layers, dropout)
         self.evidence_encoder = nn.Sequential(
             nn.Linear(9 + 8 * 8, node_dim), nn.SiLU(), nn.Linear(node_dim, node_dim))
+        if source_conditioning:
+            # Source-only parameters must not perturb the RNG sequence used by
+            # shared B/C parameters; otherwise the factorial comparison starts
+            # from different common weights.
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(0)
+                self.source_embedding = nn.Embedding(len(SOURCE_NAMES), node_dim)
+                self.source_gate_head = nn.Linear(node_dim, 4, bias=False)
+                nn.init.normal_(self.source_gate_head.weight, std=0.01)
+        else:
+            self.source_embedding = None
+            self.source_gate_head = None
         # Four independent interface/component trust gates, not calibrated confidence.
         self.gate_head = nn.Linear(node_dim, 4)
         nn.init.zeros_(self.gate_head.weight)
@@ -52,7 +82,7 @@ class ConsensusFuse(nn.Module):
         for module in (self.judge_head, self.state_head):
             module.requires_grad_(False)
 
-    def forward(self, graph, proposals, diffusion_state):
+    def forward(self, graph, proposals, diffusion_state, source=0):
         coords, types = graph['node_coords'], graph['node_types']
         pooled = self.pooling(graph['node_features'], coords, types,
                               lig_edge_index=graph['lig_edge_index'])
@@ -66,11 +96,21 @@ class ConsensusFuse(nn.Module):
                             + [geometry_cross, proposal_cross], dim=1)
         gram = basis @ basis.transpose(-1, -2)
         evidence = self.evidence_encoder(torch.cat((diffusion_state, gram.flatten(1)), -1))
+        source_index = candidate_source_tensor(source, evidence)
+        source_context = None
+        if self.source_embedding is not None:
+            source_context = self.source_embedding(source_index)
+            evidence = evidence + source_context
         tokens = torch.stack((pooled['global'], pooled['e3l'], pooled['pol'],
                               pooled['ligand_tokens'][0].mean(0, keepdim=True), evidence), dim=1)
         negotiated = self.transformer(tokens)
         context = negotiated.mean(1)
-        gates = torch.sigmoid(self.gate_head(context))
+        gate_logits = self.gate_head(context)
+        if source_context is not None:
+            # This source-owned nonzero path avoids the zero-initialized common
+            # heads blocking embedding gradients on the first training batch.
+            gate_logits = gate_logits + self.source_gate_head(source_context)
+        gates = torch.sigmoid(gate_logits)
         coefficients = self.residual_head(context).reshape(-1, 4, 8)
         residual = torch.einsum('bik,bkj->bij', coefficients, basis)
         prior = gates.unsqueeze(-1) * torch.stack(raw, 1)
@@ -135,7 +175,8 @@ class ConsensusCoopDiff(nn.Module):
         return None
 
     def forward(self, e3_data, poi_data, ligand_data, t_e3l, t_pol=None,
-                r_e3_to_poi=None, receptor_crop_cutoff=None, diffusion_state=None):
+                r_e3_to_poi=None, receptor_crop_cutoff=None, diffusion_state=None,
+                source=0):
         if t_e3l.shape != (1,):
             raise ValueError('model-v2 currently requires B=1')
         if t_pol is not None and not torch.equal(t_e3l, t_pol):
@@ -179,7 +220,7 @@ class ConsensusCoopDiff(nn.Module):
             ligand_data['coords'][0], ligand_data['features'][0],
             lig_edge_index=ligand_data['edge_index'], lig_edge_mask=ligand_data['edge_mask'],
             lig_mask_rotate=ligand_data['mask_rotate'])
-        result = self.trifuse(graph, proposals, diffusion_state)
+        result = self.trifuse(graph, proposals, diffusion_state, source=source)
         # Kept explicitly as diagnostic evidence, never consumed as another update.
         result['binary_proposals'] = proposals
         return result

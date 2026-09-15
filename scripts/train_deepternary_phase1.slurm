@@ -42,7 +42,6 @@ echo "git_status=$(git status --porcelain | wc -l) modified_paths"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 python -c "import runpy; tests=runpy.run_path('tests/test_torsion_utils.py'); tests['test_modify_conformer_torsion_angles_copies_and_rotates']()"
 python tests/test_model_build.py
-python tests/test_lora.py
 python tests/test_training_contract.py
 python tests/test_sdpi_flow.py
 
@@ -77,15 +76,6 @@ PYTHONUNBUFFERED=1 python scripts/train_entry.py \
     --phase 1 \
     --expert_model_dir checkpoints/score_model \
     --cache_dir results/featurize_cache_phase1_joint_v1 \
-    --lora_rank 4 \
-    --lora_alpha 8 \
-    --lora_start_layer 0 \
-    --lora_early_layers 4 \
-    --lora_early_rank 2 \
-    --lora_early_alpha 4 \
-    --lora_lr 1e-5 \
-    --lora_early_lr 5e-6 \
-    --lora-warmup-steps 100 \
     --torsion-expert-aux-weight 0.25 \
     --log_interval 10 \
     --save_interval 1 \
@@ -105,15 +95,6 @@ PYTHONUNBUFFERED=1 python scripts/train_entry.py \
     --phase 1 \
     --expert_model_dir checkpoints/score_model \
     --cache_dir results/featurize_cache_phase1_joint_v1 \
-    --lora_rank 4 \
-    --lora_alpha 8 \
-    --lora_start_layer 0 \
-    --lora_early_layers 4 \
-    --lora_early_rank 2 \
-    --lora_early_alpha 4 \
-    --lora_lr 1e-5 \
-    --lora_early_lr 5e-6 \
-    --lora-warmup-steps 100 \
     --torsion-expert-aux-weight 0.25 \
     --log_interval 25 \
     --save_interval 5 \

@@ -222,7 +222,7 @@ def main():
     validate_expert_base_identity(base, expert)
     fuse = ConsensusFuse(**base['model_config']).to(device)
     fuse.load_state_dict(base['ema_trifuse_state_dict'])
-    model = ExperimentalConsensus(expert, fuse, base['expert_lora_config'])
+    model = ExperimentalConsensus(expert, fuse)
     contract = {'chemistry': 'ccd', 'torsion': 'single_bond', 'adaptation': 'frozen',
                 'training': 'deterministic_paired_pilot_v2', 'variant': args.variant,
                 'rng_pairing': 'per_example_reset_and_supervised_forward_restore_v1',
@@ -232,7 +232,6 @@ def main():
                 'seed': args.seed, 'base_checkpoint_sha256': sha256(args.base),
                 'train_cases': [b['case'] for b in train], 'val_cases': [b['case'] for b in val]}
     common = dict(device=device, experiment_contract=contract, lr=5e-5,
-                  lora_lr=1e-5, lora_early_lr=5e-6, lora_warmup_steps=0,
                   activation_clamp=base['runtime_config']['activation_clamp'],
                   activation_clamp_mode=base['runtime_config']['activation_clamp_mode'],
                   residual_weight=base['runtime_config']['residual_weight'],
@@ -289,9 +288,6 @@ def main():
                     group_results.append(trainer.train_step(
                         **copy.deepcopy(train[int(index)])))
             else:
-                if model.experiment_lora_config:
-                    raise ValueError('accumulation pilot currently requires frozen experts')
-                trainer._set_lora_trainable(False)
                 trainer.model.train()
                 trainer.optimizer.zero_grad()
                 group_results = []

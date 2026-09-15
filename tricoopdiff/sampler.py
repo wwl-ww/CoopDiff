@@ -20,6 +20,22 @@ import torch
 
 from .initialization import TernaryInitializer
 from .sdpi_flow import SDPIFlow, FLOW_VERSION
+from .consensus import SOURCE_NAMES
+
+
+def actual_candidate_source(init_mode, initialization):
+    """Return the source actually produced, including BiTSeed fallback."""
+    if init_mode == "sdpi":
+        source = "sdpi"
+    elif init_mode == "fixed_candidate":
+        source = initialization.get("candidate_source")
+    elif init_mode == "expert_anchor":
+        source = "sdpi" if initialization.get("fallback") else "bitseed"
+    else:
+        raise ValueError(f"unsupported initialization mode: {init_mode}")
+    if source not in SOURCE_NAMES:
+        raise ValueError("initializer did not report a valid actual candidate source")
+    return source
 
 
 @torch.no_grad()
@@ -147,6 +163,9 @@ def sample_single(
         r_e3_to_poi = torch.eye(3, device=device, dtype=poi_pos.dtype).unsqueeze(0)
     initialization["freeze_poi"] = bool(freeze_poi)
     initialization['generative_process'] = FLOW_VERSION
+    candidate_source = actual_candidate_source(init_mode, initialization)
+    initialization["candidate_source"] = candidate_source
+    source_index = SOURCE_NAMES.index(candidate_source)
     initialization["expert"] = getattr(model.expert, "provenance", {})
     ca_distances = torch.cdist(e3_coords, poi_pos[0])
     initialization["initial_geometry"] = {
@@ -236,6 +255,7 @@ def sample_single(
             r_e3_to_poi=r_e3_to_poi,
             receptor_crop_cutoff=receptor_crop_cutoff,
             diffusion_state=diffusion_state,
+            source=source_index,
         )
         if return_rank_features:
             features = out.get('rank_features')
