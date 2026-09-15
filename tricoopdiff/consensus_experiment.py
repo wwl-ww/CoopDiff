@@ -31,7 +31,16 @@ class ExperimentalConsensus(ConsensusCoopDiff):
 
     def _expert_context(self):
         # Respect outer no_grad during evaluation; never force enable_grad.
-        return nullcontext() if self.experiment_lora_config else torch.no_grad()
+        if not self.experiment_lora_config:
+            return torch.no_grad()
+        if self.training and torch.is_grad_enabled():
+            # Full-expert LoRA needs gradients through the immutable DiffDock
+            # base. Large ternary graphs otherwise retain roughly 30 GiB of
+            # CUDA activations and can exceed a 32 GiB card. Moving tensors
+            # saved for backward to pinned CPU memory preserves the full-layer
+            # experiment while bounding its CUDA activation footprint.
+            return torch.autograd.graph.save_on_cpu(pin_memory=True)
+        return nullcontext()
 
     def _select_expert_branch(self, index):
         if self.experiment_lora_config:
