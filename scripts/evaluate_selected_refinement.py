@@ -3,17 +3,30 @@
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import math
 import os
+import sys
 import time
 from pathlib import Path
+
+# Keep assets in this repository while using an explicitly selected model runtime.
+# This avoids editing a worktree whose training jobs are still running.
+_bootstrap = argparse.ArgumentParser(add_help=False)
+_bootstrap.add_argument("--runtime-root")
+_bootstrap.add_argument("--project-root")
+_runtime_args, _ = _bootstrap.parse_known_args()
+RUNTIME_ROOT = Path(_runtime_args.runtime_root or Path(__file__).resolve().parent.parent).resolve()
+sys.path.insert(0, str(RUNTIME_ROOT / "scripts"))
+sys.path.insert(0, str(RUNTIME_ROOT))
+import tricoopdiff.diffdock_compat  # noqa: E402,F401
 
 import numpy as np
 import torch
 
-from evaluation_common import resolve_entry_paths, sha256_file
+from evaluation_common import evaluation_input_signature, resolve_entry_paths, sha256_file
 from evaluation_runner import EvaluationRunner
 from featurize_common import featurize_complex
 from tricoopdiff.deepternary_metrics import compute_fullatom_dockq
@@ -24,8 +37,8 @@ from tricoopdiff.expert_anchors import (
 from tricoopdiff.sampler import sample_single
 
 
-ROOT = Path(__file__).resolve().parent.parent
-PROTOCOL = "bitseed_hybrid_selected_refinement_v2"
+ROOT = Path(_runtime_args.project_root or Path(__file__).resolve().parent.parent).resolve()
+PROTOCOL = "bitseed_hybrid_selected_refinement_v3"
 
 
 def parser():
@@ -33,6 +46,10 @@ def parser():
     result.add_argument("--index", required=True)
     result.add_argument("--out-dir", required=True)
     result.add_argument("--checkpoint", required=True)
+    result.add_argument("--runtime-root", help="Explicit code worktree; assets remain relative to this script's repository")
+    result.add_argument("--project-root", help="Asset/output root when executing a frozen code snapshot")
+    result.add_argument("--smoke-one-per-source", action="store_true",
+                        help="Refine only the first BiTSeed and first SDPI candidate; verify source at every model call")
     result.add_argument("--cases", help="Comma-separated case IDs; default is the full index")
     result.add_argument("--device", default="cuda")
     result.add_argument("--cache-dir", default="results/featurize_cache_proposal_oracle")
@@ -53,7 +70,8 @@ def parser():
         help="Refine all 256 candidates so every selector has a counterfactual final label",
     )
     result.add_argument("--allow-experimental-checkpoint", action="store_true")
-    result.add_argument("--no-resume", action="store_true")
+    result.add_argument("--no-resume", action="store_true",
+                        help="Run without reusing case reports; requires no existing case outputs")
     return result
 
 
@@ -66,6 +84,16 @@ def atomic_json(payload, destination):
 
 def source(candidate):
     return "sdpi" if candidate["candidate_id"][0] == "sdpi" else "bitseed"
+
+
+def candidate_hash(candidate):
+    digest = hashlib.sha256()
+    digest.update(json.dumps(candidate["candidate_id"]).encode())
+    for key in ("ligand", "poi", "rotation"):
+        value = candidate[key].detach().cpu().contiguous().numpy()
+        digest.update(str((value.shape, value.dtype)).encode())
+        digest.update(value.tobytes())
+    return digest.hexdigest()
 
 
 def exact_dockq(candidate_ligand, candidate_poi, *, e3_data, paths, native,
@@ -99,13 +127,89 @@ def summarize(rows, metric):
     }
 
 
+def resolve_case_inputs(entry, project_root, native_root):
+    """Resolve model inputs and every structure used by exact scoring."""
+    root = Path(project_root)
+    paths = resolve_entry_paths(entry, root)
+    metric_paths = {}
+    for key in ("metric_protein1", "metric_protein2"):
+        if key in entry:
+            value = Path(entry[key])
+            value = value if value.is_absolute() else root / value
+            if not value.is_file():
+                raise FileNotFoundError(value)
+            metric_paths[f"{key}_pdb"] = str(value.resolve())
+    if len(metric_paths) not in (0, 2):
+        raise ValueError("provide both metric protein templates or neither")
+    native_value = entry.get("complex")
+    native = (Path(native_value) if native_value else
+              root / native_root / entry["case"] / "gt_complex.pdb")
+    native = native if native.is_absolute() else root / native
+    if not native.is_file():
+        raise FileNotFoundError(native)
+    return paths, native.resolve(), metric_paths
+
+
+def validate_resume_output(output, manifest, *, resume=True):
+    """Fail before any output writes if existing results cannot be safely reused."""
+    output = Path(output)
+
+    def read(path):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise ValueError(f"Cannot verify {path}; use a new --out-dir") from error
+        if not isinstance(value, dict):
+            raise ValueError(f"Invalid report {path}; use a new --out-dir")
+        return value
+
+    manifest_path = output / "manifest.json"
+    if manifest_path.exists() and read(manifest_path) != manifest:
+        raise ValueError("Existing manifest differs or is legacy; use a new --out-dir")
+    completed = {}
+    for case in manifest["cases"]:
+        path = output / f"{case}.json"
+        if not path.exists():
+            continue
+        if not resume:
+            raise ValueError(f"{path} already exists; --no-resume requires a new --out-dir")
+        report = read(path)
+        if report.get("case") != case or report.get("config") != manifest:
+            raise ValueError(f"{case}: existing report contract mismatch; use a new --out-dir")
+        if report.get("status") == "complete":
+            completed[case] = report
+    return completed
+
+
+def refinement_metric_fields(initial, refined=None):
+    """The oracle union retains a valid initialization even if refinement fails."""
+    for metrics in (initial, refined):
+        if metrics is not None and not all(
+                math.isfinite(float(metrics[key])) for key in ("dockq", "fnat", "lrms", "irms")):
+            raise ValueError("exact scoring returned non-finite metrics")
+    fields = {f"initial_{key}": initial[key] for key in ("dockq", "fnat", "lrms", "irms")}
+    fields.update(safe_dockq=initial["dockq"], safe_stage="initial")
+    if refined is not None:
+        fields.update({f"refined_{key}": refined[key]
+                       for key in ("dockq", "fnat", "lrms", "irms")})
+        fields["refinement_delta_dockq"] = refined["dockq"] - initial["dockq"]
+        if refined["dockq"] >= initial["dockq"]:
+            fields.update(safe_dockq=refined["dockq"], safe_stage="refined")
+    return fields
+
+
 def main():
+    # Some legacy runtime imports change CWD to their own checkout. Keep all
+    # relative data/output/cache paths anchored to this asset repository.
+    os.chdir(ROOT)
     args = parser().parse_args()
+    if args.smoke_one_per_source and args.max_refinements is not None:
+        raise ValueError("source smoke cannot be combined with max-refinements")
     if args.steps < 1 or args.max_refinements is not None and args.max_refinements < 1:
         raise ValueError("steps and max-refinements must be positive")
     index_path = Path(args.index).resolve()
     payload = json.loads(index_path.read_text(encoding="utf-8"))
-    entries = payload.get("entries", payload)
+    entries = payload.get("entries", payload) if isinstance(payload, dict) else payload
     if args.cases:
         requested = [case.strip() for case in args.cases.split(",") if case.strip()]
         by_case = {entry["case"]: entry for entry in entries}
@@ -113,6 +217,8 @@ def main():
         if missing:
             raise ValueError(f"case IDs absent from index: {sorted(missing)}")
         entries = [by_case[case] for case in requested]
+    if len({entry["case"] for entry in entries}) != len(entries):
+        raise ValueError("duplicate case IDs cannot share an output directory")
 
     output = Path(args.out_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -122,6 +228,11 @@ def main():
     deepternary_root = Path(args.deepternary_root)
     if not deepternary_root.is_absolute():
         deepternary_root = (ROOT / deepternary_root).resolve()
+    native_root = (ROOT / args.native_root).resolve()
+    case_inputs = {
+        entry["case"]: resolve_case_inputs(entry, ROOT, native_root)
+        for entry in entries
+    }
     manifest = {
         "protocol": PROTOCOL,
         "scope": "native-free selection followed by oracle-scored CoopDiff refinement",
@@ -130,6 +241,32 @@ def main():
         "cases": [entry["case"] for entry in entries],
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": sha256_file(checkpoint),
+        "runtime_root": str(RUNTIME_ROOT),
+        "project_root": str(ROOT),
+        "native_root": str(native_root),
+        "deepternary_root": str(deepternary_root),
+        "input_signatures": {
+            case: evaluation_input_signature({**paths, **metric_paths}, native)
+            for case, (paths, native, metric_paths) in case_inputs.items()
+        },
+        "expert_assets_sha256": {
+            name: sha256_file(ROOT / "checkpoints/score_model" / name)
+            for name in ("model_parameters.yml", "best_ema_inference_epoch_model.pt")
+        },
+        "dockq_source_sha256": {
+            str(path.relative_to(deepternary_root)): sha256_file(path)
+            for path in sorted((deepternary_root / "DockQ").rglob("*.py"))
+        },
+        "entrypoint_sha256": sha256_file(Path(__file__)),
+        "runtime_source_sha256": {
+            name: sha256_file(RUNTIME_ROOT / name) for name in (
+                "tricoopdiff/consensus.py", "tricoopdiff/sampler.py",
+                "tricoopdiff/sdpi_flow.py", "tricoopdiff/expert_anchors.py",
+                "scripts/evaluation_runner.py", "scripts/featurize_common.py",
+                "scripts/evaluation_common.py", "tricoopdiff/deepternary_metrics.py",
+            )
+        },
+        "smoke_one_per_source": args.smoke_one_per_source,
         "allow_experimental_checkpoint": args.allow_experimental_checkpoint,
         "candidate_pool": {
             "bitseed": args.bitseed_candidates, "sdpi": args.sdpi_candidates,
@@ -158,44 +295,46 @@ def main():
         "native_information_used_for_selection": False,
         "native_information_used_for_reported_metrics_only": True,
     }
+    if not manifest["dockq_source_sha256"]:
+        raise FileNotFoundError(f"DockQ scoring sources missing under {deepternary_root}")
+    previous_reports = validate_resume_output(output, manifest, resume=not args.no_resume)
     atomic_json(manifest, output / "manifest.json")
 
-    runner = EvaluationRunner(
-        ROOT, checkpoint, device=args.device, deepternary_root=deepternary_root,
-        allow_experimental_checkpoint=args.allow_experimental_checkpoint,
-    )
+    runner = None
     failures = []
+    completed_cases = []
+    run_started = time.monotonic()
+
+    def progress(state, case=None, refinement=None, requested=None):
+        atomic_json({
+            "state": state, "pid": os.getpid(),
+            "updated_unix": time.time(),
+            "elapsed_seconds": time.monotonic() - run_started,
+            "requested_cases": len(entries),
+            "completed_cases": list(completed_cases),
+            "failures": list(failures), "current_case": case,
+            "refinements_done": refinement, "refinements_requested": requested,
+        }, output / "progress.json")
+
+    progress("running")
     for position, entry in enumerate(entries, start=1):
         case = entry["case"]
         destination = output / f"{case}.json"
-        if not args.no_resume and destination.is_file():
-            try:
-                previous = json.loads(destination.read_text(encoding="utf-8"))
-                if previous.get("status") == "complete" and previous.get("config") == manifest:
-                    print(f"[{position}/{len(entries)}] SKIP {case}", flush=True)
-                    continue
-            except (OSError, json.JSONDecodeError):
-                pass
+        if case in previous_reports:
+            completed_cases.append(case)
+            progress("running")
+            print(f"[{position}/{len(entries)}] SKIP {case}", flush=True)
+            continue
         print(f"[{position}/{len(entries)}] RUN {case}", flush=True)
+        progress("generating", case)
         started = time.monotonic()
         try:
-            paths = resolve_entry_paths(entry, ROOT)
-            metric_paths = {}
-            for key in ("metric_protein1", "metric_protein2"):
-                if key in entry:
-                    value = Path(entry[key])
-                    value = value if value.is_absolute() else ROOT / value
-                    if not value.is_file():
-                        raise FileNotFoundError(value)
-                    metric_paths[f"{key}_pdb"] = str(value.resolve())
-            if len(metric_paths) not in (0, 2):
-                raise ValueError("provide both metric protein templates or neither")
-            native_value = entry.get("complex")
-            native = (Path(native_value) if native_value else
-                      ROOT / args.native_root / case / "gt_complex.pdb")
-            native = native if native.is_absolute() else ROOT / native
-            if not native.is_file():
-                raise FileNotFoundError(native)
+            paths, native, metric_paths = case_inputs[case]
+            if runner is None:
+                runner = EvaluationRunner(
+                    ROOT, checkpoint, device=args.device, deepternary_root=deepternary_root,
+                    allow_experimental_checkpoint=args.allow_experimental_checkpoint,
+                )
             e3_data, poi_data, ligand_data, input_dim = featurize_complex(
                 case, str(paths["protein1"]), str(paths["protein2"]),
                 str(paths["ligand"]), runner.score_model_args, args.device,
@@ -264,9 +403,14 @@ def main():
                 if repr(candidate["candidate_id"]) in selected_ids
             ])
             union_requested_count = len(union)
+            if args.smoke_one_per_source:
+                if not bitseed or not sdpi:
+                    raise RuntimeError("source smoke requires a real candidate from each source")
+                union = [bitseed[0], sdpi[0]]
             if args.max_refinements is not None:
                 union = union[:args.max_refinements]
             rows = []
+            progress("refining", case, 0, len(union))
             for union_index, candidate in enumerate(union, start=1):
                 key = repr(candidate["candidate_id"])
                 index = pool_index[key]
@@ -286,28 +430,47 @@ def main():
                 fixed = FixedCandidateInitializer(
                     candidate, no_torsion=runner.initializer.no_torsion,
                 )
-                sampled = sample_single(
-                    runner.model, runner.diffusion, fixed,
-                    e3_data, poi_data, ligand_data, steps=args.steps,
-                    device=args.device, seed=diffusion_seed,
-                    init_mode="fixed_candidate", t_anchor=1.0,
-                )
+                seen_sources = []
+                hook = None
+                if args.smoke_one_per_source:
+                    def observe_source(module, positional, keyword):
+                        value = keyword.get("source")
+                        seen_sources.append(None if value is None else int(value))
+                    hook = runner.model.register_forward_pre_hook(observe_source, with_kwargs=True)
+                refinement_started = time.monotonic()
+                try:
+                    sampled = sample_single(
+                        runner.model, runner.diffusion, fixed,
+                        e3_data, poi_data, ligand_data, steps=args.steps,
+                        device=args.device, seed=diffusion_seed,
+                        init_mode="fixed_candidate", t_anchor=1.0,
+                    )
+                finally:
+                    if hook is not None:
+                        hook.remove()
+                refinement_seconds = time.monotonic() - refinement_started
+                if args.smoke_one_per_source:
+                    expected_source = 0 if source(candidate) == "sdpi" else 1
+                    if len(seen_sources) != args.steps or any(value != expected_source for value in seen_sources):
+                        raise RuntimeError(f"source route mismatch: expected {expected_source}, got {seen_sources}")
+                    if not sampled.get("valid", True):
+                        raise RuntimeError(f"source smoke refinement failed: {sampled.get('termination_reason')}")
                 row = {
                     "candidate_id": candidate["candidate_id"],
                     "pool_index": index,
                     "source": source(candidate),
+                    "initial_state_sha256": candidate_hash(candidate),
+                    "model_source_trace": seen_sources if args.smoke_one_per_source else None,
+                    "refinement_seconds": refinement_seconds,
                     "acceptable": bool(candidate.get("acceptable", False)),
                     "penalty": list(candidate.get("penalty", ())),
                     "geometry": candidate.get("geometry"),
                     "fit_rmsd": candidate.get("fit_rmsd"),
                     "diffusion_seed": diffusion_seed,
-                    "initial_dockq": initial["dockq"],
-                    "initial_fnat": initial["fnat"],
-                    "initial_lrms": initial["lrms"],
-                    "initial_irms": initial["irms"],
                     "valid": bool(sampled.get("valid", True)),
                     "termination_reason": sampled.get("termination_reason"),
                 }
+                refined = None
                 if row["valid"]:
                     refined = exact_dockq(
                         sampled["ligand_coords"], sampled["poi_coords"],
@@ -315,21 +478,10 @@ def main():
                         deepternary_root=deepternary_root,
                         metric_paths=metric_paths,
                     )
-                    row.update({
-                        "refined_dockq": refined["dockq"],
-                        "refined_fnat": refined["fnat"],
-                        "refined_lrms": refined["lrms"],
-                        "refined_irms": refined["irms"],
-                        "refinement_delta_dockq": (
-                            refined["dockq"] - initial["dockq"]
-                        ),
-                        "safe_dockq": max(refined["dockq"], initial["dockq"]),
-                        "safe_stage": (
-                            "refined" if refined["dockq"] >= initial["dockq"]
-                            else "initial"
-                        ),
-                    })
+                row.update(refinement_metric_fields(initial, refined))
                 rows.append(row)
+                if union_index % 16 == 0 or union_index == len(union):
+                    progress("refining", case, union_index, len(union))
             by_id = {repr(row["candidate_id"]): row for row in rows}
             arm_reports = {}
             for name, selected in arms.items():
@@ -378,6 +530,10 @@ def main():
                 "case": case,
                 "config": manifest,
                 "generation": generation,
+                "proposal_pool_sha256": hashlib.sha256(
+                    "".join(candidate_hash(candidate) for candidate in candidates).encode()
+                ).hexdigest(),
+                "evaluation_scope": "two_source_smoke" if args.smoke_one_per_source else "refinement_audit",
                 "selector_metadata": {
                     "bitseed_diversity_64": meta_bitseed,
                     "geometry_64": meta_geometry,
@@ -393,13 +549,36 @@ def main():
                 "timing_seconds": {"total": time.monotonic() - started},
             }
             atomic_json(report, destination)
+            completed_cases.append(case)
+            progress("running")
             print(f"[{position}/{len(entries)}] DONE {case}", flush=True)
         except Exception as error:
             failures.append({"case": case, "error": f"{type(error).__name__}: {error}"})
+            progress("running")
             print(f"[{position}/{len(entries)}] FAIL {case}: {error}", flush=True)
             if str(args.device).startswith("cuda"):
                 torch.cuda.empty_cache()
     atomic_json({"config": manifest, "failures": failures}, output / "failures.json")
+    case_reports = [json.loads((output / f"{case}.json").read_text())
+                    for case in completed_cases]
+    arm_names = sorted({name for report in case_reports for name in report["arms"]})
+    leaderboards = {}
+    for name in arm_names:
+        leaderboards[name] = {}
+        for stage in ("initial", "refined", "safe_union"):
+            values = [{"value": report["arms"][name][stage]["best"]}
+                      for report in case_reports if name in report["arms"]]
+            leaderboards[name][stage] = summarize(values, "value")
+    atomic_json({
+        "scope": "case-best oracle; not native-free ranked top1",
+        "config": manifest, "requested_cases": len(entries),
+        "completed_cases": completed_cases, "failures": failures,
+        "leaderboards": leaderboards,
+        "valid_refinements": sum(row["valid"] for report in case_reports
+                                 for row in report["refinements"]),
+        "evaluated_refinements": sum(len(report["refinements"]) for report in case_reports),
+    }, output / "summary.json")
+    progress("failed" if failures else "complete")
     if failures:
         raise SystemExit(1)
 
