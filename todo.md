@@ -2,6 +2,25 @@
 
 更新：2026-09-15。这里仅记录执行状态，不重复协议或历史流水账。
 
+## model-v3 起点与清理范围
+
+本分支从已推送的 `master` 合并提交 `92cf1f0` 创建；尚未实现或训练 model-v3 模型。
+第一步只清理退役入口，不改模型或实验数据：
+
+- 移除旧 GPU3 夜间执行/接管、factorial/rollout 启动与固定路径 `local_*` 诊断链。
+- 移除已由 lazy C1M1 替代的全池训练端点缓存生成/合并/启动脚本，以及5个 SLURM wrapper、旧 Phase1 readiness 和一次性交接/rigid-oracle 汇总。
+- 删除只测试上述退役流程的测试；旧 v2 测试里的验证集整簇排除逻辑迁到 `prepare_validation_index.py` / `test_validation_index.py`。它只写新索引，不自动修订现有训练集。
+- 保留标准训练、B/C 启动、全池精修、时间步审计、二元基线、数据处理、ranker 原型及核心回归。保留库内 factorial checkpoint 加载与几何/轨迹不变量测试，避免破坏旧基线复评。
+- 全量 CPU 检查统一为 `python scripts/run_cpu_tests.py`；默认不启动任何 GPU 作业。
+
+清理验收：移除36个退役脚本/配置与4个专用测试，另迁移1个 v2 测试文件并保留其数据划分检查。
+剩余44个测试文件共228项 CPU 检查全部通过；130个一方 Python 文件语法与删除入口引用扫描通过，
+保留的本地 shell 启动器语法检查通过。模型库、数据、权重和历史结果未修改，未启动 GPU 实验。
+
+历史文件均可从 `92cf1f0` 恢复。完整清理前源码可在独立 worktree 查看，例如
+`git worktree add --detach /mnt/disk/wl/MoRE-tri/CoopDiff-v2-review 92cf1f0`（目标需不存在）。
+Git 不携带被忽略的数据/权重；复跑旧实验仍需原 manifest 和本地资产。
+
 ## 本分支已完成
 
 - [x] 在线 BiTSeed、短补采、部分成功保留和 SDPI 缺额补位。

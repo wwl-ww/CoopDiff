@@ -13,7 +13,7 @@ SDPI/BiTSeed 单模型联合训练已合入：B/C 各完成 100 epochs，训练�
 ## 目录
 
 - `tricoopdiff/`：模型、坐标、初始化、训练与采样；`diffdock/` 为 vendored 专家。
-- `scripts/`：特征化、实验、审计入口和历史运行 wrapper。
+- `scripts/`：当前特征化、训练、评估与通用审计入口；model-v3 已移除退役运行 wrapper。
 - `tests/`：断言式回归检查。
 - `doc/`：主题文档；从[文档索引](doc/README.md)进入。
 - `data/`、`checkpoints/`、`results/`、`logs/`：本地资产/产物。
@@ -23,6 +23,7 @@ SDPI/BiTSeed 单模型联合训练已合入：B/C 各完成 100 epochs，训练�
 从仓库根目录运行；代码未作为 Python 包安装。仓库有 [environment.yml](environment.yml)，但它是环境导出，不保证不同 CUDA/驱动机器可直接复建。
 
 ```bash
+python scripts/run_cpu_tests.py
 python tests/test_model_build.py
 python tests/test_training_contract.py
 python tests/test_dual_init.py
@@ -30,6 +31,8 @@ bash scripts/gpu_status.sh
 ```
 
 本项目在本地 GPU 环境直接运行，不使用 SLURM。模型任务需要冻结专家权重、ESM 缓存、数据与匹配的 checkpoint。
+
+`run_cpu_tests.py` 在离线 CPU 子进程中逐个执行全部测试函数，不依赖 pytest；需要环境依赖和现有 DiffDock 数值缓存，不自动下载或生成缓存。
 
 ## 接手与贡献
 
