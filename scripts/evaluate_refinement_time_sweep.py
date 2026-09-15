@@ -14,6 +14,7 @@ from tricoopdiff.expert_anchors import (
     DualExpertAnchorInitializer, FixedCandidateInitializer,
     generate_hybrid_candidates,
 )
+from tricoopdiff.endpoint_kinematics import endpoint_internal_geometry
 from tricoopdiff.sampler import sample_single
 
 
@@ -37,6 +38,9 @@ def parser():
         help="Comma-separated t_anchor:steps pairs",
     )
     result.add_argument("--allow-experimental-checkpoint", action="store_true")
+    result.add_argument("--expect-identity", type=float)
+    result.add_argument("--expect-refined", type=float)
+    result.add_argument("--expect-tolerance", type=float, default=1e-5)
     return result
 
 
@@ -116,6 +120,11 @@ def main():
         e3_data=e3_data, paths=paths, native=native,
         deepternary_root=deepternary_root, metric_paths=metric_paths,
     )
+    endpoint_geometry = endpoint_internal_geometry(
+        ligand_data["coords"][0].detach().cpu().numpy(),
+        candidate["ligand"][0].detach().cpu().numpy(),
+        ligand_data["edge_index"].detach().cpu().numpy(),
+    )
     results = []
     for anchor, steps in schedules:
         print(f"[sweep] t_anchor={anchor:.2f}, steps={steps}", flush=True)
@@ -142,6 +151,18 @@ def main():
             row.update(metric)
             row["dockq_delta_from_identity"] = metric["dockq"] - identity["dockq"]
         results.append(row)
+    if args.expect_identity is not None:
+        if abs(identity["dockq"] - args.expect_identity) > args.expect_tolerance:
+            raise AssertionError(
+                f"identity DockQ {identity['dockq']} != expected {args.expect_identity}"
+            )
+    if args.expect_refined is not None:
+        if len(results) != 1 or not results[0]["valid"]:
+            raise AssertionError("expected refined DockQ requires one valid schedule")
+        if abs(results[0]["dockq"] - args.expect_refined) > args.expect_tolerance:
+            raise AssertionError(
+                f"refined DockQ {results[0]['dockq']} != expected {args.expect_refined}"
+            )
     report = {
         "status": "complete",
         "protocol": "fixed_candidate_truncated_clock_sweep_v1",
@@ -152,6 +173,7 @@ def main():
         "candidate_acceptable": bool(candidate.get("acceptable", False)),
         "candidate_geometry": candidate.get("geometry"),
         "identity": identity,
+        "endpoint_internal_geometry": endpoint_geometry,
         "schedules": results,
         "generation": generation,
         "config": {
