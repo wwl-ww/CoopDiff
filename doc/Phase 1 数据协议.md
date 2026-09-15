@@ -1,42 +1,35 @@
-# TriCoopDiff Phase 1 数据协议
+# 数据与指标协议
 
-## 训练池
+更新：2026-09-15。区分历史训练池设计、具体 checkpoint 的训练来源和当前开发评估；三者不能互相替代。
 
-正式 Phase 1 使用 DeepTernary 公开的两个训练 cluster 文件作为数据来源：
+## 训练池与内部验证
 
-- `PROTAC/train_clusters_poc6.json`
-- `MolecularGlue/train_clusters_poc3_exUNL.json`
+历史 Phase 1 取 DeepTernary 的 `PROTAC/train_clusters_poc6.json` 与 `MolecularGlue/train_clusters_poc3_exUNL.json` 成员交集，排除 PROTAC22/MGD94 同四位 PDB ID，得到 7,198 cases、653 merged clusters。原配置 `split_seed=0`，588 train / 65 validation clusters；每 epoch 按 cluster 采样，角色交换概率 50%。
 
-仅保留两个成员集合的精确交集，并排除与 PROTAC22 或 Molecular Glue 94
-benchmark 具有相同四位 PDB ID 的 case。最终联合池固定为 **7,198 cases、
-653 个合并 cluster**。两个来源中的 cluster 关系通过并查集合并，防止关联
-case 被拆到训练和验证两侧。
+这些是原索引设计，不是所有已训练权重的实际数据。历史 train/val 曾发现 **83 个同 PDB 重叠**：cluster-disjoint 不自动保证 PDB-disjoint。生成或接收索引时检查成员、显式 split 标签、PDB 交集、benchmark 排除、输入可解析性及内容哈希；不要仅凭 7,198/653 计数放行。
 
-## 内部验证与采样
+内部验证用于 checkpoint、时间步、筛选阈值和来源比例选择。固定路径验证不等于未见结构验证；少量 cluster smoke 不代表完整验证集。MGD94 已用于开发消融，PROTAC22 也已用于协议比较，不能再称完全未触碰测试集，更不能用于 selector 监督训练。
 
-使用 `split_seed=0` 按 cluster 留出 10% 作为内部 validation：训练为 588
-clusters，validation 为 65 clusters。训练时每个 epoch 从每个 cluster 采一个
-case：80% 从全部成员选择，20% 优先选择官方 representative；无
-representative 时退化为全部成员。Validation 固定使用每个 cluster 的首个
-representative，保证 checkpoint 选择可复现。
+## 联合训练来源
 
-与 DeepTernary 一致，训练期以 50% 概率交换两个 protein 的角色；交换时整个
-三元状态一起平移到新的固定 protein 参考系。Validation 不做随机交换。
+B/C 训练以 `SDPI:BiTSeed = 1:1` 交替取样，验证集固定包含 65 个 SDPI 与 65 个 BiTSeed 路径。BiTSeed endpoint 在首次访问 case 时在线生成，固定 `C=1, M=1`：一个 ETKDGv3 conformer，两个冻结专家各生成一次。任一专家在 OOD 输入上失败时整例回退 SDPI，实际来源记为 SDPI，不丢弃样本。
 
-正式 benchmark 不参与 `t_anchor`、epoch 或 checkpoint 选择。
+训练分支按内部 validation loss 选择 source-conditioned C epoch 81 EMA（`3.1384998601`），不等于 DockQ 最优。PROTAC22 完整配对评估后，本分支以 C40 EMA 为精修工作基线，C81作为验证loss最佳的对照。详细协议和分项 loss 见 [SDPI–BiTSeed 联合训练交接](SDPI-BiTSeed联合训练交接.md)，下游结果见[调研第2节](../RANKING_PROTAC_RESEARCH.md)。
 
-## 正式评估目标（与当前工程诊断区分）
+## 当前输入口径
 
-- PROTAC：官方 22 cases，unbound 输入，每个 case 40 seeds。
-- Molecular Glue：官方 94 cases，bound 输入，每个 case 1 seed。
+- MGD94 全池审计：94 例、bound 蛋白；索引 `results/reproduction_20260911/index_current/mgd94_full_v1.json`。当前配体化学为 93 例 CCD SDF、3IQV 一例 PDB fallback。
+- PROTAC22 比例消融：unbound 蛋白与完整 ligand；bound 模板仅用于事后评分。
+- 早期从晶体拆分蛋白的 PROTAC smoke 仍是 bound 输入；重新生成 ligand 不能使蛋白变成 unbound。
+- 所有输入、模板、链映射、原子顺序、化学策略、torsion policy 和缓存版本须进入 manifest。
 
-PROTAC 的主结果应按经验证的预测置信度选择 top-1；当前代码尚无经过监督的
-ranking head，评估报告的 best 是按真实结构指标挑选的 oracle-best，不能称作
-model-ranked top-1。旧的 23-case bound、70-case 或 791-case representative
-结果以及当前晶体拆分输入的初始化 smoke 仅作工程诊断。
+## 指标与报告
 
-## 可复现性门禁
+使用 [deepternary_metrics.py](../tricoopdiff/deepternary_metrics.py) 的完整原子 DockQ 口径；近似 DockQ 单列。每个 case 固定候选池与 selector 集合 S：
 
-`scripts/make_deepternary_index.py` 会验证联合池计数，并在任一结构无法拆分时
-终止。正式 wrapper 记录 Git commit、索引与专家权重 SHA256，先在同一 GPU
-allocation 内完成跨越 LoRA warmup 的 smoke，再从头启动正式训练。
+- Initial：`I=max(DockQ_initial[j], j∈S)`。
+- Final：`F=max(DockQ_final[j], j∈S)`。
+- Union：`U=max(I,F)`，只比较初末态。
+- Retention：逐例 selected-oracle / full-pool-oracle 的比值再平均。
+
+这些都是读取真实结构后的 oracle；native-free selector 选出候选不等于部署 top-1。比较必须共享 case、seed、初态、权重和数值协议。模型或协议改变后必须重新评估。

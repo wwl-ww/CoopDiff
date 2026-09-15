@@ -54,7 +54,6 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--gradient-every', type=int, default=25)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--lora-warmup-steps', type=int, default=100)
     parser.add_argument('--expert-model-dir', default='checkpoints/score_model')
     parser.add_argument('--cache-dir', default='results/featurize_cache')
     parser.add_argument('--random-paths', action='store_true',
@@ -63,9 +62,8 @@ def main():
     args = parser.parse_args()
     if args.condition_ablation and not args.random_paths:
         parser.error('condition-ablation requires random-paths held-out probes')
-    if args.steps < 0 or args.lora_warmup_steps < 0 or (
-            args.steps > 0 and args.steps <= args.lora_warmup_steps):
-        parser.error('positive steps must exceed nonnegative LoRA warmup')
+    if args.steps < 0:
+        parser.error('steps must be nonnegative')
     if not 0 <= args.time <= 1 or args.gradient_every < 1:
         parser.error('time must be in [0,1] and gradient-every positive')
     output = Path(args.out)
@@ -78,7 +76,6 @@ def main():
     config = parse_args([
         '--train_data', args.train_index, '--val_data', args.train_index,
         '--output_dir', str(output), '--lr', str(args.lr),
-        '--lora-warmup-steps', str(args.lora_warmup_steps),
         '--expert_model_dir', args.expert_model_dir, '--device', 'cuda',
     ])
     loader = TernaryDataLoader(
@@ -163,7 +160,6 @@ def main():
                 time = float(torch.rand(()).item())
             else:
                 time = args.time
-            trainer._set_lora_trainable(step >= trainer.lora_warmup_steps)
             trainer.optimizer.zero_grad(set_to_none=True)
             # Copy defensively: graph preparation must not mutate the frozen pair.
             losses = trainer.compute_loss(
@@ -173,10 +169,9 @@ def main():
                    'n_torsions': len(coupling['angles']), 'loss': losses['loss_total'].item(),
                    'components': {k: v.item() for k, v in losses['components'].items()},
                    'rms': losses['rms'],
-                   'expert_probe': model._last_step0_probe,
-                   'lora_enabled': step >= trainer.lora_warmup_steps}
+                   'expert_probe': model._last_step0_probe}
             active = [(n, p) for n, p in named if p.requires_grad]
-            if step % args.gradient_every == 0 or step == trainer.lora_warmup_steps:
+            if step % args.gradient_every == 0:
                 contributions = {}
                 for key, loss in losses['components'].items():
                     if loss.requires_grad:
@@ -204,7 +199,7 @@ def main():
             log.write(json.dumps(row, allow_nan=False) + '\n')
             log.flush()
             history.append(row['loss'])
-            print(f"step={step} loss={row['loss']:.6g} lora={row['lora_enabled']}", flush=True)
+            print(f"step={step} loss={row['loss']:.6g}", flush=True)
     summary = {'initial_loss': history[0], 'final_loss': history[-1],
                'final_initial_ratio': history[-1] / max(history[0], 1e-12),
                'last_20_mean': float(np.mean(history[-20:])),

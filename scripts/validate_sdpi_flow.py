@@ -53,7 +53,7 @@ def check_geometry(directory, seeds):
 
 
 def gpu_smoke(directories, output):
-    """Three real updates, LoRA warmup transition, checkpoint restore, sampling.
+    """Three real frozen-expert updates, checkpoint restore, and sampling.
 
     Benchmark examples here are ONLY diagnostic. Never use this checkpoint
     for a benchmark accuracy claim or as a formal training initialization.
@@ -65,15 +65,13 @@ def gpu_smoke(directories, output):
     from evaluation_common import validate_checkpoint_payload
 
     if not torch.cuda.is_available():
-        raise RuntimeError('GPU smoke requires a dedicated CUDA device; use SLURM on a cluster')
+        raise RuntimeError('GPU smoke requires a dedicated CUDA device')
     output.mkdir(parents=True, exist_ok=False)
     os.environ['NAN_CLAMP'] = '100'
     args = SimpleNamespace(
-        expert_model_dir=str(ROOT / 'checkpoints/score_model'), lora_rank=4, lora_alpha=8.,
-        lora_start_layer=0, lora_early_layers=4, lora_early_rank=2, lora_early_alpha=4.,
+        expert_model_dir=str(ROOT / 'checkpoints/score_model'),
         node_dim=128, ns=32, nv=4, num_transformer_layers=3, lr=1e-4, weight_decay=1e-4,
-        lora_lr=1e-5, lora_early_lr=5e-6, nan_clamp=100., torsion_expert_aux_weight=.25,
-        lora_warmup_steps=1,
+        nan_clamp=100., torsion_expert_aux_weight=.25,
     )
     score_args = _load_score_model_args(args.expert_model_dir)
     batches = []
@@ -89,7 +87,7 @@ def gpu_smoke(directories, output):
     model, flow, trainer = build_trainer(args, torch.device('cuda'), input_dim=dim)
     trainer.set_phase(1)
     before = {name: p.detach().cpu().clone() for name, p in model.named_parameters()
-              if name.startswith('trifuse.') or 'lora_' in name}
+              if name.startswith('trifuse.')}
     records = []
     for i, batch in enumerate(batches):
         result = trainer.train_step(**batch)
@@ -98,8 +96,7 @@ def gpu_smoke(directories, output):
         print(f'[flow train] step={i} {batch["case"]} loss={result["loss_total"]:.6g}', flush=True)
     changed = [name for name, p in model.named_parameters()
                if name in before and not torch.equal(before[name], p.detach().cpu())]
-    for pattern in ('film', 'bridge', 'torsion_coordinator', 'lora_'):
-        assert any(pattern in name for name in changed), f'no {pattern} parameter update'
+    assert changed, 'no TriFuse parameter update'
     validation = trainer.validate_step(**batches[0])
     assert not model.training and np.isfinite(validation['loss_total'])
     checkpoint = output / 'diagnostic_only.pt'

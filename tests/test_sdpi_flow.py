@@ -41,6 +41,20 @@ def test_flow_clean_and_prior_endpoints():
     assert torch.allclose(torch.cdist(poi, poi), torch.cdist(b, b), atol=1e-10)
 
 
+def test_truncated_clock_is_refinement_only():
+    flow = SDPIFlow()
+    try:
+        flow.get_inference_schedule(5, t_start=0.25)
+    except ValueError as error:
+        assert "prior endpoint" in str(error)
+    else:
+        raise AssertionError("ordinary SDPI inference accepted a truncated clock")
+    schedule = flow.get_refinement_schedule(5, t_start=0.25)
+    assert np.allclose(schedule["tr_schedule"], np.linspace(0.25, 0.0, 6))
+    assert np.allclose(schedule["rot_schedule"], schedule["tr_schedule"])
+    assert np.allclose(schedule["tor_schedule"], schedule["tr_schedule"])
+
+
 def test_flow_complete_cartesian_tangent_and_step_convergence():
     # Both interfaces, mixed torsions, and nontrivial body frames must agree.
     for smiles in ('CCCOCC', 'CC1CCCCC1', 'c1ccccc1'):
@@ -112,7 +126,13 @@ def test_flow_loss_backward_and_shared_clock_guard():
             return {'interface_scores': scores, 'torsion_score': self.weight.expand(1, n_tor)}
 
     model = Predictor()
-    trainer = SimpleNamespace(device='cpu', model=model, diffusion=flow, torsion_expert_aux_weight=.25)
+    # Keep real bound state/forward hooks without constructing checkpoints or
+    # an optimizer. A SimpleNamespace no longer implements compute_loss's API.
+    trainer = TriCoopDiffTrainer.__new__(TriCoopDiffTrainer)
+    trainer.device = 'cpu'
+    trainer.model = model
+    trainer.diffusion = flow
+    trainer.torsion_expert_aux_weight = .25
     coupling = flow.sample_coupling(a, b, data)
     fixed = dict(t_override=torch.tensor([.5]), coupling_override=coupling)
     plain = TriCoopDiffTrainer.compute_loss(trainer, {'coords': a}, {'coords': b}, data, **fixed)

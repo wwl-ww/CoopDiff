@@ -20,6 +20,22 @@ import torch
 
 from .initialization import TernaryInitializer
 from .sdpi_flow import SDPIFlow, FLOW_VERSION
+from .consensus import SOURCE_NAMES
+
+
+def actual_candidate_source(init_mode, initialization):
+    """Return the source actually produced, including BiTSeed fallback."""
+    if init_mode == "sdpi":
+        source = "sdpi"
+    elif init_mode == "fixed_candidate":
+        source = initialization.get("candidate_source")
+    elif init_mode == "expert_anchor":
+        source = "sdpi" if initialization.get("fallback") else "bitseed"
+    else:
+        raise ValueError(f"unsupported initialization mode: {init_mode}")
+    if source not in SOURCE_NAMES:
+        raise ValueError("initializer did not report a valid actual candidate source")
+    return source
 
 
 @torch.no_grad()
@@ -67,6 +83,10 @@ def sample_single(
     freeze_poi: bool = False,
     init_mode: str = "sdpi",
     t_anchor: float = None,
+    translation_velocity_scale: float = 1.0,
+    rotation_velocity_scale: float = 1.0,
+    velocity_transform=None,
+    return_rank_features: bool = False,
 ) -> dict:
     """
     Run one reverse-flow trajectory (single walker) from t=1 to t=0.
@@ -85,8 +105,14 @@ def sample_single(
             disable the SE3 reverse updates. This defines the strict zero-FiLM
             E3-L parity baseline: the sampler reduces to native-style DiffDock on
             the PROTAC branch instead of running an extra ternary POI dynamics.
-        init_mode: only ``sdpi`` is supported.
+        init_mode: ``sdpi``, ``expert_anchor``, or a preselected native-free
+            ``fixed_candidate`` proposal used by controlled refinement audits.
         t_anchor: must be 1.0 for the broad sdpi prior.
+        velocity_transform: optional diagnostic callback applied to physical
+            velocities immediately before integration. Production callers
+            leave this as ``None``.
+        return_rank_features: retain the final pre-update invariant consensus
+            context for separately supervised pose ranking.
 
     Returns:
         dict with 'ligand_coords' [N_lig, 3], 'poi_coords' [N_poi, 3] (CPU numpy),
@@ -102,6 +128,12 @@ def sample_single(
         steps = diffusion.inference_steps
     if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
         raise ValueError("steps must be a positive integer")
+    for name, value in (("translation_velocity_scale", translation_velocity_scale),
+                        ("rotation_velocity_scale", rotation_velocity_scale)):
+        if not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be a finite non-negative number")
+    if velocity_transform is not None and not callable(velocity_transform):
+        raise TypeError("velocity_transform must be callable or None")
 
     # Clean templates (drop the B=1 dim).
     ligand_template = ligand_data["coords"][0].detach()  # [N_lig, 3]
@@ -109,12 +141,14 @@ def sample_single(
     e3_coords = e3_data["coords"][0].detach()            # [N_e3, 3]
 
     e3_center = e3_coords.mean(dim=0, keepdim=True)
-    if init_mode != "sdpi":
-        raise ValueError(f"removed initialization mode: {init_mode}; use sdpi")
+    if init_mode not in {"sdpi", "expert_anchor", "fixed_candidate"}:
+        raise ValueError(f"unsupported initialization mode: {init_mode}")
     if t_anchor is None:
         t_anchor = 1.0
-    if t_anchor != 1.0:
-        raise ValueError("sdpi requires t_anchor=1")
+    if init_mode != "fixed_candidate" and t_anchor != 1.0:
+        raise ValueError("broad-prior sampling requires t_anchor=1")
+    if init_mode == "fixed_candidate" and not 0.0 < float(t_anchor) <= 1.0:
+        raise ValueError("fixed-candidate refinement requires t_anchor in (0, 1]")
     if not isinstance(diffusion, SDPIFlow):
         raise ValueError('sampling requires SDPIFlow, not the legacy DSM process')
     if initializer.no_torsion != bool(getattr(model.expert.model, 'no_torsion', False)):
@@ -129,6 +163,9 @@ def sample_single(
         r_e3_to_poi = torch.eye(3, device=device, dtype=poi_pos.dtype).unsqueeze(0)
     initialization["freeze_poi"] = bool(freeze_poi)
     initialization['generative_process'] = FLOW_VERSION
+    candidate_source = actual_candidate_source(init_mode, initialization)
+    initialization["candidate_source"] = candidate_source
+    source_index = SOURCE_NAMES.index(candidate_source)
     initialization["expert"] = getattr(model.expert, "provenance", {})
     ca_distances = torch.cdist(e3_coords, poi_pos[0])
     initialization["initial_geometry"] = {
@@ -138,10 +175,15 @@ def sample_single(
         "minimum_poi_ca_ligand_distance": float(torch.cdist(poi_pos[0], ligand_pos[0]).min()),
     }
 
-    schedule = diffusion.get_inference_schedule(steps, t_start=t_anchor)
+    schedule = (
+        diffusion.get_refinement_schedule(steps, t_start=t_anchor)
+        if init_mode == "fixed_candidate"
+        else diffusion.get_inference_schedule(steps, t_start=t_anchor)
+    )
     trajectory = [] if return_trajectory else None
     trace = [] if return_trace else None
     nonfinite_score_steps = []
+    final_rank_features = None
 
     init_ligand_com = ligand_pos.mean(dim=1)[0]
     init_poi_com = poi_pos.mean(dim=1)[0]
@@ -213,7 +255,13 @@ def sample_single(
             r_e3_to_poi=r_e3_to_poi,
             receptor_crop_cutoff=receptor_crop_cutoff,
             diffusion_state=diffusion_state,
+            source=source_index,
         )
+        if return_rank_features:
+            features = out.get('rank_features')
+            if features is None or features.ndim != 2 or features.shape[0] != 1:
+                raise ValueError('model did not return rank_features [1,D]')
+            final_rank_features = features[0].detach().cpu().numpy().copy()
         if return_trace:
             step0_probe = getattr(model, '_last_step0_probe', None)
             setattr(model, '_debug_step0_probe', False)
@@ -221,6 +269,17 @@ def sample_single(
             step0_probe = None
         predicted = diffusion.normalized_predictions(out, t_tr)
         velocities = diffusion.velocities(predicted, e3_data['coords'], poi_data['coords'])
+        for branch in ('e3_ligand', 'poi_ligand'):
+            velocities[branch]['tr'] = (
+                velocities[branch]['tr'] * translation_velocity_scale)
+            velocities[branch]['rot'] = (
+                velocities[branch]['rot'] * rotation_velocity_scale)
+        if velocity_transform is not None:
+            velocities = velocity_transform(
+                velocities, ligand_pos, poi_pos, r_e3_to_poi,
+                t_tr, dt_tr, ligand_data)
+            if not isinstance(velocities, dict):
+                raise TypeError("velocity_transform must return a velocity dictionary")
         interface_scores = velocities
         s_q = {}
         sanitized_components = []
@@ -308,6 +367,10 @@ def sample_single(
                     "poi_ligand_rot": _tensor_summary(s_pol["rot"]),
                 },
                 "step0_probe": step0_probe,
+                "consensus": {
+                    key: value.detach().cpu().tolist()
+                    for key, value in out.get('consensus_diagnostics', {}).items()
+                },
             }
             trace.append(step_record)
 
@@ -330,6 +393,10 @@ def sample_single(
         result["trajectory"] = trajectory
     if return_trace:
         result["trace"] = trace
+    if return_rank_features:
+        if final_rank_features is None:
+            raise RuntimeError('no rank features were produced')
+        result['rank_features'] = final_rank_features
     return result
 
 
@@ -347,6 +414,9 @@ def sample_ensemble(
     freeze_poi: bool = False,
     init_mode: str = "sdpi",
     t_anchor: float = None,
+    translation_velocity_scale: float = 1.0,
+    rotation_velocity_scale: float = 1.0,
+    return_rank_features: bool = False,
 ) -> list:
     """
     Run ``n_walkers`` independent reverse-flow trajectories.
@@ -375,6 +445,9 @@ def sample_ensemble(
                 steps=steps, device=device, seed=seeds[i], freeze_poi=freeze_poi,
                 init_mode=init_mode,
                 t_anchor=t_anchor,
+                translation_velocity_scale=translation_velocity_scale,
+                rotation_velocity_scale=rotation_velocity_scale,
+                return_rank_features=return_rank_features,
             )
         )
     return results

@@ -21,6 +21,7 @@ from .graphs import (
     transform_ligand_to_poi_frame,
 )
 from .expert import FrozenDiffDock
+from .expert_time import _set_time_embeddings
 from .trifuse import TriFuse
 from .film import apply_film
 
@@ -66,6 +67,7 @@ class TriCoopDiff(nn.Module):
         r_e3_to_poi: torch.Tensor = None,
         receptor_crop_cutoff: torch.Tensor = None,
         diffusion_state: torch.Tensor = None,
+        source=0,
     ) -> dict:
         """
         Single diffusion step forward pass.
@@ -88,6 +90,8 @@ class TriCoopDiff(nn.Module):
                 receptor residues within this cutoff of the current ligand pose
                 (with a nearest-residue fallback), mirroring DiffDock's
                 step-level ``crop_beyond(tr_sigma * 3 + 20)`` driver behavior.
+            source: Candidate-source class retained for the shared model API.
+                Legacy TriFuse checkpoints do not consume this value.
 
         Returns:
             dict with:
@@ -440,8 +444,6 @@ class TriCoopDiff(nn.Module):
 def _prepare_expert_stream(expert, data, t, branch, probe=None):
     """Prepare one DiffDock stream for lock-step dual-expert execution."""
     model = expert.model
-    from .lora import set_expert_lora_branch
-    set_expert_lora_branch(expert, branch)
     _set_time_embeddings(data, t, model)
     tr_sigma, rot_sigma, tor_sigma = model.t_to_sigma(
         *[data.complex_t[name] for name in ('tr', 'rot', 'tor')]
@@ -522,7 +524,6 @@ def _prepare_expert_stream(expert, data, t, branch, probe=None):
 def _advance_expert_stream(stream, layer_index):
     """Run exactly one convolution and return its pre-FiLM activations."""
     model = stream['model']
-    expert = stream['expert']
     node_attr = stream['node_attr']
     edge_index = stream['edge_index']
     edge_attr = stream['edge_attr']
@@ -552,24 +553,10 @@ def _advance_expert_stream(stream, layer_index):
             edge_attr_layer = [edge_attr_layer[:s1], edge_attr_layer[s1:s2]]
 
     layer = model.conv_layers[layer_index]
-    if bool(getattr(expert, 'lora_enabled', False)) and torch.is_grad_enabled():
-        from torch.utils.checkpoint import checkpoint
-
-        def forward(node_attr_input):
-            from .lora import set_expert_lora_branch
-            set_expert_lora_branch(expert, stream['branch'])
-            return layer(
-                node_attr_input, layer_edge_index, edge_attr_layer,
-                layer_edge_sh, edge_weight=layer_edge_weight,
-            )
-        node_attr = checkpoint(forward, node_attr, use_reentrant=False)
-    else:
-        from .lora import set_expert_lora_branch
-        set_expert_lora_branch(expert, stream['branch'])
-        node_attr = layer(
-            node_attr, layer_edge_index, edge_attr_layer, layer_edge_sh,
-            edge_weight=layer_edge_weight,
-        )
+    node_attr = layer(
+        node_attr, layer_edge_index, edge_attr_layer, layer_edge_sh,
+        edge_weight=layer_edge_weight,
+    )
     stream['node_attr'] = node_attr
     return node_attr
 
@@ -712,26 +699,9 @@ def _expert_forward_with_film(
     # themselves. Keep trace spam opt-in; a non-empty prefix is attached only when
     # NAN_TRACE is exported in the environment.
     nan_trace = bool(os.environ.get("NAN_TRACE"))
-    lora_branch = "sub2" if str(trace_prefix).startswith("sub2") else "sub1"
-
     def run_conv(layer, current_node_attr, current_edge_index,
                  current_edge_attr, current_edge_sh, current_edge_weight):
-        """Checkpoint LoRA-enabled convolutions to bound training memory."""
-        if bool(getattr(expert, "lora_enabled", False)) and torch.is_grad_enabled():
-            from torch.utils.checkpoint import checkpoint
-
-            def forward(node_attr_input):
-                # Checkpoint recomputation happens during backward, after the
-                # shared expert may have run the other branch. Re-select the
-                # adapter so recomputation uses the same parameters as forward.
-                from .lora import set_expert_lora_branch
-                set_expert_lora_branch(expert, lora_branch)
-                return layer(
-                    node_attr_input, current_edge_index, current_edge_attr,
-                    current_edge_sh, edge_weight=current_edge_weight,
-                )
-
-            return checkpoint(forward, current_node_attr, use_reentrant=False)
+        """Run one frozen expert convolution."""
         return layer(
             current_node_attr, current_edge_index, current_edge_attr,
             current_edge_sh, edge_weight=current_edge_weight,
@@ -1009,41 +979,6 @@ def _expert_forward_with_film(
         sys.stderr.flush()
 
     return scores
-
-
-def _set_time_embeddings(data, t, model):
-    """
-    Set diffusion time information on the HeteroData object, matching DiffDock's
-    `set_time` semantics: `complex_t` holds per-graph [batchsize] tensors and
-    `ligand.node_t` holds per-node [num_nodes] tensors. CGModel's
-    `timestep_emb_func` (GaussianFourierProjection) requires 1-D tensor inputs,
-    so these must be tensors, not Python floats.
-    """
-    device = data['ligand'].pos.device
-    if not torch.is_tensor(t):
-        t = torch.tensor(t, device=device, dtype=torch.float32)
-    t = t.to(device).reshape(-1)  # [1] (single-complex mode)
-
-    batchsize = int(data.num_graphs)
-    num_nodes = data['ligand'].pos.shape[0]
-
-    data.complex_t = {
-        'tr': t.expand(batchsize),
-        'rot': t.expand(batchsize),
-        'tor': t.expand(batchsize),
-    }
-    data['ligand'].node_t = {
-        'tr': t.expand(num_nodes),
-        'rot': t.expand(num_nodes),
-        'tor': t.expand(num_nodes),
-    }
-    if 'receptor' in data.node_types:
-        num_rec_nodes = data['receptor'].pos.shape[0]
-        data['receptor'].node_t = {
-            'tr': t.expand(num_rec_nodes),
-            'rot': t.expand(num_rec_nodes),
-            'tor': t.expand(num_rec_nodes),
-        }
 
 
 def zero_film_verification(expert, data, trifuse, tri_graph, t=None, atol=1e-5):

@@ -43,8 +43,13 @@ def test_sdf_ligand_records_preserve_atom_order():
         writer.write(molecule)
         writer.close()
         lines, indices, coords = exact._ligand_records(path)
-    assert len(indices) == molecule.GetNumAtoms()
-    assert coords.shape == (molecule.GetNumAtoms(), 3)
+    heavy_atoms = [atom.GetIdx() for atom in molecule.GetAtoms()
+                   if atom.GetAtomicNum() > 1]
+    assert len(indices) == len(heavy_atoms)
+    assert coords.shape == (len(heavy_atoms), 3)
+    expected = molecule.GetConformer().GetPositions()[heavy_atoms]
+    # SDF rounds to four decimals, then PDB to three; keep the heavy-atom order.
+    assert np.allclose(coords, expected, atol=6e-4, rtol=0)
     assert all(lines[index].startswith(("ATOM", "HETATM")) for index in indices)
 
 

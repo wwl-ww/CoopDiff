@@ -16,16 +16,29 @@ Convention (matches torch_cluster): `radius(x, y, r)` returns
 index 1 into the source set `x`.
 """
 
+import math
+
 import torch
 
 
 def _radius_pytorch(x, y, r, batch_x=None, batch_y=None, max_num_neighbors=32,
-                    batch_size=None):
+                    num_workers=1, batch_size=None):
     """Replacement for torch_cluster.radius.
 
-    For each element in `y`, find all points in `x` within distance `r`.
-    Returns [y_indices, x_indices].
+    Return [query, source] edges with torch_cluster 1.6.3 CUDA semantics.
+
+    The radius boundary is strict. Saturated neighborhoods keep the first
+    source indices, matching the CUDA kernel's scan order; native CPU uses
+    a spatial tree and can select a different subset. Counts span all blocks.
     """
+    if not math.isfinite(float(r)) or r < 0:
+        raise ValueError('radius must be finite and non-negative')
+    if max_num_neighbors < 0:
+        raise ValueError('max_num_neighbors must be non-negative')
+    if x.numel() == 0 or y.numel() == 0 or max_num_neighbors == 0:
+        return torch.empty((2, 0), dtype=torch.long, device=x.device)
+    x = x.reshape(-1, 1) if x.ndim == 1 else x
+    y = y.reshape(-1, 1) if y.ndim == 1 else y
     if batch_x is None:
         batch_x = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
     if batch_y is None:
@@ -35,37 +48,49 @@ def _radius_pytorch(x, y, r, batch_x=None, batch_y=None, max_num_neighbors=32,
         mask_x = (batch_x == bx)
         idx_x = mask_x.nonzero(as_tuple=False).squeeze(-1)
         xi = x[mask_x]
-        for by_ in batch_y.unique():
-            if bx != by_:
-                continue
-            mask_y = (batch_y == by_)
-            idx_y = mask_y.nonzero(as_tuple=False).squeeze(-1)
-            yj = y[mask_y]
-            block_size = 1024
-            for a in range(0, xi.shape[0], block_size):
-                a_end = min(a + block_size, xi.shape[0])
-                xi_block = xi[a:a_end]
-                for b in range(0, yj.shape[0], block_size):
-                    b_end = min(b + block_size, yj.shape[0])
-                    yj_block = yj[b:b_end]
-                    dist_block = torch.cdist(xi_block, yj_block)
-                    rows, cols = (dist_block <= r).nonzero(as_tuple=True)
-                    if rows.numel() > 0:
-                        # torch_cluster convention: [y_idx, x_idx]
-                        edge_index_list.append(
-                            torch.stack([idx_y[b + cols], idx_x[a + rows]], dim=0))
+        idx_y = (batch_y == bx).nonzero(as_tuple=False).squeeze(-1)
+        for b in range(0, idx_y.numel(), 256):
+            query_indices = idx_y[b:b + 256]
+            queries = y[query_indices]
+            used = torch.zeros(len(queries), dtype=torch.long, device=x.device)
+            for a in range(0, xi.shape[0], 1024):
+                sources = xi[a:a + 1024]
+                # Direct differences avoid cancellation under translation.
+                squared = (queries[:, None] - sources[None]).square().sum(-1)
+                within = squared < r * r
+                rank = within.long().cumsum(dim=1)
+                accepted = within & (rank <= (max_num_neighbors - used)[:, None])
+                used = used + accepted.sum(dim=1)
+                query, source = accepted.nonzero(as_tuple=True)
+                if query.numel():
+                    edge_index_list.append(torch.stack(
+                        [query_indices[query], idx_x[a + source]], dim=0))
     if not edge_index_list:
         return torch.empty((2, 0), dtype=torch.long, device=x.device)
-    return torch.cat(edge_index_list, dim=1).int()
+    edges = torch.cat(edge_index_list, dim=1)
+    # Restore query-major/source-major ordering across source blocks.
+    return edges[:, torch.argsort(edges[0], stable=True)]
 
 
-def _radius_graph_pytorch(x, r, batch=None, max_num_neighbors=32,
-                          flow='source_to_target', loop=False, max_radius=None):
-    """Replacement for torch_cluster.radius_graph."""
-    assert flow in ['source_to_target', 'target_to_source']
+def _radius_graph_pytorch(x, r, batch=None, loop=False, max_num_neighbors=32,
+                          flow='source_to_target', num_workers=1, batch_size=None,
+                          max_radius=None):
+    """Match torch_cluster 1.6.3's radius-plus-self-filter wrapper.
+
+    Its no-loop wrapper requests cap+1 before filtering self edges. If a
+    saturated scan excludes self, cap+1 edges can remain, as in that version.
+    """
+    if flow not in ('source_to_target', 'target_to_source'):
+        raise ValueError(f'unsupported flow: {flow}')
     if batch is None:
         batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
-    ei = _radius_pytorch(x, x, r, batch, batch, max_num_neighbors)
+    if max_num_neighbors <= 0:
+        if max_num_neighbors < 0:
+            raise ValueError('max_num_neighbors must be non-negative')
+        return torch.empty((2, 0), dtype=torch.long, device=x.device)
+    ei = _radius_pytorch(x, x, r, batch, batch,
+                         max_num_neighbors if loop else max_num_neighbors + 1,
+                         num_workers, batch_size)
     if flow == 'source_to_target':
         row, col = ei[1], ei[0]  # swap: message flows neighbor→center
     else:
@@ -73,12 +98,16 @@ def _radius_graph_pytorch(x, r, batch=None, max_num_neighbors=32,
     if not loop:
         mask = row != col
         row, col = row[mask], col[mask]
-    return torch.stack([row, col], dim=0).int()
+    return torch.stack([row, col], dim=0)
 
 
 def _knn_graph_pytorch(x, k, batch=None, loop=False, flow='source_to_target',
                        cosine=False, num_workers=1):
     """Replacement for torch_cluster.knn_graph."""
+    if flow not in ('source_to_target', 'target_to_source'):
+        raise ValueError(f'unsupported flow: {flow}')
+    if k < 0:
+        raise ValueError('k must be non-negative')
     if batch is None:
         batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
     ei_list = []
@@ -86,19 +115,30 @@ def _knn_graph_pytorch(x, k, batch=None, loop=False, flow='source_to_target',
         mask = (batch == b)
         idx = mask.nonzero(as_tuple=False).squeeze(-1)
         xi = x[mask]
-        dist = torch.cdist(xi, xi)
+        if cosine:
+            normalized = torch.nn.functional.normalize(xi, dim=-1)
+            dist = 1 - normalized @ normalized.T
+        else:
+            # The matrix-multiplication distance formula loses close-neighbor
+            # ordering when PDB coordinates have a large common translation.
+            dist = torch.cdist(xi, xi, compute_mode='donot_use_mm_for_euclid_dist')
         if not loop:
             dist.diagonal().fill_(float('inf'))
-        kk = min(k, xi.shape[0])
+        kk = min(k, xi.shape[0] if loop else max(0, xi.shape[0] - 1))
+        if not kk:
+            continue
         _, topk = dist.topk(kk, dim=1, largest=False)
         rows = torch.arange(xi.shape[0], device=x.device).unsqueeze(1).expand(-1, kk).reshape(-1)
         cols = topk.reshape(-1)
         valid = cols < xi.shape[0]
         rows, cols = rows[valid], cols[valid]
-        ei_list.append(torch.stack([idx[rows], idx[cols]], dim=0))
+        # rows are query/center nodes; cols are their nearest neighbors.
+        # torch_cluster's default sends messages from neighbor to center.
+        source, target = (cols, rows) if flow == 'source_to_target' else (rows, cols)
+        ei_list.append(torch.stack([idx[source], idx[target]], dim=0))
     if not ei_list:
         return torch.empty((2, 0), dtype=torch.long, device=x.device)
-    return torch.cat(ei_list, dim=1).int()  # int32 for torch.bincount
+    return torch.cat(ei_list, dim=1).long()
 
 
 def _scatter_pytorch(src, index, dim_size=None, dim=0, reduce='sum'):
@@ -149,8 +189,22 @@ def apply_patches():
 
     Idempotent. MUST be called before `models.cg_model` is imported.
     """
-    import torch_cluster
-    import torch_scatter
+    import sys
+    from importlib.machinery import ModuleSpec
+    from types import ModuleType
+
+    try:
+        import torch_cluster
+    except ModuleNotFoundError:
+        torch_cluster = ModuleType('torch_cluster')
+        torch_cluster.__spec__ = ModuleSpec('torch_cluster', loader=None)
+        sys.modules['torch_cluster'] = torch_cluster
+    try:
+        import torch_scatter
+    except ModuleNotFoundError:
+        torch_scatter = ModuleType('torch_scatter')
+        torch_scatter.__spec__ = ModuleSpec('torch_scatter', loader=None)
+        sys.modules['torch_scatter'] = torch_scatter
     torch_cluster.radius = _radius_pytorch
     torch_cluster.radius_graph = _radius_graph_pytorch
     torch_cluster.knn_graph = _knn_graph_pytorch

@@ -113,6 +113,19 @@ class SDPIFlow:
             raise ValueError('SDPI flow must start at its prior endpoint t=1')
         return self._expert_conditioning.get_inference_schedule(steps, t_start)
 
+    def get_refinement_schedule(self, steps, t_start):
+        """Return a truncated clock for an externally generated fixed proposal.
+
+        This deliberately does not relax ``get_inference_schedule``: ordinary
+        SDPI samples must still start at their prior endpoint. The caller is
+        responsible for restricting this schedule to fixed native-free seeds.
+        """
+        if not isinstance(t_start, (int, float)) or not 0.0 < float(t_start) <= 1.0:
+            raise ValueError('refinement t_start must be in (0, 1]')
+        return self._expert_conditioning.get_inference_schedule(
+            steps, float(t_start),
+        )
+
     @staticmethod
     def scales(e3_coords, poi_coords):
         _check_coords(e3_coords)
@@ -133,6 +146,8 @@ class SDPIFlow:
         This is a trainable function parameterization, not a score-to-flow
         identity. LoRA/TriFuse must be retrained under the velocity loss.
         """
+        if 'normalized_velocity' in output:
+            return output['normalized_velocity']
         from .diffdock.utils import torus
 
         tr, rot, tor = self.t_to_sigma(t, t, t)

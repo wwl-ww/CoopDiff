@@ -46,7 +46,10 @@ os.chdir(_PROJECT_ROOT)
 # Featurization cache schema version. Bump whenever the geometry/frame handling
 # of the produced data changes, so stale on-disk caches (written before the
 # shared-reference-frame fix) are invalidated instead of silently reused.
-_FEATURIZE_CACHE_VERSION = 5
+# v6 fixes the directed k-NN convention and small-receptor self loops.
+# v7 also avoids distance cancellation for translated PDB coordinates.
+# v5 caches contain reversed directed receptor edges and cannot be reused.
+_FEATURIZE_CACHE_VERSION = 7
 
 
 def _featurize_signature(protein1, protein2, ligand_path, score_model_args):
@@ -135,7 +138,11 @@ def generate_esm_embeddings(protein_paths, device):
     from tricoopdiff.esm_embedder import ESMEmbedder
 
     print(f"Loading ESM2-650M on {device} via HF mirror...", flush=True)
-    embedder = ESMEmbedder(device=device)
+    local_model = os.environ.get("TRICOOPDIFF_ESM_MODEL")
+    embedder = (
+        ESMEmbedder(model_name=local_model, device=device)
+        if local_model else ESMEmbedder(device=device)
+    )
 
     print(f"Extracting sequences from {len(protein_paths)} proteins...", flush=True)
     seqs_list = get_sequences(protein_paths, [None] * len(protein_paths))
@@ -361,7 +368,13 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
             'cache_version': _FEATURIZE_CACHE_VERSION,
             'source_signature': cache_signature,
         }
-        temporary_path = cache_path.with_suffix(cache_path.suffix + '.tmp')
+        # B/C training processes intentionally share this cache.  A fixed
+        # ``.tmp`` name lets one process move the other process's in-progress
+        # file, causing the loser to fail at os.replace.  Per-process names
+        # preserve atomic publication without cross-process collisions.
+        temporary_path = cache_path.with_suffix(
+            cache_path.suffix + f'.tmp.{os.getpid()}'
+        )
         torch.save(payload, temporary_path)
         os.replace(temporary_path, cache_path)
 

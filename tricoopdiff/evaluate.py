@@ -585,6 +585,9 @@ def evaluate_model(
     t_anchor: float = None,
     deepternary_dockq_paths: Optional[Dict[str, str]] = None,
     seed: int = 0,
+    translation_velocity_scale: float = 1.0,
+    rotation_velocity_scale: float = 1.0,
+    return_rank_features: bool = False,
 ) -> dict:
     """
     Sample a conformational ensemble and score structure quality vs the native
@@ -631,6 +634,9 @@ def evaluate_model(
         freeze_poi=freeze_poi,
         init_mode=init_mode,
         t_anchor=t_anchor,
+        translation_velocity_scale=translation_velocity_scale,
+        rotation_velocity_scale=rotation_velocity_scale,
+        return_rank_features=return_rank_features,
     )
 
     ref_lig = ligand_data['coords'][0].detach().cpu().numpy()  # [N_lig, 3] native
@@ -665,6 +671,11 @@ def evaluate_model(
             'protac_rmsd': compute_rmsd(pred, ref_lig, align_first=True),
             'pocket_dist': float(np.linalg.norm(pred.mean(axis=0) - ref_lig.mean(axis=0))),
         }
+        if return_rank_features:
+            features = r.get('rank_features')
+            if features is None or np.asarray(features).ndim != 1:
+                raise ValueError('walker is missing one-dimensional rank_features')
+            rec['rank_features'] = np.asarray(features).tolist()
         deepternary_m = compute_deepternary_dockq(
             ref_lig, e3_ca, ref_poi,
             pred, e3_ca, pred_poi,

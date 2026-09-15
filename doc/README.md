@@ -1,44 +1,32 @@
-# TriCoopDiff 文档索引
+# 文档索引
 
-- [Phase 1 数据协议](./Phase%201%20数据协议.md)：正式联合训练池、cluster
-  切分/采样规则及 PROTAC/Molecular Glue benchmark 协议。
-
-本目录只保留长期有效的设计、验证和运行文档。代码、测试与最新结果始终优先于文档；实验产物位于 `results/`，不要把临时日志或 agent 交接稿放入 `doc/`。
+更新：2026-09-15。当前代码定义实现，实验 manifest 与逐例结果定义已运行事实；提案和历史 smoke 不能替代二者。
 
 ## 阅读顺序
 
-| 文档 | 用途 | 何时阅读 |
-|---|---|---|
-| [TriCoopDiff 模型架构图.md](TriCoopDiff%20模型架构图.md) | 完整 Mermaid 模型图、模块职责与单步坐标更新 | 快速查看当前整体架构时 |
-| [TriFuse 架构与审计.md](TriFuse%20架构与审计.md) | `trifuse_v13` 数据流、参考系、训练契约与已知边界 | 快速理解或审计当前模型时 |
-| [TriCoopDiff 模型交接文档.md](TriCoopDiff%20模型交接文档.md) | `trifuse_v13` 架构、FiLM、训练和采样 | 修改核心模型前 |
-| [双DiffDock界面协同修正方案.md](双DiffDock界面协同修正方案.md) | 双 expert 的界面职责与刚体更新顺序 | 修改坐标动力学时 |
-| [双二元强先验接入方案.md](双二元强先验接入方案.md) | 双端点、双口袋与局部 frame 的输入契约，以及继续训练/从头训练两条路线 | 对齐 DeepTernary 的预测先验时 |
-| [DeepTernary与TriCoopDiff训练推理初始化对照.md](DeepTernary与TriCoopDiff训练推理初始化对照.md) | 当前初始化与 DeepTernary 不同入口的输入条件差异 | 设计公平对照实验时 |
-| [初始化方案_gpt6.md](初始化方案_gpt6.md) | 唯一 `sdpi` 初始化、共享构象、精确装配与验收 | 修改采样或初始化时 |
-| [训练入口 SLURM 与 Phase1 smoke 交接文档.md](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md) | 环境预检、SLURM、缓存和训练入口 | 提交训练前 |
-| [DiffDock 审计文档.md](DiffDock%20审计文档.md) | 冻结二体专家的结构和扩散实现 | 修改 expert 集成时 |
-| [公式推导参考.md](公式推导参考.md) | SO(3)、DSM、Tweedie 和物理项推导 | 核对数学约定时 |
+| 文档 | 唯一负责的主题 |
+| --- | --- |
+| [项目概览](../README.md) | 项目定位、目录与快速检查 |
+| [当前工作](../todo.md) | 当前分支状态与下一步 |
+| [联合训练交接](SDPI-BiTSeed联合训练交接.md) | SDPI/BiTSeed 路径、B/C 结果、最终 checkpoint 和 LoRA 结论 |
+| [BiTSeed-Hybrid 协议](BiTSeed-Hybrid在线初始化规格.md) | 候选生成、fallback、selector、当前实验榜单 |
+| [模型与坐标契约](TriCoopDiff%20模型架构图.md) | 当前 Consensus、SDPI flow、source conditioning、版本与不变量 |
+| [数据与指标协议](Phase%201%20数据协议.md) | 训练/验证划分、MGD/PROTAC 输入和评分边界 |
+| [运行指南](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md) | 环境、入口、复跑与验收；SLURM 仅为历史记录 |
+| [问题账本](../Q.md) | 已修复缺陷、未解决限制和证据路径 |
+| [独立二元评估](独立DiffDock小分子评估.md) | 历史两案例对照、小分子 LRMSD/DockQ 口径 |
+| [Ranking与PROTAC条件调研](../RANKING_PROTAC_RESEARCH.md) | 2026-09-15研究提案、C40/C81完整对照、原始资料与后续实验；不是已实现协议 |
 
-## 当前权威结论
+`AGENTS.md` 为贡献约定。`hh.md` 是用户原始讨论稿，非现行实现规格。
 
-- 历史 [DeepTernary 审计产物](../results/audit_sota_metrics.json) 记录 mean oracle-best DockQ 0.6588（22 cases × 40 seeds）；不是当前模型结果或 model-ranked top-1，比较前须核对入口与输入先验。
-- 与 DeepTernary 横向比较时，主指标必须调用其完整原子 `DockQ/dockq_util.py::cal_dockq`；Cα 或接触恢复近似值只能作为诊断指标。
-- E3 固定；动态状态是 E3–Ligand 与 POI–Ligand 两个相对刚体界面以及共享 Ligand torsion。
-- 推理唯一支持 `sdpi`：从完整化学图生成一次构象并采样一次 torsion，分别使用两侧受体 RMS radius 计算平移尺度，再精确逆装配；旧 `native`、`coupled5a`、`anchor_local` 和固定 Å 初始化均已删除。
-- 两个 rigid proposal 从同一个旧 Ligand 生成；Ligand 采用 `sub1` proposal，POI 接收将 `sub2` proposal 对齐到 `sub1` proposal 的精确刚体变换。
-- TriFuse 使用组分类型、三组跨分子距离分布和接触统计，负责 branch-specific FiLM 与逐键 torsion 协调；它不输出刚体 merge gate 或独立 SE(3) score。
-- 生产训练使用 `SDPIFlow` 条件速度匹配，采样反向积分同一速度场；不再使用
-  native DSM target 或经验温度 SDE。可动自由度终端与 SDPI 对齐，内部几何差异
-  仍是已知近似；原始晶体监督不投影。数学契约见[初始化规范 §8](初始化方案_gpt6.md)。
-- 新 checkpoint 必须是 version 17、`architecture=trifuse_v13`、
-  `generative_process=sdpi_flow_v1`；旧版本必须拒绝，不能直接拿旧 DSM 权重做 flow 推理。
-- version 17 记录 activation clamp、torsion 辅助损失与 LoRA warmup；训练与评估必须恢复一致配置。
-- 当前只定义 Phase 1；`judge_head/state_head` 缺少监督标签，因此保持冻结，不能用无损失的“Phase 2”假装完成微调。
-- Phase 1 使用 PROTAC/Molecular Glue 官方训练成员的去 benchmark 同 PDB
-  交集（7,198 cases、653 merged clusters），并按 cluster 留出内部 validation。
-- `binary_prior` sidecar 和 prior adapter 仅有设计，尚未实现；不属于 `sdpi`。已合并重复的三分子初始化文档，以初始化规范为唯一入口。
+## 当前事实边界
+
+- B/C 均已完成 100 epochs；训练分支按 validation loss 交付 C81 EMA（`3.1384998601`），本分支 PROTAC 精修工作基线仍为 C40 EMA。完整22例 Final/Union差异见[配对结果](../RANKING_PROTAC_RESEARCH.md)。
+- 正式模型使用冻结 DiffDock experts。LoRA 从头训练与 best-checkpoint 微调均未超过父模型，已停止并删除可训练实现。
+- 联合训练 BiTSeed 固定 lazy `C=1, M=1`；两个二元专家各运行一次，任一失败时回退 SDPI。
+- MGD94与PROTAC22按各自输入协议分别报告；当前还在研究PROTAC额外条件，不能混比两种数据。完整原子 DeepTernary DockQ 是主指标，近似 DockQ 只作诊断。
+- BiTSeed 本身不包含 oracle、selector 或 ranker。
 
 ## 维护规则
 
-每份主题只保留一个权威文档。新结论直接更新对应文档，不再创建“交接 v2”“最终版”或一次性任务 brief。命令必须从仓库根目录运行；结果路径只作示例，不作为永久证据。删除过时文档前，将仍有效的结论合并到上表对应文件。
+每个主题一个主文档，不新增“最终版/交接 v2”。新协议同时更新实现与对应文档；尚未实现的能力必须明确标注。不要把静态 GPU 占用、一次性临时环境或已删除脚本写成可直接执行的当前入口。

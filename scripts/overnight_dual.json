@@ -1,0 +1,13 @@
+{
+  "architecture": "dual_consensus_experimental",
+  "note": "BLOCKED: dual-state model and scientific gate entry points are not implemented. Fill argv only after implementing and testing them. No substitution with single-state v2.",
+  "stages": [
+    {"name": "contracts", "seconds": 1800, "argv": null},
+    {"name": "binary_preservation", "seconds": 3600, "argv": null},
+    {"name": "overfit", "seconds": 3600, "argv": null},
+    {"name": "pilot", "seconds": 3600, "argv": null},
+    {"name": "train", "seconds": 19800, "argv": null},
+    {"name": "evaluate_protac", "seconds": 1800, "argv": null},
+    {"name": "evaluate_mgd", "seconds": 1800, "argv": null}
+  ]
+}
