@@ -2,6 +2,7 @@
 
 import sys
 import tempfile
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,7 @@ from tricoopdiff.dual_init import (  # noqa: E402
 )
 from tricoopdiff.online_endpoints import (  # noqa: E402
     LazyTrainingEndpointStore, ONLINE_TRAINING_ENDPOINT_PROTOCOL,
+    endpoint_input_signature,
 )
 
 
@@ -94,6 +96,84 @@ def test_lazy_training_protocol_is_exactly_one_pose_per_expert():
                 'no_torsion': False,
             },
         }
+
+
+def _input_batch():
+    return {
+        'e3_data': {'coords': torch.zeros(1, 3, 3), 'features': torch.ones(1, 3, 2)},
+        'poi_data': {'coords': torch.zeros(1, 5, 3)},
+        'ligand_data': {
+            'coords': torch.arange(12).float().reshape(1, 4, 3),
+            'mol': b'ordered chemistry', 'edge_index': torch.tensor([[1], [2]]),
+            'mask_rotate': np.array([[False, False, True, True]]),
+        },
+    }
+
+
+def _lazy_store(directory):
+    expert = type('Expert', (), {'provenance': {
+        'diffdock_commit': 'test', 'score_checkpoint_sha256': 'abc', 'no_torsion': False,
+    }})()
+    return LazyTrainingEndpointStore(directory, expert)
+
+
+def test_endpoint_signature_tracks_geometry_chemistry_and_atom_order():
+    batch = _input_batch()
+    signature = endpoint_input_signature(batch)
+    assert endpoint_input_signature(deepcopy(batch)) == signature
+    for component, key, replacement in (
+        ('ligand_data', 'coords', torch.zeros(1, 6, 3)),
+        ('ligand_data', 'coords', batch['ligand_data']['coords'].flip(1)),
+        ('ligand_data', 'mol', b'different chemistry'),
+        ('ligand_data', 'edge_index', torch.tensor([[2], [1]])),
+        ('ligand_data', 'mask_rotate', np.ones((1, 4), dtype=bool)),
+        ('e3_data', 'coords', torch.ones(1, 3, 3)),
+        ('e3_data', 'features', torch.zeros(1, 3, 2)),
+        ('poi_data', 'coords', torch.ones(1, 5, 3)),
+    ):
+        changed = deepcopy(batch)
+        changed[component][key] = replacement
+        assert endpoint_input_signature(changed) != signature, (component, key)
+
+
+def test_lazy_cache_checks_disk_and_memory_inputs_without_overwriting():
+    with tempfile.TemporaryDirectory() as directory:
+        store = _lazy_store(directory)
+        batch = _input_batch()
+        path = store._path('demo')
+        torch.save({'case': 'demo', 'protocol': store.protocol,
+                    'record': payload()['entries'][0],
+                    'input_signature': endpoint_input_signature(batch)}, path)
+        original = path.read_bytes()
+        first, _ = store.coupling('demo', batch=batch)
+        first['angles'][0] = 99
+        again, _ = store.coupling('demo', batch=deepcopy(batch))
+        assert again['angles'][0] == 0
+        changed = deepcopy(batch)
+        changed['ligand_data']['coords'] = torch.ones(1, 6, 3)
+        for reader in (store, _lazy_store(directory)):
+            try:
+                reader.coupling('demo', batch=changed)
+            except ValueError as error:
+                assert 'input signature' in str(error)
+            else:
+                raise AssertionError('changed input must not reuse the cached coupling')
+        assert path.read_bytes() == original, 'rejection must leave old cache untouched'
+
+
+def test_lazy_legacy_cache_and_missing_batch_are_rejected():
+    with tempfile.TemporaryDirectory() as directory:
+        store = _lazy_store(directory)
+        path = store._path('demo')
+        torch.save({'case': 'demo', 'protocol': store.protocol,
+                    'record': payload()['entries'][0]}, path)
+        for batch in (None, _input_batch()):
+            try:
+                store.coupling('demo', batch=batch)
+            except ValueError as error:
+                assert 'batch is required' in str(error) or 'signature missing' in str(error)
+            else:
+                raise AssertionError('unverified legacy cache must be rejected')
 
 
 if __name__ == '__main__':

@@ -1,6 +1,7 @@
 """Lazy C=1/M=1 BiTSeed endpoints used only by mixed-source training."""
 
 import hashlib
+import json
 import os
 import random
 from pathlib import Path
@@ -20,6 +21,39 @@ from .sdpi_flow import SDPIFlow
 
 ONLINE_TRAINING_ENDPOINT_PROTOCOL = "online_bitseed_training_c1_m1_v1"
 ONLINE_TRAINING_BASE_SEED = 41_000
+ENDPOINT_INPUT_SIGNATURE_VERSION = "featurized_endpoint_inputs_v1"
+
+
+def endpoint_input_signature(batch):
+    """Hash ordered geometry, chemistry and graph features, independent of device."""
+    digest = hashlib.sha256(ENDPOINT_INPUT_SIGNATURE_VERSION.encode())
+
+    def update(value):
+        if torch.is_tensor(value):
+            value = value.detach().cpu().contiguous().numpy()
+        if isinstance(value, np.ndarray):
+            if value.dtype.hasobject:
+                raise TypeError("endpoint inputs cannot contain object arrays")
+            update((value.dtype.str, value.shape))
+            update(value.tobytes(order="C"))
+        elif isinstance(value, dict):
+            digest.update(b"dict[")
+            for key in sorted(value):
+                update(key)
+                update(value[key])
+            digest.update(b"]")
+        elif isinstance(value, (list, tuple)):
+            digest.update(b"sequence[")
+            for item in value:
+                update(item)
+            digest.update(b"]")
+        else:
+            data = value if isinstance(value, bytes) else json.dumps(value).encode()
+            digest.update(b"bytes:" if isinstance(value, bytes) else b"json:")
+            digest.update(str(len(data)).encode() + b":" + data)
+
+    update({key: batch[key] for key in ("e3_data", "poi_data", "ligand_data")})
+    return digest.hexdigest()
 
 
 def _cpu_array(value):
@@ -63,6 +97,7 @@ class LazyTrainingEndpointStore:
             "frozen_expert": expert_base_identity(expert),
         }
         self._records = {}
+        self._input_signatures = {}
 
     def _path(self, case):
         safe = "".join(char if char.isalnum() or char in "-_." else "_"
@@ -70,18 +105,23 @@ class LazyTrainingEndpointStore:
         suffix = hashlib.sha256(case.encode("utf-8")).hexdigest()[:12]
         return self.cache_dir / f"{safe}.{suffix}.pt"
 
-    def _load(self, case):
+    def _load(self, case, input_signature):
         path = self._path(case)
         if not path.is_file():
             return None
         payload = torch.load(path, map_location="cpu", weights_only=False)
         if payload.get("protocol") != self.protocol or payload.get("case") != case:
             raise ValueError(f"{case}: lazy endpoint cache contract mismatch")
+        if payload.get("input_signature") != input_signature:
+            raise ValueError(
+                f"{case}: endpoint input signature missing or mismatched; "
+                "use a new endpoint cache directory (old cache left unchanged)"
+            )
         record = payload.get("record")
         validate_endpoint_record(record)
         return record
 
-    def _generate(self, case, batch):
+    def _generate(self, case, batch, input_signature):
         e3, poi, ligand = batch["e3_data"], batch["poi_data"], batch["ligand_data"]
         initializer = DualExpertAnchorInitializer(
             self.expert, e3, poi, binary_steps=self.binary_steps,
@@ -201,20 +241,25 @@ class LazyTrainingEndpointStore:
                 f"(max_abs_error={roundtrip_error:.6g} Angstrom)"
             )
         validate_endpoint_record(record)
-        _atomic_save({"case": case, "protocol": self.protocol, "record": record},
+        _atomic_save({"case": case, "protocol": self.protocol, "record": record,
+                      "input_signature": input_signature},
                      self._path(case))
         return record
 
     def coupling(self, case, occurrence=0, *, batch=None):
         del occurrence  # One immutable endpoint per case and experiment seed.
+        if batch is None:
+            raise ValueError(f"{case}: batch is required to validate endpoint inputs")
+        input_signature = endpoint_input_signature(batch)
         record = self._records.get(case)
+        if record is not None and self._input_signatures[case] != input_signature:
+            raise ValueError(f"{case}: in-memory endpoint input signature mismatch")
         if record is None:
-            record = self._load(case)
+            record = self._load(case, input_signature)
         if record is None:
-            if batch is None:
-                raise ValueError(f"{case}: batch is required for first endpoint generation")
-            record = self._generate(case, batch)
+            record = self._generate(case, batch, input_signature)
         self._records[case] = record
+        self._input_signatures[case] = input_signature
         coupling = {name: np.asarray(value).copy()
                     for name, value in record["coupling"].items()}
         return coupling, record
