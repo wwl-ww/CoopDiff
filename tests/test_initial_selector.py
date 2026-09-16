@@ -11,7 +11,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tricoopdiff.initial_selector import (future_selector_retention, initial_pool_features,
-                                          selector_retention)
+                                          exact_random_selection, selector_retention)
 from tricoopdiff.ranking_archive import state_hash
 
 SPEC = importlib.util.spec_from_file_location(
@@ -75,6 +75,17 @@ def test_future_retention_separates_initial_final_and_rescued_candidates():
     assert result['rescued_hit_retained'] == 1
 
 
+def test_exact_random_selection_matches_enumerated_source_quota():
+    import itertools
+    dockq = torch.tensor([.9, .4, .3, .1])
+    sources = ['bitseed', 'bitseed', 'sdpi', 'sdpi']
+    result = exact_random_selection(dockq, sources, {'bitseed': 1, 'sdpi': 1})
+    maxima = [max(float(dockq[i]), float(dockq[j]))
+              for i, j in itertools.product((0, 1), (2, 3))]
+    assert abs(result['expected_best'] - sum(maxima) / len(maxima)) < 1e-7
+    assert abs(result['hit_probability_0.23'] - 1.) < 1e-10
+
+
 def test_selector_training_loader_requires_complete_ordered_pool():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory); archives = root / 'archives'; labels = root / 'labels'
@@ -99,4 +110,5 @@ if __name__ == '__main__':
     test_all_pool_features_are_aligned_and_checksummed()
     test_retention_tracks_oracle_and_source_budget()
     test_future_retention_separates_initial_final_and_rescued_candidates()
+    test_exact_random_selection_matches_enumerated_source_quota()
     test_selector_training_loader_requires_complete_ordered_pool()

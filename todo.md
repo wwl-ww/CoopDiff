@@ -385,6 +385,8 @@ GPU 状态、PID 和 ETA 不写成长期规范。需要时运行 `bash scripts/g
 
 为定位post-ranker失败是否源于特征过弱，新增native-free expanded-geometry对照。原14维Cα摘要之外，`scripts/extract_expanded_ranking_features.py`从输入蛋白PDB提取重原子，以Cα刚体拟合到每个候选frame，计算双侧配体距离/覆盖及双向蛋白界面37维统计；输入index显式禁止label/native字段，特征产物绑定archive hash。`scripts/train_expanded_geometry_ranker.py`使用完全相同的标签、loss、n=160和三seed，仅替换为51维几何，因此可与旧geometry n160直接比较。后台结果目录为`results/model_v3_expanded_ranker_20260916/`。
 
+full-pool selector完成后另算精确随机基线，不靠有限次随机seed：uniform-64以及按来源32/32、48/16、56/8分别由组合概率得到expected-best、oracle retention和≥0.23期望命中数。报告目录为`results/model_v3_selector_baselines_20260916/random_baselines/`。
+
 ### PROTAC条件模型
 
 已实现独立条件架构、训练checkpoint、训练入口和部署入口：

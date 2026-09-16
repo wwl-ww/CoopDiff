@@ -1,5 +1,7 @@
 """Full-pool initial-state features and compute-allocation retention metrics."""
 
+import math
+
 import torch
 
 from .ranking_archive import geometry_features, state_hash
@@ -99,4 +101,47 @@ def future_selector_retention(scores, initial_dockq, final_dockq, sources,
         'selected_source_counts': {
             source: sum(sources[int(index)] == source for index in order)
             for source in ('bitseed', 'sdpi')},
+    }
+
+
+def exact_random_selection(dockq, sources, quotas, threshold=.23):
+    """Exact expected best and hit probability for source-quota random selection."""
+    values = torch.as_tensor(dockq).float()
+    if (values.ndim != 1 or not values.numel() or len(sources) != values.numel()
+            or not torch.isfinite(values).all()
+            or not bool(((values >= 0) & (values <= 1)).all())):
+        raise ValueError('invalid random selection labels')
+    quotas = {str(key): int(value) for key, value in quotas.items()}
+    counts = {source: sum(value == source for value in sources) for source in quotas}
+    if (set(sources) != set(quotas) or any(q < 0 or q > counts[s] for s, q in quotas.items())
+            or not 1 <= sum(quotas.values()) <= values.numel()):
+        raise ValueError('invalid random selection source quotas')
+    denominator = math.prod(math.comb(counts[source], quota)
+                            for source, quota in quotas.items())
+    remaining = dict(counts)
+    expected_best = hit_probability = probability_sum = 0.
+    order = torch.argsort(values, descending=True, stable=True).tolist()
+    for index in order:
+        source = sources[index]
+        remaining[source] -= 1
+        if quotas[source] == 0:
+            continue
+        ways = 1
+        for group, quota in quotas.items():
+            needed = quota - int(group == source)
+            ways *= math.comb(remaining[group], needed) if 0 <= needed <= remaining[group] else 0
+        probability = ways / denominator
+        probability_sum += probability
+        expected_best += probability * float(values[index])
+        if float(values[index]) >= threshold:
+            hit_probability += probability
+    if abs(probability_sum - 1.) > 1e-10:
+        raise AssertionError('random maximum probabilities do not sum to one')
+    oracle = float(values.max())
+    return {
+        'expected_best': expected_best,
+        'full_pool_oracle': oracle,
+        'expected_oracle_retention': expected_best / oracle if oracle > 0 else None,
+        'hit_probability_0.23': hit_probability,
+        'quotas': quotas,
     }
