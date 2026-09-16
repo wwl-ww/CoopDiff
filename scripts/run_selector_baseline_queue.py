@@ -17,10 +17,11 @@ def main(argv=None):
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--wait-hours', type=float, default=24.)
     args = parser.parse_args(argv)
-    if args.out.exists() or not 0 <= args.wait_hours <= 48:
+    selector_run, out = args.selector_run.resolve(), args.out.resolve()
+    if out.exists() or not 0 <= args.wait_hours <= 48:
         parser.error('use a new output directory and wait-hours in [0,48]')
-    args.out.mkdir(parents=True)
-    status_path = args.out / 'status.json'
+    out.mkdir(parents=True)
+    status_path = out / 'status.json'
 
     def update(stage, **details):
         payload = {'pid': os.getpid(), 'stage': stage, 'updated_unix': time.time(), **details}
@@ -31,7 +32,7 @@ def main(argv=None):
         update('waiting_selector')
         deadline = time.monotonic() + args.wait_hours * 3600
         while True:
-            upstream = json.loads((args.selector_run / 'status.json').read_text())
+            upstream = json.loads((selector_run / 'status.json').read_text())
             if upstream['stage'] == 'complete':
                 break
             if upstream['stage'] == 'failed':
@@ -40,9 +41,9 @@ def main(argv=None):
                 raise TimeoutError('selector baseline wait expired')
             time.sleep(30)
         update('auditing')
-        destination = args.out / 'random_baselines'
+        destination = out / 'random_baselines'
         command = [sys.executable, str(ROOT / 'scripts/audit_selector_random_baselines.py'),
-                   '--labels', str(args.selector_run / 'val8_labels'),
+                   '--labels', str(selector_run / 'val8_labels'),
                    '--out', str(destination)]
         code = subprocess.run(command, cwd=ROOT).returncode
         if code:
