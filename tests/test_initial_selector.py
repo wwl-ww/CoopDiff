@@ -11,7 +11,9 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tricoopdiff.initial_selector import (future_selector_retention, initial_pool_features,
-                                          exact_random_selection, selector_retention)
+                                          diversity_aware_indices, exact_random_selection,
+                                          selector_retention,
+                                          selector_retention_at_indices)
 from tricoopdiff.ranking_archive import state_hash
 
 SPEC = importlib.util.spec_from_file_location(
@@ -57,6 +59,18 @@ def test_retention_tracks_oracle_and_source_budget():
     assert result['selected_hit'] == result['full_pool_hit'] == 1
     assert result['oracle_index_retained'] == 0
     assert result['selected_source_counts'] == {'bitseed': 0, 'sdpi': 64}
+
+
+def test_diversity_selection_has_exact_topk_control_and_removes_redundancy():
+    scores = torch.tensor([1., .99, .8, .7])
+    descriptors = torch.tensor([[0., 0.], [0., 0.], [10., 0.], [0., 10.]])
+    assert diversity_aware_indices(scores, descriptors, keep=2, penalty=0).tolist() == [0, 1]
+    selected = diversity_aware_indices(scores, descriptors, keep=2, penalty=.5)
+    assert selected.tolist() == [0, 2]
+    result = selector_retention_at_indices(selected, torch.tensor([.1, .9, .8, .2]),
+                                           ['bitseed'] * 2 + ['sdpi'] * 2)
+    assert result['keep'] == 2 and abs(result['selected_best'] - .8) < 1e-6
+    assert result['selected_source_counts'] == {'bitseed': 1, 'sdpi': 1}
 
 
 def test_future_retention_separates_initial_final_and_rescued_candidates():
@@ -109,6 +123,7 @@ def test_selector_training_loader_requires_complete_ordered_pool():
 if __name__ == '__main__':
     test_all_pool_features_are_aligned_and_checksummed()
     test_retention_tracks_oracle_and_source_budget()
+    test_diversity_selection_has_exact_topk_control_and_removes_redundancy()
     test_future_retention_separates_initial_final_and_rescued_candidates()
     test_exact_random_selection_matches_enumerated_source_quota()
     test_selector_training_loader_requires_complete_ordered_pool()

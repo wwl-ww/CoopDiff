@@ -36,27 +36,76 @@ def initial_pool_features(archive):
     return rows
 
 
-def selector_retention(scores, dockq, sources, keep=64, threshold=.23):
-    """Measure whether a fixed-budget selection preserves useful basins."""
-    scores, dockq = torch.as_tensor(scores), torch.as_tensor(dockq)
-    if (scores.ndim != 1 or dockq.shape != scores.shape or len(sources) != scores.numel()
-            or not 1 <= keep <= scores.numel() or not torch.isfinite(scores).all()
-            or not torch.isfinite(dockq).all() or not bool(((dockq >= 0) & (dockq <= 1)).all())):
-        raise ValueError('invalid selector retention inputs')
-    order = torch.argsort(scores, descending=True, stable=True)[:keep]
-    selected = dockq[order]
+def diversity_aware_indices(scores, descriptors, keep=64, penalty=.0):
+    """Greedily trade predicted quality against redundancy in a candidate set.
+
+    Descriptors must already be native-free and scaled to comparable units.  An
+    RBF similarity uses the within-case median non-zero distance as bandwidth,
+    so ``penalty`` remains comparable across cases.  ``penalty=0`` is exactly
+    stable top-k selection and is kept as an implementation control.
+    """
+    scores = torch.as_tensor(scores).float()
+    descriptors = torch.as_tensor(descriptors, device=scores.device).float()
+    if (scores.ndim != 1 or descriptors.ndim != 2
+            or descriptors.shape[0] != scores.numel()
+            or not 1 <= keep <= scores.numel() or penalty < 0
+            or not torch.isfinite(scores).all()
+            or not torch.isfinite(descriptors).all()):
+        raise ValueError('invalid diversity-aware selection inputs')
+    if penalty == 0:
+        return torch.argsort(scores, descending=True, stable=True)[:keep]
+    distances = torch.cdist(descriptors, descriptors)
+    nonzero = distances[distances > 0]
+    bandwidth = torch.median(nonzero) if nonzero.numel() else scores.new_tensor(1.)
+    similarity = torch.exp(-.5 * (distances / bandwidth.clamp_min(1e-8)).square())
+    selected = []
+    available = torch.ones(scores.numel(), dtype=torch.bool, device=scores.device)
+    redundancy = torch.zeros_like(scores)
+    for _ in range(keep):
+        utility = scores - float(penalty) * redundancy
+        utility = utility.masked_fill(~available, -torch.inf)
+        index = int(torch.argmax(utility))
+        selected.append(index)
+        available[index] = False
+        redundancy = torch.maximum(redundancy, similarity[index])
+    return torch.tensor(selected, dtype=torch.long, device=scores.device)
+
+
+def selector_retention_at_indices(indices, dockq, sources, threshold=.23):
+    """Measure oracle retention for an explicitly selected candidate subset."""
+    dockq = torch.as_tensor(dockq)
+    indices = torch.as_tensor(indices, dtype=torch.long)
+    if (dockq.ndim != 1 or indices.ndim != 1 or not indices.numel()
+            or len(sources) != dockq.numel() or indices.unique().numel() != indices.numel()
+            or int(indices.min()) < 0 or int(indices.max()) >= dockq.numel()
+            or not torch.isfinite(dockq).all()
+            or not bool(((dockq >= 0) & (dockq <= 1)).all())):
+        raise ValueError('invalid explicit selector retention inputs')
+    order = indices.cpu()
+    selected = dockq[order.to(dockq.device)]
     oracle = float(dockq.max())
-    selected_best = float(selected.max())
     return {
-        'keep': keep, 'selected_best': selected_best, 'full_pool_oracle': oracle,
-        'oracle_retention': selected_best / oracle if oracle > 0 else None,
-        'selected_hit': int(selected_best >= threshold),
+        'keep': order.numel(), 'selected_best': float(selected.max()),
+        'full_pool_oracle': oracle,
+        'oracle_retention': float(selected.max()) / oracle if oracle > 0 else None,
+        'selected_hit': int(float(selected.max()) >= threshold),
         'full_pool_hit': int(oracle >= threshold),
         'oracle_index_retained': int(int(torch.argmax(dockq)) in set(order.tolist())),
         'selected_source_counts': {
             source: sum(sources[int(i)] == source for i in order)
             for source in ('bitseed', 'sdpi')},
     }
+
+
+def selector_retention(scores, dockq, sources, keep=64, threshold=.23):
+    """Measure whether stable top-score selection preserves useful basins."""
+    scores, dockq = torch.as_tensor(scores), torch.as_tensor(dockq)
+    if (scores.ndim != 1 or dockq.shape != scores.shape or len(sources) != scores.numel()
+            or not 1 <= keep <= scores.numel() or not torch.isfinite(scores).all()
+            or not torch.isfinite(dockq).all() or not bool(((dockq >= 0) & (dockq <= 1)).all())):
+        raise ValueError('invalid selector retention inputs')
+    order = torch.argsort(scores, descending=True, stable=True)[:keep]
+    return selector_retention_at_indices(order, dockq, sources, threshold)
 
 
 def future_selector_retention(scores, initial_dockq, final_dockq, sources,
