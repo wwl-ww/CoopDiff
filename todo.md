@@ -391,6 +391,8 @@ full-pool selector完成后另算精确随机基线，不靠有限次随机seed�
 
 全链结束后，`model_v3_ranking_summary`要求current selector、精确随机配额、future selector、51维重原子post-ranker和两类去冗余审计全部成功，才生成`results/model_v3_ranking_summary_20260916/report/summary.{json,md}`；任一上游失败均拒绝汇总成功子集。总表明确区分“所选64条中的oracle-best”（计算分配指标）与“ranker实际top-1”（部署指标），二者不得互换。新增代码通过67个逐文件测试入口；后台runtime均记录对应Git提交。
 
+旧post-ranker的160例监督共20,480个状态，但仅78个`0.23≤DockQ<0.49`、1个`≥0.49`，因此另加固定loss对照以区分特征不足与稀疏分类项拖累：复用同一51维特征、网络、160/8划分和三seed，只训练同case listwise目标，温度固定为0.05与0.01。队列`model_v3_expanded_objective_v2`等待expanded特征完成后运行6个CPU fit，写入`results/model_v3_expanded_objective_v2_20260916/`；首个无状态文件的等待器未开始fit即停止并由v2取代。总汇也由`model_v3_ranking_summary_v2`取代旧等待器，并把composite与两种ranking-only目标并列，不按seed或温度挑最好结果。
+
 ### PROTAC条件模型
 
 已实现独立条件架构、训练checkpoint、训练入口和部署入口：
