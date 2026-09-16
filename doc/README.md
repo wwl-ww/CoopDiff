@@ -1,6 +1,6 @@
 # 文档索引
 
-更新：2026-09-15。当前代码定义实现，实验 manifest 与逐例结果定义已运行事实；提案和历史 smoke 不能替代二者。
+更新：2026-09-16。当前代码定义实现，实验 manifest 与逐例结果定义已运行事实；提案和历史 smoke 不能替代二者。
 
 ## 阅读顺序
 
@@ -26,6 +26,7 @@
 - 联合训练 BiTSeed 固定 lazy `C=1, M=1`；两个二元专家各运行一次，任一失败时回退 SDPI。
 - MGD94与PROTAC22按各自输入协议分别报告；当前还在研究PROTAC额外条件，不能混比两种数据。完整原子 DeepTernary DockQ 是主指标，近似 DockQ 只作诊断。
 - BiTSeed 本身不包含 oracle、selector 或 ranker。
+- model-v3 将ranking拆为全池初态256→64 pre-selector与已精修状态post-ranker；两者标签、checkpoint和指标不可互换。PROTAC条件模型已有独立训练/部署合同，正式587/65簇的条件/全缺失40-epoch配对训练已在GPU5/7启动；在结构评估完成前不宣称DockQ收益。
 
 ## 维护规则
 

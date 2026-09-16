@@ -1,6 +1,10 @@
 # TriCoopDiff 下一阶段：Ranking 与 PROTAC 条件建模调研
 
-调研日期：2026-09-15。范围：本仓库代码、C40/C81 已完成结果、DeepTernary 本地实现和原始论文/官方资料。本文是设计意见，不表示已实现、已训练或已获得 GPU 启动授权。
+调研日期：2026-09-15；执行状态更新至2026-09-16。范围：本仓库代码、C40/C81 已完成结果、DeepTernary 本地实现和原始论文/官方资料。设计章节仍是研究意见；第9节单独记录已经实现或启动的范围。
+
+执行进展另见 [todo.md](todo.md)：32/8组采集及首轮排序已完成，160例训练扩展正在打标签并排队运行18项学习曲线；学习排序器此前仍无≥0.23的验证top1命中。
+条件编码已推进到独立训练checkpoint、真实数据训练入口、四格配对验证与显式部署manifest；587/65簇的40-epoch正式条件/全缺失配对训练已经启动。P0化学恢复不等于二元来源验证。
+以下整体架构仍是提案；已运行范围和当前限制以该执行记录及对应 manifest 为准。
 
 ## 1. 我的结论：先补齐信息和决策，再增加模型复杂度
 
@@ -474,7 +478,31 @@ R1和P0/P1是两个可独立推进的研究工作包，但本文没有自动启�
 
 最小测试包括：全局SE(3)协变、两个二元frame独立扰动、原子重排/对称映射、单侧/无条件、错误条件、fallback来源、断开native仍可推理、ranker梯度不进入冻结生成器、未来特征不可提前读取、初末态标签不进入输入、恢复运行后坐标hash一致。
 
-## 15. 最终观点
+## 15. 2026-09-16 双线执行合同
+
+### Ranking：明确拆成 pre-selector 与 post-ranker
+
+- post-ranker 的封存档案只覆盖被抽中的64个候选及其末态；当前夜间队列扩展到160个训练case，固定32/80/160三档、geometry/frozen+geometry两类特征、三个seed，共18项。8例验证被用于选epoch，只能称内部验证。
+- 另建 full-pool initial 协议，对每例全部256个初态重算14维native-free几何并独立打DockQ标签；训练目标是256→64计算分配，主指标为选64后保留的全池oracle、≥0.23命中和来源组成。它不读取末态，不能冒充未来价值R2。
+- 两条rank任务使用不同checkpoint和报告。第一版不做walker在线交换：在post-ranker未证明可泛化前，不允许用其分数改变轨迹。
+- 后台状态分别见 `results/model_v3_ranking_night160_20260915/queue_status.json` 与 `results/model_v3_initial_selector_20260916/status.json`。只有完整网格成功才生成总表。
+
+### PROTAC：从C EMA做严格零扰动迁移
+
+- `ConditionedConsensusFuse` 增加蛋白口袋mask、配体双端角色、端点—本侧蛋白局部距离和条件来源编码；三个条件注入通道由一个零门控制，因此未训练时无论条件是否存在都逐位复现父C模型输出。第一步先学习开门，随后梯度进入条件编码器。
+- 通用三元训练的native坐标只生成6 Å二值接触mask与旋转平移不变的本侧最近距离，坐标不进入条件张量或checkpoint。默认condition dropout覆盖全缺失、单侧、口袋、配体角色和binary局部几何缺失。
+- checkpoint独立为`conditioned_consensus_training_v1`，绑定父checkpoint SHA256并注明从`ema_trifuse_state_dict`迁移；旧v20加载器拒绝它。训练继续使用1:1 SDPI/BiTSeed与在线C=1/M=1端点。
+- 优化器把成熟父模型参数保持在`1e-4`，新condition参数使用显式记录的`1e-3`；两组都进入同一plateau scheduler。该比例仍需pilot验证，不是最终超参数。
+- 验证固定为`SDPI/BiTSeed端点 × full/absent`四格。同一case四格共享flow时间，同一来源的full/absent共享coupling；BiTSeed失败回退单独计数。
+- 部署只接受`protac_condition_manifest_v1`：必须核对case、canonical isomeric SMILES、原子数、片段子图映射和蛋白节点顺序；schema没有native三元坐标字段。conditioned evaluator需显式opt-in，旧checkpoint不能静默读取manifest。
+- PROTAC22两端严格warhead化学映射目前没有一例双侧同时通过，因此第一轮结构评估不伪造原子映射。新增的pocket-only协议直接由各侧unbound protein及同frame的`unbound_lig{1,2}.pdb`生成6 Å Cα口袋mask；22/22例完整，明确标作provided template，不读取native三元结构、不使用跨蛋白坐标，也不声称已提供linker/warhead条件。
+- 这一pocket-only部署输入仍有明确分布差：当前默认训练中role与binary通道各独立以0.1概率丢弃，双侧同时只剩pocket的组合很少。第一轮可用于检验模型能否利用口袋，但若结果为负，不能据此否定完整PROTAC条件；下一版应显式加入pocket-only可用性模式并单列验证格，而不是事后提高测试条件。
+
+真实单例烟测完成一次训练与保存/恢复。修正配对验证后，epoch1 EMA的full/absent loss分别为SDPI `11.7704687/11.7704687`、BiTSeed端点 `1.8034111/1.8034112`；这只证明迁移与验证合同正确，不是条件模型已学到收益。8/4例pilot据此确定新condition参数使用`1e-3`而父参数保持`1e-4`。
+
+正式40-epoch配对训练已在物理GPU5/7后台启动：默认条件dropout对全条件缺失控制；587训练簇、65验证簇、父C40、seed和双来源端点协议相同。完成前不把中途loss差写成结论。训练结束后固定Hybrid-56/8的64个walker，比较`condition训练+pocket`、`condition训练+absent`和`absent训练+absent`；候选seed、20步精修和DockQ口径不变。只有这组结构级比较才能回答额外条件是否改善最终DockQ。
+
+## 16. 最终观点
 
 **先把“能生成好构象”与“能识别好构象”分别做实，再用未来价值把二者连接。**
 
