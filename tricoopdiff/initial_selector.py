@@ -108,20 +108,22 @@ def selector_retention(scores, dockq, sources, keep=64, threshold=.23):
     return selector_retention_at_indices(order, dockq, sources, threshold)
 
 
-def future_selector_retention(scores, initial_dockq, final_dockq, sources,
-                              keep=64, threshold=.23):
-    """Audit whether a compute selector preserves candidates valuable after refinement."""
-    scores = torch.as_tensor(scores)
+def future_selector_retention_at_indices(indices, initial_dockq, final_dockq,
+                                         sources, threshold=.23):
+    """Audit future-value retention for an explicitly selected subset."""
+    indices = torch.as_tensor(indices, dtype=torch.long)
     initial = torch.as_tensor(initial_dockq)
     final = torch.as_tensor(final_dockq)
-    if (scores.ndim != 1 or initial.shape != scores.shape or final.shape != scores.shape
-            or len(sources) != scores.numel() or not 1 <= keep <= scores.numel()
-            or not torch.isfinite(scores).all() or not torch.isfinite(initial).all()
+    if (indices.ndim != 1 or not indices.numel() or initial.ndim != 1
+            or final.shape != initial.shape or len(sources) != initial.numel()
+            or indices.unique().numel() != indices.numel()
+            or int(indices.min()) < 0 or int(indices.max()) >= initial.numel()
+            or not torch.isfinite(initial).all()
             or not torch.isfinite(final).all()
             or not bool(((initial >= 0) & (initial <= 1)).all())
             or not bool(((final >= 0) & (final <= 1)).all())):
-        raise ValueError('invalid future selector retention inputs')
-    order = torch.argsort(scores, descending=True, stable=True)[:keep]
+        raise ValueError('invalid explicit future selector retention inputs')
+    order = indices.cpu()
     chosen = set(order.tolist())
     union = torch.maximum(initial, final)
     rescued = (initial < threshold) & (final >= threshold)
@@ -140,7 +142,7 @@ def future_selector_retention(scores, initial_dockq, final_dockq, sources,
     rescued_ids = torch.where(rescued)[0]
     selected_rescued = [int(index) for index in rescued_ids if int(index) in chosen]
     return {
-        'keep': keep,
+        'keep': order.numel(),
         'initial': stage_metrics(initial),
         'final': stage_metrics(final),
         'union': stage_metrics(union),
@@ -151,6 +153,21 @@ def future_selector_retention(scores, initial_dockq, final_dockq, sources,
             source: sum(sources[int(index)] == source for index in order)
             for source in ('bitseed', 'sdpi')},
     }
+
+
+def future_selector_retention(scores, initial_dockq, final_dockq, sources,
+                              keep=64, threshold=.23):
+    """Audit stable top-score compute selection against future refined value."""
+    scores = torch.as_tensor(scores)
+    initial = torch.as_tensor(initial_dockq)
+    final = torch.as_tensor(final_dockq)
+    if (scores.ndim != 1 or initial.shape != scores.shape or final.shape != scores.shape
+            or len(sources) != scores.numel() or not 1 <= keep <= scores.numel()
+            or not torch.isfinite(scores).all()):
+        raise ValueError('invalid future selector score inputs')
+    order = torch.argsort(scores, descending=True, stable=True)[:keep]
+    return future_selector_retention_at_indices(
+        order, initial, final, sources, threshold)
 
 
 def exact_random_selection(dockq, sources, quotas, threshold=.23):

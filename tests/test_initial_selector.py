@@ -10,7 +10,9 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tricoopdiff.initial_selector import (future_selector_retention, initial_pool_features,
+from tricoopdiff.initial_selector import (future_selector_retention,
+                                          future_selector_retention_at_indices,
+                                          initial_pool_features,
                                           diversity_aware_indices, exact_random_selection,
                                           selector_retention,
                                           selector_retention_at_indices)
@@ -87,6 +89,9 @@ def test_future_retention_separates_initial_final_and_rescued_candidates():
     assert result['rescued_candidates'] == 2
     assert result['rescued_candidates_retained'] == 1
     assert result['rescued_hit_retained'] == 1
+    explicit = future_selector_retention_at_indices(
+        torch.arange(192, 256), initial, final, sources)
+    assert explicit == result
 
 
 def test_exact_random_selection_matches_enumerated_source_quota():
