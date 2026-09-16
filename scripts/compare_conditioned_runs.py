@@ -58,7 +58,14 @@ def _assert_paired_configs(conditioned, control):
     right = _read_json(Path(control) / 'config.json')
     # Separate cache directories may contain the same deterministic endpoint
     # protocol; their contents are independently audited by the trainers.
-    allowed = {'output_dir', 'condition_dropout', 'bitseed_lazy_cache_dir'}
+    allowed = {
+        'output_dir', 'condition_dropout', 'bitseed_lazy_cache_dir',
+        # Strict paired continuation deliberately uses distinct epoch-1
+        # checkpoints and makes only the control arm a cache follower.
+        'resume', 'paired_cache_follower',
+        'condition_drop_all', 'condition_drop_side', 'condition_drop_pocket',
+        'condition_drop_ligand_role', 'condition_drop_binary',
+    }
     mismatches = {
         key: [left.get(key), right.get(key)]
         for key in sorted(set(left) | set(right))
@@ -66,9 +73,13 @@ def _assert_paired_configs(conditioned, control):
     }
     if mismatches:
         raise RuntimeError(f'paired configuration mismatch: {mismatches}')
-    if float(left['condition_dropout']['drop_all']) >= 1.:
+    def drop_all(config):
+        values = config['condition_dropout']
+        return float(values.get('drop_all_probability', values.get('drop_all')))
+
+    if drop_all(left) >= 1.:
         raise RuntimeError('conditioned run unexpectedly drops all conditions')
-    if float(right['condition_dropout']['drop_all']) != 1.:
+    if drop_all(right) != 1.:
         raise RuntimeError('absent control must use drop_all=1')
     return left, right
 
