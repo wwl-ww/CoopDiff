@@ -400,7 +400,9 @@ GPU 状态、PID 和 ETA 不写成长期规范。需要时运行 `bash scripts/g
 
 首轮formal作业在epoch1结束前停止：审计发现训练条件只出现`training_native_supervision`，推理manifest却会激活从未训练的`template` provenance输入列。该目录保留为aborted诊断，不产出模型结论。v2把provenance/evidence ID仅保留在manifest与报告，不进入条件张量；网络只看role/pocket/binary可用性及confidence。
 
-第二次启动又发现两臂各自扩展endpoint cache时会产生微小GPU非确定性，因此也在epoch1结束前停止，不作结果。当前严格配对作业使用会话`model_v3_conditioned_v3_default/absent`在物理GPU5/7运行；两者均为587训练簇、65验证簇、40 epoch、C40 EMA父权重、相同seed与1:1 SDPI/BiTSeed协议。结果分别写入`results/model_v3_conditioned_full40_v3_{default,absent}_20260916/`，代码runtime封存在`results/model_v3_conditioned_full40_v2_20260916_runtime/`。两臂读取同一个只含冻结专家C=1/M=1结果的共享cache，default臂预先领先约270步填充不可变条目，absent臂随后读取完全相同的序列化端点；cache不含条件张量。只有该v3作业是当前formal结果。
+第二次启动又发现两臂各自扩展endpoint cache时会产生微小GPU非确定性，因此也在epoch1结束前停止，不作结果。v3尝试用default臂预领先共享cache，但epoch1验证后两臂重新同步；cache仅395例，无法保证后续未缓存case不会并发生成。v3只保留完整epoch1及其checkpoint，已产生的epoch2部分不采用。
+
+当前formal作业为`model_v3_conditioned_v4_default/absent`，从各自v3 epoch1 checkpoint续跑epoch2–40，物理GPU5/7；结果写入`results/model_v3_conditioned_full40_v4_{default,absent}_20260916/`，runtime为`results/model_v3_conditioned_full40_v4_20260916_runtime/`。default是feature/endpoint cache唯一写者，absent带`--paired-cache-follower`，遇到未缓存case只等待并读取写者原子发布的文件，超时即失败，绝不自行生成。两者仍为587训练簇、65验证簇、C40 EMA父权重、相同seed与1:1 SDPI/BiTSeed协议；64个测试文件通过。formal训练序列由v3 epoch1加v4 epoch2–40组成。
 
 训练loss自动审计会话为`model_v3_conditioned_compare`：等待两侧`final_model.pt`后核对除dropout/输出路径外的配置完全一致，输出逐epoch四格loss、full−absent差和raw/EMA condition gate；报告明确不把loss差写成DockQ收益。
 
@@ -415,4 +417,4 @@ GPU 状态、PID 和 ETA 不写成长期规范。需要时运行 `bash scripts/g
 | control-absent | 训练时始终缺失 | 全条件缺失 | 条件训练本身的代价/收益 |
 
 三组必须核对逐case proposal pool hash及初态hash；任一不一致不能作配对结论。结构评估报告Initial/Final/Union及≥0.23/0.49，仍需另接post-ranker才是部署top1。后台接管入口为`scripts/run_conditioned_protac_queue.py`，每张物理卡串行执行任务，不与训练同时增加GPU worker。
-GPU5队列在训练完成后运行`default-pocket`，GPU7串行运行`default-absent`与`control-absent`；当前会话分别为`model_v3_conditioned_v3_eval_gpu5/7`。`model_v3_conditioned_v3_audit`等待三组全部22例结束后才汇总逐例配对差、胜/平/负及pool/初态/seed一致性，不接纳成功子集。
+GPU5队列在训练完成后运行`default-pocket`，GPU7串行运行`default-absent`与`control-absent`；当前会话分别为`model_v3_conditioned_v4_eval_gpu5/7`。`model_v3_conditioned_v4_audit`等待三组全部22例结束后才汇总逐例配对差、胜/平/负及pool/初态/seed一致性，不接纳成功子集。
