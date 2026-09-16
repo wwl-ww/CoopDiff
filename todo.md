@@ -387,6 +387,10 @@ GPU 状态、PID 和 ETA 不写成长期规范。需要时运行 `bash scripts/g
 
 full-pool selector完成后另算精确随机基线，不靠有限次随机seed：uniform-64以及按来源32/32、48/16、56/8分别由组合概率得到expected-best、oracle retention和≥0.23期望命中数。报告目录为`results/model_v3_selector_baselines_20260916/random_baselines/`。
 
+新增学习分数后的native-free去冗余对照，不修改或重训selector。选择规则为`q_hat - λ × max RBF similarity`，相似度只使用按训练统计标准化的14维初态几何；预声明`λ={0,.025,.05,.1,.2}`，其中0必须逐项复现原稳定top-64。current-quality审计等待9个selector完成后写入`results/model_v3_selector_diversity_20260916/`；future-value审计分别覆盖Final/Union目标及rescued basin，写入`results/model_v3_future_selector_diversity_20260916/`。这些λ共用内部8例，只是诊断，不能挑最佳值后称为独立验证。
+
+全链结束后，`model_v3_ranking_summary`要求current selector、精确随机配额、future selector、51维重原子post-ranker和两类去冗余审计全部成功，才生成`results/model_v3_ranking_summary_20260916/report/summary.{json,md}`；任一上游失败均拒绝汇总成功子集。总表明确区分“所选64条中的oracle-best”（计算分配指标）与“ranker实际top-1”（部署指标），二者不得互换。新增代码通过67个逐文件测试入口；后台runtime均记录对应Git提交。
+
 ### PROTAC条件模型
 
 已实现独立条件架构、训练checkpoint、训练入口和部署入口：
