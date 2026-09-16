@@ -60,6 +60,16 @@ def state_quality_loss(output, dockq):
     return ranking + .5 * regression + .5 * classification
 
 
+def state_ranking_only_loss(output, dockq, temperature=0.05):
+    """Top-focused within-case objective without sparse absolute-class heads."""
+    if dockq.ndim != 1 or dockq.shape != output['score'].shape or dockq.numel() < 2:
+        raise ValueError('ranking-only supervision requires matching vectors with N >= 2')
+    if (not torch.isfinite(dockq).all()
+            or not bool(((dockq >= 0) & (dockq <= 1)).all())):
+        raise ValueError('DockQ labels must be finite in [0,1]')
+    return listwise_ranking_loss(output['score'], dockq.detach(), temperature)
+
+
 def listwise_ranking_loss(scores, dockq, temperature=0.05):
     """Cross entropy against a soft distribution over within-case DockQ."""
     if scores.ndim != 1 or dockq.shape != scores.shape or scores.numel() < 2:

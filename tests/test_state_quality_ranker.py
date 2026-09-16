@@ -8,7 +8,8 @@ from unittest.mock import patch
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tricoopdiff.pose_ranking import StateQualityRanker, state_quality_loss
+from tricoopdiff.pose_ranking import (StateQualityRanker, state_quality_loss,
+                                      state_ranking_only_loss)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from evaluation_common import sha256_file
 from train_state_ranker import combine_training_parts, evaluate, load_split, quality_class_support
@@ -43,6 +44,18 @@ def test_quality_loss_updates_only_ranker_and_rejects_invalid_truth():
         pass
     else:
         raise AssertionError('invalid quality labels must be rejected')
+
+
+def test_ranking_only_loss_is_temperature_sensitive_and_ignores_class_heads():
+    model = StateQualityRanker(3, 4)
+    output = model(torch.randn(5, 3))
+    labels = torch.tensor([0., .01, .02, .1, .3])
+    broad = state_ranking_only_loss(output, labels, .05)
+    sharp = state_ranking_only_loss(output, labels, .01)
+    assert torch.isfinite(broad) and torch.isfinite(sharp) and broad != sharp
+    broad.backward()
+    assert model.head.weight.grad[0].abs().sum() > 0
+    assert model.head.weight.grad[1:].abs().sum() == 0
 
 
 def test_archive_loader_keeps_failed_probe_and_separates_labels(tmp_path):

@@ -10,7 +10,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 NAMES = ('current', 'random', 'future', 'expanded', 'current_diversity',
-         'future_diversity')
+         'future_diversity', 'objective')
 
 
 def main(argv=None):

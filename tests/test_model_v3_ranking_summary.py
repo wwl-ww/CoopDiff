@@ -24,7 +24,7 @@ def test_ranking_summary_keeps_all_metric_types_separate(tmp_path=None):
     root = Path(context.name) if context is not None else tmp_path
     inputs = {name: root / name for name in (
         'current', 'random', 'future', 'expanded', 'current_diversity',
-        'future_diversity', 'old')}
+        'future_diversity', 'objective', 'old')}
     base = {'mean_selected_best': .2, 'mean_case_oracle_retention': .8,
             'selected_hits_0.23': 3}
     write(inputs['current'] / 'summary.json', {'runs': [
@@ -50,6 +50,9 @@ def test_ranking_summary_keeps_all_metric_types_separate(tmp_path=None):
     write(inputs['future_diversity'] / 'audit/report.json', {'runs': [
         {'target': target, 'summary': [future_diversity_row]}
         for target in ('final', 'union')]})
+    write(inputs['objective'] / 'summary.json', {'runs': [
+        {'temperature': .05, **leaderboard},
+        {'temperature': .01, **leaderboard}]})
     old_runs = []
     for features in ('geometry', 'frozen_geometry'):
         old_runs.append({'features': features, 'train_cases': 160,
@@ -60,6 +63,7 @@ def test_ranking_summary_keeps_all_metric_types_separate(tmp_path=None):
     text = summary.markdown(payload)
     assert payload['current_quality_selection'][0]['mean_selected_best'] == .2
     assert payload['postranking_top1'][-1]['union_top1'] == .05
+    assert len(payload['postranking_top1']) == 5
     assert 'oracle-within-the-selected-64' in text and 'Post-ranker top-1' in text
     if context is not None:
         context.cleanup()

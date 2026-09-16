@@ -22,6 +22,7 @@ def summarize(inputs):
     expanded = load(inputs['expanded'] / 'summary.json')['runs']
     current_diversity = load(inputs['current_diversity'] / 'audit/report.json')['runs']
     future_diversity = load(inputs['future_diversity'] / 'audit/report.json')['runs']
+    objective = load(inputs['objective'] / 'summary.json')['runs']
     old = load(inputs['old'] / 'summary.json')['runs']
 
     current_table = []
@@ -102,6 +103,12 @@ def summarize(inputs):
     postranker_table.append({'features': 'expanded_geometry', **{
         f'{stage}_top1': mean([row[stage] for row in expanded], 'mean_top1')
         for stage in ('initial', 'final', 'union')}})
+    for temperature in sorted({row['temperature'] for row in objective}, reverse=True):
+        rows = [row for row in objective if row['temperature'] == temperature]
+        postranker_table.append({
+            'features': f'expanded_ranking_only_t{temperature:.2f}', **{
+                f'{stage}_top1': mean([row[stage] for row in rows], 'mean_top1')
+                for stage in ('initial', 'final', 'union')}})
     return {
         'scope': ('internal validation n=8; validation reused for epoch selection and '
                   'penalty diagnostics; all seeds and penalties retained'),
@@ -158,7 +165,7 @@ def markdown(payload):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('current', 'random', 'future', 'expanded', 'current_diversity',
-                 'future_diversity', 'old'):
+                 'future_diversity', 'objective', 'old'):
         parser.add_argument('--' + name.replace('_', '-'), type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args(argv)
@@ -166,7 +173,7 @@ def main(argv=None):
         parser.error('output must not exist')
     inputs = {name: getattr(args, name) for name in (
         'current', 'random', 'future', 'expanded', 'current_diversity',
-        'future_diversity', 'old')}
+        'future_diversity', 'objective', 'old')}
     payload = summarize(inputs)
     args.out.mkdir(parents=True, exist_ok=False)
     (args.out / 'summary.json').write_text(json.dumps(payload, indent=2) + '\n')
