@@ -22,8 +22,11 @@ def condition_feature_shapes(protein_sizes, ligand_atoms):
     if (len(protein_sizes) != 2 or any(type(n) is not int or n < 1 for n in protein_sizes)
             or type(ligand_atoms) is not int or ligand_atoms < 1):
         raise ValueError('condition shapes require two proteins and a nonempty ligand')
+    # Provenance is mandatory audit metadata but is deliberately not a learned
+    # feature: generic training only observes native-derived supervision and
+    # cannot calibrate separate template/docked/predicted embedding columns.
     return {'protein1': (protein_sizes[0], 3), 'protein2': (protein_sizes[1], 3),
-            'ligand': (ligand_atoms, 8), 'sides': (2, 4 + len(PROVENANCE))}
+            'ligand': (ligand_atoms, 8), 'sides': (2, 4)}
 
 
 @dataclass(frozen=True)
@@ -76,7 +79,7 @@ annotations, never inferred as every atom outside an incomplete fragment.
         raise ValueError('empty ligand')
     ligand = torch.zeros(count, 8)
     proteins = [torch.zeros(n, 3) for n in protein_sizes]
-    metadata = torch.zeros(2, 4 + len(PROVENANCE))
+    metadata = torch.zeros(2, 4)
     maps = []
     for index, side in enumerate(sides):
         if side is None:
@@ -114,7 +117,6 @@ annotations, never inferred as every atom outside an incomplete fragment.
         if not metadata[index, :3].any():
             raise ValueError('empty condition must be represented by None')
         metadata[index, 3] = side.confidence
-        metadata[index, 4 + PROVENANCE.index(side.provenance)] = 1.
     if protac and set(maps[0]) & set(maps[1]):
         raise ValueError('overlapping PROTAC ends; use generic ternary mode if intended')
     linker = tuple(linker_indices)
@@ -161,7 +163,6 @@ def build_supervised_contact_features(molecule, protein_coords, ligand_coords, c
         result['sides'][index, 0:2] = 1.
         result['sides'][index, 2] = float(role.any())
         result['sides'][index, 3] = 1.
-        result['sides'][index, 4 + PROVENANCE.index('training_native_supervision')] = 1.
     result['ligand'][:, 3] = (result['ligand'][:, :3].sum(1) == 0).float()
     return result
 
@@ -174,7 +175,7 @@ class ProtacConditionEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.ligand_encoder = nn.Sequential(nn.Linear(8, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
         self.protein_encoder = nn.Sequential(nn.Linear(3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
-        self.side_encoder = nn.Sequential(nn.Linear(4 + len(PROVENANCE), hidden_dim), nn.SiLU(),
+        self.side_encoder = nn.Sequential(nn.Linear(4, hidden_dim), nn.SiLU(),
                                           nn.Linear(hidden_dim, hidden_dim))
 
     def forward(self, features):

@@ -326,7 +326,7 @@ availability_mask, confidence/uncertainty
 provenance = experimental_binary / template / docked / predicted / absent
 ```
 
-`source`仍表示当前候选的生成来源；`provenance`表示条件来源；`availability`表示条件有无。三者不得压成一个0/1。原候选fallback为SDPI时，source=0，但它仍可具有可靠的口袋条件。
+`source`仍表示当前候选的生成来源；`provenance`表示条件来源；`availability`表示条件有无。三者不得压成一个0/1。原候选fallback为SDPI时，source=0，但它仍可具有可靠的口袋条件。当前v2将provenance保留为manifest/报告审计字段，但**不送入神经网络**：通用训练只见过native监督，无法校准template/docked/predicted的独立embedding。
 
 ### 9.2 原子映射与坐标检查是第一优先级
 
@@ -489,7 +489,7 @@ R1和P0/P1是两个可独立推进的研究工作包，但本文没有自动启�
 
 ### PROTAC：从C EMA做严格零扰动迁移
 
-- `ConditionedConsensusFuse` 增加蛋白口袋mask、配体双端角色、端点—本侧蛋白局部距离和条件来源编码；三个条件注入通道由一个零门控制，因此未训练时无论条件是否存在都逐位复现父C模型输出。第一步先学习开门，随后梯度进入条件编码器。
+- `ConditionedConsensusFuse` 增加蛋白口袋mask、配体双端角色、端点—本侧蛋白局部距离和条件可用性/置信度；三个条件注入通道由一个零门控制，因此未训练时无论条件是否存在都逐位复现父C模型输出。provenance只审计、不学习。第一步先学习开门，随后梯度进入条件编码器。
 - 通用三元训练的native坐标只生成6 Å二值接触mask与旋转平移不变的本侧最近距离，坐标不进入条件张量或checkpoint。默认condition dropout覆盖全缺失、单侧、口袋、配体角色和binary局部几何缺失。
 - checkpoint独立为`conditioned_consensus_training_v1`，绑定父checkpoint SHA256并注明从`ema_trifuse_state_dict`迁移；旧v20加载器拒绝它。训练继续使用1:1 SDPI/BiTSeed与在线C=1/M=1端点。
 - 优化器把成熟父模型参数保持在`1e-4`，新condition参数使用显式记录的`1e-3`；两组都进入同一plateau scheduler。该比例仍需pilot验证，不是最终超参数。
@@ -500,7 +500,7 @@ R1和P0/P1是两个可独立推进的研究工作包，但本文没有自动启�
 
 真实单例烟测完成一次训练与保存/恢复。修正配对验证后，epoch1 EMA的full/absent loss分别为SDPI `11.7704687/11.7704687`、BiTSeed端点 `1.8034111/1.8034112`；这只证明迁移与验证合同正确，不是条件模型已学到收益。8/4例pilot据此确定新condition参数使用`1e-3`而父参数保持`1e-4`。
 
-正式40-epoch配对训练已在物理GPU5/7后台启动：默认条件dropout对全条件缺失控制；587训练簇、65验证簇、父C40、seed和双来源端点协议相同。完成前不把中途loss差写成结论。训练结束后固定Hybrid-56/8的64个walker，比较`condition训练+pocket`、`condition训练+absent`和`absent训练+absent`；候选seed、20步精修和DockQ口径不变。只有这组结构级比较才能回答额外条件是否改善最终DockQ。
+首轮formal作业在epoch1结束前审计出“训练只见native provenance、推理却激活未训练template列”的缺陷，已主动终止且不作结果。v2从模型张量删除provenance后以相同40-epoch协议在物理GPU5/7重启：默认条件dropout对全条件缺失控制；587训练簇、65验证簇、父C40、seed和双来源端点协议相同。完成前不把中途loss差写成结论。训练结束后固定Hybrid-56/8的64个walker，比较`condition训练+pocket`、`condition训练+absent`和`absent训练+absent`；候选seed、20步精修和DockQ口径不变。只有这组结构级比较才能回答额外条件是否改善最终DockQ。
 
 ## 16. 最终观点
 

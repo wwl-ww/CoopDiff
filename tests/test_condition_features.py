@@ -71,6 +71,17 @@ def test_missing_pocket_differs_from_known_negative_and_gradients_flow():
     assert any(torch.count_nonzero(p.grad) for p in encoder.parameters())
 
 
+def test_provenance_is_audited_but_not_an_untrained_model_feature():
+    molecule = Chem.MolFromSmiles('CCOCCN')
+    side = binary_side()
+    variants = [build_condition_features(
+        molecule, (2, 2), (replace(side, provenance=provenance), None))
+        for provenance in ('experimental_binary', 'template', 'docked', 'predicted')]
+    assert all(torch.equal(variants[0][name], variant[name])
+               for variant in variants[1:] for name in variants[0])
+    assert variants[0]['sides'].shape == (2, 4)
+
+
 def test_invalid_chemistry_unverified_provenance_and_overlapping_ends_rejected():
     molecule, side = Chem.MolFromSmiles('CCOCCN'), binary_side()
     invalid = [replace(side, atom_map=(0, 1)), replace(side, provenance='native'),

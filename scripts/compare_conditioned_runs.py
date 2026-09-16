@@ -56,7 +56,9 @@ def _validations(run):
 def _assert_paired_configs(conditioned, control):
     left = _read_json(Path(conditioned) / 'config.json')
     right = _read_json(Path(control) / 'config.json')
-    allowed = {'output_dir', 'condition_dropout'}
+    # Separate cache directories may contain the same deterministic endpoint
+    # protocol; their contents are independently audited by the trainers.
+    allowed = {'output_dir', 'condition_dropout', 'bitseed_lazy_cache_dir'}
     mismatches = {
         key: [left.get(key), right.get(key)]
         for key in sorted(set(left) | set(right))

@@ -16,6 +16,7 @@ def _write_run(path, drop_all, losses):
         'epochs': 2,
         'seed': 7315,
         'parent_checkpoint_sha256': 'abc123',
+        'bitseed_lazy_cache_dir': str(path / 'endpoint_cache'),
     }
     (path / 'config.json').write_text(json.dumps(config))
     with (path / 'metrics.jsonl').open('w') as handle:

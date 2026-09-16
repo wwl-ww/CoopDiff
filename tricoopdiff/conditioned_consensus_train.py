@@ -23,7 +23,7 @@ from .sdpi_flow import FLOW_VERSION
 
 
 CHECKPOINT_FORMAT = 'conditioned_consensus_training_v1'
-TRAINING_CONDITION_CONTRACT = 'native_contact_masks_local_distances_6A_dropout_v2'
+TRAINING_CONDITION_CONTRACT = 'native_contact_masks_local_distances_6A_dropout_v3_no_provenance'
 
 
 def _sha256(value):

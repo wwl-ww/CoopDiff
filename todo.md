@@ -118,7 +118,7 @@ PROTAC 增量报告 `protac_condition_diagnostics_v2.json`：44侧中29侧能匹
 | 片段/角色 | 显式化学图及立体匹配的原子映射；E3端、POI端、linker、未知；linker必须显式注释，不把所有剩余原子都算作linker |
 | 口袋 | 已对齐当前受体节点顺序的概率及可用性；未知口袋与已知全负口袋分开 |
 | 二元几何 | 两侧各自的蛋白/片段坐标；当前只编码侧内距离与可用性，不利用任意跨侧绝对布局 |
-| 来源/可靠度 | 条件 provenance、evidence ID、confidence 单独保存；不复用候选 source 的0/1；拒绝 native/unverified 类型 |
+| 来源/可靠度 | provenance/evidence ID保留在manifest审计，confidence进入模型；不复用候选source的0/1；拒绝native/unverified部署类型。通用训练无法校准多类provenance，v2不把其one-hot送入模型 |
 
 支持单侧/无条件、通用三元配体的双侧角色重叠；PROTAC模式拒绝端点重叠。无条件编码输出严格为零；
 新增的C40 EMA合成输入迁移回归见下文。当前二元距离摘要不等于完整known-binary姿态约束：
@@ -394,7 +394,9 @@ GPU 状态、PID 和 ETA 不写成长期规范。需要时运行 `bash scripts/g
 
 真实单case/单epoch烟测已完成训练、EMA验证及checkpoint往返。配对后的full/absent数值在两来源上相同到浮点误差，证明迁移合同成立；它不证明条件带来精度收益。8训练/4验证的20-epoch pilot显示condition与父模型同用`1e-4`时门过小；改为condition组`1e-3`后门稳定打开且未数值失稳，但小样本full/absent差仍很小。
 
-正式配对训练已于2026-09-16后台启动：`model_v3_conditioned_full40_default`在物理GPU5使用默认condition dropout，`model_v3_conditioned_full40_absent`在物理GPU7使用全条件缺失控制；两者均为587训练簇、65验证簇、40 epoch、C40 EMA父权重、相同seed与1:1 SDPI/BiTSeed协议。结果分别写入`results/model_v3_conditioned_full40_{default,absent}_20260916/`，runtime封存在`results/model_v3_conditioned_full40_20260916_runtime/`。训练完成前不根据中途loss宣称条件收益；最终先比较四格validation及来源保持，再安排结构推理。
+首轮formal作业在epoch1结束前停止：审计发现训练条件只出现`training_native_supervision`，推理manifest却会激活从未训练的`template` provenance输入列。该目录保留为aborted诊断，不产出模型结论。v2把provenance/evidence ID仅保留在manifest与报告，不进入条件张量；网络只看role/pocket/binary可用性及confidence。
+
+修正后的配对训练使用会话`model_v3_conditioned_v2_default/absent`在物理GPU5/7运行；两者仍为587训练簇、65验证簇、40 epoch、C40 EMA父权重、相同seed与1:1 SDPI/BiTSeed协议。结果分别写入`results/model_v3_conditioned_full40_v2_{default,absent}_20260916/`，runtime封存在`results/model_v3_conditioned_full40_v2_20260916_runtime/`。复用的旧endpoint cache只含冻结专家C=1/M=1结果，不含条件张量；两臂各用自己的原cache，训练配置/协议仍配对。
 
 训练loss自动审计会话为`model_v3_conditioned_compare`：等待两侧`final_model.pt`后核对除dropout/输出路径外的配置完全一致，输出逐epoch四格loss、full−absent差和raw/EMA condition gate；报告明确不把loss差写成DockQ收益。
 
@@ -409,4 +411,4 @@ GPU 状态、PID 和 ETA 不写成长期规范。需要时运行 `bash scripts/g
 | control-absent | 训练时始终缺失 | 全条件缺失 | 条件训练本身的代价/收益 |
 
 三组必须核对逐case proposal pool hash及初态hash；任一不一致不能作配对结论。结构评估报告Initial/Final/Union及≥0.23/0.49，仍需另接post-ranker才是部署top1。后台接管入口为`scripts/run_conditioned_protac_queue.py`，每张物理卡串行执行任务，不与训练同时增加GPU worker。
-GPU5队列在训练完成后运行`default-pocket`，GPU7串行运行`default-absent`与`control-absent`；会话分别为`model_v3_conditioned_eval_gpu5/7`。`model_v3_conditioned_protac_audit`等待三组全部22例结束后才汇总逐例配对差、胜/平/负及pool/初态/seed一致性，不接纳成功子集。
+GPU5队列在训练完成后运行`default-pocket`，GPU7串行运行`default-absent`与`control-absent`；当前v2会话分别为`model_v3_conditioned_v2_eval_gpu5/7`。`model_v3_conditioned_v2_audit`等待三组全部22例结束后才汇总逐例配对差、胜/平/负及pool/初态/seed一致性，不接纳成功子集。

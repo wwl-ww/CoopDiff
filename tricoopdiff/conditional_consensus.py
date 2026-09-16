@@ -8,7 +8,7 @@ from .consensus import ConsensusCoopDiff, ConsensusFuse
 
 
 ARCHITECTURE = 'conditioned_residual_consensus_v3_prototype'
-CONDITION_CONTRACT = 'protac_condition_features_v1'
+CONDITION_CONTRACT = 'protac_condition_features_v2_no_learned_provenance'
 
 
 class ConditionedConsensusFuse(ConsensusFuse):
