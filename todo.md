@@ -404,7 +404,9 @@ full-pool selector完成后另算精确随机基线，不靠有限次随机seed�
 
 第二次启动又发现两臂各自扩展endpoint cache时会产生微小GPU非确定性，因此也在epoch1结束前停止，不作结果。v3尝试用default臂预领先共享cache，但epoch1验证后两臂重新同步；cache仅395例，无法保证后续未缓存case不会并发生成。v3只保留完整epoch1及其checkpoint，已产生的epoch2部分不采用。
 
-当前formal作业为`model_v3_conditioned_v4_default/absent`，从各自v3 epoch1 checkpoint续跑epoch2–40，物理GPU5/7；结果写入`results/model_v3_conditioned_full40_v4_{default,absent}_20260916/`，runtime为`results/model_v3_conditioned_full40_v4_20260916_runtime/`。default是feature/endpoint cache唯一写者，absent带`--paired-cache-follower`，遇到未缓存case只等待并读取写者原子发布的文件，超时即失败，绝不自行生成。两者仍为587训练簇、65验证簇、C40 EMA父权重、相同seed与1:1 SDPI/BiTSeed协议；64个测试文件通过。formal训练序列由v3 epoch1加v4 epoch2–40组成。
+v4实现了严格的单写者cache，但复查发现训练中“双侧仅pocket可用”的自然概率约万分之一，而PROTAC22首轮部署正是pocket-only；v4的epoch2部分因此停止且不作最终结论。
+
+当前formal作业为`model_v3_conditioned_v5_default/absent`，从各自v3 epoch1 checkpoint续跑epoch2–40，物理GPU5/7；结果写入`results/model_v3_conditioned_full40_v5_{default,absent}_20260916/`，runtime为`results/model_v3_conditioned_full40_v5_20260916_runtime/`。default以0.2概率显式保留双侧pocket、同时移除role/binary；验证扩展为`SDPI/BiTSeed × full/pocket-only/absent`六格。default仍是feature/endpoint cache唯一写者，absent带`--paired-cache-follower`且始终全缺失。两者仍为587训练簇、65验证簇、C40 EMA父权重、相同seed与1:1 SDPI/BiTSeed协议；64个测试文件通过。formal训练序列由v3 epoch1加v5 epoch2–40组成。
 
 训练loss自动审计会话为`model_v3_conditioned_compare`：等待两侧`final_model.pt`后核对除dropout/输出路径外的配置完全一致，输出逐epoch四格loss、full−absent差和raw/EMA condition gate；报告明确不把loss差写成DockQ收益。
 
@@ -419,4 +421,4 @@ full-pool selector完成后另算精确随机基线，不靠有限次随机seed�
 | control-absent | 训练时始终缺失 | 全条件缺失 | 条件训练本身的代价/收益 |
 
 三组必须核对逐case proposal pool hash及初态hash；任一不一致不能作配对结论。结构评估报告Initial/Final/Union及≥0.23/0.49，仍需另接post-ranker才是部署top1。后台接管入口为`scripts/run_conditioned_protac_queue.py`，每张物理卡串行执行任务，不与训练同时增加GPU worker。
-GPU5队列在训练完成后运行`default-pocket`，GPU7串行运行`default-absent`与`control-absent`；当前会话分别为`model_v3_conditioned_v4_eval_gpu5/7`。`model_v3_conditioned_v4_audit`等待三组全部22例结束后才汇总逐例配对差、胜/平/负及pool/初态/seed一致性，不接纳成功子集。
+GPU5队列在训练完成后运行`default-pocket`，GPU7串行运行`default-absent`与`control-absent`；当前会话分别为`model_v3_conditioned_v5_eval_gpu5/7`。`model_v3_conditioned_v5_audit`等待三组全部22例结束后才汇总逐例配对差、胜/平/负及pool/初态/seed一致性，不接纳成功子集。

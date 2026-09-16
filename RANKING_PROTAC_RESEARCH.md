@@ -503,7 +503,9 @@ R1和P0/P1是两个可独立推进的研究工作包，但本文没有自动启�
 
 真实单例烟测完成一次训练与保存/恢复。修正配对验证后，epoch1 EMA的full/absent loss分别为SDPI `11.7704687/11.7704687`、BiTSeed端点 `1.8034111/1.8034112`；这只证明迁移与验证合同正确，不是条件模型已学到收益。8/4例pilot据此确定新condition参数使用`1e-3`而父参数保持`1e-4`。
 
-首轮formal作业在epoch1结束前审计出“训练只见native provenance、推理却激活未训练template列”的缺陷，已主动终止且不作结果。删除该神经输入后的第二次作业又暴露两臂独立生成端点的微小GPU非确定性，同样终止。v3共享cache的epoch1严格对齐，但“写者预领先”在验证后消失，不能保证新case不并发生成；因此仅保留完整epoch1，丢弃其epoch2部分。当前v4从两臂各自epoch1 checkpoint继续：default是feature与endpoint cache唯一写者，absent只读等待原子发布，确保epoch2–40样本顺序、图和双来源端点完全相同。两臂仍采用相同40-epoch总协议、587训练簇、65验证簇、父C40和seed；完成前不把中途loss差写成结论。训练结束后固定Hybrid-56/8的64个walker，比较`condition训练+pocket`、`condition训练+absent`和`absent训练+absent`；候选seed、20步精修和DockQ口径不变。只有这组结构级比较才能回答额外条件是否改善最终DockQ。
+首轮formal作业在epoch1结束前审计出“训练只见native provenance、推理却激活未训练template列”的缺陷，已主动终止且不作结果。删除该神经输入后的第二次作业又暴露两臂独立生成端点的微小GPU非确定性，同样终止。v3共享cache的epoch1严格对齐，但“写者预领先”在验证后消失，不能保证新case不并发生成；因此仅保留完整epoch1，丢弃其epoch2部分。v4建立了单写者/只读等待者合同，但进一步审计发现部署所需的双侧pocket-only在独立dropout下几乎不出现，也停止其epoch2诊断。
+
+当前v5从两臂各自epoch1 checkpoint继续：default显式以0.2概率训练双侧pocket-only，验证为`SDPI/BiTSeed × full/pocket-only/absent`六格；default是feature与endpoint cache唯一写者，absent只读等待且训练条件始终缺失，确保epoch2–40样本顺序、图和双来源端点完全相同。两臂仍采用相同40-epoch总协议、587训练簇、65验证簇、父C40和seed；完成前不把中途loss差写成结论。训练结束后固定Hybrid-56/8的64个walker，比较`condition训练+pocket`、`condition训练+absent`和`absent训练+absent`；候选seed、20步精修和DockQ口径不变。只有这组结构级比较才能回答额外条件是否改善最终DockQ。
 
 ## 16. 最终观点
 
