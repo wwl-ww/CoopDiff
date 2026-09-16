@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import gc
+import time
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -267,7 +268,8 @@ def _to_device_and_batch(data, device):
 
 
 def featurize_complex(case_label, protein1, protein2, ligand_path,
-                      score_model_args, device, cache_dir=None):
+                      score_model_args, device, cache_dir=None,
+                      cache_read_only=False, cache_wait_seconds=3600.):
     """Featurize one ternary complex into the three B=1 data dicts.
 
     Args:
@@ -301,24 +303,33 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
     cache_signature = _featurize_signature(
         protein1, protein2, ligand_path, score_model_args
     )
+    if cache_wait_seconds < 0:
+        raise ValueError('cache_wait_seconds must be nonnegative')
     if cache_dir is not None:
         cache_path = Path(cache_dir) / f"{case_label.replace('/', '_')}.pt"
-        if cache_path.exists():
-            # weights_only=False: the cache holds numpy arrays (mask_rotate),
-            # which PyTorch 2.6's default weights_only=True refuses to unpickle.
-            # The file is written by us (trusted), so full unpickling is safe.
-            cached = torch.load(cache_path, map_location="cpu", weights_only=False)
-            if (
-                cached.get('cache_version') == _FEATURIZE_CACHE_VERSION
-                and cached.get('source_signature') == cache_signature
-            ):
-                e3 = _to_device_and_batch(cached['e3_data'], device)
-                poi = _to_device_and_batch(cached['poi_data'], device)
-                lig = _to_device_and_batch(cached['ligand_data'], device)
-                return e3, poi, lig, cached['receptor_feat_dim']
-            # else: stale cache written before the shared-reference-frame fix
-            # (BUG-18) — fall through and re-featurize so the corrected geometry
-            # is never silently replaced by the old per-molecule-centered one.
+        deadline = time.monotonic() + cache_wait_seconds
+        while True:
+            if cache_path.exists():
+                # weights_only=False: the cache holds numpy arrays (mask_rotate),
+                # which PyTorch 2.6's default weights_only=True refuses to unpickle.
+                # The file is written by us (trusted), so full unpickling is safe.
+                cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+                if (
+                    cached.get('cache_version') == _FEATURIZE_CACHE_VERSION
+                    and cached.get('source_signature') == cache_signature
+                ):
+                    e3 = _to_device_and_batch(cached['e3_data'], device)
+                    poi = _to_device_and_batch(cached['poi_data'], device)
+                    lig = _to_device_and_batch(cached['ligand_data'], device)
+                    return e3, poi, lig, cached['receptor_feat_dim']
+            if not cache_read_only:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f'{case_label}: read-only featurization follower timed out waiting for writer')
+            time.sleep(min(.1, max(0., deadline - time.monotonic())))
+            # A stale cache can be atomically replaced by the writer while the
+            # follower waits.  It must never featurize or publish independently.
 
     embeddings_map = generate_esm_embeddings([protein1, protein2], device)
 

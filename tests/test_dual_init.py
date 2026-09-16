@@ -161,6 +161,18 @@ def test_lazy_cache_checks_disk_and_memory_inputs_without_overwriting():
         assert path.read_bytes() == original, 'rejection must leave old cache untouched'
 
 
+def test_read_only_endpoint_follower_never_generates_missing_case():
+    with tempfile.TemporaryDirectory() as directory:
+        store = LazyTrainingEndpointStore(
+            directory, _lazy_store(directory).expert, read_only=True, wait_seconds=0.)
+        try:
+            store.coupling('missing', batch=_input_batch())
+        except TimeoutError as error:
+            assert 'read-only endpoint follower' in str(error)
+        else:
+            raise AssertionError('read-only follower generated a missing endpoint')
+
+
 def test_lazy_legacy_cache_and_missing_batch_are_rejected():
     with tempfile.TemporaryDirectory() as directory:
         store = _lazy_store(directory)

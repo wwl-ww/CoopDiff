@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -79,12 +80,17 @@ class LazyTrainingEndpointStore:
     lazy = True
 
     def __init__(self, cache_dir, expert, *, binary_steps=20,
-                 base_seed=ONLINE_TRAINING_BASE_SEED):
+                 base_seed=ONLINE_TRAINING_BASE_SEED, read_only=False,
+                 wait_seconds=3600.):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.expert = expert
         self.binary_steps = int(binary_steps)
         self.base_seed = int(base_seed)
+        self.read_only = bool(read_only)
+        self.wait_seconds = float(wait_seconds)
+        if self.wait_seconds < 0:
+            raise ValueError('endpoint cache wait_seconds must be nonnegative')
         self.protocol = {
             "version": ONLINE_TRAINING_ENDPOINT_PROTOCOL,
             "conformers": 1,
@@ -257,7 +263,16 @@ class LazyTrainingEndpointStore:
         if record is None:
             record = self._load(case, input_signature)
         if record is None:
-            record = self._generate(case, batch, input_signature)
+            if self.read_only:
+                deadline = time.monotonic() + self.wait_seconds
+                while record is None and time.monotonic() < deadline:
+                    time.sleep(min(.1, max(0., deadline - time.monotonic())))
+                    record = self._load(case, input_signature)
+                if record is None:
+                    raise TimeoutError(
+                        f'{case}: read-only endpoint follower timed out waiting for writer')
+            else:
+                record = self._generate(case, batch, input_signature)
         self._records[case] = record
         self._input_signatures[case] = input_signature
         coupling = {name: np.asarray(value).copy()

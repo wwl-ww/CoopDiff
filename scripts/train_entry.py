@@ -596,7 +596,8 @@ class TernaryDataLoader:
 
     def __init__(self, data_json, score_model_args, shuffle=True, device="cuda",
                  cache_dir=None, skip_on_error=False, max_clusters=None,
-                 random_flip_proteins=False):
+                 random_flip_proteins=False, cache_read_only=False,
+                 cache_wait_seconds=3600.):
         self.entries, self.clusters, self.entries_by_case = _load_index(data_json)
         if max_clusters is not None:
             if max_clusters <= 0:
@@ -614,6 +615,8 @@ class TernaryDataLoader:
         self.cache_dir = cache_dir
         self.skip_on_error = skip_on_error
         self.random_flip_proteins = bool(random_flip_proteins)
+        self.cache_read_only = bool(cache_read_only)
+        self.cache_wait_seconds = float(cache_wait_seconds)
         self.skipped = []
 
     def __iter__(self):
@@ -674,6 +677,8 @@ class TernaryDataLoader:
                 e3_data, poi_data, ligand_data, _ = featurize_complex(
                     entry["case"], entry["protein1"], entry["protein2"], entry["ligand"],
                     self.score_model_args, self.device, cache_dir=self.cache_dir,
+                    cache_read_only=self.cache_read_only,
+                    cache_wait_seconds=self.cache_wait_seconds,
                 )
         finally:
             np.random.set_state(numpy_state)

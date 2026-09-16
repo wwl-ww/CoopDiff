@@ -47,6 +47,9 @@ def parse_args(argv=None):
     parser.add_argument('--expert-model-dir', default='checkpoints/score_model')
     parser.add_argument('--cache-dir', default='results/featurize_cache')
     parser.add_argument('--bitseed-lazy-cache-dir', default=None)
+    parser.add_argument('--paired-cache-follower', action='store_true',
+                        help='Never generate shared features/endpoints; wait for the writer arm')
+    parser.add_argument('--paired-cache-wait-seconds', type=float, default=3600.)
     parser.add_argument('--epochs', type=int, default=40)
     parser.add_argument('--max-train-clusters', type=int)
     parser.add_argument('--max-val-clusters', type=int)
@@ -68,7 +71,7 @@ def parse_args(argv=None):
     parser.add_argument('--resume')
     args = parser.parse_args(argv)
     if (args.epochs < 1 or args.save_interval < 1 or args.log_interval < 1
-            or args.nan_clamp <= 0):
+            or args.nan_clamp <= 0 or args.paired_cache_wait_seconds < 0):
         parser.error('epochs/intervals and --nan-clamp must be positive')
     try:
         condition_dropout(args).validate()
@@ -191,21 +194,34 @@ def main(argv=None):
     score_args = _load_score_model_args(args.expert_model_dir)
     first = entries[0]
     featurize_complex(first['case'], first['protein1'], first['protein2'], first['ligand'],
-                      score_args, str(device), cache_dir=args.cache_dir)
+                      score_args, str(device), cache_dir=args.cache_dir,
+                      cache_read_only=args.paired_cache_follower,
+                      cache_wait_seconds=args.paired_cache_wait_seconds)
     seed_training(args.seed, device)
     model, trainer, _ = build_trainer(args, device)
-    endpoint_store = LazyTrainingEndpointStore(endpoint_cache, model.expert)
+    endpoint_store = LazyTrainingEndpointStore(
+        endpoint_cache, model.expert, read_only=args.paired_cache_follower,
+        wait_seconds=args.paired_cache_wait_seconds)
     train_loader = TernaryDataLoader(
         args.train_data, score_args, shuffle=True, device=str(device), cache_dir=args.cache_dir,
-        max_clusters=args.max_train_clusters, random_flip_proteins=False)
+        max_clusters=args.max_train_clusters, random_flip_proteins=False,
+        cache_read_only=args.paired_cache_follower,
+        cache_wait_seconds=args.paired_cache_wait_seconds)
     val_loader = TernaryDataLoader(
         args.val_data, score_args, shuffle=False, device=str(device), cache_dir=args.cache_dir,
-        max_clusters=args.max_val_clusters, random_flip_proteins=False)
+        max_clusters=args.max_val_clusters, random_flip_proteins=False,
+        cache_read_only=args.paired_cache_follower,
+        cache_wait_seconds=args.paired_cache_wait_seconds)
     if args.resume:
         trainer.load_checkpoint(args.resume)
     start_epoch, best = trainer.resume_epoch + 1, trainer.resume_best_val_loss
     if start_epoch > args.epochs:
         raise RuntimeError('resume epoch meets or exceeds target epochs')
+    if args.resume:
+        # A new formal output directory must remain self-contained even when
+        # the resumed epoch stays best for the rest of training.
+        trainer.save_checkpoint(output / 'best_model.pt', epoch=trainer.resume_epoch,
+                                best_val_loss=best)
 
     for epoch in range(start_epoch, args.epochs + 1):
         started, losses = time.time(), []
