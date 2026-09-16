@@ -41,6 +41,7 @@ def main(argv=None):
     env = dict(os.environ, OMP_NUM_THREADS='1', MKL_NUM_THREADS='1',
                OPENBLAS_NUM_THREADS='1', PYTHONDONTWRITEBYTECODE='1')
     try:
+        update('waiting_expanded_ranker')
         deadline = time.monotonic() + args.wait_hours * 3600
         while True:
             upstream = json.loads((expanded / 'status.json').read_text())
