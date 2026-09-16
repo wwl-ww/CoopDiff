@@ -279,7 +279,7 @@ class TernaryGeometryEncoder(nn.Module):
 
     def forward(self, node_features: torch.Tensor, node_coords: torch.Tensor,
                 node_types: torch.Tensor, batch: torch.Tensor = None,
-                lig_edge_index: torch.Tensor = None) -> dict:
+                lig_edge_index: torch.Tensor = None, node_residual: torch.Tensor = None) -> dict:
         if batch is None:
             batch = torch.zeros(
                 node_features.shape[0], dtype=torch.long,
@@ -297,6 +297,11 @@ class TernaryGeometryEncoder(nn.Module):
             node_features[ligand_mask]
         )
         features = features + self.type_embedding(node_types)
+        if node_residual is not None:
+            if node_residual.shape != features.shape or not torch.isfinite(node_residual).all():
+                raise ValueError('condition residual must match embedded node features')
+            # Apply only after categorical atom encoding, never to raw category IDs.
+            features = features + node_residual
 
         global_outputs = []
         e3l_outputs = []

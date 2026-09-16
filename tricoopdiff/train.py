@@ -93,26 +93,27 @@ class TriCoopDiffTrainer:
         )
 
     def _forward_state(self, e3_data, poi_data, ligand_data,
-                       ligand, poi, body, t, dt, source=0):
+                       ligand, poi, body, t, dt, source=0, conditions=None):
         """Run the model at an explicitly supplied flow state."""
         conditioning = self.diffusion.conditioning(
             t, dt, e3_data['coords'], poi_data['coords'])
         tr_condition, _, _ = self.diffusion.t_to_sigma(t, t, t)
         crop = (tr_condition * 3 + 20
                 if bool(getattr(self.model.expert.model, 'dynamic_max_cross', False)) else None)
+        condition_kwargs = {'conditions': conditions} if conditions is not None else {}
         return self.model(
             e3_data, {**poi_data, 'coords': poi},
             {**ligand_data, 'coords': ligand},
             t_e3l=t, t_pol=t, r_e3_to_poi=body,
             diffusion_state=conditioning, receptor_crop_cutoff=crop,
-            source=source,
+            source=source, **condition_kwargs,
         )
 
     def compute_loss(
         self, e3_data: dict, poi_data: dict, ligand_data: dict,
         case: str = "unknown", t_override: Optional[torch.Tensor] = None,
         t_pol_override: Optional[torch.Tensor] = None,
-        coupling_override=None, diagnostics: bool = False, source=0,
+        coupling_override=None, diagnostics: bool = False, source=0, conditions=None,
     ) -> dict:
         """Conditional velocity matching; t=0 crystal, t=1 SDPI movable DOFs."""
         if e3_data['coords'].shape[0] != 1:
@@ -137,7 +138,7 @@ class TriCoopDiffTrainer:
         ligand, poi, body, targets = self._training_state(
             e3_data, poi_data, ligand_data, coupling, t, dt)
         output = self._forward_state(
-            e3_data, poi_data, ligand_data, ligand, poi, body, t, dt, source,
+            e3_data, poi_data, ligand_data, ligand, poi, body, t, dt, source, conditions,
         )
         predictions = self.diffusion.normalized_predictions(output, t)
         scales = self.diffusion.scales(e3_data['coords'], poi_data['coords'])

@@ -49,17 +49,19 @@ def test_rank_features_are_saved_only_when_requested():
                     initialization={}, rank_features=np.array([1., 2., 3.]))]
     data = {'coords': torch.tensor(coords).unsqueeze(0),
             'edge_index': torch.tensor([[0, 1], [1, 0]])}
+    conditions = {'contract': object()}
     with ExitStack() as stack:
-        stack.enter_context(patch('tricoopdiff.sampler.sample_ensemble', return_value=samples))
+        sampler = stack.enter_context(patch('tricoopdiff.sampler.sample_ensemble', return_value=samples))
         for name in ('compute_deepternary_dockq', 'compute_e3_interface_dockq',
                      'compute_poi_dockq', 'compute_poi_com_dist'):
             stack.enter_context(patch(f'tricoopdiff.evaluate.{name}', return_value=None))
         stack.enter_context(patch('tricoopdiff.ensemble_analysis.analyze_ensemble', return_value={}))
         report = evaluate_model(
             None, data, data, data, None, initializer=object(), device='cpu',
-            n_walkers=1, return_rank_features=True,
+            n_walkers=1, return_rank_features=True, conditions=conditions,
         )
     assert report['walkers'][0]['rank_features'] == [1.0, 2.0, 3.0]
+    assert sampler.call_args.kwargs['conditions'] is conditions
 
 
 def test_unbound_metric_templates_receive_only_predicted_rigid_motion():
@@ -114,6 +116,7 @@ def test_sdf_metric_template_preserves_heavy_atom_order():
 
 if __name__ == '__main__':
     test_walker_metrics_preserve_seeds_and_exact_failures()
+    test_rank_features_are_saved_only_when_requested()
     test_unbound_metric_templates_receive_only_predicted_rigid_motion()
     test_sdf_metric_template_preserves_heavy_atom_order()
     print('Evaluation walker provenance test passed')

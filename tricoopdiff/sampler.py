@@ -87,6 +87,8 @@ def sample_single(
     rotation_velocity_scale: float = 1.0,
     velocity_transform=None,
     return_rank_features: bool = False,
+    return_body_frame: bool = False,
+    conditions=None,
 ) -> dict:
     """
     Run one reverse-flow trajectory (single walker) from t=1 to t=0.
@@ -113,6 +115,7 @@ def sample_single(
             leave this as ``None``.
         return_rank_features: retain the final pre-update invariant consensus
             context for separately supervised pose ranking.
+        conditions: optional immutable, node-aligned PROTAC condition features.
 
     Returns:
         dict with 'ligand_coords' [N_lig, 3], 'poi_coords' [N_poi, 3] (CPU numpy),
@@ -256,6 +259,7 @@ def sample_single(
             receptor_crop_cutoff=receptor_crop_cutoff,
             diffusion_state=diffusion_state,
             source=source_index,
+            conditions=conditions,
         )
         if return_rank_features:
             features = out.get('rank_features')
@@ -391,6 +395,8 @@ def sample_single(
     }
     if return_trajectory:
         result["trajectory"] = trajectory
+    if return_body_frame:
+        result["body_frame"] = r_e3_to_poi[0].detach().cpu().numpy().copy()
     if return_trace:
         result["trace"] = trace
     if return_rank_features:
@@ -417,6 +423,7 @@ def sample_ensemble(
     translation_velocity_scale: float = 1.0,
     rotation_velocity_scale: float = 1.0,
     return_rank_features: bool = False,
+    conditions=None,
 ) -> list:
     """
     Run ``n_walkers`` independent reverse-flow trajectories.
@@ -448,6 +455,7 @@ def sample_ensemble(
                 translation_velocity_scale=translation_velocity_scale,
                 rotation_velocity_scale=rotation_velocity_scale,
                 return_rank_features=return_rank_features,
+                conditions=conditions,
             )
         )
     return results

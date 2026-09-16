@@ -45,6 +45,8 @@ def bounded_vector(value):
 class ConsensusFuse(nn.Module):
     """Read proposals after expert inference; decide all executable DOFs."""
 
+    supports_conditions = False
+
     def __init__(self, node_dim=128, input_dim=None, num_transformer_layers=3,
                  dropout=0.1, source_conditioning=False,
                  **unused_legacy_dimensions):
@@ -82,10 +84,17 @@ class ConsensusFuse(nn.Module):
         for module in (self.judge_head, self.state_head):
             module.requires_grad_(False)
 
-    def forward(self, graph, proposals, diffusion_state, source=0):
+    def prepare_conditions(self, graph, conditions):
+        raise ValueError('legacy ConsensusFuse does not accept PROTAC conditions')
+
+    def forward(self, graph, proposals, diffusion_state, source=0, *, conditions=None):
+        condition_context, condition_gate_bias = None, None
+        if conditions is not None:
+            graph, condition_context, condition_gate_bias = self.prepare_conditions(graph, conditions)
         coords, types = graph['node_coords'], graph['node_types']
+        pooling_kwargs = {'node_residual': graph['condition_node_residual']} if conditions is not None else {}
         pooled = self.pooling(graph['node_features'], coords, types,
-                              lig_edge_index=graph['lig_edge_index'])
+                              lig_edge_index=graph['lig_edge_index'], **pooling_kwargs)
         centers = [coords[types == i].mean(0, keepdim=True) for i in range(3)]
         directions = [bounded_vector((centers[i] - centers[2]) / 10) for i in (0, 1)]
         raw = [proposals[b][c] for b in BRANCHES for c in ('tr', 'rot')]
@@ -96,6 +105,8 @@ class ConsensusFuse(nn.Module):
                             + [geometry_cross, proposal_cross], dim=1)
         gram = basis @ basis.transpose(-1, -2)
         evidence = self.evidence_encoder(torch.cat((diffusion_state, gram.flatten(1)), -1))
+        if condition_context is not None:
+            evidence = evidence + condition_context
         source_index = candidate_source_tensor(source, evidence)
         source_context = None
         if self.source_embedding is not None:
@@ -106,6 +117,8 @@ class ConsensusFuse(nn.Module):
         negotiated = self.transformer(tokens)
         context = negotiated.mean(1)
         gate_logits = self.gate_head(context)
+        if condition_gate_bias is not None:
+            gate_logits = gate_logits + condition_gate_bias
         if source_context is not None:
             # This source-owned nonzero path avoids the zero-initialized common
             # heads blocking embedding gradients on the first training batch.
@@ -157,6 +170,8 @@ class ConsensusCoopDiff(nn.Module):
 
     def __init__(self, frozen_expert, trifuse, num_conv_layers=None, use_film=False):
         super().__init__()
+        if getattr(trifuse, 'supports_conditions', False) and self.architecture == ARCHITECTURE:
+            raise ValueError('conditional fuse requires its separate model architecture')
         if use_film:
             raise ValueError('model-v2 does not allow FiLM inside binary experts')
         if any('lora' in name for name, _ in frozen_expert.named_parameters()):
@@ -176,7 +191,9 @@ class ConsensusCoopDiff(nn.Module):
 
     def forward(self, e3_data, poi_data, ligand_data, t_e3l, t_pol=None,
                 r_e3_to_poi=None, receptor_crop_cutoff=None, diffusion_state=None,
-                source=0):
+                source=0, *, conditions=None):
+        if conditions is not None and not self.trifuse.supports_conditions:
+            raise ValueError('legacy model cannot consume PROTAC conditions')
         if t_e3l.shape != (1,):
             raise ValueError('model-v2 currently requires B=1')
         if t_pol is not None and not torch.equal(t_e3l, t_pol):
@@ -220,7 +237,8 @@ class ConsensusCoopDiff(nn.Module):
             ligand_data['coords'][0], ligand_data['features'][0],
             lig_edge_index=ligand_data['edge_index'], lig_edge_mask=ligand_data['edge_mask'],
             lig_mask_rotate=ligand_data['mask_rotate'])
-        result = self.trifuse(graph, proposals, diffusion_state, source=source)
+        condition_kwargs = {'conditions': conditions} if conditions is not None else {}
+        result = self.trifuse(graph, proposals, diffusion_state, source=source, **condition_kwargs)
         # Kept explicitly as diagnostic evidence, never consumed as another update.
         result['binary_proposals'] = proposals
         return result

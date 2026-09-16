@@ -120,6 +120,7 @@ def test_flow_loss_backward_and_shared_clock_guard():
             self.expert = SimpleNamespace(model=SimpleNamespace(no_torsion=False, dynamic_max_cross=False))
 
         def forward(self, *args, **kwargs):
+            self.last_conditions = kwargs.get('conditions')
             scores = {name: {'tr': self.weight.expand(1, 3), 'rot': self.weight.expand(1, 3),
                               'tor': self.weight.expand(1, n_tor)}
                       for name in ('e3_ligand', 'poi_ligand')}
@@ -157,6 +158,10 @@ def test_flow_loss_backward_and_shared_clock_guard():
         assert 'shared interface clock' in str(error)
     else:
         raise AssertionError('mismatched flow clocks must fail')
+    marker = {'ligand': torch.ones(1)}
+    TriCoopDiffTrainer.compute_loss(trainer, {'coords': a}, {'coords': b}, data,
+                                    conditions=marker, **fixed)
+    assert model.last_conditions is marker
 
 
 def test_flow_is_equivariant_under_global_rigid_transform():

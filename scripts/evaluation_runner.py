@@ -32,7 +32,8 @@ class EvaluationRunner:
                  expert_checkpoint="best_ema_inference_epoch_model.pt",
                  deepternary_root=None, deterministic=True,
                  conformer_policy="etkdgv3_random",
-                 allow_experimental_checkpoint=False):
+                 allow_experimental_checkpoint=False,
+                 allow_conditioned_checkpoint=False):
         self.reproducibility = configure_inference_reproducibility(deterministic)
         self.reproducibility['torus_score_norm_version'] = SCORE_NORM_VERSION
         self.root = Path(project_root).resolve()
@@ -51,7 +52,15 @@ class EvaluationRunner:
         self.experimental_checkpoint = (
             self.checkpoint.get('architecture') == 'residual_consensus_factorial_v1'
         )
-        if self.experimental_checkpoint:
+        self.conditioned_checkpoint = (
+            self.checkpoint.get('format') == 'conditioned_consensus_training_v1'
+        )
+        if self.conditioned_checkpoint:
+            if not allow_conditioned_checkpoint:
+                raise ValueError('conditioned checkpoint requires explicit opt-in')
+            from tricoopdiff.conditioned_consensus_train import validate_conditioned_checkpoint
+            validate_conditioned_checkpoint(self.checkpoint)
+        elif self.experimental_checkpoint:
             if not allow_experimental_checkpoint:
                 raise ValueError(
                     'experimental factorial checkpoint requires explicit '
@@ -113,12 +122,19 @@ class EvaluationRunner:
             return
         if self.checkpoint['model_config']['input_dim'] != input_dim:
             raise ValueError('checkpoint input feature dimension mismatch')
-        trifuse = ConsensusFuse(**self.checkpoint['model_config'])
+        if self.conditioned_checkpoint:
+            from tricoopdiff.conditional_consensus import (ConditionedConsensusCoopDiff,
+                                                          ConditionedConsensusFuse)
+            trifuse = ConditionedConsensusFuse(**self.checkpoint['model_config'])
+            self.model = ConditionedConsensusCoopDiff(
+                self.expert, trifuse, num_conv_layers=self.expert.num_conv_layers).to(self.device)
+        else:
+            trifuse = ConsensusFuse(**self.checkpoint['model_config'])
         if self.experimental_checkpoint:
             from tricoopdiff.consensus_experiment import ExperimentalConsensus
 
             self.model = ExperimentalConsensus(self.expert, trifuse).to(self.device)
-        else:
+        elif not self.conditioned_checkpoint:
             self.model = ConsensusCoopDiff(
                 frozen_expert=self.expert,
                 trifuse=trifuse,
@@ -137,7 +153,8 @@ class EvaluationRunner:
                       debug_trace=False, debug_seed=0,
                       translation_velocity_scale=1.0,
                       rotation_velocity_scale=1.0,
-                      return_rank_features=False):
+                      return_rank_features=False,
+                      condition_manifest=None):
         """Featurize and evaluate one case with the resident model."""
         torch.manual_seed(seed)
         if self.device.type == "cuda":
@@ -148,6 +165,20 @@ class EvaluationRunner:
             cache_dir=str(cache_dir),
         )
         self._ensure_model(input_dim)
+        conditions, condition_audit, condition_path = None, None, None
+        if self.conditioned_checkpoint:
+            if condition_manifest is None:
+                raise ValueError('conditioned evaluation requires a deploy-time condition manifest')
+            from rdkit import Chem
+            from tricoopdiff.condition_manifest import load_condition_manifest
+            condition_path = Path(condition_manifest)
+            if not condition_path.is_absolute():
+                condition_path = self.root / condition_path
+            conditions, condition_audit = load_condition_manifest(
+                condition_path, case=case, molecule=Chem.Mol(ligand_data['mol']),
+                protein_sizes=(e3_data['coords'].shape[1], poi_data['coords'].shape[1]))
+        elif condition_manifest is not None:
+            raise ValueError('legacy checkpoints cannot silently consume condition manifests')
         case_initializer = self.initializer
         initialization_version = "sdpi_v1"
         if init_mode == "expert_anchor":
@@ -178,6 +209,7 @@ class EvaluationRunner:
             translation_velocity_scale=translation_velocity_scale,
             rotation_velocity_scale=rotation_velocity_scale,
             return_rank_features=return_rank_features,
+            conditions=conditions,
             deepternary_dockq_paths={
                 "protein1_pdb": str(paths["protein1"]),
                 "protein2_pdb": str(paths["protein2"]),
@@ -211,14 +243,19 @@ class EvaluationRunner:
                          1.0),
             "trifuse_checkpoint": str(self.checkpoint_path.resolve()),
             "checkpoint_schema": (
-                "experimental_factorial_v1_ema" if self.experimental_checkpoint
-                else "production_v18_ema"
-            ),
+                "conditioned_consensus_training_v1_ema" if self.conditioned_checkpoint else
+                "experimental_factorial_v1_ema" if self.experimental_checkpoint else
+                "production_v18_ema"),
+            "condition_manifest": (str(condition_path.resolve()) if condition_path else None),
+            "condition_manifest_sha256": (sha256_file(condition_path) if condition_path else None),
+            "condition_audit": condition_audit,
             "rank_features_saved": bool(return_rank_features),
             "checkpoint_sha256": self.checkpoint_sha256,
             "expert_checkpoint_sha256": self.expert.provenance["score_checkpoint_sha256"],
             "expert_config_sha256": self.expert_config_sha256,
-            "input_signature": evaluation_input_signature(paths, native_complex_pdb),
+            "input_signature": evaluation_input_signature(
+                {**paths, **({'condition_manifest': condition_path} if condition_path else {})},
+                native_complex_pdb),
             "activation_clamp": self.activation_clamp,
             "activation_clamp_mode": self.activation_clamp_mode,
             "dockq_reconstruction": (

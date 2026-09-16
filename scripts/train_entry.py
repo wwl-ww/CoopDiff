@@ -24,6 +24,7 @@ Usage:
 """
 
 import argparse
+import random
 import json
 import os
 import sys
@@ -661,10 +662,22 @@ class TernaryDataLoader:
         return selected
 
     def _load_one(self, entry):
-        e3_data, poi_data, ligand_data, _ = featurize_complex(
-            entry["case"], entry["protein1"], entry["protein2"], entry["ligand"],
-            self.score_model_args, self.device, cache_dir=self.cache_dir,
-        )
+        # ESM/model construction on a cold cache can consume framework RNG
+        # while a warm-cache read does not. Feature cache state must never
+        # alter diffusion couplings, dropout or later epoch order.
+        numpy_state, python_state = np.random.get_state(), random.getstate()
+        device = torch.device(self.device)
+        cuda_devices = ([device.index if device.index is not None else torch.cuda.current_device()]
+                        if device.type == 'cuda' else [])
+        try:
+            with torch.random.fork_rng(devices=cuda_devices):
+                e3_data, poi_data, ligand_data, _ = featurize_complex(
+                    entry["case"], entry["protein1"], entry["protein2"], entry["ligand"],
+                    self.score_model_args, self.device, cache_dir=self.cache_dir,
+                )
+        finally:
+            np.random.set_state(numpy_state)
+            random.setstate(python_state)
         if self.random_flip_proteins and np.random.random() < 0.5:
             # Re-express the entire ternary state in the old POI-centered frame,
             # then exchange branch identities. This matches DeepTernary's

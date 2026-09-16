@@ -588,6 +588,7 @@ def evaluate_model(
     translation_velocity_scale: float = 1.0,
     rotation_velocity_scale: float = 1.0,
     return_rank_features: bool = False,
+    conditions=None,
 ) -> dict:
     """
     Sample a conformational ensemble and score structure quality vs the native
@@ -637,6 +638,7 @@ def evaluate_model(
         translation_velocity_scale=translation_velocity_scale,
         rotation_velocity_scale=rotation_velocity_scale,
         return_rank_features=return_rank_features,
+        conditions=conditions,
     )
 
     ref_lig = ligand_data['coords'][0].detach().cpu().numpy()  # [N_lig, 3] native
@@ -856,6 +858,7 @@ def evaluate_model(
             freeze_poi=freeze_poi,
             init_mode=init_mode,
             t_anchor=t_anchor,
+            conditions=conditions,
         )
 
     report = {

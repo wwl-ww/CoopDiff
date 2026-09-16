@@ -2,11 +2,13 @@
 
 import sys
 import os
+import random
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
@@ -15,7 +17,8 @@ from tricoopdiff.train import TriCoopDiffTrainer
 from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.sampler import actual_candidate_source
 from train_entry import (
-    build_trainer, parse_args, prepare_source_batch, swap_protein_reference,
+    TernaryDataLoader, build_trainer, parse_args, prepare_source_batch,
+    swap_protein_reference,
 )
 
 
@@ -60,6 +63,27 @@ def test_protein_role_swap_changes_reference_without_changing_geometry():
         new_ligand['coords'] - new_poi['coords'][:, :1],
         ligand['coords'] - e3['coords'][:, :1],
     )
+
+
+def test_featurization_cache_state_cannot_change_training_rng():
+    loader = TernaryDataLoader.__new__(TernaryDataLoader)
+    loader.score_model_args = object(); loader.device = 'cpu'; loader.cache_dir = 'unused'
+    loader.random_flip_proteins = False
+    entry = {'case': 'fixture', 'protein1': 'a', 'protein2': 'b', 'ligand': 'c'}
+
+    def consuming(*args, **kwargs):
+        torch.rand(5); np.random.random(5); random.random()
+        data = {'coords': torch.zeros(1, 1, 3)}
+        return data, data, data, 1
+
+    torch.manual_seed(3); np.random.seed(3); random.seed(3)
+    expected = (torch.rand(1), np.random.random(), random.random())
+    torch.manual_seed(3); np.random.seed(3); random.seed(3)
+    with patch('train_entry.featurize_complex', side_effect=consuming):
+        loader._load_one(entry)
+    actual = (torch.rand(1), np.random.random(), random.random())
+    assert torch.equal(expected[0], actual[0])
+    assert expected[1:] == actual[1:]
 
 
 def test_trainer_owns_recorded_activation_clamp_runtime():
