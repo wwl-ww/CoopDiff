@@ -377,9 +377,11 @@ GPU 状态、PID 和 ETA 不写成长期规范。需要时运行 `bash scripts/g
 
 ### Ranking
 
-`model_v3_ranking_night160` 已完成128个新增case的64条精修采集，正在两个CPU分片上计算initial/final精确DockQ；随后自动执行32/80/160 case、两种特征、三个seed的18项post-ranker学习曲线。独立会话`model_v3_ranking_paired_audit`等待完整网格结束后才做按case配对比较，不审计成功子集。
+`model_v3_ranking_night160`的128个新增case采集、精确DockQ和18项post-ranker网格已经完整结束。8例内部验证上没有形成可靠学习曲线：纯几何从32增至160例的union top1没有提升，冻结特征也未稳定胜过纯几何；所有配置的union ≥0.23均为0，仅`frozen+geometry, n=160`有一个seed达到1/8。该结果说明当前特征/标签不够支持部署top1，不允许挑单seed上线。按case配对审计见`results/model_v3_ranking_night160_20260915/paired_audit/paired.md`。
 
 新增`model_v3_initial_selector`后继队列，固定在上述post-ranker完整结束后运行。它对32个原训练case、128个扩展case和8个验证case的全部256个初态打标签，再训练3种数据规模×3个seed的geometry-only 256→64 pre-selector。主指标是selected-best、逐例oracle retention、≥0.23命中和全池oracle ID是否保留；这不是post-ranker，也不是预测C40精修后价值。结果目录为`results/model_v3_initial_selector_20260916/`。
+
+新增C40 future-value selector对照，避免把“当前初始化好”误当成“值得花精修预算”。`scripts/train_future_selector.py`只读初态14维几何，分别训练预测final与union价值；训练用160例中预先随机且按来源平衡抽取的64条，验证强制8例×完整256条。主审计除final/union oracle retention外，还统计初态<0.23、末态≥0.23的救回候选是否被选64保留。后台队列在current-quality selector完整结束后运行三seed×两target，写入`results/model_v3_future_selector_20260916/`。
 
 ### PROTAC条件模型
 

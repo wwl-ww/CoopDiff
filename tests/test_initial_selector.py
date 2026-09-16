@@ -10,7 +10,8 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tricoopdiff.initial_selector import initial_pool_features, selector_retention
+from tricoopdiff.initial_selector import (future_selector_retention, initial_pool_features,
+                                          selector_retention)
 from tricoopdiff.ranking_archive import state_hash
 
 SPEC = importlib.util.spec_from_file_location(
@@ -58,6 +59,22 @@ def test_retention_tracks_oracle_and_source_budget():
     assert result['selected_source_counts'] == {'bitseed': 0, 'sdpi': 64}
 
 
+def test_future_retention_separates_initial_final_and_rescued_candidates():
+    scores = torch.arange(256).float()
+    initial = torch.zeros(256); final = torch.zeros(256)
+    initial[10] = .8
+    final[250] = .6
+    final[20] = .3
+    sources = ['bitseed'] * 192 + ['sdpi'] * 64
+    result = future_selector_retention(scores, initial, final, sources)
+    assert result['initial']['oracle_index_retained'] == 0
+    assert result['final']['oracle_index_retained'] == 1
+    assert abs(result['union']['full_pool_oracle'] - .8) < 1e-6
+    assert result['rescued_candidates'] == 2
+    assert result['rescued_candidates_retained'] == 1
+    assert result['rescued_hit_retained'] == 1
+
+
 def test_selector_training_loader_requires_complete_ordered_pool():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory); archives = root / 'archives'; labels = root / 'labels'
@@ -81,4 +98,5 @@ def test_selector_training_loader_requires_complete_ordered_pool():
 if __name__ == '__main__':
     test_all_pool_features_are_aligned_and_checksummed()
     test_retention_tracks_oracle_and_source_budget()
+    test_future_retention_separates_initial_final_and_rescued_candidates()
     test_selector_training_loader_requires_complete_ordered_pool()
