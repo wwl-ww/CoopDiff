@@ -383,6 +383,8 @@ GPU 状态、PID 和 ETA 不写成长期规范。需要时运行 `bash scripts/g
 
 新增C40 future-value selector对照，避免把“当前初始化好”误当成“值得花精修预算”。`scripts/train_future_selector.py`只读初态14维几何，分别训练预测final与union价值；训练用160例中预先随机且按来源平衡抽取的64条，验证强制8例×完整256条。主审计除final/union oracle retention外，还统计初态<0.23、末态≥0.23的救回候选是否被选64保留。后台队列在current-quality selector完整结束后运行三seed×两target，写入`results/model_v3_future_selector_20260916/`。
 
+为定位post-ranker失败是否源于特征过弱，新增native-free expanded-geometry对照。原14维Cα摘要之外，`scripts/extract_expanded_ranking_features.py`从输入蛋白PDB提取重原子，以Cα刚体拟合到每个候选frame，计算双侧配体距离/覆盖及双向蛋白界面37维统计；输入index显式禁止label/native字段，特征产物绑定archive hash。`scripts/train_expanded_geometry_ranker.py`使用完全相同的标签、loss、n=160和三seed，仅替换为51维几何，因此可与旧geometry n160直接比较。后台结果目录为`results/model_v3_expanded_ranker_20260916/`。
+
 ### PROTAC条件模型
 
 已实现独立条件架构、训练checkpoint、训练入口和部署入口：

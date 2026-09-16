@@ -485,6 +485,7 @@ R1和P0/P1是两个可独立推进的研究工作包，但本文没有自动启�
 - post-ranker 的封存档案只覆盖被抽中的64个候选及其末态；当前夜间队列扩展到160个训练case，固定32/80/160三档、geometry/frozen+geometry两类特征、三个seed，共18项。8例验证被用于选epoch，只能称内部验证。
 - 另建 full-pool initial 协议，对每例全部256个初态重算14维native-free几何并独立打DockQ标签；训练目标是256→64计算分配，主指标为选64后保留的全池oracle、≥0.23命中和来源组成。它不读取末态，不能冒充未来价值R2。
 - 增加独立的C40 future-value对照：仍只输入初态14维几何，但分别用`final DockQ`和`max(initial, final)`训练；160个训练case各用预先随机、按来源平衡抽取的64条精修，8个内部验证case必须覆盖完整256条。报告选64后的final/union oracle retention，以及初态<0.23而末态≥0.23的“救回”case是否保留。该结果受C40和当前内部验证集绑定，不与current-quality selector共用checkpoint。
+- post-ranker补充51维expanded-geometry对照：保留原14维Cα摘要，再从部署时已有的两份蛋白PDB和候选坐标计算37维重原子距离、覆盖与双向蛋白界面统计。蛋白重原子只按各自Cα拟合到候选frame，不读取native三元结构或标签；特征文件与DockQ标签仍由独立进程生成。该对照使用与旧n160模型相同的loss、三seed和内部验证，单独检验此前失败是否主要来自Cα特征过弱。
 - 两条rank任务使用不同checkpoint和报告。第一版不做walker在线交换：在post-ranker未证明可泛化前，不允许用其分数改变轨迹。
 - 后台状态分别见 `results/model_v3_ranking_night160_20260915/queue_status.json`、`results/model_v3_initial_selector_20260916/status.json`和`results/model_v3_future_selector_20260916/status.json`。只有完整网格成功才生成总表。
 
