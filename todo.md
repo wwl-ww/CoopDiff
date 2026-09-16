@@ -393,6 +393,10 @@ full-pool selector完成后另算精确随机基线，不靠有限次随机seed�
 
 旧post-ranker的160例监督共20,480个状态，但仅78个`0.23≤DockQ<0.49`、1个`≥0.49`，因此另加固定loss对照以区分特征不足与稀疏分类项拖累：复用同一51维特征、网络、160/8划分和三seed，只训练同case listwise目标，温度固定为0.05与0.01。队列`model_v3_expanded_objective_v2`等待expanded特征完成后运行6个CPU fit，写入`results/model_v3_expanded_objective_v2_20260916/`；首个无状态文件的等待器未开始fit即停止并由v2取代。总汇也由`model_v3_ranking_summary_v2`取代旧等待器，并把composite与两种ranking-only目标并列，不按seed或温度挑最好结果。
 
+上述ranking链现已全部完成，最终统一报告为`results/model_v3_ranking_summary_v3_20260916/report/summary.{json,md}`。精确随机基线首个队列因封存runtime切换cwd后传递相对路径而失败；算法和标签无误，入口已改为启动时解析绝对路径并加入回归测试，正式v2结果为`results/model_v3_selector_baselines_v2_20260916/random_baselines/`。current-quality学习选择的selected-best为0.1645–0.1711，明显高于四种随机/固定配额期望0.1183–0.1221，但32→80→160没有稳定学习曲线；小λ去冗余偶有改善但跨训练规模不稳定。future selector的Final retention为0.7666、Union目标的Union retention为0.8436，唯一rescued case保留对seed/λ敏感，不能冻结。
+
+post-ranker结论为否定：旧14维geometry/frozen-geometry的Union top-1分别0.0338/0.0440；51维expanded geometry为0.0287；ranking-only温度0.05/0.01为0.0276/0.0306。所有新旧配置在8例上均无稳定`≥0.23` top-1命中，重原子摘要和去除稀疏分类项都没有解决部署排序。故本轮仅证明学习pre-allocation有信号，未交付可部署top-1 ranker，也不从共用内部8例挑seed、λ或温度上线。
+
 ### PROTAC条件模型
 
 已实现独立条件架构、训练checkpoint、训练入口和部署入口：
