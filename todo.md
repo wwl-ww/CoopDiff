@@ -430,3 +430,7 @@ v5封存runtime写入`config.json`的`checkpoint_selection`说明字符串沿用
 
 三组必须核对逐case proposal pool hash及初态hash；任一不一致不能作配对结论。结构评估报告Initial/Final/Union及≥0.23/0.49，仍需另接post-ranker才是部署top1。后台接管入口为`scripts/run_conditioned_protac_queue.py`，每张物理卡串行执行任务，不与训练同时增加GPU worker。
 GPU5队列在训练完成后运行`default-pocket`，GPU7串行运行`default-absent`与`control-absent`；当前会话分别为`model_v3_conditioned_v5_eval_gpu5/7`。`model_v3_conditioned_v5_audit`等待三组全部22例结束后才汇总逐例配对差、胜/平/负及pool/初态/seed一致性，不接纳成功子集。
+
+结果落盘前固定决策门槛：先要求三组均22/22完成且pool、选中初态与diffusion seed逐项一致；条件边际看`default-pocket − default-absent`的Final主指标并同时报告Union、≥0.23/0.49与逐例W/L/T；训练代价看`default-absent − control-absent`。只有完整系统`default-pocket`的Final均值提高、≥0.23命中不减少且逐例胜数不少于负数，才把pocket-only条件列为下一阶段默认；否则保留为诊断或否决，不能用单个case或仅validation loss挽救结论。
+
+Ranking也预先固定门槛：pre-selector的selected-best/retention必须与精确随机及固定来源配额同表，但它仍只是计算分配oracle；post-ranker必须用实际native-free top-1超过固定R0/随机水平，并且提升不能只来自一个seed，才有资格进入部署协议。去冗余λ和ranking-only温度共用内部8例，只能判断机制方向，不能在该8例上挑最佳值后直接冻结；若所有配置仍无稳定`≥0.23` top-1，则本轮结论是“当前特征/监督不足”，不是选择一个数值最高的坏模型。
