@@ -13,8 +13,10 @@ import time
 
 VALIDATION_CELLS = (
     'sdpi/full',
+    'sdpi/pocket_only',
     'sdpi/absent',
     'bitseed_endpoint/full',
+    'bitseed_endpoint/pocket_only',
     'bitseed_endpoint/absent',
 )
 
@@ -65,6 +67,7 @@ def _assert_paired_configs(conditioned, control):
         'resume', 'paired_cache_follower',
         'condition_drop_all', 'condition_drop_side', 'condition_drop_pocket',
         'condition_drop_ligand_role', 'condition_drop_binary',
+        'condition_pocket_only',
     }
     mismatches = {
         key: [left.get(key), right.get(key)]
@@ -120,6 +123,11 @@ def compare(conditioned, control, require_complete=True):
                          - float(conditioned_row['by_cell'][f'{source}/absent']))
                 for source in ('sdpi', 'bitseed_endpoint')
             },
+            'within_conditioned_pocket_only_minus_absent': {
+                source: (float(conditioned_row['by_cell'][f'{source}/pocket_only'])
+                         - float(conditioned_row['by_cell'][f'{source}/absent']))
+                for source in ('sdpi', 'bitseed_endpoint')
+            },
         })
     best_conditioned = min(rows, key=lambda row: row['conditioned_selection_loss'])
     best_control = min(rows, key=lambda row: row['absent_control_selection_loss'])
@@ -170,14 +178,17 @@ def render_markdown(summary):
         '## Per-epoch audit',
         '',
         '| Epoch | Selection delta | SDPI full−absent | BiTSeed full−absent | '
+        'SDPI pocket−absent | BiTSeed pocket−absent | '
         'Raw condition scale | EMA condition scale |',
-        '| ---: | ---: | ---: | ---: | ---: | ---: |',
+        '| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
     ]
     for row in summary['epochs']:
         within = row['within_conditioned_full_minus_absent']
+        pocket = row['within_conditioned_pocket_only_minus_absent']
         lines.append(
             f'| {row["epoch"]} | {row["selection_loss_delta"]:+.6f} | '
             f'{within["sdpi"]:+.6f} | {within["bitseed_endpoint"]:+.6f} | '
+            f'{pocket["sdpi"]:+.6f} | {pocket["bitseed_endpoint"]:+.6f} | '
             f'{row["raw_condition_scale"]:+.6g} | '
             f'{row["ema_condition_scale"]:+.6g} |')
     return '\n'.join(lines) + '\n'

@@ -36,7 +36,7 @@ class EndpointStore:
         return 'bitseed-coupling', {'actual_source': 'bitseed'}
 
 
-def test_four_cells_reuse_time_and_pair_each_coupling():
+def test_six_cells_reuse_time_and_pair_each_coupling():
     molecule = Chem.MolFromSmiles('C')
     batch = {
         'case': 'fixture',
@@ -47,13 +47,18 @@ def test_four_cells_reuse_time_and_pair_each_coupling():
     trainer = Trainer()
     result = module.validate_grid(trainer, [batch], EndpointStore(), torch.device('cpu'), 7)
     assert result['counts'] == {name: 1 for name in (
-        'sdpi/full', 'sdpi/absent', 'bitseed_endpoint/full', 'bitseed_endpoint/absent')}
-    assert len(trainer.calls) == 4
+        'sdpi/full', 'sdpi/pocket_only', 'sdpi/absent',
+        'bitseed_endpoint/full', 'bitseed_endpoint/pocket_only',
+        'bitseed_endpoint/absent')}
+    assert len(trainer.calls) == 6
     assert all(call['t_override'] is trainer.calls[0]['t_override'] for call in trainer.calls)
-    assert trainer.calls[0]['coupling_override'] == trainer.calls[1]['coupling_override'] == 'sdpi-coupling'
-    assert trainer.calls[2]['coupling_override'] == trainer.calls[3]['coupling_override'] == 'bitseed-coupling'
-    assert not torch.equal(trainer.calls[0]['conditions']['sides'], trainer.calls[1]['conditions']['sides'])
+    assert all(call['coupling_override'] == 'sdpi-coupling' for call in trainer.calls[:3])
+    assert all(call['coupling_override'] == 'bitseed-coupling' for call in trainer.calls[3:])
+    assert not torch.equal(trainer.calls[0]['conditions']['sides'],
+                           trainer.calls[1]['conditions']['sides'])
+    assert not torch.equal(trainer.calls[1]['conditions']['sides'],
+                           trainer.calls[2]['conditions']['sides'])
 
 
 if __name__ == '__main__':
-    test_four_cells_reuse_time_and_pair_each_coupling()
+    test_six_cells_reuse_time_and_pair_each_coupling()

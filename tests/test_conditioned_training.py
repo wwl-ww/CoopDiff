@@ -38,7 +38,7 @@ class FrozenExpert(nn.Module):
         }
 
 
-def trainer(parent='a' * 64):
+def trainer(parent='a' * 64, dropout=ConditionFeatureDropout()):
     base = ConsensusFuse(node_dim=16, input_dim=8, num_transformer_layers=1,
                          dropout=0., source_conditioning=True)
     fuse = ConditionedConsensusFuse.from_base(base)
@@ -49,6 +49,7 @@ def trainer(parent='a' * 64):
         training_source_mix='sdpi_bitseed_1_1',
         training_endpoint_protocol='online_bitseed_training_c1_m1_v1',
         parent_checkpoint_sha256=parent,
+        condition_dropout=dropout,
     )
 
 
@@ -123,6 +124,21 @@ def test_conditioned_checkpoint_rejects_implicit_policy():
         raise AssertionError('implicit condition dropout accepted')
 
 
+def test_resume_dropout_change_requires_explicit_opt_in():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / 'checkpoint.pt'
+        trainer().save_checkpoint(path, epoch=1)
+        changed = trainer(dropout=ConditionFeatureDropout(pocket_only_probability=.2))
+        try:
+            changed.load_checkpoint(path)
+        except ValueError as error:
+            assert 'condition_dropout' in str(error)
+        else:
+            raise AssertionError('implicit resume augmentation change accepted')
+        changed.load_checkpoint(path, allow_dropout_change=True)
+        assert changed.resume_epoch == 1
+
+
 def test_conditioned_evaluator_builds_only_the_isolated_wrapper():
     instance = trainer()
     with tempfile.TemporaryDirectory() as directory:
@@ -143,4 +159,5 @@ if __name__ == '__main__':
     test_supervised_masks_are_discrete_aligned_and_coordinate_free()
     test_conditioned_checkpoint_roundtrip_and_legacy_rejection()
     test_conditioned_checkpoint_rejects_implicit_policy()
+    test_resume_dropout_change_requires_explicit_opt_in()
     test_conditioned_evaluator_builds_only_the_isolated_wrapper()

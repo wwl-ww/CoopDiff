@@ -34,8 +34,9 @@ from tricoopdiff.online_endpoints import LazyTrainingEndpointStore, ONLINE_TRAIN
 from tricoopdiff.sdpi_flow import SDPIFlow
 
 
-FULL = ConditionFeatureDropout(0., 0., 0., 0., 0.)
-ABSENT = ConditionFeatureDropout(1., 0., 0., 0., 0.)
+FULL = ConditionFeatureDropout(0., 0., 0., 0., 0., 0.)
+POCKET_ONLY = ConditionFeatureDropout(0., 0., 0., 1., 1., 0.)
+ABSENT = ConditionFeatureDropout(1., 0., 0., 0., 0., 0.)
 
 
 def parse_args(argv=None):
@@ -64,11 +65,15 @@ def parse_args(argv=None):
     parser.add_argument('--condition-drop-pocket', type=float, default=.1)
     parser.add_argument('--condition-drop-ligand-role', type=float, default=.1)
     parser.add_argument('--condition-drop-binary', type=float, default=.1)
+    parser.add_argument('--condition-pocket-only', type=float, default=.2,
+                        help='Probability of retaining only both pocket masks')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--seed', type=int, default=7315)
     parser.add_argument('--save-interval', type=int, default=10)
     parser.add_argument('--log-interval', type=int, default=10)
     parser.add_argument('--resume')
+    parser.add_argument('--allow-resume-dropout-change', action='store_true',
+                        help='Explicitly replace only the augmentation policy on resume')
     args = parser.parse_args(argv)
     if (args.epochs < 1 or args.save_interval < 1 or args.log_interval < 1
             or args.nan_clamp <= 0 or args.paired_cache_wait_seconds < 0):
@@ -84,7 +89,7 @@ def condition_dropout(args):
     return ConditionFeatureDropout(
         args.condition_drop_all, args.condition_drop_side,
         args.condition_drop_pocket, args.condition_drop_ligand_role,
-        args.condition_drop_binary)
+        args.condition_drop_binary, args.condition_pocket_only)
 
 
 def build_trainer(args, device):
@@ -120,7 +125,7 @@ def validate_grid(trainer, loader, endpoint_store, device, seed):
                     if device.type == 'cuda' else [])
     numpy_state = np.random.get_state()
     cells = {f'{source}/{mode}': [] for source in ('sdpi', 'bitseed_endpoint')
-             for mode in ('full', 'absent')}
+             for mode in ('full', 'pocket_only', 'absent')}
     fallback = 0
     try:
         with torch.random.fork_rng(devices=cuda_devices):
@@ -131,6 +136,8 @@ def validate_grid(trainer, loader, endpoint_store, device, seed):
             for batch in loader:
                 full, _ = supervised_condition_batch(
                     batch, seed=condition_seed(batch['case'], seed), dropout=FULL)
+                pocket_only, _ = dropout_condition_features(
+                    full, seed=0, config=POCKET_ONLY)
                 absent, _ = dropout_condition_features(full, seed=0, config=ABSENT)
                 coupling, record = endpoint_store.coupling(
                     batch['case'], **({'batch': batch} if endpoint_store.lazy else {}))
@@ -150,7 +157,9 @@ def validate_grid(trainer, loader, endpoint_store, device, seed):
                     }),
                 ]
                 for source, row in source_rows:
-                    for mode, conditions in (('full', full), ('absent', absent)):
+                    for mode, conditions in (('full', full),
+                                             ('pocket_only', pocket_only),
+                                             ('absent', absent)):
                         result = trainer.validate_step(**row, conditions=conditions)
                         loss = result['loss_total']
                         if not np.isfinite(loss):
@@ -160,8 +169,11 @@ def validate_grid(trainer, loader, endpoint_store, device, seed):
         np.random.set_state(numpy_state)
         trainer.model.train()
     means = {name: float(np.mean(values)) for name, values in cells.items() if values}
-    required = {'sdpi/full', 'sdpi/absent', 'bitseed_endpoint/full',
-                'bitseed_endpoint/absent'}
+    required = {
+        'sdpi/full', 'sdpi/pocket_only', 'sdpi/absent',
+        'bitseed_endpoint/full', 'bitseed_endpoint/pocket_only',
+        'bitseed_endpoint/absent',
+    }
     if set(means) != required:
         raise RuntimeError(f'validation grid incomplete: present={sorted(means)}')
     return {'selection_loss': float(np.mean(list(means.values()))), 'by_cell': means,
@@ -213,7 +225,8 @@ def main(argv=None):
         cache_read_only=args.paired_cache_follower,
         cache_wait_seconds=args.paired_cache_wait_seconds)
     if args.resume:
-        trainer.load_checkpoint(args.resume)
+        trainer.load_checkpoint(
+            args.resume, allow_dropout_change=args.allow_resume_dropout_change)
     start_epoch, best = trainer.resume_epoch + 1, trainer.resume_best_val_loss
     if start_epoch > args.epochs:
         raise RuntimeError('resume epoch meets or exceeds target epochs')

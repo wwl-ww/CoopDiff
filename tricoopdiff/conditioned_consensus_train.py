@@ -181,7 +181,7 @@ class ConditionedConsensusTrainer(ConsensusTrainer):
         torch.save(payload, temporary)
         os.replace(temporary, path)
 
-    def load_checkpoint(self, path):
+    def load_checkpoint(self, path, *, allow_dropout_change=False):
         payload = torch.load(path, map_location=self.device, weights_only=False)
         validate_conditioned_checkpoint(payload)
         if payload['parent_checkpoint_sha256'] != self.parent_checkpoint_sha256:
@@ -200,6 +200,8 @@ class ConditionedConsensusTrainer(ConsensusTrainer):
             'condition_lr': self.condition_lr,
         }
         for key, value in expected.items():
+            if key == 'condition_dropout' and allow_dropout_change:
+                continue
             if payload['runtime_config'].get(key) != value:
                 raise ValueError(f'conditioned checkpoint runtime mismatch: {key}')
         self.model.trifuse.load_state_dict(payload['trifuse_state_dict'], strict=True)

@@ -127,3 +127,19 @@ def test_training_feature_dropout_marks_unknown_and_never_returns_native_coordin
         config=ConditionFeatureDropout(drop_pocket_probability=1., drop_ligand_role_probability=1.,
                                        drop_binary_probability=1.))
     assert audit == replay_audit and all(torch.equal(dropped[k], replay[k]) for k in dropped)
+
+
+def test_training_feature_dropout_has_explicit_two_sided_pocket_only_mode():
+    molecule = Chem.MolFromSmiles('CCO')
+    features = build_supervised_contact_features(
+        molecule, (torch.tensor([[0., 1., 0.], [5., 0., 0.]]),
+                   torch.tensor([[1., 1., 0.], [8., 0., 0.]])),
+        torch.tensor([[0., 0., 0.], [1., 0., 0.], [20., 0., 0.]]))
+    result, audit = dropout_condition_features(
+        features, seed=3, config=ConditionFeatureDropout(
+            0., 0., 0., 0., 0., pocket_only_probability=1.))
+    assert result['sides'][:, 0].sum() == 0
+    assert result['sides'][:, 1].sum() == 2
+    assert result['sides'][:, 2].sum() == 0
+    assert result['protein1'].sum() > 0 and result['protein2'].sum() > 0
+    assert audit['events'] == [{'action': 'keep_pocket_only_both_sides'}]

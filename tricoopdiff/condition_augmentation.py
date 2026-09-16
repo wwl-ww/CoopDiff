@@ -40,6 +40,7 @@ class ConditionFeatureDropout:
     drop_pocket_probability: float = 0.1
     drop_ligand_role_probability: float = 0.1
     drop_binary_probability: float = 0.1
+    pocket_only_probability: float = 0.
 
     def validate(self):
         for name, value in asdict(self).items():
@@ -61,7 +62,7 @@ def dropout_condition_features(features, *, seed, config=ConditionFeatureDropout
     if any(not torch.isfinite(value).all() for value in result.values()):
         raise ValueError('condition features must be finite')
     rng = np.random.default_rng(seed)
-    audit = {'protocol': 'condition_feature_dropout_v1', 'seed': seed, 'config': asdict(config),
+    audit = {'protocol': 'condition_feature_dropout_v2', 'seed': seed, 'config': asdict(config),
              'native_coordinates_returned': False, 'flow_state_modified': False, 'events': []}
 
     def drop_role(side):
@@ -82,6 +83,11 @@ def dropout_condition_features(features, *, seed, config=ConditionFeatureDropout
             drop_role(side); drop_pocket(side); drop_binary(side)
         result['sides'].zero_()
         audit['events'].append({'action': 'drop_all'})
+    elif (config.pocket_only_probability > 0
+          and rng.random() < config.pocket_only_probability):
+        for side in (0, 1):
+            drop_role(side); drop_binary(side)
+        audit['events'].append({'action': 'keep_pocket_only_both_sides'})
     else:
         for side in (0, 1):
             side_rng = np.random.default_rng(rng.integers(0, 2**63))
