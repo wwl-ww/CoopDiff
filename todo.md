@@ -412,6 +412,8 @@ v4实现了严格的单写者cache，但复查发现训练中“双侧仅pocket�
 
 当前formal作业为`model_v3_conditioned_v5_default/absent`，从各自v3 epoch1 checkpoint续跑epoch2–40，物理GPU5/7；结果写入`results/model_v3_conditioned_full40_v5_{default,absent}_20260916/`，runtime为`results/model_v3_conditioned_full40_v5_20260916_runtime/`。default以0.2概率显式保留双侧pocket、同时移除role/binary；验证扩展为`SDPI/BiTSeed × full/pocket-only/absent`六格。default仍是feature/endpoint cache唯一写者，absent带`--paired-cache-follower`且始终全缺失。两者仍为587训练簇、65验证簇、C40 EMA父权重、相同seed与1:1 SDPI/BiTSeed协议；64个测试文件通过。formal训练序列由v3 epoch1加v5 epoch2–40组成。
 
+v5封存runtime写入`config.json`的`checkpoint_selection`说明字符串沿用了旧四格措辞，但实际`validate_grid`、逐epochmetrics和best-checkpoint判断从启动起均为上述六格算术平均；这是元数据文字错误，不是运行逻辑变化。主分支入口已修正为明确的六格说明，不回写或替换在途封存runtime/配置，最终审计以metrics中的六个`by_cell`及实际selection loss为准。
+
 训练loss自动审计会话为`model_v3_conditioned_compare`：等待两侧`final_model.pt`后核对除dropout/输出路径外的配置完全一致，输出逐epoch四格loss、full−absent差和raw/EMA condition gate；报告明确不把loss差写成DockQ收益。
 
 部署资产新增pocket-only安全降级协议。旧严格化学恢复在PROTAC22中有34/44侧可恢复，但0/22例能同时得到双侧严格warhead映射，故第一轮不猜测atom map。`scripts/make_protac_pocket_manifests.py`只读取每侧unbound protein与同局部frame的`unbound_lig{1,2}.pdb`，按与训练一致的6 Å阈值生成Cα节点口袋mask；22/22例均成功，双侧分别为6–12和6–23个口袋节点。产物为`results/model_v3_protac22_pocket_manifests_v2_20260916/{pocket,absent}/`，报告明确：不读取native ternary、不使用cross-protein geometry、不使用warhead映射，来源仅称provided template。

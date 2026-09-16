@@ -58,6 +58,8 @@ def test_six_cells_reuse_time_and_pair_each_coupling():
                            trainer.calls[1]['conditions']['sides'])
     assert not torch.equal(trainer.calls[1]['conditions']['sides'],
                            trainer.calls[2]['conditions']['sides'])
+    assert 'six' in module.CHECKPOINT_SELECTION
+    assert 'pocket-only' in module.CHECKPOINT_SELECTION
 
 
 if __name__ == '__main__':

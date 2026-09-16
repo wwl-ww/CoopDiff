@@ -3,7 +3,7 @@
 The first protocol preserves C's 1:1 SDPI/BiTSeed endpoint schedule. Native
 ternary coordinates supervise only discrete 6 A pocket/ligand contact masks;
 they are never model inputs or checkpoint contents. Checkpoint selection uses
-all four validation cells: endpoint source x full/absent conditions.
+all six validation cells: endpoint source x full/pocket-only/absent conditions.
 """
 
 import argparse
@@ -37,6 +37,8 @@ from tricoopdiff.sdpi_flow import SDPIFlow
 FULL = ConditionFeatureDropout(0., 0., 0., 0., 0., 0.)
 POCKET_ONLY = ConditionFeatureDropout(0., 0., 0., 1., 1., 0.)
 ABSENT = ConditionFeatureDropout(1., 0., 0., 0., 0., 0.)
+CHECKPOINT_SELECTION = (
+    'mean of six SDPI/BiTSeed x full/pocket-only/absent validation cells')
 
 
 def parse_args(argv=None):
@@ -196,7 +198,7 @@ def main(argv=None):
               'training_endpoint_protocol': ONLINE_TRAINING_ENDPOINT_PROTOCOL,
               'condition_supervision': 'native discrete contact masks at 6 A',
               'condition_dropout': vars(condition_dropout(args)),
-              'checkpoint_selection': 'mean of SDPI/BiTSeed x full/absent conditions'}
+              'checkpoint_selection': CHECKPOINT_SELECTION}
     (output / 'config.json').write_text(json.dumps(config, indent=2) + '\n')
 
     # Warm/validate featurization before the expensive expert is built.
