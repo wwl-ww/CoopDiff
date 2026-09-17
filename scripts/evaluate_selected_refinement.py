@@ -19,6 +19,16 @@ _bootstrap.add_argument("--runtime-root")
 _bootstrap.add_argument("--project-root")
 _runtime_args, _ = _bootstrap.parse_known_args()
 RUNTIME_ROOT = Path(_runtime_args.runtime_root or Path(__file__).resolve().parent.parent).resolve()
+
+
+def configure_runtime_cache(project_root):
+    """Keep numerical DiffDock tables tied to the asset repository."""
+    root = Path(project_root or Path(__file__).resolve().parent.parent).resolve()
+    os.environ.setdefault(
+        'TRICOOPDIFF_CACHE_DIR', str(root / 'results/runtime_cache/diffdock'))
+
+
+configure_runtime_cache(_runtime_args.project_root)
 sys.path.insert(0, str(RUNTIME_ROOT / "scripts"))
 sys.path.insert(0, str(RUNTIME_ROOT))
 import tricoopdiff.diffdock_compat  # noqa: E402,F401
@@ -160,6 +170,49 @@ def resolve_case_inputs(entry, project_root, native_root):
     return paths, native.resolve(), metric_paths
 
 
+def preflight_condition_manifests(condition_paths, case_inputs):
+    """Validate every deploy manifest against actual graph inputs up front.
+
+    This is intentionally CPU-only and does not read native ternary structures.
+    It mirrors DiffDock's ProDy receptor-node selection so a modified residue or
+    stale manifest cannot waste completed refinements before failing on shape.
+    """
+    if set(condition_paths) != set(case_inputs):
+        raise ValueError('condition preflight requires one manifest per case')
+    from rdkit import Chem
+    import prody as pr
+    from tricoopdiff.condition_manifest import load_condition_manifest
+    from tricoopdiff.diffdock.datasets.parse_chi import get_coords
+    from tricoopdiff.diffdock.datasets.process_mols import read_molecule
+
+    result = {}
+    for case, condition_path in condition_paths.items():
+        paths = case_inputs[case][0]
+        molecule = read_molecule(str(paths['ligand']), sanitize=True, remove_hs=True)
+        if molecule is None or not molecule.GetNumAtoms():
+            raise ValueError(f'{case}: condition preflight could not read ligand')
+        sizes = []
+        for key in ('protein1', 'protein2'):
+            protein = pr.parsePDB(str(paths[key]))
+            if protein is None or protein.ca is None:
+                raise ValueError(f'{case}: condition preflight found no {key} nodes')
+            coords = get_coords(protein)[:, 1, :]
+            if (coords.ndim != 2 or coords.shape[1:] != (3,) or not len(coords)
+                    or not np.isfinite(coords).all()):
+                raise ValueError(f'{case}: condition preflight found invalid {key} nodes')
+            sizes.append(len(coords))
+        _, audit = load_condition_manifest(
+            condition_path, case=case, molecule=Chem.Mol(molecule),
+            protein_sizes=tuple(sizes),
+        )
+        result[case] = {
+            'protein_sizes': sizes,
+            'ligand_atoms': molecule.GetNumAtoms(),
+            'available_sides': audit['available_sides'],
+        }
+    return result
+
+
 def validate_resume_output(output, manifest, *, resume=True):
     """Fail before any output writes if existing results cannot be safely reused."""
     output = Path(output)
@@ -257,6 +310,7 @@ def main():
         for entry in entries
     }
     condition_paths = {}
+    condition_preflight = {}
     if args.condition_manifest_dir:
         condition_dir = Path(args.condition_manifest_dir)
         if not condition_dir.is_absolute():
@@ -268,6 +322,7 @@ def main():
         missing = [str(path) for path in condition_paths.values() if not path.is_file()]
         if missing:
             raise FileNotFoundError(f'missing condition manifests: {missing}')
+        condition_preflight = preflight_condition_manifests(condition_paths, case_inputs)
     manifest = {
         "protocol": PROTOCOL,
         "scope": "native-free selection followed by oracle-scored CoopDiff refinement",
@@ -311,6 +366,7 @@ def main():
             case: {"path": str(path), "sha256": sha256_file(path)}
             for case, path in condition_paths.items()
         },
+        "condition_preflight": condition_preflight,
         "candidate_pool": {
             "bitseed": args.bitseed_candidates, "sdpi": args.sdpi_candidates,
             "conformers": args.conformers, "poses_per_side": args.poses_per_side,

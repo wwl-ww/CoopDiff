@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 
 import evaluate_selected_refinement as evaluation
+from tricoopdiff.condition_manifest import MANIFEST_VERSION, canonical_isomeric_smiles
 
 
 def _metrics(dockq):
@@ -25,6 +26,18 @@ def test_union_keeps_initialization_when_refinement_fails():
     assert 'refined_dockq' not in row, 'a failed refinement is not a valid final pose'
     assert evaluation.summarize([row], 'safe_dockq')['hits_0.49'] == 1
     assert evaluation.summarize([row], 'refined_dockq')['count'] == 0
+
+
+def test_runtime_cache_defaults_to_asset_repository_without_overriding_explicit_value():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        with patch.dict(os.environ, {}, clear=True):
+            evaluation.configure_runtime_cache(root)
+            assert os.environ['TRICOOPDIFF_CACHE_DIR'] == str(
+                root / 'results/runtime_cache/diffdock')
+        with patch.dict(os.environ, {'TRICOOPDIFF_CACHE_DIR': '/explicit'}, clear=True):
+            evaluation.configure_runtime_cache(root)
+            assert os.environ['TRICOOPDIFF_CACHE_DIR'] == '/explicit'
 
 
 def test_union_selects_better_stage_and_rejects_nonfinite_scores():
@@ -67,6 +80,54 @@ def test_resume_rejects_mismatch_legacy_and_overwrite_without_mutations():
             pass
         else:
             raise AssertionError('unsigned legacy output must not be silently adopted')
+
+
+def test_condition_preflight_catches_receptor_node_mismatch():
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    def pdb_line(serial, residue, number, x):
+        return (f'ATOM  {serial:5d}  CA  {residue:>3} A{number:4d}    '
+                f'{x:8.3f}{0.:8.3f}{0.:8.3f}{1.:6.2f}{20.:6.2f}          C \n')
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        protein = pdb_line(1, 'ALA', 1, 0.) + pdb_line(2, 'GLY', 2, 10.) + 'END\n'
+        for side in (1, 2):
+            (root / f'protein{side}.pdb').write_text(protein)
+        molecule = Chem.AddHs(Chem.MolFromSmiles('CC'))
+        AllChem.EmbedMolecule(molecule, randomSeed=7)
+        ligand = root / 'ligand.sdf'
+        Chem.MolToMolFile(molecule, str(ligand))
+        molecule = Chem.RemoveHs(molecule)
+        manifest = {
+            'schema': MANIFEST_VERSION, 'case': 'fixture',
+            'ligand_atom_count': molecule.GetNumAtoms(),
+            'ligand_canonical_isomeric_smiles': canonical_isomeric_smiles(molecule),
+            'sides': [
+                {'provenance': 'template', 'evidence_id': 'left',
+                 'pocket_probabilities': [1., 0.]},
+                {'provenance': 'template', 'evidence_id': 'right',
+                 'pocket_probabilities': [1., 0.]},
+            ],
+            'linker_indices': [], 'protac': True,
+        }
+        condition = root / 'fixture.json'
+        condition.write_text(json.dumps(manifest))
+        paths = {'protein1': root / 'protein1.pdb', 'protein2': root / 'protein2.pdb',
+                 'ligand': ligand}
+        case_inputs = {'fixture': (paths, root / 'unused_native.pdb', {})}
+        audit = evaluation.preflight_condition_manifests(
+            {'fixture': condition}, case_inputs)
+        assert audit['fixture']['protein_sizes'] == [2, 2]
+        manifest['sides'][0]['pocket_probabilities'].append(0.)
+        condition.write_text(json.dumps(manifest))
+        try:
+            evaluation.preflight_condition_manifests({'fixture': condition}, case_inputs)
+        except ValueError as error:
+            assert 'expected finite shape (2,)' in str(error)
+        else:
+            raise AssertionError('misaligned receptor pocket passed preflight')
 
 
 def test_main_checks_all_inputs_before_writing_or_loading_models():

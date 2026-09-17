@@ -10,12 +10,20 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CHECKPOINT_NAME = re.compile(r'checkpoint_epoch[1-9][0-9]*[.]pt')
+
+
+def supported_checkpoint_name(name):
+    """Accept explicit best/final or numbered periodic checkpoints."""
+    return name in ('best_model.pt', 'final_model.pt') or bool(
+        CHECKPOINT_NAME.fullmatch(name))
 
 
 def atomic_json(value, path):
@@ -78,8 +86,10 @@ def main(argv=None):
             raise ValueError('unsafe task name')
         if not manifests.is_dir():
             raise FileNotFoundError(manifests)
-        if checkpoint.name not in ('best_model.pt', 'final_model.pt'):
-            raise ValueError('evaluate an explicit best_model.pt or final_model.pt')
+        if not supported_checkpoint_name(checkpoint.name):
+            raise ValueError(
+                'evaluate an explicit best_model.pt, final_model.pt, or '
+                'checkpoint_epoch<N>.pt')
     args.out.mkdir(parents=True)
     status_path = args.out / 'status.json'
     status = {

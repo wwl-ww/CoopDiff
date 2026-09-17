@@ -13,6 +13,7 @@ import sys
 
 import numpy as np
 from rdkit import Chem
+import prody as pr
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
@@ -20,6 +21,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 from evaluation_common import sha256_file
 from tricoopdiff.condition_manifest import (MANIFEST_VERSION, canonical_isomeric_smiles,
                                             load_condition_manifest)
+from tricoopdiff.diffdock.datasets.parse_chi import get_coords
 
 
 def pdb_coordinates(path, *, alpha_carbons=False):
@@ -49,8 +51,25 @@ def pdb_coordinates(path, *, alpha_carbons=False):
     return result
 
 
+def receptor_node_coordinates(path):
+    """Return C-alpha coordinates in DiffDock receptor-node order.
+
+    Raw ``ATOM CA`` rows are not sufficient: ProDy's protein C-alpha selection
+    excludes some modified residues (for example CAS), and DiffDock constructs
+    its receptor graph from that selection.  Reuse the same parser and ordering
+    here so pocket arrays are exactly node aligned at inference time.
+    """
+    protein = pr.parsePDB(str(path))
+    if protein is None or protein.ca is None:
+        raise ValueError(f'{path}: no protein C-alpha nodes')
+    result = get_coords(protein)[:, 1, :].astype(np.float32, copy=False)
+    if result.ndim != 2 or result.shape[1:] != (3,) or not len(result) or not np.isfinite(result).all():
+        raise ValueError(f'{path}: no finite DiffDock receptor-node coordinates')
+    return result
+
+
 def pocket_probabilities(protein_path, ligand_path, cutoff=6.):
-    protein = pdb_coordinates(protein_path, alpha_carbons=True)
+    protein = receptor_node_coordinates(protein_path)
     ligand = pdb_coordinates(ligand_path, alpha_carbons=False)
     distances = np.linalg.norm(protein[:, None, :] - ligand[None, :, :], axis=-1)
     return (distances.min(1) <= cutoff).astype(np.float32), protein, ligand

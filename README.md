@@ -4,11 +4,9 @@ TriCoopDiff 研究蛋白–配体–蛋白三元装配：两个冻结 DiffDock �
 
 ## 当前研究状态
 
-候选池工作配置为 **192 BiTSeed + 64 SDPI**，从中选择 64 个初态交给 TriCoopDiff。该配置用于后续对照，不代表全局最优；selector 尚未冻结。
+候选池工作配置为 **192 BiTSeed + 64 SDPI**，从中选择 64 个初态交给 TriCoopDiff。该配置是对照基线，不是已证明的全局最优配置；selector 尚未冻结。候选生成、失败补位和 MGD94 审计见[初始化与实验协议](doc/BiTSeed-Hybrid在线初始化规格.md)。
 
-MGD94 全池精修审计使用历史 factorial checkpoint；其 Geometry-64 / Diversity-64 最终 oracle 均值略高于 SDPI-64，但不足以证明唯一最佳选择器。初始化优势不保证精修后仍保留；这些结果不是 model-ranked top-1。详见[初始化与实验协议](doc/BiTSeed-Hybrid在线初始化规格.md)。
-
-SDPI/BiTSeed 单模型联合训练已合入：B/C 各完成 100 epochs，训练分支按 validation loss 交付 C epoch 81 EMA（`3.1384998601`）。这不等于下游精修最优：完整 PROTAC22 配对实验中 C40 的五组 Final 均值均高于 C81，当前精修工作基线保留 **C40 EMA**；部分64候选 Union 则是 C81 更高。两者均保留，不外推到未运行的 MGD 新模型对照。LoRA 消融未超过无 LoRA 父模型的验证 loss，可训练 adapter 实现已删除。详见[联合训练交接](doc/SDPI-BiTSeed联合训练交接.md)及[完整对照与调研](RANKING_PROTAC_RESEARCH.md)。
+当前双线为 ranking 与 PROTAC 条件建模。已有学习型 pre-selector 显示计算分配信号，但尚无可部署的 native-free top-1 ranker；pocket-only 输入也未产生稳定正收益，不列为默认。完整数值、当前 checkpoint 边界和后续门禁统一见 [todo.md](todo.md) 与[Ranking/PROTAC 调研](RANKING_PROTAC_RESEARCH.md)；联合训练的实现与 LoRA 结论见[联合训练交接](doc/SDPI-BiTSeed联合训练交接.md)。
 
 ## 目录
 

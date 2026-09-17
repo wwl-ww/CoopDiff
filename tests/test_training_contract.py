@@ -68,6 +68,7 @@ def test_protein_role_swap_changes_reference_without_changing_geometry():
 def test_featurization_cache_state_cannot_change_training_rng():
     loader = TernaryDataLoader.__new__(TernaryDataLoader)
     loader.score_model_args = object(); loader.device = 'cpu'; loader.cache_dir = 'unused'
+    loader.cache_read_only = False; loader.cache_wait_seconds = 3600.0
     loader.random_flip_proteins = False
     entry = {'case': 'fixture', 'protein1': 'a', 'protein2': 'b', 'ligand': 'c'}
 
