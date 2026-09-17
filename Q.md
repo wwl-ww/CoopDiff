@@ -1,6 +1,6 @@
 # 问题与证据账本
 
-更新：2026-09-14。这里记录限制与证据，不充当任务调度器。当前结果见[BiTSeed 协议](doc/BiTSeed-Hybrid在线初始化规格.md)，执行边界见 [todo.md](todo.md)。
+更新：2026-09-17。这里记录限制与证据，不充当任务调度器。当前结果见[BiTSeed 协议](doc/BiTSeed-Hybrid在线初始化规格.md)，执行边界见 [todo.md](todo.md)。
 
 ## 尚未解决的核心问题
 
@@ -20,17 +20,23 @@
 
 训练 SDPI 端点由 native scaffold 施加 torsion 得到，推理使用 ETKDG scaffold；键长、不可旋转键角和环系差异不是现有刚体+torsion 能全部消除的。三个 validation cases×5 seeds 对齐绝对二面角后，历史审计仍有 mean aligned RMSD 2.013 Å、bond-length RMSE 0.109 Å、bond-angle RMSE 10.81°，见 `results/endpoint_support_audit_v2.json`。
 
-这证明对应样本存在支持失配，不证明全部低 DockQ 都由它解释。联合训练必须检查实际端点、可达 target、gauge 和时间一致性；不能在推理读取 native ligand，也不能仅添加来源标志便宣布解决。
+这证明对应样本存在支持失配，不证明全部低 DockQ 都由它解释。联合训练已使用实际 BiTSeed endpoint 并检查投影残差，但这不会自动消除 SDPI 的 scaffold 支持差异，也不证明条件信息已被有效使用。推理不能读取 native ligand；端点、可达 target、gauge 和时间一致性仍须按 checkpoint 合同审计。
 
 ### Q-015：selector 的初态与末态目标不一致
 
-MGD94 全池初态/末态 oracle 赢家 ID 仅25/94一致。Geometry-64 和 Diversity-64 的最终逐例平均 retention 约83.3%/83.5%，说明 native-free 256→64 仍会丢失最终好构象。二者90/94例 final 最大值相同，0.00029均值差不足以定型。新模型下须重测，不能用初始化 oracle 消融替代末态 retention。
+MGD94 全池初态/末态 oracle 赢家 ID 仅25/94一致。Geometry-64 和 Diversity-64 的最终逐例平均 retention 约83.3%/83.5%，说明 native-free 256→64 仍会丢失最终好构象。二者90/94例 final 最大值相同，0.00029均值差不足以定型。
+
+model-v3 已分别测试初态 current-quality/future-value selector 与末态 post-ranker。pre-selector 有计算分配信号，但学习曲线不稳定；已测 post-ranker 在8例验证上都没有稳定的 `DockQ >= 0.23` top-1。因此未交付可部署 ranker，不能用初态 oracle、64条内 selected-best 或 retention 代替 native-free top-1；数值与实验边界见 [todo.md](todo.md)。
 
 ### Q-016：粗几何标记不能充当最终物理判决
 
 当前 `acceptable` 混合 Cα 穿插与接触距离，而且记录的是**初态**。只有2,306/24,064初态通过；native 对照92/94通过，3UJL和5MXO因 POI–ligand 最小距离超过8 Å失败。
 
 因此该标记既不是全原子化学有效性，也不是经过验证的 hard safety。不能由初态不通过推断其精修后的高 DockQ 无效。改 hard filter 前需要独立验证好姿态召回，并分别计算初态/末态全原子几何。当前只作软排序。
+
+### Q-017：pocket-only 条件尚未形成可部署收益
+
+已完成的配对 PROTAC22 结构审计中，同权重直接加入 pocket-only 条件未改善高质量尾部，预注册门槛未通过。它不列为默认输入，也不能把“条件训练权重相对父模型改善”解释成“pocket 信息被有效利用”。后续应分别验证训练—部署分布匹配、warhead 原子对应与两侧局部二元几何；当前数值与多 seed 状态以 [todo.md](todo.md) 为准。
 
 ### Q-013 / Q-014：二元先验与小分子指标
 
