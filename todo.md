@@ -1,11 +1,11 @@
 # 当前工作与交接
 
-更新：2026-09-15。这里仅记录执行状态，不重复协议或历史流水账。
+更新：2026-09-17。这里记录当前执行状态及仍影响复现边界的历史结果；退役编排器不再作为当前入口。
 
 ## model-v3 起点与清理范围
 
 本分支从已推送的 `master` 合并提交 `92cf1f0` 创建；清理已提交为 `75a16e2`。
-正在实现独立质量排序器与 PROTAC 条件资产审计；尚未训练新的 model-v3 精修模型。
+当前双线是下一代结构ranker与PROTAC条件精修；首轮model-v3条件模型及其配对结构审计已经完成，部署匹配训练仍在多seed复评。
 第一步只清理退役入口，不改模型或实验数据：
 
 - 移除旧 GPU3 夜间执行/接管、factorial/rollout 启动与固定路径 `local_*` 诊断链。
@@ -45,8 +45,9 @@ PROTAC/MGD benchmark PDB。组内按 case 名取首例，再按固定 seed 抽�
 这仍只是16/4组的流程验证：验证数据曾参与 C40 模型选择，也未保证蛋白家族/配体独立，不能声称 untouched holdout。
 索引、排除名单与源文件指纹在 `indexes/audit.json`。
 
-实现入口：`prepare_ranking_smoke.py` → `collect_ranking_archive.py` →
-`score_ranking_archive.py` → `train_state_ranker.py`，后台编排为 `run_ranking_pipeline.py`。
+历史实现链为`prepare_ranking_smoke.py` → `collect_ranking_archive.py` →
+`score_ranking_archive.py` → `train_state_ranker.py`。底层采集、评分和训练工具仍保留；已经完成使命的
+`run_ranking_pipeline.py`一次性后台编排器已在`cleanup-v3`归档删除，复核旧运行应使用结果目录内封存runtime。
 初末态探针均在对应已保存坐标上以 t=0.05、dt=0 重新前向，并恢复随机状态；不复用旧采样器最后一步更新前的特征。
 当前质量头使用连续 DockQ 与有序0.23/0.49阈值监督，报告 Initial / Final / Union 的模型 top1、top5召回和 oracle；
 尚未实现未来价值 pre-ranker、跨 walker 交互或可用于正式 benchmark 的冻结排序器。
@@ -245,7 +246,7 @@ Initial / Final 分别在初态/末态中选top1，Union在512个初末态中统
 本批不依据已见DockQ替换低质量case；初末态仍相关，增加state数量不能替代独立case覆盖。
 为保持整批档案manifest一致，全部重新采集，不拼接修改旧档案；旧结果完整保留。
 
-新增预算参数 `run_ranking_pipeline.py --train-walkers 64 --val-walkers 256`，case数从实际索引推导，
+该批封存编排使用`train-walkers=64`、`val-walkers=256`，case数从实际索引推导；
 启动前核对schema、split、唯一case、PDB交集及抽组审计，状态记录计划4096条，不再硬编码16/4。
 评分成功后额外运行 `audit_ranking_label_balance.py`；任何采集、评分或身份审计失败都阻止自动拟合。
 训练入口现在也独立核对label manifest、完成回执、内嵌manifest、case/split及精确状态覆盖，
@@ -416,13 +417,13 @@ post-ranker结论为否定：旧14维geometry/frozen-geometry的Union top-1分�
 
 v4实现了严格的单写者cache，但复查发现训练中“双侧仅pocket可用”的自然概率约万分之一，而PROTAC22首轮部署正是pocket-only；v4的epoch2部分因此停止且不作最终结论。
 
-当前formal作业为`model_v3_conditioned_v5_default/absent`，从各自v3 epoch1 checkpoint续跑epoch2–40，物理GPU5/7；结果写入`results/model_v3_conditioned_full40_v5_{default,absent}_20260916/`，runtime为`results/model_v3_conditioned_full40_v5_20260916_runtime/`。default以0.2概率显式保留双侧pocket、同时移除role/binary；验证扩展为`SDPI/BiTSeed × full/pocket-only/absent`六格。default仍是feature/endpoint cache唯一写者，absent带`--paired-cache-follower`且始终全缺失。两者仍为587训练簇、65验证簇、C40 EMA父权重、相同seed与1:1 SDPI/BiTSeed协议；64个测试文件通过。formal训练序列由v3 epoch1加v5 epoch2–40组成。
+formal作业`model_v3_conditioned_v5_default/absent`已完成40 epoch，结果写入`results/model_v3_conditioned_full40_v5_{default,absent}_20260916/`，runtime为`results/model_v3_conditioned_full40_v5_20260916_runtime/`。default以0.2概率显式保留双侧pocket、同时移除role/binary；验证扩展为`SDPI/BiTSeed × full/pocket-only/absent`六格。default是feature/endpoint cache唯一写者，absent带`--paired-cache-follower`且始终全缺失。两者均为22,893个训练row、587训练簇、65验证簇、C40 EMA父权重、相同seed与1:1 SDPI/BiTSeed协议；全程配对row为0 mismatch。formal训练序列由v3 epoch1加v5 epoch2–40组成。
 
 v5封存runtime写入`config.json`的`checkpoint_selection`说明字符串沿用了旧四格措辞，但实际`validate_grid`、逐epochmetrics和best-checkpoint判断从启动起均为上述六格算术平均；这是元数据文字错误，不是运行逻辑变化。主分支入口已修正为明确的六格说明，不回写或替换在途封存runtime/配置，最终审计以metrics中的六个`by_cell`及实际selection loss为准。
 
-训练loss自动审计会话为`model_v3_conditioned_compare`：等待两侧`final_model.pt`后核对除dropout/输出路径外的配置完全一致，输出逐epoch四格loss、full−absent差和raw/EMA condition gate；报告明确不把loss差写成DockQ收益。
+训练loss审计已完成，见`results/model_v3_conditioned_full40_v5_comparison_20260916/REPORT.md`。default最佳为epoch39、selection loss `3.280024`，在同epoch比absent-control低`0.063798`；最终epoch40差为`-0.063579`。负差支持条件训练产生了可见验证信号，但报告明确不把loss差写成DockQ收益。
 
-部署资产新增pocket-only安全降级协议。旧严格化学恢复在PROTAC22中有34/44侧可恢复，但0/22例能同时得到双侧严格warhead映射，故第一轮不猜测atom map。`scripts/make_protac_pocket_manifests.py`只读取每侧unbound protein与同局部frame的`unbound_lig{1,2}.pdb`，按与训练一致的6 Å阈值生成Cα节点口袋mask；22/22例均成功，双侧分别为6–12和6–23个口袋节点。产物为`results/model_v3_protac22_pocket_manifests_v2_20260916/{pocket,absent}/`，报告明确：不读取native ternary、不使用cross-protein geometry、不使用warhead映射，来源仅称provided template。
+部署资产新增pocket-only安全降级协议。旧严格化学恢复在PROTAC22中有34/44侧可恢复，但0/22例能同时得到双侧严格warhead映射，故第一轮不猜测atom map。`scripts/make_protac_pocket_manifests.py`只读取每侧unbound protein与同局部frame的`unbound_lig{1,2}.pdb`，按与训练一致的6 Å阈值生成Cα节点口袋mask；报告明确不读取native ternary、不使用cross-protein geometry、不使用warhead映射，来源仅称provided template。首个v2生成器按原始`ATOM CA`行计数，在15例中把修饰残基CAS错误算作图节点，导致143对142错位；它不得用于pocket结论。生成器现复用DiffDock/ProDy的受体节点顺序并有CAS回归测试，修复产物`results/model_v3_protac22_pocket_manifests_v3_20260916/`已逐例与22个实际featurization cache核对，44侧长度全部一致。
 
 `evaluate_selected_refinement.py`的新v4协议支持显式conditioned checkpoint/manifest及指定selector arm。训练结束后的结构主对照固定Hybrid-56/8、64 walker、seed31000、20步：
 
@@ -433,8 +434,28 @@ v5封存runtime写入`config.json`的`checkpoint_selection`说明字符串沿用
 | control-absent | 训练时始终缺失 | 全条件缺失 | 条件训练本身的代价/收益 |
 
 三组必须核对逐case proposal pool hash及初态hash；任一不一致不能作配对结论。结构评估报告Initial/Final/Union及≥0.23/0.49，仍需另接post-ranker才是部署top1。后台接管入口为`scripts/run_conditioned_protac_queue.py`，每张物理卡串行执行任务，不与训练同时增加GPU worker。
-GPU5队列在训练完成后运行`default-pocket`，GPU7串行运行`default-absent`与`control-absent`；当前会话分别为`model_v3_conditioned_v5_eval_gpu5/7`。`model_v3_conditioned_v5_audit`等待三组全部22例结束后才汇总逐例配对差、胜/平/负及pool/初态/seed一致性，不接纳成功子集。
+三组结构评估均已完成22/22、每组1408条有效精修、0失败。v2错位使原GPU5 pocket队列仅7例有效后失败；严格审计未拼接两套manifest，而是用修复后的v3 manifest从头重跑。正式输出分别为`results/model_v3_conditioned_v5_protac_eval_gpu5_v3_20260916/default_pocket/`及`results/model_v3_conditioned_v5_protac_eval_gpu7_20260916/{default_absent,control_absent}/`；统一配对报告为`results/model_v3_conditioned_v5_protac_paired_audit_v3_20260916/REPORT.md`。22个proposal pool hash、选中candidate ID、初态DockQ及diffusion seed逐项一致。
 
-结果落盘前固定决策门槛：先要求三组均22/22完成且pool、选中初态与diffusion seed逐项一致；条件边际看`default-pocket − default-absent`的Final主指标并同时报告Union、≥0.23/0.49与逐例W/L/T；训练代价看`default-absent − control-absent`。只有完整系统`default-pocket`的Final均值提高、≥0.23命中不减少且逐例胜数不少于负数，才把pocket-only条件列为下一阶段默认；否则保留为诊断或否决，不能用单个case或仅validation loss挽救结论。
+| 对照 | Final均值 | Union均值 | Final ≥0.23/0.49 | Union ≥0.23/0.49 |
+| --- | ---: | ---: | --- | --- |
+| default-pocket | 0.3066 | 0.3289 | 15/1 | 17/1 |
+| default-absent | 0.3244 | 0.3374 | 17/2 | 18/2 |
+| control-absent | 0.2936 | 0.3175 | 16/0 | 17/1 |
+
+`default-pocket − default-absent`的Final为`-0.0178`、9胜/13负，Union为`-0.0085`、8胜/6平/8负；直接提供pocket-only条件反而降低结果。`default-absent − control-absent`的Final为`+0.0308`、11胜/11负，说明混合条件训练本身有平均收益，但它不是pocket输入收益。完整系统相对control的Final虽为`+0.0130`且12胜/10负，≥0.23却从16例降至15例。因此预注册门槛失败：**不把pocket-only条件列为下一阶段默认**；当前结果只支持继续研究更可信的warhead/局部二元几何条件，并把default-absent作为有潜力但仍需独立验证的精修权重对照。
+
+后继诊断固定同一default权重，把pocket与absent两种推理条件扩展到22例×完整256池，以区分64候选case-best波动和候选级系统效应；结果目录为`results/model_v3_conditioned_v5_fullpool_{pocket_gpu7,absent_gpu5}_v2_20260916/`。两条作业显式绑定正式`results/runtime_cache/diffdock`数值表；首次直接启动因遗漏该环境变量，在0个case完成时停止并保留为`aborted_cache`，不得混入结果。
+
+2026-09-16夜间三组full-pool均完成22/22、各5632条有效精修、零失败，四路身份审计见`results/model_v3_conditioned_v5_fullpool_audit_v2_20260916/`。全池case-best的Final/Union分别为：pocket `0.3472/0.3629`、default-absent `0.3513/0.3584`、control-absent `0.3289/0.3506`、C40 parent `0.3369/0.3512`。候选级5632条上pocket−absent的Final均值为`+0.00171`且3481胜/2151负，但取每例oracle-best后反为`-0.00410`且8胜/14负；这说明pocket造成的微小广泛移动没有改善高质量尾部，不能用候选平均掩盖部署相关的case-best退化。default-absent相对parent的全池Final为`+0.01446`、13胜/9负，支持新训练权重本身有精修潜力，但不是pocket输入收益。control权重的raw/EMA `condition_scale`均严格为0，因此未运行数学上等价的control-pocket。
+
+同日晚间曾启动checkpoint/推理seed扫描，但复核后认为它主要重复确认已知负结果，信息增量不值得占用五张卡；在首例尚未完成时全部停止，不产出或引用结论。对应partial目录`model_v3_conditioned_checkpoint_sweep_gpu*`及`model_v3_conditioned_seed_replicates_gpu4_seed41000_20260916`仅保留启动诊断，不得拼接续跑。
+
+正式替代实验针对真正的训练—部署错配：v5 default训练中双侧pocket-only自然占比约18%，而首轮PROTAC部署是100% pocket-only。GPU0–2训练`P90`（90% pocket-only + 10% absent）三个seed 7315/7316/7317；GPU3–4训练`P100`（100% pocket-only）两个seed 7315/7316。二者都不混入role/binary/full条件，直接检验模型是否能学习当前实际可提供的PROTAC信息，并由P90/P100对照缺失增强是否必要。所有模型从同一C40 EMA父权重训练40 epoch；结构评估预先固定`final_model.pt`的EMA，不按本轮validation挑epoch。
+
+首个启动版因只读feature cache对新shuffle seed并不完整而在epoch1开头停止；第二版又在epoch1开头发现自动评估会使用与部署目标不一致的六格loss best checkpoint，因此也停止。两版均有`ABORTED.json`，不得作为结果。v3中seed7315的P90/P100均完成40 epoch及两条件结构评估；严格配对后P90的pocket−absent为Final `-0.01209`、Union `-0.00674`，P100为Final `+0.00146`、Union `-0.00068`，单seed尚不支持pocket收益。其余三个跨seed follower因cluster成员随shuffle变化、所需cache键无法由seed7315单写者覆盖而持续等待，现已停止并标记aborted。
+
+2026-09-17修复采用按seed隔离的增量cache：现有cache以硬链接作为只读基底，每个seed仅在自己的目录新增缺项；同seed的P90为唯一写者，P100跟随，因此避免跨seed缺项与并发写。v4补跑P90 seed7316/7317、P100 seed7316，并新增P100 seed7317，使两协议最终各有三个seed。训练完成后仍固定epoch40 final EMA，并自动运行同一PROTAC22、Hybrid-56/8、seed31000的pocket/absent两组20步精修。会话为`model_v3_{p90,p100}_s<seed>_v4_gpu<id>`；统一等待审计`model_v3_pocket_matched_audit_v4`输出`results/model_v3_pocket_matched_multiseed_audit_v4_20260917/`，要求每对pool、selected ID、初态hash、diffusion seed及初始DockQ完全一致。该实验仍使用PROTAC22开发集；多seed用于判断方向稳定性，不冒充独立holdout。
+
+结果落盘前固定的决策门槛已经按原定义执行：三组均22/22且身份审计通过，但完整系统的Final ≥0.23命中减少，且同权重的pocket条件边际在均值和胜负数上均为负，因此结论是否决pocket-only默认。不能用validation loss或完整系统相对退化control的均值提升挽救该结论。
 
 Ranking也预先固定门槛：pre-selector的selected-best/retention必须与精确随机及固定来源配额同表，但它仍只是计算分配oracle；post-ranker必须用实际native-free top-1超过固定R0/随机水平，并且提升不能只来自一个seed，才有资格进入部署协议。去冗余λ和ranking-only温度共用内部8例，只能判断机制方向，不能在该8例上挑最佳值后直接冻结；若所有配置仍无稳定`≥0.23` top-1，则本轮结论是“当前特征/监督不足”，不是选择一个数值最高的坏模型。
