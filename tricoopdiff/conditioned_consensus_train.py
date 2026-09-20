@@ -27,13 +27,14 @@ VALIDATION_SELECTION = 'full_conditions_two_sources_v1'
 LEGACY_TRAINING_CONDITION_CONTRACT = 'native_contact_roles_binary_radial_profiles_6A_dropout_v4'
 EXPANDED_TRAINING_CONDITION_CONTRACT = 'native_contact_graph_dilated_roles_binary_radial_profiles_6A_dropout_v5'
 PAIRED_ABSENT_TRAINING_CONDITION_CONTRACT = 'paired_full_absent_native_contact_binary_radial_v6'
+DISJOINT_TRAINING_CONDITION_CONTRACT = 'disjoint_pseudo_warheads_binary_geometry_v8'
+DISJOINT_PAIRED_TRAINING_CONDITION_CONTRACT = 'disjoint_pseudo_warheads_binary_geometry_paired_absent_v8'
 
 
 def training_condition_contract(role_graph_radius, paired_absent_weight=0.):
     if paired_absent_weight > 0:
-        return PAIRED_ABSENT_TRAINING_CONDITION_CONTRACT
-    return (LEGACY_TRAINING_CONDITION_CONTRACT if role_graph_radius == 0
-            else EXPANDED_TRAINING_CONDITION_CONTRACT)
+        return DISJOINT_PAIRED_TRAINING_CONDITION_CONTRACT
+    return DISJOINT_TRAINING_CONDITION_CONTRACT
 
 
 def _sha256(value):
@@ -75,7 +76,7 @@ def supervised_condition_batch(batch, *, seed, dropout=ConditionFeatureDropout()
         molecule,
         (batch['e3_data']['coords'][0], batch['poi_data']['coords'][0]),
         batch['ligand_data']['coords'][0], cutoff=cutoff,
-        role_graph_radius=role_graph_radius)
+        role_graph_radius=role_graph_radius, disjoint_roles=True)
     features, audit = dropout_condition_features(features, seed=seed, config=dropout)
     audit.update(condition_contract=training_condition_contract(role_graph_radius),
                  pocket_cutoff_angstrom=float(cutoff), role_graph_radius=role_graph_radius,
@@ -87,8 +88,8 @@ def validate_conditioned_checkpoint(payload):
     if (payload.get('format') != CHECKPOINT_FORMAT or payload.get('architecture') != ARCHITECTURE
             or payload.get('condition_contract') != CONDITION_CONTRACT
             or payload.get('training_condition_contract') not in {
-                LEGACY_TRAINING_CONDITION_CONTRACT, EXPANDED_TRAINING_CONDITION_CONTRACT,
-                PAIRED_ABSENT_TRAINING_CONDITION_CONTRACT}
+                DISJOINT_TRAINING_CONDITION_CONTRACT,
+                DISJOINT_PAIRED_TRAINING_CONDITION_CONTRACT}
             or payload.get('generative_process') != FLOW_VERSION):
         raise ValueError('unsupported conditioned consensus training checkpoint')
     if not _sha256(payload.get('parent_checkpoint_sha256')):

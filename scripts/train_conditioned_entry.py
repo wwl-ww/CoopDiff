@@ -212,8 +212,9 @@ def main(argv=None):
               'training_source_mix': 'sdpi_bitseed_1_1',
               'training_endpoint_protocol': ONLINE_TRAINING_ENDPOINT_PROTOCOL,
               'condition_supervision': (
-                  'native 6 A contacts expanded by recorded covalent graph radius '
-                  'with side-local radial profiles and complete mapped binary distances'),
+                  'disjoint pseudo-warheads from side-preferred native 6 A contacts; '
+                  'ambiguous atoms are linker; side-local radial profiles and complete '
+                  'mapped binary distances use only the corresponding end'),
               'condition_dropout': vars(condition_dropout(args)),
               'checkpoint_selection': CHECKPOINT_SELECTION}
     (output / 'config.json').write_text(json.dumps(config, indent=2) + '\n')

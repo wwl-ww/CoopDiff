@@ -15,7 +15,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'tests')]
 from test_consensus import fixture
 from tricoopdiff.condition_features import SideCondition, build_condition_features
 from tricoopdiff.conditional_consensus import (ConditionedConsensusFuse, ConditionedConsensusCoopDiff,
-                                              load_prototype_checkpoint)
+                                              SideAwareConditionFusion, load_prototype_checkpoint)
 from tricoopdiff.consensus import BRANCHES, ConsensusCoopDiff, ConsensusFuse
 from tricoopdiff.consensus_train import validate_consensus_checkpoint
 from tricoopdiff.diffusion import so3_exp
@@ -32,6 +32,29 @@ def conditions():
 def velocities(result):
     return [result['normalized_velocity'][b][c] for b in BRANCHES for c in ('tr', 'rot')] + [
         result['normalized_velocity']['torsion']]
+
+
+def test_side_aware_fusion_preserves_identity_missingness_and_linker_gradients():
+    hidden = 8
+    module = SideAwareConditionFusion(hidden)
+    encoded = {
+        'protein1': torch.randn(5, hidden), 'protein2': torch.randn(6, hidden),
+        'ligand': torch.randn(4, hidden), 'sides': torch.randn(2, hidden),
+    }
+    features = {name: value.clone() for name, value in conditions().items()}
+    features['sides'][1] = features['sides'][0]
+    features['ligand'][3, 1] = 1.
+    features['ligand'][0, 2] = 1.
+    side, linker, joint = module(encoded, features)
+    assert side.shape == (2, hidden) and linker.shape == joint.shape == (hidden,)
+    assert all(torch.count_nonzero(value) for value in (side[0], side[1], linker, joint))
+    joint.square().sum().backward()
+    assert all(parameter.grad is not None for parameter in module.parameters())
+    absent = build_condition_features(Chem.MolFromSmiles('CCON'), (5, 6))
+    absent_side, absent_linker, absent_joint = module(encoded, absent)
+    assert torch.count_nonzero(absent_side) == 0
+    assert torch.count_nonzero(absent_linker) == 0
+    assert torch.count_nonzero(absent_joint) == 0
 
 
 def test_migration_preserves_base_weights_rng_and_absent_condition_outputs():

@@ -1,5 +1,18 @@
 # PROTAC 信息建模交接
 
+## v8 side-aware linker 模型（2026-09-20）
+
+`conditioned_residual_consensus_v8_side_aware_linker` 从同一 C40 EMA 主干迁移，
+继续冻结两个 DiffDock expert。它不再把两侧条件直接平均：E3 end、POI end 和
+linker 分别汇聚，保留侧别、缺失掩码及两端乘积/差异，再生成联合条件上下文。
+侧别上下文同时注入对应蛋白节点和 warhead 原子；linker 上下文只注入 linker
+原子。联合上下文驱动 consensus gate、刚体速度和 torsion 残差。
+
+训练监督改为互斥 pseudo-warhead 合同：按原子到两侧蛋白的局部接触优势分配
+两端，模糊或 dilation 冲突区域作为 linker；本侧 pocket 和 binary distance map
+只由本侧 end 定义。这样避免旧合同中一个原子同时充当两端，以及整条配体定义
+两侧 pocket 的训练—部署错配。新 checkpoint 与 v7 不兼容，必须从 C40 重新训练。
+
 ## 分支与职责
 
 ### 当前实现更新：二元姿态参与自主生成（2026-09-17）

@@ -220,7 +220,8 @@ def _dilate_ligand_mask(molecule, mask, radius):
 
 
 def build_supervised_contact_features(molecule, protein_coords, ligand_coords, cutoff=6.,
-                                      role_graph_radius=0):
+                                      role_graph_radius=0, disjoint_roles=False,
+                                      role_margin=1.):
     """Build generic ternary pocket masks from native training coordinates.
 
     This mirrors the discrete ligand/protein pocket masks exposed by
@@ -229,7 +230,8 @@ def build_supervised_contact_features(molecule, protein_coords, ligand_coords, c
     returned. Generic ligands may contact both sides.
     """
     if (not isinstance(cutoff, (int, float)) or not 0 < cutoff < 20
-            or type(role_graph_radius) is not int or role_graph_radius < 0):
+            or type(role_graph_radius) is not int or role_graph_radius < 0
+            or not isinstance(role_margin, (int, float)) or role_margin < 0):
         raise ValueError('training pocket cutoff must be finite and in (0,20) Å')
     proteins = [torch.as_tensor(value, dtype=torch.float32).detach().cpu()
                 for value in protein_coords]
@@ -241,11 +243,28 @@ def build_supervised_contact_features(molecule, protein_coords, ligand_coords, c
         raise ValueError('native condition coordinates do not match the chemical graph/proteins')
     shapes = condition_feature_shapes([len(p) for p in proteins], len(ligand))
     result = {name: torch.zeros(shape) for name, shape in shapes.items()}
+    distances_by_side = [torch.cdist(ligand, protein) for protein in proteins]
+    roles = []
+    if disjoint_roles:
+        nearest = [distance.min(1).values for distance in distances_by_side]
+        roles = [((nearest[0] <= float(cutoff))
+                  & (nearest[0] + float(role_margin) < nearest[1])),
+                 ((nearest[1] <= float(cutoff))
+                  & (nearest[1] + float(role_margin) < nearest[0]))]
+        roles = [_dilate_ligand_mask(molecule, role, role_graph_radius) for role in roles]
+        # Dilation can meet in the linker. Ambiguous atoms stay linker rather
+        # than becoming impossible overlapping PROTAC ends.
+        overlap = roles[0] & roles[1]
+        roles = [role & ~overlap for role in roles]
     for index, protein in enumerate(proteins):
-        distances = torch.cdist(ligand, protein)
-        contacts = distances <= float(cutoff)
+        distances = distances_by_side[index]
+        all_contacts = distances <= float(cutoff)
         nearest = distances.min(1).values
-        role = _dilate_ligand_mask(molecule, contacts.any(1), role_graph_radius)
+        role = roles[index] if disjoint_roles else _dilate_ligand_mask(
+            molecule, all_contacts.any(1), role_graph_radius)
+        contacts = all_contacts & role[:, None]
+        if disjoint_roles and not role.any():
+            continue
         binary = result[f'binary{index + 1}']
         binary[0, role, :, 0] = distances[role]
         binary[0, role, :, 1] = distances[role]
@@ -276,6 +295,8 @@ def build_supervised_contact_features(molecule, protein_coords, ligand_coords, c
         result['sides'][index, 2] = float(role.any())
         result['sides'][index, 3] = 1.
         result['sides'][index, 4] = role.float().mean()
+    if disjoint_roles:
+        result['ligand'][:, 2] = (~roles[0] & ~roles[1]).float()
     result['ligand'][:, 3] = (result['ligand'][:, :3].sum(1) == 0).float()
     return result
 

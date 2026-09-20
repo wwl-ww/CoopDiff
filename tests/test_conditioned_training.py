@@ -68,10 +68,11 @@ def test_supervised_masks_are_discrete_aligned_and_coordinate_free():
     first, audit = supervised_condition_batch(batch, seed=9, dropout=dropout)
     second, _ = supervised_condition_batch(batch, seed=9, dropout=dropout)
     assert all(torch.equal(first[name], second[name]) for name in first)
-    assert first['ligand'][:, :2].tolist() == [[1., 1.], [1., 1.], [0., 0.]]
+    assert first['ligand'][:, :2].tolist() == [[1., 0.], [0., 1.], [0., 0.]]
+    assert first['ligand'][:, 2].tolist() == [0., 0., 1.]
     assert first['protein1'][:, 0].tolist() == [1., 0.]
     assert first['protein2'][:, 0].tolist() == [1., 0.]
-    assert first['ligand'][:, [7, 12]].tolist() == [[1., 1.], [1., 1.], [0., 0.]]
+    assert first['ligand'][:, [7, 12]].tolist() == [[1., 0.], [0., 1.], [0., 0.]]
     assert set(first) == {'ligand', 'protein1', 'protein2', 'sides', 'binary1', 'binary2'}
     assert not any('coord' in key for key in first)
     assert audit['native_coordinates_returned'] is False

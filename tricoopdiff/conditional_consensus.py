@@ -9,8 +9,53 @@ from .binary_geometry import BinaryGeometryEncoder, binary_torsion_directions
 from .interface_geometry import InterfaceGeometryEncoder
 
 
-ARCHITECTURE = 'conditioned_residual_consensus_v7_interface_geometry'
+ARCHITECTURE = 'conditioned_residual_consensus_v8_side_aware_linker'
 CONDITION_CONTRACT = 'protac_condition_features_v5_complete_binary_maps'
+
+
+class SideAwareConditionFusion(nn.Module):
+    """Keep E3 and POI evidence distinct before modelling linker compatibility."""
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.side = nn.ModuleList([
+            nn.Sequential(nn.Linear(3 * hidden_dim + 1, hidden_dim), nn.SiLU(),
+                          nn.Linear(hidden_dim, hidden_dim))
+            for _ in range(2)
+        ])
+        self.linker = nn.Sequential(nn.Linear(hidden_dim + 1, hidden_dim), nn.SiLU(),
+                                    nn.Linear(hidden_dim, hidden_dim))
+        self.joint = nn.Sequential(nn.Linear(5 * hidden_dim + 2, 2 * hidden_dim), nn.SiLU(),
+                                   nn.Linear(2 * hidden_dim, hidden_dim))
+
+    @staticmethod
+    def _masked_mean(nodes, mask):
+        weight = mask.to(nodes).unsqueeze(-1)
+        return (nodes * weight).sum(0) / weight.sum().clamp_min(1.)
+
+    def forward(self, encoded, features):
+        ligand = encoded['ligand']
+        side_contexts, available = [], []
+        for index, protein_name in enumerate(('protein1', 'protein2')):
+            side_available = (features['sides'][index, :3].sum() > 0).to(ligand)
+            role = features['ligand'][:, index] > 0
+            ligand_end = self._masked_mean(ligand, role)
+            protein = encoded[protein_name].mean(0)
+            inputs = torch.cat((encoded['sides'][index], protein, ligand_end,
+                                side_available.reshape(1)))
+            side_contexts.append(self.side[index](inputs) * side_available)
+            available.append(side_available)
+        linker_mask = features['ligand'][:, 2] > 0
+        linker_available = linker_mask.any().to(ligand)
+        linker = self.linker(torch.cat((self._masked_mean(ligand, linker_mask),
+                                        linker_available.reshape(1)))) * linker_available
+        left, right = side_contexts
+        availability = torch.stack(available)
+        joint = self.joint(torch.cat((left, right, linker, left * right,
+                                      (left - right).abs(), availability)))
+        # No condition must remain an exact zero path after migration.
+        joint = joint * availability.max()
+        return torch.stack(side_contexts), linker, joint
 
 
 class ConditionedConsensusFuse(ConsensusFuse):
@@ -30,6 +75,7 @@ class ConditionedConsensusFuse(ConsensusFuse):
             self.condition_gate_head = nn.Linear(self.config['node_dim'], 4, bias=False)
             self.condition_geometry = BinaryGeometryEncoder(self.config['node_dim'])
             self.condition_interface = InterfaceGeometryEncoder(self.config['node_dim'])
+            self.condition_side_fusion = SideAwareConditionFusion(self.config['node_dim'])
             self.condition_vector_head = nn.Linear(self.config['node_dim'], 32, bias=False)
             self.condition_torsion_head = nn.Linear(self.config['node_dim'], 2, bias=False)
             # Exact function-preserving migration matters more than avoiding a
@@ -77,14 +123,18 @@ class ConditionedConsensusFuse(ConsensusFuse):
         geometry_basis = torch.cat((geometry_basis, interface_basis), dim=1)
         forces = forces + interface_forces
         delta = reference.new_zeros(reference.shape[0], self.config['node_dim'])
-        summaries = [encoded['sides'].mean(0, keepdim=True)]
+        side_contexts, linker_context, joint_context = self.condition_side_fusion(encoded, values)
         for index, name in enumerate(('protein1', 'protein2', 'ligand')):
             if encoded[name].shape[0] == 0:
                 raise ValueError('conditioned consensus requires nonempty node groups')
             delta[types == index] = self.condition_node_projection(encoded[name]) * self.condition_scale
             delta[types == index] += geometry_nodes[types == index] * self.condition_scale
-            summaries.append(encoded[name].mean(0, keepdim=True))
-        raw_context = torch.stack(summaries).mean(0) + geometry_nodes.mean(0, keepdim=True)
+        for side in (0, 1):
+            delta[types == side] += side_contexts[side] * self.condition_scale
+            ligand_role = values['ligand'][:, side:side + 1]
+            delta[types == 2] += ligand_role * side_contexts[side] * self.condition_scale
+        delta[types == 2] += values['ligand'][:, 2:3] * linker_context * self.condition_scale
+        raw_context = (joint_context + geometry_nodes.mean(0)).unsqueeze(0)
         context = raw_context * self.condition_scale
         gate_bias = self.condition_gate_head(raw_context) * self.condition_scale
         coefficients = self.condition_vector_head(raw_context).reshape(1, 4, 8)
