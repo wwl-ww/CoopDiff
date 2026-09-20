@@ -23,7 +23,17 @@ from .sdpi_flow import FLOW_VERSION
 
 
 CHECKPOINT_FORMAT = 'conditioned_consensus_training_v1'
-TRAINING_CONDITION_CONTRACT = 'native_contact_masks_local_distances_6A_dropout_v3_no_provenance'
+VALIDATION_SELECTION = 'full_conditions_two_sources_v1'
+LEGACY_TRAINING_CONDITION_CONTRACT = 'native_contact_roles_binary_radial_profiles_6A_dropout_v4'
+EXPANDED_TRAINING_CONDITION_CONTRACT = 'native_contact_graph_dilated_roles_binary_radial_profiles_6A_dropout_v5'
+PAIRED_ABSENT_TRAINING_CONDITION_CONTRACT = 'paired_full_absent_native_contact_binary_radial_v6'
+
+
+def training_condition_contract(role_graph_radius, paired_absent_weight=0.):
+    if paired_absent_weight > 0:
+        return PAIRED_ABSENT_TRAINING_CONDITION_CONTRACT
+    return (LEGACY_TRAINING_CONDITION_CONTRACT if role_graph_radius == 0
+            else EXPANDED_TRAINING_CONDITION_CONTRACT)
 
 
 def _sha256(value):
@@ -53,8 +63,9 @@ def build_conditioned_model(parent_payload, frozen_expert):
         frozen_expert, conditioned, num_conv_layers=frozen_expert.num_conv_layers)
 
 
-def supervised_condition_batch(batch, *, seed, dropout=ConditionFeatureDropout(), cutoff=6.):
-    """Create training-only masks in current node order and discard native coordinates."""
+def supervised_condition_batch(batch, *, seed, dropout=ConditionFeatureDropout(), cutoff=6.,
+                               role_graph_radius=0):
+    """Create training roles and protein-local binary distances; discard coordinates."""
     if type(seed) is not int or seed < 0:
         raise ValueError('condition batch seed must be a nonnegative integer')
     molecule = Chem.Mol(batch['ligand_data']['mol'])
@@ -63,9 +74,11 @@ def supervised_condition_batch(batch, *, seed, dropout=ConditionFeatureDropout()
     features = build_supervised_contact_features(
         molecule,
         (batch['e3_data']['coords'][0], batch['poi_data']['coords'][0]),
-        batch['ligand_data']['coords'][0], cutoff=cutoff)
+        batch['ligand_data']['coords'][0], cutoff=cutoff,
+        role_graph_radius=role_graph_radius)
     features, audit = dropout_condition_features(features, seed=seed, config=dropout)
-    audit.update(condition_contract=TRAINING_CONDITION_CONTRACT, pocket_cutoff_angstrom=float(cutoff),
+    audit.update(condition_contract=training_condition_contract(role_graph_radius),
+                 pocket_cutoff_angstrom=float(cutoff), role_graph_radius=role_graph_radius,
                  case=batch.get('case', 'unknown'), source='native_training_geometry')
     return features, audit
 
@@ -73,7 +86,9 @@ def supervised_condition_batch(batch, *, seed, dropout=ConditionFeatureDropout()
 def validate_conditioned_checkpoint(payload):
     if (payload.get('format') != CHECKPOINT_FORMAT or payload.get('architecture') != ARCHITECTURE
             or payload.get('condition_contract') != CONDITION_CONTRACT
-            or payload.get('training_condition_contract') != TRAINING_CONDITION_CONTRACT
+            or payload.get('training_condition_contract') not in {
+                LEGACY_TRAINING_CONDITION_CONTRACT, EXPANDED_TRAINING_CONDITION_CONTRACT,
+                PAIRED_ABSENT_TRAINING_CONDITION_CONTRACT}
             or payload.get('generative_process') != FLOW_VERSION):
         raise ValueError('unsupported conditioned consensus training checkpoint')
     if not _sha256(payload.get('parent_checkpoint_sha256')):
@@ -83,14 +98,22 @@ def validate_conditioned_checkpoint(payload):
         if not payload.get(key):
             raise ValueError(f'conditioned checkpoint missing {key}')
     runtime = payload.get('runtime_config', {})
+    role_graph_radius = runtime.get('role_graph_radius', 0)
+    paired_absent_weight = runtime.get('paired_absent_weight', 0.)
+    if (type(role_graph_radius) is not int or role_graph_radius < 0
+            or not isinstance(paired_absent_weight, (int, float))
+            or not math.isfinite(paired_absent_weight) or paired_absent_weight < 0
+            or payload['training_condition_contract']
+            != training_condition_contract(role_graph_radius, paired_absent_weight)):
+        raise ValueError('conditioned checkpoint role expansion contract mismatch')
     for key in ('activation_clamp', 'residual_weight', 'ema_decay', 'pocket_cutoff_angstrom',
-                'condition_lr'):
+                'condition_lr', 'structure_loss_weight'):
         value = runtime.get(key)
         if not isinstance(value, (int, float)) or not math.isfinite(value):
             raise ValueError(f'invalid conditioned runtime value: {key}')
     if (runtime['activation_clamp'] <= 0 or runtime['residual_weight'] < 0
             or not 0 <= runtime['ema_decay'] < 1 or runtime['pocket_cutoff_angstrom'] != 6.
-            or runtime['condition_lr'] <= 0):
+            or runtime['condition_lr'] <= 0 or runtime['structure_loss_weight'] < 0):
         raise ValueError('invalid conditioned runtime range/contract')
     dropout = runtime.get('condition_dropout')
     if not isinstance(dropout, dict):
@@ -111,7 +134,8 @@ class ConditionedConsensusTrainer(ConsensusTrainer):
     """EMA trainer whose checkpoint cannot be loaded as an old C40/v20 model."""
 
     def __init__(self, *args, parent_checkpoint_sha256, condition_dropout=ConditionFeatureDropout(),
-                 pocket_cutoff_angstrom=6., condition_lr=1e-3, **kwargs):
+                 pocket_cutoff_angstrom=6., condition_lr=1e-3,
+                 role_graph_radius=0, paired_absent_weight=0., structure_loss_weight=.1, **kwargs):
         if not _sha256(parent_checkpoint_sha256):
             raise ValueError('record the C40 parent checkpoint SHA256')
         condition_dropout.validate()
@@ -123,6 +147,16 @@ class ConditionedConsensusTrainer(ConsensusTrainer):
         self.parent_checkpoint_sha256 = parent_checkpoint_sha256
         self.condition_dropout = condition_dropout
         self.pocket_cutoff_angstrom = float(pocket_cutoff_angstrom)
+        if type(role_graph_radius) is not int or role_graph_radius < 0:
+            raise ValueError('role graph radius must be a nonnegative integer')
+        self.role_graph_radius = role_graph_radius
+        if (not isinstance(paired_absent_weight, (int, float))
+                or not math.isfinite(paired_absent_weight) or paired_absent_weight < 0):
+            raise ValueError('paired absent weight must be finite and nonnegative')
+        self.paired_absent_weight = float(paired_absent_weight)
+        if not math.isfinite(structure_loss_weight) or structure_loss_weight < 0:
+            raise ValueError('structure loss weight must be finite and nonnegative')
+        self.structure_loss_weight = float(structure_loss_weight)
         if not isinstance(condition_lr, (int, float)) or not math.isfinite(condition_lr) or condition_lr <= 0:
             raise ValueError('condition learning rate must be finite and positive')
         self.condition_lr = float(condition_lr)
@@ -144,13 +178,48 @@ class ConditionedConsensusTrainer(ConsensusTrainer):
 
     def condition_batch(self, batch, *, seed):
         return supervised_condition_batch(
-            batch, seed=seed, dropout=self.condition_dropout, cutoff=self.pocket_cutoff_angstrom)
+            batch, seed=seed, dropout=self.condition_dropout, cutoff=self.pocket_cutoff_angstrom,
+            role_graph_radius=self.role_graph_radius)
+
+    def structure_loss(self, e3_data, ligand, poi, predictions, targets, ligand_data, conditions):
+        from .structure_velocity import structural_velocity_loss
+        e3 = e3_data['coords']
+        predicted = self.diffusion.velocities(predictions, e3, poi)
+        scale = sum(self.diffusion.scales(e3, poi)) / 2
+        return structural_velocity_loss(e3[0], ligand[0], poi[0], predicted, targets,
+                                        ligand_data, conditions, scale)
+
+    def compute_loss(self, *args, conditions=None, diagnostics=False, **kwargs):
+        """Optionally train full and absent conditions on exactly the same state."""
+        if self.paired_absent_weight == 0:
+            return super().compute_loss(
+                *args, conditions=conditions, diagnostics=diagnostics, **kwargs)
+        if conditions is None:
+            raise ValueError('paired absent training requires explicit conditions')
+        if kwargs.get('t_override') is None:
+            kwargs['t_override'] = torch.rand(1, device=self.device)
+        full = super().compute_loss(
+            *args, conditions=conditions, diagnostics=True, **kwargs)
+        absent_conditions = {name: torch.zeros_like(torch.as_tensor(value))
+                             for name, value in conditions.items()}
+        absent = super().compute_loss(
+            *args, conditions=absent_conditions, diagnostics=True, **kwargs)
+        total = full['loss_total'] + self.paired_absent_weight * absent['loss_total']
+        components = dict(full['components'])
+        components['loss_paired_absent'] = absent['loss_total']
+        if diagnostics:
+            rms = dict(full['rms'])
+            rms.update({f'paired_absent_{key}': value for key, value in absent['rms'].items()})
+            return {'loss_total': total, 'components': components, 'rms': rms}
+        return {'loss_total': total, 'loss_score': total.item(),
+                **{name: value.item() for name, value in components.items()}}
 
     def save_checkpoint(self, path, epoch=0, best_val_loss=float('inf')):
         payload = {
             'format': CHECKPOINT_FORMAT, 'architecture': ARCHITECTURE,
             'condition_contract': CONDITION_CONTRACT,
-            'training_condition_contract': TRAINING_CONDITION_CONTRACT,
+            'training_condition_contract': training_condition_contract(
+                self.role_graph_radius, self.paired_absent_weight),
             'generative_process': FLOW_VERSION,
             'parent_checkpoint_sha256': self.parent_checkpoint_sha256,
             'expert_base_identity': expert_base_identity(self.model.expert),
@@ -165,6 +234,10 @@ class ConditionedConsensusTrainer(ConsensusTrainer):
                 'training_endpoint_protocol': self.training_endpoint_protocol,
                 'parent_weight_source': 'ema_trifuse_state_dict',
                 'pocket_cutoff_angstrom': self.pocket_cutoff_angstrom,
+                'role_graph_radius': self.role_graph_radius,
+                'paired_absent_weight': self.paired_absent_weight,
+                'structure_loss_weight': self.structure_loss_weight,
+                'validation_selection': VALIDATION_SELECTION,
                 'condition_dropout': vars(self.condition_dropout),
                 'condition_lr': self.condition_lr,
                 'native_coordinates_stored_in_conditions': False,
@@ -181,7 +254,8 @@ class ConditionedConsensusTrainer(ConsensusTrainer):
         torch.save(payload, temporary)
         os.replace(temporary, path)
 
-    def load_checkpoint(self, path, *, allow_dropout_change=False):
+    def load_checkpoint(self, path, *, allow_dropout_change=False,
+                        allow_paired_absent_change=False):
         payload = torch.load(path, map_location=self.device, weights_only=False)
         validate_conditioned_checkpoint(payload)
         if payload['parent_checkpoint_sha256'] != self.parent_checkpoint_sha256:
@@ -196,13 +270,21 @@ class ConditionedConsensusTrainer(ConsensusTrainer):
             'training_endpoint_protocol': self.training_endpoint_protocol,
             'parent_weight_source': 'ema_trifuse_state_dict',
             'pocket_cutoff_angstrom': self.pocket_cutoff_angstrom,
+            'role_graph_radius': self.role_graph_radius,
+            'paired_absent_weight': self.paired_absent_weight,
+            'structure_loss_weight': self.structure_loss_weight,
+            'validation_selection': VALIDATION_SELECTION,
             'condition_dropout': vars(self.condition_dropout), 'native_coordinates_stored_in_conditions': False,
             'condition_lr': self.condition_lr,
         }
         for key, value in expected.items():
             if key == 'condition_dropout' and allow_dropout_change:
                 continue
-            if payload['runtime_config'].get(key) != value:
+            if key == 'paired_absent_weight' and allow_paired_absent_change:
+                continue
+            stored = payload['runtime_config'].get(
+                key, 0 if key in ('role_graph_radius', 'paired_absent_weight') else None)
+            if stored != value:
                 raise ValueError(f'conditioned checkpoint runtime mismatch: {key}')
         self.model.trifuse.load_state_dict(payload['trifuse_state_dict'], strict=True)
         self.ema = {name: value.clone() for name, value in payload['ema_trifuse_state_dict'].items()}

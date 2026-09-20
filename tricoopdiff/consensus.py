@@ -126,6 +126,8 @@ class ConsensusFuse(nn.Module):
         gates = torch.sigmoid(gate_logits)
         coefficients = self.residual_head(context).reshape(-1, 4, 8)
         residual = torch.einsum('bik,bkj->bij', coefficients, basis)
+        if 'condition_velocity_residual' in graph:
+            residual = residual + graph['condition_velocity_residual']
         prior = gates.unsqueeze(-1) * torch.stack(raw, 1)
         field = prior + residual
         bond_context = self.bond_context_encoder(
@@ -133,6 +135,10 @@ class ConsensusFuse(nn.Module):
             graph['lig_edge_mask'], graph['lig_mask_rotate'], context)
         tor_a, tor_b = (proposals[b]['tor'] for b in BRANCHES)
         torsion, tor_gate, tor_residual = self.torsion_coordinator(bond_context, tor_a, tor_b)
+        if 'condition_torsion_residual' in graph:
+            correction = graph['condition_torsion_residual']
+            torsion = torsion + correction
+            tor_residual = tor_residual + correction
         predictions = {
             branch: {'tr': field[:, 2 * i], 'rot': field[:, 2 * i + 1],
                      'tor': proposals[branch]['tor']}

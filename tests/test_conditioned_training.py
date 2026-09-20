@@ -38,7 +38,7 @@ class FrozenExpert(nn.Module):
         }
 
 
-def trainer(parent='a' * 64, dropout=ConditionFeatureDropout()):
+def trainer(parent='a' * 64, dropout=ConditionFeatureDropout(), paired_absent_weight=0.):
     base = ConsensusFuse(node_dim=16, input_dim=8, num_transformer_layers=1,
                          dropout=0., source_conditioning=True)
     fuse = ConditionedConsensusFuse.from_base(base)
@@ -50,6 +50,7 @@ def trainer(parent='a' * 64, dropout=ConditionFeatureDropout()):
         training_endpoint_protocol='online_bitseed_training_c1_m1_v1',
         parent_checkpoint_sha256=parent,
         condition_dropout=dropout,
+        paired_absent_weight=paired_absent_weight,
     )
 
 
@@ -70,8 +71,8 @@ def test_supervised_masks_are_discrete_aligned_and_coordinate_free():
     assert first['ligand'][:, :2].tolist() == [[1., 1.], [1., 1.], [0., 0.]]
     assert first['protein1'][:, 0].tolist() == [1., 0.]
     assert first['protein2'][:, 0].tolist() == [1., 0.]
-    assert first['ligand'][:, 6:8].tolist() == [[1., 1.], [1., 1.], [0., 0.]]
-    assert set(first) == {'ligand', 'protein1', 'protein2', 'sides'}
+    assert first['ligand'][:, [7, 12]].tolist() == [[1., 1.], [1., 1.], [0., 0.]]
+    assert set(first) == {'ligand', 'protein1', 'protein2', 'sides', 'binary1', 'binary2'}
     assert not any('coord' in key for key in first)
     assert audit['native_coordinates_returned'] is False
     assert audit['flow_state_modified'] is False
@@ -107,6 +108,15 @@ def test_conditioned_checkpoint_roundtrip_and_legacy_rejection():
             assert 'parent checkpoint mismatch' in str(error)
         else:
             raise AssertionError('wrong C40 parent identity accepted')
+        paired = trainer(paired_absent_weight=.25)
+        try:
+            paired.load_checkpoint(path)
+        except ValueError as error:
+            assert 'paired_absent_weight' in str(error)
+        else:
+            raise AssertionError('paired objective changed silently on resume')
+        paired.load_checkpoint(path, allow_paired_absent_change=True)
+        assert paired.paired_absent_weight == .25
 
 
 def test_conditioned_checkpoint_rejects_implicit_policy():

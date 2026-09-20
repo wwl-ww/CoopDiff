@@ -10,7 +10,7 @@ from rdkit import Chem
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tricoopdiff.condition_manifest import (MANIFEST_VERSION, canonical_isomeric_smiles,
-                                            load_condition_manifest)
+                                            load_binary_pose_sides, load_condition_manifest)
 
 
 def payload(molecule):
@@ -41,8 +41,8 @@ def test_manifest_builds_aligned_features_without_native_geometry():
         features, audit = load_condition_manifest(
             write(payload(molecule), directory), case='fixture', molecule=molecule,
             protein_sizes=(2, 3))
-    assert features['protein1'].shape == (2, 3)
-    assert features['protein2'].shape == (3, 3)
+    assert features['protein1'].shape == (2, 6)
+    assert features['protein2'].shape == (3, 6)
     assert features['ligand'][:, :2].tolist() == [[1., 0.], [1., 0.], [0., 1.], [0., 1.]]
     assert audit['native_ternary_geometry_read'] is False
 
@@ -63,6 +63,24 @@ def test_manifest_rejects_case_chemistry_unknown_fields_and_native_provenance():
                 pass
             else:
                 raise AssertionError(f'invalid manifest variant {index} accepted')
+
+
+def test_binary_pose_loader_returns_only_complete_local_pose_sides():
+    molecule = Chem.MolFromSmiles('CCON')
+    value = payload(molecule)
+    value['sides'][0].update(
+        provenance='experimental_binary',
+        atom_maps=[[0, 1]],
+        binary_fragment_coords=[[0., 0., 0.], [1., 0., 0.]],
+        binary_protein_coords=[[0., 1., 0.], [1., 1., 0.]],
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        sides, audit = load_binary_pose_sides(
+            write(value, directory), case='fixture', molecule=molecule,
+            protein_sizes=(2, 3))
+    assert sides[0] is not None and sides[0].atom_maps == ((0, 1),)
+    assert sides[1] is None
+    assert audit['binary_pose_sides'] == [True, False]
 
 
 if __name__ == '__main__':

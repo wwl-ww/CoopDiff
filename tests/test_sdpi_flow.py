@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tricoopdiff.diffdock_compat  # noqa: F401
 from test_initialization import ligand_input
 from tricoopdiff.sdpi_flow import SDPIFlow
+from tricoopdiff.sampler import _apply_condition_residual
 
 
 def fixture(smiles='CCCOCC', seed=12):
@@ -105,6 +106,25 @@ def test_flow_normalization_and_conditioning_agree():
     state = flow.conditioning(t, t.new_tensor([.05]), a, b)
     assert state.shape == (1, 9) and torch.isfinite(state).all()
     assert torch.allclose(state, flow.conditioning(t, t.new_tensor([.05]), a + 13, b - 8))
+
+
+def test_absent_condition_residual_is_exactly_zero():
+    velocities = {
+        branch: {component: torch.randn(2, 3) for component in ('tr', 'rot')}
+        for branch in ('e3_ligand', 'poi_ligand')
+    }
+    velocities['torsion'] = torch.randn(2, 4)
+    identical = {
+        branch: {component: value.clone() for component, value in parts.items()}
+        for branch, parts in velocities.items() if branch != 'torsion'
+    }
+    identical['torsion'] = velocities['torsion'].clone()
+    residual = _apply_condition_residual(velocities, identical, .5)
+    tensors = [residual['torsion']]
+    tensors.extend(residual[branch][component]
+                   for branch in ('e3_ligand', 'poi_ligand')
+                   for component in ('tr', 'rot'))
+    assert all(torch.count_nonzero(value) == 0 for value in tensors)
 
 
 def test_flow_loss_backward_and_shared_clock_guard():

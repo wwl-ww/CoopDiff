@@ -79,7 +79,7 @@ def test_provenance_is_audited_but_not_an_untrained_model_feature():
         for provenance in ('experimental_binary', 'template', 'docked', 'predicted')]
     assert all(torch.equal(variants[0][name], variant[name])
                for variant in variants[1:] for name in variants[0])
-    assert variants[0]['sides'].shape == (2, 4)
+    assert variants[0]['sides'].shape == (2, 5)
 
 
 def test_invalid_chemistry_unverified_provenance_and_overlapping_ends_rejected():
@@ -105,12 +105,47 @@ def test_invalid_chemistry_unverified_provenance_and_overlapping_ends_rejected()
     assert generic['ligand'][1, :2].tolist() == [1., 1.]
 
 
+def test_conservative_mcs_requires_explicit_low_confidence_audit_marker():
+    molecule = Chem.MolFromSmiles('CCO')
+    side = SideCondition(
+        provenance='template', evidence_id='fixture:mcs', confidence=.5,
+        fragment=Chem.MolFromSmiles('CC'), atom_map=(0, 1),
+        mapping_method='conservative_charge_normalized_mcs')
+    for unsafe in (side, replace(side, audit_only=True, confidence=.6)):
+        try:
+            build_condition_features(molecule, (2, 2), (unsafe, None))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('conservative MCS entered deployment without both audit gates')
+    features = build_condition_features(
+        molecule, (2, 2), (replace(side, audit_only=True), None))
+    assert features['ligand'][:, 0].tolist() == [1., 1., 0.]
+
+
 def test_symmetry_can_fix_fragment_roles_without_fixing_atom_correspondence():
     report = fragment_matches(Chem.MolFromSmiles('CCO'), Chem.MolFromSmiles('CC'))
     assert report['mapping_status'] == 'ambiguous'
     assert report['unambiguous_role_atoms'] == [0, 1]
     truncated = fragment_matches(Chem.MolFromSmiles('CCO'), Chem.MolFromSmiles('CC'), limit=1)
     assert truncated['unambiguous_role_atoms'] is None
+
+
+def test_binary_geometry_averages_all_chemical_symmetry_maps():
+    molecule = Chem.MolFromSmiles('CCO')
+    fragment = Chem.MolFromSmiles('CC')
+    maps = tuple(fragment_matches(molecule, fragment)['atom_maps'])
+    side = SideCondition(
+        provenance='experimental_binary', evidence_id='fixture:symmetric',
+        fragment=fragment, atom_maps=maps, pocket_probabilities=[1., 0.],
+        binary_fragment_coords=[[0., 0., 0.], [2., 0., 0.]],
+        binary_protein_coords=[[0., 1., 0.], [5., 0., 0.]],
+    )
+    first = build_condition_features(molecule, (2, 2), (side, None))
+    swapped = replace(side, binary_fragment_coords=list(reversed(side.binary_fragment_coords)))
+    second = build_condition_features(molecule, (2, 2), (swapped, None))
+    assert torch.allclose(first['ligand'], second['ligand'])
+    assert first['ligand'][:2, 0].tolist() == [1., 1.]
 
 
 def test_ccd_restoration_wrapper_preserves_geometry_and_does_not_enable_pose(tmp_path):
@@ -134,10 +169,26 @@ def test_native_training_contacts_make_deepternary_style_masks_without_coordinat
     assert features['protein1'][:, 0].tolist() == [1., 0.]
     assert features['protein2'][:, 0].tolist() == [1., 0.]
     assert features['ligand'][0, :2].sum() == 2, 'generic ternary contact roles may overlap'
-    assert features['ligand'][:2, 6:8].tolist() == [[1., 1.], [1., 1.]]
+    assert features['ligand'][:2, [7, 12]].tolist() == [[1., 1.], [1., 1.]]
+    assert features['protein1'].shape[1] == 6
+    assert features['ligand'].shape[1] == 14
     assert features['sides'][:, 2].tolist() == [1., 1.]
-    assert set(features) == {'ligand', 'protein1', 'protein2', 'sides'}
-    assert all(value.ndim == 2 for value in features.values())
+    assert set(features) == {'ligand', 'protein1', 'protein2', 'sides', 'binary1', 'binary2'}
+    assert features['binary1'].shape == (1, 3, 2, 3)
+    expanded = build_supervised_contact_features(
+        molecule, proteins, ligand, cutoff=6., role_graph_radius=1)
+    assert expanded['ligand'][:, 0].tolist() == [1., 1., 1.]
+    assert expanded['ligand'][:, 7].tolist() == [1., 1., 1.]
+    assert expanded['sides'][0, 4] == 1., 'role coverage must record expanded warhead proxy'
+    assert torch.equal(expanded['protein1'][:, 0], features['protein1'][:, 0]), (
+        'role expansion must not alter the physical pocket mask')
+    try:
+        build_supervised_contact_features(
+            molecule, proteins, ligand, role_graph_radius=-1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('negative training role radius accepted')
     invalid = SideCondition('training_native_supervision', 'must-not-enter-inference',
                             pocket_probabilities=[1., 0.])
     try:

@@ -31,6 +31,10 @@ def actual_candidate_source(init_mode, initialization):
         source = initialization.get("candidate_source")
     elif init_mode == "expert_anchor":
         source = "sdpi" if initialization.get("fallback") else "bitseed"
+    elif init_mode == "binary_pose":
+        source = "bitseed"  # Closest trained source class; provenance remains explicit below.
+    elif init_mode == "deepternary_pose":
+        source = "bitseed"
     else:
         raise ValueError(f"unsupported initialization mode: {init_mode}")
     if source not in SOURCE_NAMES:
@@ -67,6 +71,16 @@ def _sanitize_score(score):
     return score, had_nonfinite
 
 
+def _apply_condition_residual(full, absent, scale):
+    """Replace model velocities by the scaled condition-only residual."""
+    for branch in ('e3_ligand', 'poi_ligand'):
+        for component in ('tr', 'rot'):
+            full[branch][component] = float(scale) * (
+                full[branch][component] - absent[branch][component])
+    full['torsion'] = float(scale) * (full['torsion'] - absent['torsion'])
+    return full
+
+
 @torch.no_grad()
 def sample_single(
     model,
@@ -89,6 +103,8 @@ def sample_single(
     return_rank_features: bool = False,
     return_body_frame: bool = False,
     conditions=None,
+    condition_guidance: str = 'full',
+    condition_guidance_scale: float = 1.0,
 ) -> dict:
     """
     Run one reverse-flow trajectory (single walker) from t=1 to t=0.
@@ -108,7 +124,8 @@ def sample_single(
             E3-L parity baseline: the sampler reduces to native-style DiffDock on
             the PROTAC branch instead of running an extra ternary POI dynamics.
         init_mode: ``sdpi``, ``expert_anchor``, or a preselected native-free
-            ``fixed_candidate`` proposal used by controlled refinement audits.
+            ``binary_pose`` known-binary assembly, or a ``fixed_candidate``
+            proposal used by controlled refinement audits.
         t_anchor: must be 1.0 for the broad sdpi prior.
         velocity_transform: optional diagnostic callback applied to physical
             velocities immediately before integration. Production callers
@@ -137,6 +154,12 @@ def sample_single(
             raise ValueError(f"{name} must be a finite non-negative number")
     if velocity_transform is not None and not callable(velocity_transform):
         raise TypeError("velocity_transform must be callable or None")
+    if condition_guidance not in ('full', 'residual'):
+        raise ValueError("condition_guidance must be 'full' or 'residual'")
+    if not 0.0 <= float(condition_guidance_scale) <= 1.0:
+        raise ValueError('condition_guidance_scale must be in [0, 1]')
+    if condition_guidance == 'residual' and conditions is None:
+        raise ValueError('residual condition guidance requires conditions')
 
     # Clean templates (drop the B=1 dim).
     ligand_template = ligand_data["coords"][0].detach()  # [N_lig, 3]
@@ -144,14 +167,16 @@ def sample_single(
     e3_coords = e3_data["coords"][0].detach()            # [N_e3, 3]
 
     e3_center = e3_coords.mean(dim=0, keepdim=True)
-    if init_mode not in {"sdpi", "expert_anchor", "fixed_candidate"}:
+    if init_mode not in {"sdpi", "expert_anchor", "binary_pose", "deepternary_pose",
+                         "fixed_candidate"}:
         raise ValueError(f"unsupported initialization mode: {init_mode}")
     if t_anchor is None:
         t_anchor = 1.0
-    if init_mode != "fixed_candidate" and t_anchor != 1.0:
+    refinement_mode = init_mode in {"fixed_candidate", "binary_pose", "deepternary_pose"}
+    if not refinement_mode and t_anchor != 1.0:
         raise ValueError("broad-prior sampling requires t_anchor=1")
-    if init_mode == "fixed_candidate" and not 0.0 < float(t_anchor) <= 1.0:
-        raise ValueError("fixed-candidate refinement requires t_anchor in (0, 1]")
+    if refinement_mode and not 0.0 < float(t_anchor) <= 1.0:
+        raise ValueError("fixed/binary-pose refinement requires t_anchor in (0, 1]")
     if not isinstance(diffusion, SDPIFlow):
         raise ValueError('sampling requires SDPIFlow, not the legacy DSM process')
     if initializer.no_torsion != bool(getattr(model.expert.model, 'no_torsion', False)):
@@ -180,7 +205,7 @@ def sample_single(
 
     schedule = (
         diffusion.get_refinement_schedule(steps, t_start=t_anchor)
-        if init_mode == "fixed_candidate"
+        if refinement_mode
         else diffusion.get_inference_schedule(steps, t_start=t_anchor)
     )
     trajectory = [] if return_trajectory else None
@@ -273,6 +298,19 @@ def sample_single(
             step0_probe = None
         predicted = diffusion.normalized_predictions(out, t_tr)
         velocities = diffusion.velocities(predicted, e3_data['coords'], poi_data['coords'])
+        if condition_guidance == 'residual':
+            absent = {name: torch.zeros_like(value) for name, value in conditions.items()}
+            out_absent = model(
+                e3_data, poi_d, lig_d, t_e3l=t_tr, t_pol=t_tr,
+                r_e3_to_poi=r_e3_to_poi,
+                receptor_crop_cutoff=receptor_crop_cutoff,
+                diffusion_state=diffusion_state, source=source_index,
+                conditions=absent)
+            absent_predicted = diffusion.normalized_predictions(out_absent, t_tr)
+            absent_velocities = diffusion.velocities(
+                absent_predicted, e3_data['coords'], poi_data['coords'])
+            velocities = _apply_condition_residual(
+                velocities, absent_velocities, condition_guidance_scale)
         for branch in ('e3_ligand', 'poi_ligand'):
             velocities[branch]['tr'] = (
                 velocities[branch]['tr'] * translation_velocity_scale)
@@ -424,6 +462,8 @@ def sample_ensemble(
     rotation_velocity_scale: float = 1.0,
     return_rank_features: bool = False,
     conditions=None,
+    condition_guidance: str = 'full',
+    condition_guidance_scale: float = 1.0,
 ) -> list:
     """
     Run ``n_walkers`` independent reverse-flow trajectories.
@@ -456,6 +496,8 @@ def sample_ensemble(
                 rotation_velocity_scale=rotation_velocity_scale,
                 return_rank_features=return_rank_features,
                 conditions=conditions,
+                condition_guidance=condition_guidance,
+                condition_guidance_scale=condition_guidance_scale,
             )
         )
     return results

@@ -5,10 +5,12 @@ from torch import nn
 
 from .condition_features import ProtacConditionEncoder, condition_feature_shapes
 from .consensus import ConsensusCoopDiff, ConsensusFuse
+from .binary_geometry import BinaryGeometryEncoder, binary_torsion_directions
+from .interface_geometry import InterfaceGeometryEncoder
 
 
-ARCHITECTURE = 'conditioned_residual_consensus_v3_prototype'
-CONDITION_CONTRACT = 'protac_condition_features_v2_no_learned_provenance'
+ARCHITECTURE = 'conditioned_residual_consensus_v7_interface_geometry'
+CONDITION_CONTRACT = 'protac_condition_features_v5_complete_binary_maps'
 
 
 class ConditionedConsensusFuse(ConsensusFuse):
@@ -26,6 +28,10 @@ class ConditionedConsensusFuse(ConsensusFuse):
             self.condition_encoder = ProtacConditionEncoder(self.config['node_dim'])
             self.condition_node_projection = nn.Linear(self.config['node_dim'], self.config['node_dim'], bias=False)
             self.condition_gate_head = nn.Linear(self.config['node_dim'], 4, bias=False)
+            self.condition_geometry = BinaryGeometryEncoder(self.config['node_dim'])
+            self.condition_interface = InterfaceGeometryEncoder(self.config['node_dim'])
+            self.condition_vector_head = nn.Linear(self.config['node_dim'], 32, bias=False)
+            self.condition_torsion_head = nn.Linear(self.config['node_dim'], 2, bias=False)
             # Exact function-preserving migration matters more than avoiding a
             # one-update delay in the new encoders. Each injection path first
             # learns whether to open, then propagates gradients into its body.
@@ -54,21 +60,44 @@ class ConditionedConsensusFuse(ConsensusFuse):
         values = {}
         for name, shape in shapes.items():
             value = torch.as_tensor(conditions[name], device=reference.device, dtype=reference.dtype).detach()
+            if name in ('binary1', 'binary2'):
+                if value.ndim != 4 or not 1 <= value.shape[0] <= 4096:
+                    raise ValueError('binary geometry requires 1..4096 complete atom maps')
+                shape = (value.shape[0], *shape[1:])
             if value.shape != shape or not torch.isfinite(value).all():
                 raise ValueError(f'condition/node alignment mismatch: {name}')
             values[name] = value
         encoded = self.condition_encoder(values)
+        geometry_nodes, geometry_basis, forces = self.condition_geometry(graph, values)
+        chemical = reference.new_zeros((len(reference), self.config['node_dim']))
+        chemical[types != 2] = self.pooling.protein_feature_proj(reference[types != 2])
+        chemical[types == 2] = self.pooling.ligand_feature_encoder(reference[types == 2])
+        interface_nodes, interface_basis, interface_forces = self.condition_interface(graph, chemical)
+        geometry_nodes = geometry_nodes + interface_nodes
+        geometry_basis = torch.cat((geometry_basis, interface_basis), dim=1)
+        forces = forces + interface_forces
         delta = reference.new_zeros(reference.shape[0], self.config['node_dim'])
         summaries = [encoded['sides'].mean(0, keepdim=True)]
         for index, name in enumerate(('protein1', 'protein2', 'ligand')):
             if encoded[name].shape[0] == 0:
                 raise ValueError('conditioned consensus requires nonempty node groups')
             delta[types == index] = self.condition_node_projection(encoded[name]) * self.condition_scale
+            delta[types == index] += geometry_nodes[types == index] * self.condition_scale
             summaries.append(encoded[name].mean(0, keepdim=True))
-        raw_context = torch.stack(summaries).mean(0)
+        raw_context = torch.stack(summaries).mean(0) + geometry_nodes.mean(0, keepdim=True)
         context = raw_context * self.condition_scale
         gate_bias = self.condition_gate_head(raw_context) * self.condition_scale
-        return {**graph, 'condition_node_residual': delta}, context, gate_bias
+        coefficients = self.condition_vector_head(raw_context).reshape(1, 4, 8)
+        vector_residual = torch.einsum('bik,bkj->bij', coefficients, geometry_basis)
+        torsion_directions = binary_torsion_directions(graph, forces)
+        bonds = graph['lig_edge_index'][:, graph['lig_edge_mask']].T
+        ligand_nodes = geometry_nodes[types == 2]
+        bond_context = (ligand_nodes[bonds[:, 0]] + ligand_nodes[bonds[:, 1]]) / 2 + raw_context
+        torsion_residual = (self.condition_torsion_head(bond_context)
+                            * torsion_directions).sum(-1).unsqueeze(0)
+        return {**graph, 'condition_node_residual': delta,
+                'condition_velocity_residual': vector_residual * self.condition_scale,
+                'condition_torsion_residual': torsion_residual * self.condition_scale}, context, gate_bias
 
     def prototype_checkpoint(self, parent_sha256):
         if len(parent_sha256) != 64 or any(c not in '0123456789abcdef' for c in parent_sha256):

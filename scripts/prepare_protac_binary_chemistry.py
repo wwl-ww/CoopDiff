@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 from evaluation_common import sha256_file
 from restore_ligand_chemistry import restore_ligand
-from tricoopdiff.protac_conditions import fragment_matches, mapping_diagnostics
+from tricoopdiff.protac_conditions import chemical_role_matches, mapping_diagnostics
 
 
 def restore_side(pdb, ccd_dir, destination, full_molecule):
@@ -32,7 +32,7 @@ def restore_side(pdb, ccd_dir, destination, full_molecule):
         raise FileNotFoundError(f'explicit offline CCD missing: {ccd}')
     if destination.exists():
         raise FileExistsError('binary chemistry output already exists')
-    report = restore_ligand(pdb, ccd, destination)
+    report = restore_ligand(pdb, ccd, destination, allow_observed_subset=True)
     restored = Chem.MolFromMolFile(str(destination), removeHs=True)
     original_coords = np.asarray([deposited.GetConformer().GetAtomPosition(a.GetIdx()) for a in atoms])
     if restored is None or restored.GetNumAtoms() != len(atoms):
@@ -41,7 +41,7 @@ def restore_side(pdb, ccd_dir, destination, full_molecule):
         raise ValueError('restoration changed deposited coordinates')
     return {'restoration': report, 'restored_sdf': str(destination.resolve()),
             'restored_sha256': sha256_file(destination), 'coordinates_preserved': True,
-            'mapping': fragment_matches(full_molecule, restored),
+            'mapping': chemical_role_matches(full_molecule, restored),
             'diagnostics': mapping_diagnostics(full_molecule, restored),
             'binary_pose_provenance_verified': False, 'ready_for_conditioned_inference': False}
 
@@ -51,6 +51,8 @@ def main():
     parser.add_argument('--index', type=Path, required=True)
     parser.add_argument('--ccd-dir', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--root', type=Path, default=ROOT,
+                        help='Root used to resolve relative paths in the index')
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     entries = json.loads(args.index.read_text())['entries']
@@ -59,13 +61,13 @@ def main():
         case = entry['case']
         if case != Path(case).name or case in ('.', '..'):
             raise ValueError('unsafe case identifier')
-        ligand_path = ROOT / entry['ligand']
+        ligand_path = args.root.resolve() / entry['ligand']
         full = Chem.MolFromMolFile(str(ligand_path), removeHs=True)
         if full is None:
             raise ValueError(f'{case}: invalid full ligand chemistry')
         sides = {}
         for side in (1, 2):
-            pdb = (ROOT / entry[f'protein{side}']).parent / f'unbound_lig{side}.pdb'
+            pdb = (args.root.resolve() / entry[f'protein{side}']).parent / f'unbound_lig{side}.pdb'
             destination = args.out / case / f'fragment{side}.sdf'
             try:
                 components = {line[17:20].strip() for line in pdb.read_text().splitlines()
@@ -84,12 +86,16 @@ def main():
     rows = [side for case in cases for side in case['sides'].values()]
     summary = {'cases': len(cases), 'sides': len(rows), 'restored': sum(r['status'] == 'restored' for r in rows),
                'unresolved': sum(r['status'] != 'restored' for r in rows),
-               'strict_unique_maps': sum(r.get('mapping', {}).get('mapping_status') == 'unique' for r in rows),
-               'strict_ambiguous_maps': sum(r.get('mapping', {}).get('mapping_status') == 'ambiguous' for r in rows),
-               'strict_unmatched': sum(r.get('mapping', {}).get('mapping_status') == 'unmatched' for r in rows),
+               'unique_maps': sum(r.get('mapping', {}).get('mapping_status') == 'unique' for r in rows),
+               'ambiguous_maps': sum(r.get('mapping', {}).get('mapping_status') == 'ambiguous' for r in rows),
+               'unmatched_maps': sum(r.get('mapping', {}).get('mapping_status') == 'unmatched' for r in rows),
                'unambiguous_fragment_roles': sum(r.get('mapping', {}).get('unambiguous_role_atoms') is not None for r in rows),
+               'charge_normalized_roles': sum(r.get('mapping', {}).get('role_mapping_method') ==
+                                              'charge_normalized_exact_stereo' for r in rows),
+               'conservative_mcs_roles': sum(r.get('mapping', {}).get('role_mapping_method') ==
+                                             'conservative_charge_normalized_mcs' for r in rows),
                'ready_for_conditioned_inference': 0}
-    result = {'protocol': 'offline_binary_ccd_restoration_v1', 'summary': summary, 'cases': cases,
+    result = {'protocol': 'offline_binary_ccd_role_mapping_v2', 'summary': summary, 'cases': cases,
               'index_sha256': sha256_file(args.index), 'native_geometry_read': False,
               'ccd_sha256': ccd_signatures,
               'scope': 'chemical restoration and mapping only; binary provenance remains unverified',

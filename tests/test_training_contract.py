@@ -177,6 +177,8 @@ def test_sampler_conditions_on_actual_fallback_source():
     assert actual_candidate_source(
         'fixed_candidate', {'candidate_source': 'bitseed'},
     ) == 'bitseed'
+    assert actual_candidate_source('binary_pose', {}) == 'bitseed'
+    assert actual_candidate_source('deepternary_pose', {}) == 'bitseed'
 
 
 def test_mixed_training_relabels_ood_expert_fallback_as_sdpi():

@@ -78,6 +78,18 @@ def test_missing_atoms_are_not_invented(tmp_path):
     assert not output.exists()
 
 
+def test_explicit_subset_mode_restores_only_observed_ccd_atoms(tmp_path):
+    pdb, ccd, _ = fixture(tmp_path)
+    pdb.write_text('\n'.join(line for line in pdb.read_text().splitlines()
+                              if line[12:16].strip() != 'O2') + '\n')
+    output = tmp_path / 'observed.sdf'
+    report = restore_ligand(pdb, ccd, output, allow_observed_subset=True)
+    molecule = Chem.SDMolSupplier(str(output), removeHs=True)[0]
+    assert molecule.GetNumAtoms() == 3
+    assert report['observed_subset']
+    assert report['missing_heavy_atom_names'] == ['O2']
+
+
 def test_uppercase_ccd_halogen_symbols(tmp_path):
     pdb, ccd, _ = fixture(tmp_path)
     ccd.write_text(ccd.read_text().replace('O2 O -1', 'O2 CL 0'))

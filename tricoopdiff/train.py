@@ -179,6 +179,11 @@ class TriCoopDiffTrainer:
         if 'residual_penalty' in output:
             losses['loss_residual'] = output['residual_penalty']
             total = total + self.residual_weight * losses['loss_residual']
+        if hasattr(self, 'structure_loss'):
+            structure = self.structure_loss(e3_data, ligand, poi, predictions, targets,
+                                            ligand_data, conditions)
+            losses['loss_structure'] = structure
+            total = total + self.structure_loss_weight * structure
         if diagnostics:
             return {'loss_total': total, 'components': losses, 'rms': rms}
         return {'loss_total': total, 'loss_score': total.item(),

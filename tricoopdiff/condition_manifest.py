@@ -6,11 +6,14 @@ from pathlib import Path
 from rdkit import Chem
 
 from .condition_features import SideCondition, build_condition_features
+from .binary_pose_constraints import BinaryPoseSide
 
 
 MANIFEST_VERSION = 'protac_condition_manifest_v1'
 SIDE_FIELDS = {
     'provenance', 'evidence_id', 'confidence', 'fragment_smiles', 'atom_map',
+    'atom_maps', 'mapping_method',
+    'audit_only',
     'pocket_probabilities', 'binary_fragment_coords', 'binary_protein_coords',
 }
 
@@ -57,6 +60,9 @@ def load_condition_manifest(path, *, case, molecule, protein_sizes):
             provenance=raw.get('provenance'), evidence_id=raw.get('evidence_id'),
             confidence=raw.get('confidence', 1.), fragment=fragment,
             atom_map=tuple(raw.get('atom_map', ())),
+            atom_maps=tuple(tuple(value) for value in raw.get('atom_maps', ())),
+            mapping_method=raw.get('mapping_method', 'exact_stereo'),
+            audit_only=raw.get('audit_only', False),
             pocket_probabilities=raw.get('pocket_probabilities'),
             binary_fragment_coords=raw.get('binary_fragment_coords'),
             binary_protein_coords=raw.get('binary_protein_coords'),
@@ -72,3 +78,25 @@ def load_condition_manifest(path, *, case, molecule, protein_sizes):
         'available_sides': [side is not None for side in sides],
     }
     return features, audit
+
+
+def load_binary_pose_sides(path, *, case, molecule, protein_sizes):
+    """Load the raw local binary poses after the normal manifest validation."""
+    _, audit = load_condition_manifest(
+        path, case=case, molecule=molecule, protein_sizes=protein_sizes)
+    payload = json.loads(Path(path).read_text(encoding='utf-8'))
+    result = []
+    for raw in payload['sides']:
+        if (raw is None or raw.get('binary_fragment_coords') is None
+                or raw.get('binary_protein_coords') is None):
+            result.append(None)
+            continue
+        maps = raw.get('atom_maps')
+        if not maps and raw.get('atom_map'):
+            maps = [raw['atom_map']]
+        result.append(BinaryPoseSide(
+            protein_coords=raw['binary_protein_coords'],
+            fragment_coords=raw['binary_fragment_coords'],
+            atom_maps=tuple(tuple(value) for value in maps or ()),
+        ))
+    return tuple(result), {**audit, 'binary_pose_sides': [side is not None for side in result]}

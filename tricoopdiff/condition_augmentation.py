@@ -56,7 +56,8 @@ def dropout_condition_features(features, *, seed, config=ConditionFeatureDropout
     by interpreting an all-zero pocket as known negative.
     """
     config.validate()
-    if type(seed) is not int or seed < 0 or set(features) != {'ligand', 'protein1', 'protein2', 'sides'}:
+    if type(seed) is not int or seed < 0 or set(features) != {
+            'ligand', 'protein1', 'protein2', 'sides', 'binary1', 'binary2'}:
         raise ValueError('feature dropout requires the versioned condition fields and a nonnegative seed')
     result = {name: torch.as_tensor(value).detach().cpu().clone() for name, value in features.items()}
     if any(not torch.isfinite(value).all() for value in result.values()):
@@ -68,14 +69,17 @@ def dropout_condition_features(features, *, seed, config=ConditionFeatureDropout
     def drop_role(side):
         result['ligand'][:, side] = 0
         result['sides'][side, 0] = 0
+        result['sides'][side, 4] = 0
 
     def drop_pocket(side):
-        result[f'protein{side + 1}'].zero_()
+        result[f'protein{side + 1}'][:, :3] = 0
         result['sides'][side, 1] = 0
 
     def drop_binary(side):
-        result['ligand'][:, 4 + side] = 0
-        result['ligand'][:, 6 + side] = 0
+        result[f'binary{side + 1}'].zero_()
+        start = 4 + 5 * side
+        result['ligand'][:, start:start + 5] = 0
+        result[f'protein{side + 1}'][:, 3:6] = 0
         result['sides'][side, 2] = 0
 
     if rng.random() < config.drop_all_probability:

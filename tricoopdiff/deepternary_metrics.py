@@ -2,6 +2,7 @@
 
 import sys
 import tempfile
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import numpy as np
@@ -70,6 +71,28 @@ def _featurized_ca_coords(path):
     return get_coords(pr.parsePDB(str(path)))[:, 1, :]
 
 
+def _featurized_ca_sequence(path):
+    """Return residue names in the same order as DiffDock C-alpha nodes."""
+    import prody as pr
+
+    structure = pr.parsePDB(str(path))
+    resindices = sorted(set(structure.ca.getResindices()))
+    return tuple(structure.select(f'resindex {index}').getResnames()[0]
+                 for index in resindices)
+
+
+def _sequence_correspondence(source_path, target_path):
+    """Match homologous C-alpha rows without assuming equal residue ranges."""
+    source = _featurized_ca_sequence(source_path)
+    target = _featurized_ca_sequence(target_path)
+    blocks = SequenceMatcher(a=source, b=target, autojunk=False).get_matching_blocks()
+    pairs = [(block.a + offset, block.b + offset)
+             for block in blocks for offset in range(block.size)]
+    if len(pairs) < 3:
+        raise ValueError(f'cannot align protein templates: only {len(pairs)} residues match')
+    return tuple(zip(*pairs))
+
+
 def _fit_rigid(source, target):
     """Return row-vector transform ``source @ R + t == target``."""
     if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
@@ -117,23 +140,35 @@ def compute_fullatom_dockq(
     p1_ca = _featurized_ca_coords(protein1_pdb)
     p2_ca = _featurized_ca_coords(protein2_pdb)
 
-    # Move TriCoopDiff's shared E3 frame back into the original PDB frame.
-    frame_r, frame_t = _fit_rigid(np.asarray(featurized_e3_ca), p1_ca)
-    pred_ligand_pdb = np.asarray(pred_ligand) @ frame_r + frame_t
-    pred_poi_ca_pdb = np.asarray(pred_poi_ca) @ frame_r + frame_t
-
-    # TriCoopDiff predicts POI as a rigid body at Cα level. Apply that fitted
-    # rigid transform to every protein2 atom before invoking full-atom DockQ.
-    poi_r, poi_t = _fit_rigid(p2_ca, pred_poi_ca_pdb)
-    pred_p2_atoms = p2_atoms @ poi_r + poi_t
     if (metric_protein1_pdb is None) != (metric_protein2_pdb is None):
         raise ValueError('provide both metric protein templates or neither')
     if metric_protein1_pdb is not None:
-        # DeepTernary predict_one_unbound applies the predicted rigid motion
-        # of the unbound receptor to its prealigned bound all-atom template.
-        # Templates are used for scoring only, never as neural-model inputs.
+        # DeepTernary scores in the bound protein1 frame. TriCoopDiff predicts
+        # in the independently supplied unbound protein1 frame, so align those
+        # frames through sequence-corresponding C-alpha atoms. These templates
+        # are used after inference only and never enter the neural model.
         p1_lines, _, _ = _records(metric_protein1_pdb, 'ATOM')
         p2_lines, p2_indices, p2_atoms = _records(metric_protein2_pdb, 'ATOM')
+        metric_p1_ca = _featurized_ca_coords(metric_protein1_pdb)
+        source_rows, metric_rows = _sequence_correspondence(
+            protein1_pdb, metric_protein1_pdb)
+        frame_r, frame_t = _fit_rigid(
+            np.asarray(featurized_e3_ca)[list(source_rows)],
+            metric_p1_ca[list(metric_rows)])
+        pred_ligand_pdb = np.asarray(pred_ligand) @ frame_r + frame_t
+        pred_poi_ca_pdb = np.asarray(pred_poi_ca) @ frame_r + frame_t
+        metric_p2_ca = _featurized_ca_coords(metric_protein2_pdb)
+        source_rows, metric_rows = _sequence_correspondence(
+            protein2_pdb, metric_protein2_pdb)
+        poi_r, poi_t = _fit_rigid(
+            metric_p2_ca[list(metric_rows)], pred_poi_ca_pdb[list(source_rows)])
+        pred_p2_atoms = p2_atoms @ poi_r + poi_t
+    else:
+        # Legacy indexes use their input templates directly for scoring.
+        frame_r, frame_t = _fit_rigid(np.asarray(featurized_e3_ca), p1_ca)
+        pred_ligand_pdb = np.asarray(pred_ligand) @ frame_r + frame_t
+        pred_poi_ca_pdb = np.asarray(pred_poi_ca) @ frame_r + frame_t
+        poi_r, poi_t = _fit_rigid(p2_ca, pred_poi_ca_pdb)
         pred_p2_atoms = p2_atoms @ poi_r + poi_t
     p2_pred_lines = _replace_coords(p2_lines, p2_indices, pred_p2_atoms)
     p1_chain = next(line[21] for line in p1_lines if line.startswith("ATOM"))

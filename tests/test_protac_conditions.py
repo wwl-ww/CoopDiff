@@ -7,7 +7,9 @@ import numpy as np
 from rdkit import Chem
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tricoopdiff.protac_conditions import attachment_bonds, fragment_matches, local_pocket, mapping_diagnostics
+from tricoopdiff.protac_conditions import (attachment_bonds, chemical_role_matches,
+                                           fragment_matches, local_pocket,
+                                           mapping_diagnostics)
 
 
 def test_fragment_atom_permutation_preserves_equivalent_mappings():
@@ -41,3 +43,18 @@ def test_relaxed_chemistry_is_diagnostic_not_a_valid_mapping():
     assert fragment_matches(aromatic, saturated)['mapping_status'] == 'unmatched'
     unrelated = mapping_diagnostics(aromatic, Chem.MolFromSmiles('C1CCNCC1'))
     assert not unrelated['element_connectivity_match']
+
+
+def test_role_mapping_handles_charge_and_caps_without_coordinates():
+    full = Chem.MolFromSmiles('CCNCC(=O)O')
+    charged = Chem.MolFromSmiles('C[NH2+]CC(=O)O')
+    charge = chemical_role_matches(full, charged, minimum_atoms=4)
+    assert charge['role_mapping_method'] == 'charge_normalized_exact_stereo'
+    assert charge['unambiguous_role_atoms'] == [1, 2, 3, 4, 5, 6]
+    capped = Chem.MolFromSmiles('OC(=O)CNCCCl')
+    common = chemical_role_matches(full, capped, minimum_atoms=5, minimum_coverage=.6)
+    assert common['role_mapping_method'] == 'conservative_charge_normalized_mcs'
+    assert common['unambiguous_role_atoms'] is not None
+    assert common['fragment_coverage'] >= .6
+    rejected = chemical_role_matches(full, Chem.MolFromSmiles('c1ccccc1'), minimum_atoms=5)
+    assert rejected['role_mapping_method'] == 'unresolved'

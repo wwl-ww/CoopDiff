@@ -14,7 +14,7 @@ from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 from rdkit import Chem
 
 
-def restore_ligand(pdb_path, ccd_path, destination):
+def restore_ligand(pdb_path, ccd_path, destination, *, allow_observed_subset=False):
     pdb_path, ccd_path, destination = map(Path, (pdb_path, ccd_path, destination))
     deposited = Chem.MolFromPDBFile(str(pdb_path), sanitize=False,
                                    removeHs=False, proximityBonding=False)
@@ -50,10 +50,11 @@ def restore_ligand(pdb_path, ccd_path, destination):
             names[index] = next(iter(aliases[name]))
     if len(set(names)) != len(names):
         raise ValueError('CCD aliases map multiple deposited atoms to one atom')
-    if set(names) != set(definition):
+    missing = sorted(set(definition) - set(names))
+    extra = sorted(set(names) - set(definition))
+    if extra or (missing and not allow_observed_subset):
         raise ValueError(f'incomplete or modified component: missing '
-                         f'{sorted(set(definition) - set(names))}; extra '
-                         f'{sorted(set(names) - set(definition))}')
+                         f'{missing}; extra {extra}')
     molecule = Chem.RWMol()
     positions = Chem.Conformer(len(atoms))
     positions.Set3D(True)
@@ -76,10 +77,13 @@ def restore_ligand(pdb_path, ccd_path, destination):
     for left, right, order in zip(ccd.get('_chem_comp_bond.atom_id_1', []),
                                   ccd.get('_chem_comp_bond.atom_id_2', []),
                                   ccd.get('_chem_comp_bond.value_order', [])):
-        if any(name not in lookup and name not in hydrogen_names for name in (left, right)):
+        if any(name not in lookup and name not in hydrogen_names
+               and name not in definition for name in (left, right)):
             raise ValueError(f'CCD bond references an undefined atom: {left}, {right}')
         if left in hydrogen_names or right in hydrogen_names:
             continue  # Explicit CCD hydrogens are omitted from the heavy graph.
+        if left not in lookup or right not in lookup:
+            continue  # Explicit subset mode retains only observed heavy atoms and bonds.
         if order not in types:
             raise ValueError(f'unsupported CCD bond order: {order}')
         molecule.AddBond(lookup[left], lookup[right], types[order])
@@ -102,6 +106,7 @@ def restore_ligand(pdb_path, ccd_path, destination):
         'formal_charge': Chem.GetFormalCharge(molecule),
         'aromatic_atoms': sum(a.GetIsAromatic() for a in molecule.GetAtoms()),
         'smiles': Chem.MolToSmiles(molecule),
+        'observed_subset': bool(missing), 'missing_heavy_atom_names': missing,
     }
     molecule.SetProp('chemistry_provenance', json.dumps(report, sort_keys=True))
     destination.parent.mkdir(parents=True, exist_ok=True)
