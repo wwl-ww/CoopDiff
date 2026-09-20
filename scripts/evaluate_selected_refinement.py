@@ -704,7 +704,7 @@ def main():
             leaderboards[name][stage] = summarize(values, "value")
         top1_rows = [report['arms'][name]['native_free_top1']
                      for report in case_reports if name in report['arms']
-                     and report['arms'][name]['native_free_top1'] is not None]
+                     and report['arms'][name].get('native_free_top1') is not None]
         leaderboards[name]['native_free_top1'] = {
             stage: summarize(top1_rows, f'{stage}_dockq')
             for stage in ('initial', 'refined', 'safe')
