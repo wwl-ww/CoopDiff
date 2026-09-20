@@ -1,6 +1,139 @@
 # 当前工作与交接
 
+## 当前主线：完成自主模型的二元几何连接（2026-09-17）
+
+### 夜间双卡队列（已完成）
+
+用户明确授权的两张卡后台串行任务于2026-09-17 17:28 UTC启动；两条队列
+均提前完成全部160轮和四次采样检查，分别运行6.68与7.23小时，未跑满预估的
+十小时。根目录为`results/protac_v7_overnight_20260917/`。
+GPU0 seed7315从封存的epoch7权重恢复；GPU1 seed8426从C40父模型独立训练。
+两卡均完成40/80/120/160轮及其独立SDPI/BiTSeed采样检查。
+没有DeepTernary预测/精修、条件消融或额外并发GPU任务。
+每轮保存checkpoint；截止时终止当前子任务，保留最后完整轮次，不伪造final完成标记。
+实际进度见各卡目录`status.json`、`train_to_epoch40.log`及后续阶段日志。
+原前台会话在第8轮中途结束，旧日志保留到global_step4531；最新完整checkpoint
+是epoch7/global_step4109，已复制为夜间目录`resume_epoch7.pt`，第8轮重新计算。
+旧checkpoint不保存RNG状态，因此这是优化器/EMA续训，不宣称逐位连续重放。
+训练仍使用原封存runtime和原数据划分；队列脚本也封存到夜间根目录。
+两条训练记录均连续到global_step93920，最终权重有限，全部子任务exit=0。
+seed7315真实最优为epoch77/loss2.71031，seed8426为epoch41/loss2.73142；已固化到
+`results/protac_v7_selected_20260920/`。分段续训的旧best_model传递缺陷已修复；
+历史目录中的best_model不可代替上述编号checkpoint。
+
+2026-09-20已用seed7315/epoch77启动自主PROTAC22结构评估。22例分片到GPU0--4，
+固定256候选、native-free geometry selector取64、20步精修；结果目录为
+`results/protac_v7_epoch77_geometry_top1_eval_20260920_shard{0..4}/`。
+逐例同时记录selector实际top-1与case-best oracle，二者不可互换。
+
+### 原前台运行记录（已中断，勿当作正在运行）
+
+v7全量前台训练原输出 `results/protac_v7_full_training_20260917/run/`；
+同目录上级的 `runtime/` 封存源码，`preparation.json`记录源码/索引指纹。
+训练集保持6834条/587簇不变；原验证集与训练共享83个PDB，因此按整簇排除后
+使用112条/46簇，当前PDB交集为零。该验证集仍属于内部开发集，不能抹去
+父模型曾使用历史验证集的事实。40轮、seed7315、冻结DiffDock、C40 EMA父权重，
+结构损失权重0.1、完整条件下SDPI/BiTSeed两来源平均loss选择checkpoint。
+不再默认运行六格条件对照；缺失条件增强保留，pocket-only特殊增强概率为0。
+完整训练必须核验final_model.pt及对应轮次/步数；夜间续训的日志从恢复轮次开始，
+不能套用原非resume审计的“日志必须从第1步开始”假设。
+前七轮完整条件验证均值依次为4.2745、3.8264、3.5105、3.4256、3.3750、
+3.3258、3.2718。第五轮checkpoint原始/EMA权重均有限；condition优化器组33个
+参数张量均有状态和非零梯度二阶矩。
+这些是内部loss，不是结构精度结论。
+只读验收入口：`python scripts/audit_conditioned_training_run.py --run-root
+results/protac_v7_full_training_20260917 --in-progress`；完成后去掉`--in-progress`，
+只适用于原非resume运行，不适用于夜间续训。该工具的5项防误报检查已通过。
+工作树评估输出补充native_metric_oracle和model_top1_available=false标记；
+conditioned入口终端摘要明确称dockq_oracle_best，不再含混展示best。
+这是训练启动后的报告标注变更，未修改封存runtime；候选排序top-1需独立报告。
+
+用户明确要求优先完成模型/模块。主线已回到自身 SDPI/BiTSeed 生成。
+新增 `tricoopdiff/binary_geometry.py`，保留逐配体原子—蛋白节点的完整映射距离，
+每步由当前构象重算误差；化学键消息传递把端点信息传给 linker。
+新增可学习刚体方向/力矩输出，以及依据实际旋转键和 moving-atom mask 的
+双侧共享 torsion 约束投影。条件构建、缺失增强、训练、manifest 与采样均接通。
+架构为 `conditioned_residual_consensus_v7_interface_geometry`，旧 radial/v5/v6
+checkpoint 不能直接加载为新模型；从冻结专家/C父模型迁移并重新训练。
+
+前台 GPU0 实现验收已完成：`results/binary_pair_geometry_build_smoke_20260917/`
+包含2轮、2训练簇/1验证簇的训练及 checkpoint。`independent_sampling_6HAY.json`
+记录 SDPI 与真正 BiTSeed（无 fallback）各20步的有限坐标完整轨迹检查。
+5T35 的两次 BiTSeed尝试触发碰撞回退，仅算 fallback 路径通过，不冒充BiTSeed成功。
+以上v5记录只验证实现，不报告准确率。v6已用完整合法映射选择替代独立距离区间，
+并修正torsion轴方向、扣除采样器Kabsch去掉的整体运动。新增结构velocity损失，
+按相同flow目标监督笛卡尔运动与本侧二元距离变化率，权重写入checkpoint。
+v6真实数据两轮训练位于 `results/binary_map_structure_build_smoke_20260917/`。
+74项相关检查通过，其中包含与真实采样步的有限差分比较；尚未进行完整训练。
+
+v7增加 `interface_geometry.py`，复用化学特征编码，直接读取三个当前界面的
+近邻与粗粒度碰撞信息，输出节点消息、刚体方向以及共享torsion所需的配体作用。
+接口损失同步加入三个界面的距离变化率监督，不使用真实界面作为模型输入。
+`results/interface_geometry_build_smoke_20260917/` 已完成4训练簇/2验证簇、
+2轮前台GPU0训练，76项相关检查通过。该通道工作在蛋白Cα分辨率，不宣称
+全原子排斥或消除全部碰撞；新模型尚未完成全量训练。条件可用性改变会改变
+结构loss项，不能把full/absent损失差当作结构精度增益。
+
+
 更新：2026-09-17。这里记录当前执行状态及仍影响复现边界的历史结果；退役编排器不再作为当前入口。
+
+## PROTAC 二元先验 v3
+
+本分支已把 DeepTernary 使用的端点角色与本侧二元姿态接入新的条件合同。CCD 裁剪恢复与分级化学映射在 PROTAC22 上覆盖 44/44 侧；34 侧角色集合明确。部署生成器只接纳严格或仅质子化差异的 27 侧，形成 7 个双侧完整 case；保守 MCS 的 4 个额外双侧 case 仅作审计。条件张量新增 ligand/protein 双向径向距离轮廓，并对全部合法对称映射平均，架构版本升级为 `conditioned_residual_consensus_v4_binary_radial_profile`。旧条件权重不兼容，尚未产生新结构成绩，不能声称已超过 DeepTernary。下一门槛是 correct/absent/side-swap/wrong-pair 配对机制实验，再进行多 seed 训练和独立 holdout。
+
+真实资产位于 `results/protac_binary_conditions_v3_20260917/`；1-cluster GPU smoke 已通过训练、六格验证和 checkpoint 往返。首个完整 seed 7421 正在物理 GPU4 前台运行，封存 runtime 和独立 hard-link cache 位于 `results/protac_binary_radial_seed7421_v1_20260917/`；按当前执行约束没有 tmux 或后台 evaluation queue。训练完成后再前台串行运行 correct/absent 的 PROTAC22 配对评估。这是开发集机制实验，完成前无效果结论。
+
+已加入 native-free `binary_pose` 初始化：每侧二元蛋白与 warhead pose 经化学原子映射组装，固定两端后只松弛 linker，并按蛋白/配体碰撞选择 ETKDG 候选。5T35 的 128-candidate smoke 保持两端拟合误差约 `2e-7 A`，三类严重碰撞计数均为 0（最小 E3-POI/E3-ligand/POI-ligand 距离为 4.21/3.51/3.41 A）。这是候选可行性证据，不是 holdout 精度结论。
+
+精确 DeepTernary DockQ 桥已保留索引中的 bound 评分模板，并通过序列对应把 unbound 模型框架映射到 bound protein1 框架；native 重建正对照 DockQ 为 0.9997。对无碰撞候选加入跨蛋白 8 A 接触先验后，5T35 单 walker/单步 smoke 的精确 DockQ 从 0.0258 提高到 0.0616，PROTAC RMSD 从 4.32 A 降至 3.35 A。该提升说明紧凑界面先验有用，但仍远未形成最终排序器，且不能用单个开发 case 调参后声称泛化。
+
+新增 `deepternary_pose` 初始化源，可将 DeepTernary 官方 checkpoint 的预测刚体映射到当前 E3 frame，再由条件 TriCoopDiff 做截断精修。官方模型在清理非氨基酸 `CAS` 记录后成功前台复现；5T35 seed0 原始精确 DockQ 为 0.4838。条件模型 epoch10、`t_anchor=0.05`、单步精修得到 0.5069，配对 absent 条件为 0.4867；完整条件相对 absent 增益 0.0202，相对 DeepTernary 原始输出增益 0.0231。五步同起点为 0.5012。该单例证明组合路径和条件机制可行，但 PROTAC22 多 case/多 seed 完成前不得宣称总体超过 DeepTernary。
+
+为避免基础扩散破坏强初态，另加 `condition_guidance=residual`，只施加同状态下 `full - absent` 的速度。必须在同一 bound-template 重建口径下比较：7 个双侧高置信 case 的零更新均值为 0.38465，条件残差精修为 0.39301，平均增益 0.00835，5/7 例为正；直接评分用户版 DeepTernary unbound PDB 的均值 0.38312 不作为该配对分母。样本高度同源且仅 seed0/epoch10，因此这是开发机制结果，不是独立 benchmark 胜出结论。
+
+同一协议的 epoch20 检查进一步提升到均值 0.40611，相对零更新平均 `+0.02145`，7/7 例为正；逐例增益范围 `+0.00815` 至 `+0.04074`。这支持条件残差随训练增强，但仍是同源 7-case、DeepTernary seed0 开发审计；下一步必须提高 DeepTernary seed 数并固定其官方 surrogate top-1，再做多 seed/最终 checkpoint 复评。
+
+已完成每例 4 个 DeepTernary seed，并严格按其官方 `pred_p2_rmsd` surrogate 选择 top-1；epoch20 条件残差在相同 top-1、相同 bound-template 重建口径下把 DockQ 均值从 0.38713 提高到 0.40443，平均增益 `+0.01730`，6/7 例为正。逐例增益为 5T35 `-0.00120`、6HAX-B `+0.04928`、6HAX-F `+0.00038`、6HAY-B `+0.00974`、6HAY-F `+0.01031`、6HR2-B `+0.01776`、6HR2-F `+0.03484`。DeepTernary surrogate top-1 在部分样例并非 DockQ 最优，因此下一步需保存全部 seed 的真实 DockQ，并分别报告“官方 surrogate 选择”与“DockQ oracle”上界；当前仍不可外推为独立 benchmark 胜出。
+
+28 个原始候选的直接 DockQ 审计显示，官方 surrogate top-1 均值为 0.38021，四种子 DockQ oracle 为 0.43091，且仅 5/7 例选择一致；最大失配是 6HAX-F（官方 seed2 为 0.1150，seed3 为 0.3957）。对各例 oracle 候选采用同一重建口径后，epoch20 residual 将均值从 0.43416 提高到 0.45513，平均 `+0.02097`，7/7 例为正。该 oracle 只用于拆解“候选质量/排序/精修”三类瓶颈，不能作为可部署成绩；可部署路径仍需学习 native-free ranker。
+
+一个不落权重的 28-candidate 可行性审计表明，按 case 留一的强正则线性模型仅使用 surrogate、clash 和预测结构接触几何时可得到约 0.4098 的选择均值，高于官方单 surrogate 的 0.3802；E3--ligand 最小距离与 DockQ 的 Spearman 相关约为 -0.575。样本量过小且正则选择未做嵌套验证，不能作为正式 ranker 成绩；它只支持下一步在更大、按复合物分组的数据上训练 native-free selector。
+
+epoch25 虽将六格验证 selection loss 从 epoch20 的 2.93148 降到 2.92468，但官方四种子 surrogate top-1 的结构均值为 0.40222，相对 zero 为 `+0.01509`（6/7 正），低于 epoch20 的 0.40443 / `+0.01730`。因此当前结构选择仍保留 epoch20；不得只依据训练/验证 loss 更新部署 checkpoint。
+
+epoch20 单步 residual 的固定全局 `t_anchor` 扫描已覆盖 0.025--0.50。均值在 0.30 达峰：0.49714，相对同口径 zero 0.38713 为 `+0.11001`（6/7 正，最差仅 -0.00214）；0.40 降至 0.48439，0.50 明显崩落至 0.39604，确认峰值已被括住。若强调全例非负，0.15 为当前保守点（0.44813，平均 `+0.06099`，7/7 正）。该步长是在这 7 个同源开发 case 上选择，必须在冻结的独立 case 上验证后才能作为部署默认值。
+
+`t_anchor=0.30` 已扩展到全部 7x4 个 DeepTernary 候选：28 个精修结果总体均值为 0.47357，每例精修后 DockQ oracle 均值为 0.58921，而官方 surrogate top-1 精修均值为 0.49714，尚有约 0.092 的排序空间。按 case 留一、强正则的 native-free 线性几何可行性审计得到 0.56037，但仍只有 7 组且正则选择未嵌套，不能当正式泛化成绩。checkpoint 轨迹在相同步长下为 epoch20 0.49714、epoch30 0.42755、epoch35 0.35420，显示后期权重结构性退化；当前保持 epoch20。
+
+候选标签现已按冻结的 epoch20/`t_anchor=0.30`/5-step 协议扩展到所有高置信 exact manifest：20 case、80 个 DeepTernary 候选，其中 7 个双侧、13 个单侧。严格按 PDB ID 整组留出的 nested LOOCV（同一晶体的不同链向绝不跨 fold）显示线性 native-free ranker 均值 0.39161，低于官方 surrogate 的 0.43300，oracle 为 0.54733；此前 7-case 的正面结果属于小样本乐观估计，ranker 不可部署，当前仍保留官方选择。数据集和审计分别位于 `results/deepternary_selector_dataset_exact20_seed4_epoch20_t0300_steps5_20260917.json` 与 `results/deepternary_selector_nested_pdb_loocv_exact20_steps5_20260917.json`。
+
+同一批 20 case 的官方候选完成 exact-condition/absent 配对：无条件 5-step 精修均值 0.35961，精确 PROTAC 条件均值 0.43300，平均提升 `+0.07339`，13/20 为正。7 个双侧开发 case 平均提升 `+0.14707`；13 个单侧 case 从 0.34479 提至 0.38273（`+0.03794`，8/13 正），但 6SIS-D 为 `-0.09805`、6W7O-D 为 `-0.01982`。结论是双侧 exact 证据可保持满强度，单侧证据需要独立验证的置信度门控，不能仅凭平均值强制 scale=1。
+
+单侧 exact 的固定 `condition_guidance_scale=0.5` 审计均值为 0.36349，相对 absent 提升 `+0.01871`（7/13 正），最坏负迁移由 scale=1 的 `-0.09805` 收缩至 `-0.05342`；但平均收益少于 scale=1 的一半。因而暂时保留两个明确口径：均值导向 scale=1、风险导向 scale=0.5，均不得在独立 PDB 验证前固化为部署默认值。
+
+冻结协议在未参与 `t_anchor`/步数选择的 9 个新增 exact-unilateral case 上从 0.35181 提至 0.38274（`+0.03094`，6/9 正）；精确 sign-flip 单侧检验 `p=0.178`、bootstrap 95% 区间约 `[-0.0228, 0.0928]`，方向为正但样本量不足以宣称独立显著胜出。所有 13 个单侧 manifest 都只提供 side-1，故负迁移不是 side 编码反转。
+
+6SIS 同 PDB 正/负链向完成条件消融。D 链向的 absent/role-only/role+pocket/full DockQ 为 `0.7136/0.6813/0.6713/0.6155`，H 链向为 `0.2636/0.2672/0.3988/0.4739`：binary geometry 在 H 上强力纠错，却在已经很好的 D 初态上过度修正。对称 atom-map 的原子集合完全一致，排除了 warhead 扩散 bug；native-free binary/DeepTernary radial 一致性与收益相关仅 `r=-0.33`，按 PDB 留出的 ridge gate 也未超过始终使用 full residual，因此不部署小样本 gate。训练目前用 6 Å contact atoms 充当 ligand role，而部署 role 是完整 warhead（33--39 atoms），这是下一版需显式修复并重训的语义错配。
+
+已实现带 checkpoint 契约的实验性 contact-role 化学键扩展（`--condition-role-graph-radius`），旧 v4 权重严格解释为 radius=0。启动重训前在64个真实训练 case/128侧审计：radius 0/1/2 的 role 覆盖中位数分别约 0.457/0.589/0.730，覆盖超过80%的比例为17%/32%/44%；而部署单侧 warhead 常约43%--49%。radius=2 会把大量小分子近乎全部标为 warhead，故默认保持0且不启动该重训；语义错配需要更有约束的片段代理，而非无条件图膨胀。
+
+6SIS 的固定 `t_anchor=0.30` 步数轨迹排除了“只是积分过久”：D 的 absent 为0.7136，1/2/3/4/5步为0.6078/0.6130/0.6146/0.6153/0.6155，第一步方向即有害；H 的 absent 为0.2636，1/2/3/4/5步为0.4784/0.4767/0.4753/0.4745/0.4739，第一步方向即强力有益。early stopping无法区分两者；下一版训练应在同一状态成对约束 full/absent 前向，使部署使用的 `full-absent` 残差得到直接校准，而不是继续调积分步数。
+
+paired full/absent objective 已实现为显式 v6 checkpoint 契约，并带受控的旧权重迁移开关。零初始化条件分支的5-epoch 试验几乎不移动姿态（6SIS-D/H为0.7136/0.2636），说明 EMA=0.999 下短训不足；随后从成熟 epoch20 权重续训1 epoch，六格loss中full优于absent，但结构D/H为0.6103/0.4758，相比原epoch20的0.6155/0.4739没有解决方向冲突，故不扩展该训练。外部160-case初态几何质量模型迁移到20个PROTAC官方候选后，预测质量与原始DockQ相关仅`r=0.04`，同样不能作为raw/refined安全gate。官方surrogate、binary一致性、内部ridge和外部质量模型四类native-free gate均未通过，当前部署保持官方DeepTernary候选 + 固定epoch20 residual，不引入拟合gate。
+
+已新增生产入口 `scripts/refine_deepternary_official.py`：只按 DeepTernary 模型输出 `pred_p2_rmsd` 选 top-1 seed（平局按seed稳定决策），强制预测文件位于对应case目录，并固定单walker、residual、默认`t_anchor=0.30`/5步；7KHH集成烟测严格复现0.02885113。统一增益由 `scripts/audit_deepternary_refinement_gain.py` 重算：20例4-seed模型top-1从0.359609→0.432999，平均`+0.073390`，13正/7负。这里不是DockQ oracle，但也不是DeepTernary默认40-seed PROTAC协议，故不得称为其论文/默认top-1；该报告只是开发审计。
+
+40 epoch 前台训练已自然完成；epoch40 六格 validation loss 降至 2.90657，但相同 DeepTernary-prior 协议的结构均值进一步降至 0.34987。最终 checkpoint 轨迹为 epoch20/30/35/40 = 0.49714/0.42755/0.35420/0.34987，明确证明现有 velocity-loss `best_model.pt` 与目标局部精修质量失配。正式训练应使用与训练 case 隔离的 prior-refinement 验证集做 checkpoint 选择；本轮开发审计继续固定 epoch20，不能把 epoch40 或 loss-best 当部署权重。
+
+epoch20、`t_anchor=0.30` 的积分步数审计表明增益并非单步 Euler 偶然：固定官方 top-1 时，1/3/5 步均值依次为 0.49714/0.51744/0.52635，相对 zero 为 `+0.11001/+0.13031/+0.13922`。3 步为 6/7 正，5 步为 5/7 正，但两项负值均不足 0.002；5 步给出当前最高固定协议均值。步数同样由开发集选择，独立验证前不得宣称最终 benchmark。
+
+10 步收敛检查均值回落到 0.51881（相对 zero `+0.13168`），因此当前开发协议锁定 5 步，而不是继续增加计算量。`deepternary_pose` 的 CLI 与 runner 现在都要求显式 `t_anchor`，防止缺省为 1.0 后把强先验当全噪声重采样；对应回归测试已通过。
+
+另建立了显式 `deployment_eligible=false` 的 conservative-MCS audit manifest：部分 MCS 只编码有证据的诱导子图，必须同时带 `audit_only=true` 且 confidence <= 0.5；普通部署加载仍拒绝该映射。它新增 4 个未参与协议选择的双侧 case。冻结 epoch20/`t_anchor=0.30`/5-step 后，四例均值从 0.32900 提至 0.38800，但仅 1/4 正：5T35-H `+0.26669`，6W7O `-0.00022`，7JTO `-0.01645`，7Q2J `-0.01401`。因此低置信 MCS 不可按 exact 条件强度部署；下一步应实现由证据置信度控制的 residual guidance scale，并用这四例验证风险收缩。
+
+已实现显式 `condition_guidance_scale`（默认 1.0，限制在 [0,1]，写入结果 provenance），只缩放 `full-absent` 速度。MCS audit 上 scale 0.25/0.5 的均值分别为 0.35756/0.37087，相对 zero 为 `+0.02856/+0.04187`；两者仍仅 1/4 正，但最差回退从 scale1 的 -0.01645 收缩到 -0.00395/-0.00759。低置信证据缩放确实降低风险，却不能把 MCS 变成可靠部署条件；正式路径继续只允许 exact，scale1。
+
+候选排序已从临时分析升级为版本化资产：`deepternary_candidate_geometry_v1` 复用仓库 14 维刚体不变几何并附加官方 surrogate/clash，共 16 个 native-free 特征；28-candidate label 数据集逐项校验预测/精修报告身份与 SHA256。真正 nested case-LOOCV（每个外层 case 的 ridge 正则只由其余 case 内层选择）得到 0.53681，高于官方 surrogate 的 0.49714、低于 oracle 0.58921，仅选中 2/7 oracle。它在 HAY-B/HR2-B 会错过官方好候选，因此当前只证明 selector 值得扩大数据，不能替换官方排序。
 
 ## model-v3 起点与清理范围
 
