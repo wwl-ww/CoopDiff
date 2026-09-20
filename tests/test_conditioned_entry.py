@@ -16,9 +16,22 @@ module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(module)
 
 
+def test_resume_requires_paired_best_checkpoint():
+    try:
+        module.parse_args(['--parent', 'p', '--output-dir', 'o', '--resume', 'r'])
+    except SystemExit as error:
+        assert error.code == 2
+    else:
+        raise AssertionError('unpaired resume checkpoint accepted')
+    args = module.parse_args(['--parent', 'p', '--output-dir', 'o',
+                              '--resume', 'r', '--resume-best', 'b'])
+    assert args.resume == 'r' and args.resume_best == 'b'
+
+
 class Trainer:
     def __init__(self):
         self.calls = []
+        self.role_graph_radius = 0
         self.diffusion = SimpleNamespace(sample_coupling=lambda *args, **kwargs: 'sdpi-coupling')
         self.model = SimpleNamespace(
             expert=SimpleNamespace(model=SimpleNamespace(no_torsion=False)),
@@ -45,7 +58,8 @@ def test_six_cells_reuse_time_and_pair_each_coupling():
         'ligand_data': {'coords': torch.zeros(1, 1, 3), 'mol': molecule.ToBinary()},
     }
     trainer = Trainer()
-    result = module.validate_grid(trainer, [batch], EndpointStore(), torch.device('cpu'), 7)
+    result = module.validate_grid(trainer, [batch], EndpointStore(), torch.device('cpu'), 7,
+                                  include_robustness=True)
     assert result['counts'] == {name: 1 for name in (
         'sdpi/full', 'sdpi/pocket_only', 'sdpi/absent',
         'bitseed_endpoint/full', 'bitseed_endpoint/pocket_only',
@@ -58,8 +72,11 @@ def test_six_cells_reuse_time_and_pair_each_coupling():
                            trainer.calls[1]['conditions']['sides'])
     assert not torch.equal(trainer.calls[1]['conditions']['sides'],
                            trainer.calls[2]['conditions']['sides'])
-    assert 'six' in module.CHECKPOINT_SELECTION
-    assert 'pocket-only' in module.CHECKPOINT_SELECTION
+    trainer.calls.clear()
+    result = module.validate_grid(trainer, [batch], EndpointStore(), torch.device('cpu'), 7)
+    assert set(result['counts']) == {'sdpi/full', 'bitseed_endpoint/full'}
+    assert len(trainer.calls) == 2
+    assert 'SDPI/full' in module.CHECKPOINT_SELECTION
 
 
 if __name__ == '__main__':

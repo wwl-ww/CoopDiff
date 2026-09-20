@@ -1,9 +1,9 @@
 """Train the isolated PROTAC-conditioned model from a frozen C checkpoint.
 
-The first protocol preserves C's 1:1 SDPI/BiTSeed endpoint schedule. Native
-ternary coordinates supervise only discrete 6 A pocket/ligand contact masks;
-they are never model inputs or checkpoint contents. Checkpoint selection uses
-all six validation cells: endpoint source x full/pocket-only/absent conditions.
+The protocol preserves C's 1:1 SDPI/BiTSeed endpoint schedule. Native ternary
+coordinates supervise 6 A pocket/ligand roles and receptor-indexed binary distances;
+raw coordinates are never model inputs or checkpoint contents. Checkpoint selection uses
+the full-condition loss averaged over SDPI and BiTSeed endpoint sources.
 """
 
 import argparse
@@ -37,8 +37,7 @@ from tricoopdiff.sdpi_flow import SDPIFlow
 FULL = ConditionFeatureDropout(0., 0., 0., 0., 0., 0.)
 POCKET_ONLY = ConditionFeatureDropout(0., 0., 0., 1., 1., 0.)
 ABSENT = ConditionFeatureDropout(1., 0., 0., 0., 0., 0.)
-CHECKPOINT_SELECTION = (
-    'mean of six SDPI/BiTSeed x full/pocket-only/absent validation cells')
+CHECKPOINT_SELECTION = 'mean of SDPI/full and BiTSeed/full validation losses'
 
 
 def parse_args(argv=None):
@@ -60,6 +59,7 @@ def parse_args(argv=None):
     parser.add_argument('--condition-lr', type=float, default=1e-3)
     parser.add_argument('--weight-decay', type=float, default=1e-4)
     parser.add_argument('--residual-weight', type=float, default=1e-3)
+    parser.add_argument('--structure-loss-weight', type=float, default=.1)
     parser.add_argument('--ema-decay', type=float, default=.999)
     parser.add_argument('--nan-clamp', type=float, default=100.)
     parser.add_argument('--condition-drop-all', type=float, default=.1)
@@ -69,17 +69,32 @@ def parse_args(argv=None):
     parser.add_argument('--condition-drop-binary', type=float, default=.1)
     parser.add_argument('--condition-pocket-only', type=float, default=.2,
                         help='Probability of retaining only both pocket masks')
+    parser.add_argument('--condition-role-graph-radius', type=int, default=0,
+                        help='Experimental covalent expansion of contact roles; default preserves v4')
+    parser.add_argument('--paired-absent-weight', type=float, default=0.,
+                        help='Auxiliary absent loss on the identical state used by each full condition')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--seed', type=int, default=7315)
     parser.add_argument('--save-interval', type=int, default=10)
     parser.add_argument('--log-interval', type=int, default=10)
     parser.add_argument('--resume')
+    parser.add_argument('--resume-best',
+                        help='Best checkpoint paired with --resume; copied into the new run')
     parser.add_argument('--allow-resume-dropout-change', action='store_true',
                         help='Explicitly replace only the augmentation policy on resume')
+    parser.add_argument('--allow-resume-paired-absent-change', action='store_true',
+                        help='Explicitly enable/change paired absent loss when resuming')
     args = parser.parse_args(argv)
+    if bool(args.resume_best) != bool(args.resume):
+        parser.error('--resume-best and --resume must be provided together')
     if (args.epochs < 1 or args.save_interval < 1 or args.log_interval < 1
-            or args.nan_clamp <= 0 or args.paired_cache_wait_seconds < 0):
+            or args.nan_clamp <= 0 or args.paired_cache_wait_seconds < 0
+            or args.condition_role_graph_radius < 0):
         parser.error('epochs/intervals and --nan-clamp must be positive')
+    if not np.isfinite(args.paired_absent_weight) or args.paired_absent_weight < 0:
+        parser.error('--paired-absent-weight must be finite and nonnegative')
+    if not np.isfinite(args.structure_loss_weight) or args.structure_loss_weight < 0:
+        parser.error('--structure-loss-weight must be finite and nonnegative')
     try:
         condition_dropout(args).validate()
     except ValueError as error:
@@ -109,6 +124,9 @@ def build_trainer(args, device):
         parent_checkpoint_sha256=checkpoint_sha256(args.parent),
         condition_dropout=condition_dropout(args),
         condition_lr=args.condition_lr,
+        role_graph_radius=args.condition_role_graph_radius,
+        paired_absent_weight=args.paired_absent_weight,
+        structure_loss_weight=args.structure_loss_weight,
     )
     return model, trainer, parent
 
@@ -121,13 +139,14 @@ def condition_seed(case, base):
 
 
 @torch.no_grad()
-def validate_grid(trainer, loader, endpoint_store, device, seed):
-    """Evaluate the predeclared source x condition-availability grid."""
+def validate_grid(trainer, loader, endpoint_store, device, seed, *, include_robustness=False):
+    """Select on complete inputs; optional missing-input checks are diagnostic."""
     cuda_devices = ([device.index if device.index is not None else torch.cuda.current_device()]
                     if device.type == 'cuda' else [])
     numpy_state = np.random.get_state()
+    modes = ('full', 'pocket_only', 'absent') if include_robustness else ('full',)
     cells = {f'{source}/{mode}': [] for source in ('sdpi', 'bitseed_endpoint')
-             for mode in ('full', 'pocket_only', 'absent')}
+             for mode in modes}
     fallback = 0
     try:
         with torch.random.fork_rng(devices=cuda_devices):
@@ -137,10 +156,12 @@ def validate_grid(trainer, loader, endpoint_store, device, seed):
             np.random.seed(seed)
             for batch in loader:
                 full, _ = supervised_condition_batch(
-                    batch, seed=condition_seed(batch['case'], seed), dropout=FULL)
-                pocket_only, _ = dropout_condition_features(
-                    full, seed=0, config=POCKET_ONLY)
-                absent, _ = dropout_condition_features(full, seed=0, config=ABSENT)
+                    batch, seed=condition_seed(batch['case'], seed), dropout=FULL,
+                    role_graph_radius=trainer.role_graph_radius)
+                condition_rows = {'full': full}
+                if include_robustness:
+                    condition_rows['pocket_only'], _ = dropout_condition_features(full, seed=0, config=POCKET_ONLY)
+                    condition_rows['absent'], _ = dropout_condition_features(full, seed=0, config=ABSENT)
                 coupling, record = endpoint_store.coupling(
                     batch['case'], **({'batch': batch} if endpoint_store.lazy else {}))
                 endpoint_source = record['actual_source']
@@ -159,9 +180,7 @@ def validate_grid(trainer, loader, endpoint_store, device, seed):
                     }),
                 ]
                 for source, row in source_rows:
-                    for mode, conditions in (('full', full),
-                                             ('pocket_only', pocket_only),
-                                             ('absent', absent)):
+                    for mode, conditions in condition_rows.items():
                         result = trainer.validate_step(**row, conditions=conditions)
                         loss = result['loss_total']
                         if not np.isfinite(loss):
@@ -171,14 +190,10 @@ def validate_grid(trainer, loader, endpoint_store, device, seed):
         np.random.set_state(numpy_state)
         trainer.model.train()
     means = {name: float(np.mean(values)) for name, values in cells.items() if values}
-    required = {
-        'sdpi/full', 'sdpi/pocket_only', 'sdpi/absent',
-        'bitseed_endpoint/full', 'bitseed_endpoint/pocket_only',
-        'bitseed_endpoint/absent',
-    }
+    required = set(cells)
     if set(means) != required:
         raise RuntimeError(f'validation grid incomplete: present={sorted(means)}')
-    return {'selection_loss': float(np.mean(list(means.values()))), 'by_cell': means,
+    return {'selection_loss': .5 * (means['sdpi/full'] + means['bitseed_endpoint/full']), 'by_cell': means,
             'counts': {name: len(values) for name, values in cells.items()},
             'bitseed_fallback_count': fallback}
 
@@ -196,7 +211,9 @@ def main(argv=None):
               'parent_checkpoint_sha256': checkpoint_sha256(args.parent),
               'training_source_mix': 'sdpi_bitseed_1_1',
               'training_endpoint_protocol': ONLINE_TRAINING_ENDPOINT_PROTOCOL,
-              'condition_supervision': 'native discrete contact masks at 6 A',
+              'condition_supervision': (
+                  'native 6 A contacts expanded by recorded covalent graph radius '
+                  'with side-local radial profiles and complete mapped binary distances'),
               'condition_dropout': vars(condition_dropout(args)),
               'checkpoint_selection': CHECKPOINT_SELECTION}
     (output / 'config.json').write_text(json.dumps(config, indent=2) + '\n')
@@ -228,15 +245,23 @@ def main(argv=None):
         cache_wait_seconds=args.paired_cache_wait_seconds)
     if args.resume:
         trainer.load_checkpoint(
-            args.resume, allow_dropout_change=args.allow_resume_dropout_change)
+            args.resume, allow_dropout_change=args.allow_resume_dropout_change,
+            allow_paired_absent_change=args.allow_resume_paired_absent_change)
     start_epoch, best = trainer.resume_epoch + 1, trainer.resume_best_val_loss
     if start_epoch > args.epochs:
         raise RuntimeError('resume epoch meets or exceeds target epochs')
     if args.resume:
-        # A new formal output directory must remain self-contained even when
-        # the resumed epoch stays best for the rest of training.
-        trainer.save_checkpoint(output / 'best_model.pt', epoch=trainer.resume_epoch,
-                                best_val_loss=best)
+        # A current-state resume checkpoint cannot stand in for an earlier
+        # best state. Carry the paired checkpoint forward byte-for-byte.
+        best_payload = torch.load(args.resume_best, map_location=device, weights_only=False)
+        from tricoopdiff.conditioned_consensus_train import validate_conditioned_checkpoint
+        validate_conditioned_checkpoint(best_payload)
+        if (best_payload['parent_checkpoint_sha256'] != trainer.parent_checkpoint_sha256
+                or best_payload['model_config'] != trainer.model.trifuse.config
+                or best_payload['training_state']['best_val_loss'] != best):
+            raise ValueError('resume-best does not match resume history')
+        import shutil
+        shutil.copy2(args.resume_best, output / 'best_model.pt')
 
     for epoch in range(start_epoch, args.epochs + 1):
         started, losses = time.time(), []
