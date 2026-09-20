@@ -154,8 +154,13 @@ class EvaluationRunner:
                       translation_velocity_scale=1.0,
                       rotation_velocity_scale=1.0,
                       return_rank_features=False,
-                      condition_manifest=None):
+                      condition_manifest=None,
+                      binary_pose_candidates=24,
+                      deepternary_pose=None,
+                      condition_guidance='full', condition_guidance_scale=1.0):
         """Featurize and evaluate one case with the resident model."""
+        if init_mode == 'deepternary_pose' and t_anchor is None:
+            raise ValueError('deepternary-pose refinement requires an explicit t_anchor')
         torch.manual_seed(seed)
         if self.device.type == "cuda":
             torch.cuda.manual_seed_all(seed)
@@ -166,6 +171,7 @@ class EvaluationRunner:
         )
         self._ensure_model(input_dim)
         conditions, condition_audit, condition_path = None, None, None
+        binary_pose_sides = None
         if self.conditioned_checkpoint:
             if condition_manifest is None:
                 raise ValueError('conditioned evaluation requires a deploy-time condition manifest')
@@ -177,6 +183,12 @@ class EvaluationRunner:
             conditions, condition_audit = load_condition_manifest(
                 condition_path, case=case, molecule=Chem.Mol(ligand_data['mol']),
                 protein_sizes=(e3_data['coords'].shape[1], poi_data['coords'].shape[1]))
+            if init_mode == 'binary_pose':
+                from tricoopdiff.condition_manifest import load_binary_pose_sides
+                binary_pose_sides, pose_audit = load_binary_pose_sides(
+                    condition_path, case=case, molecule=Chem.Mol(ligand_data['mol']),
+                    protein_sizes=(e3_data['coords'].shape[1], poi_data['coords'].shape[1]))
+                condition_audit.update(pose_audit)
         elif condition_manifest is not None:
             raise ValueError('legacy checkpoints cannot silently consume condition manifests')
         case_initializer = self.initializer
@@ -197,6 +209,23 @@ class EvaluationRunner:
                 EXPERT_ANCHOR_CONSENSUS_VERSION
                 if anchor_selection == "consensus" else EXPERT_ANCHOR_VERSION
             )
+        elif init_mode == 'binary_pose':
+            from tricoopdiff.binary_pose_constraints import BinaryPoseInitializer
+            if binary_pose_sides is None or any(side is None for side in binary_pose_sides):
+                raise ValueError('binary-pose initialization requires two complete manifest sides')
+            case_initializer = BinaryPoseInitializer(
+                *binary_pose_sides,
+                no_torsion=bool(getattr(self.expert.model, 'no_torsion', False)),
+                max_candidates=binary_pose_candidates)
+            initialization_version = 'known_binary_pose_initializer_v1'
+        elif init_mode == 'deepternary_pose':
+            from tricoopdiff.deepternary_pose import DeepTernaryPoseInitializer
+            if deepternary_pose is None:
+                raise ValueError('deepternary-pose initialization requires an explicit prediction')
+            case_initializer = DeepTernaryPoseInitializer(
+                deepternary_pose,
+                no_torsion=bool(getattr(self.expert.model, 'no_torsion', False)))
+            initialization_version = 'deepternary_pose_initializer_v1'
         report = evaluate_model(
             self.model, e3_data, poi_data, ligand_data, self.diffusion,
             initializer=case_initializer, device=str(self.device),
@@ -210,6 +239,8 @@ class EvaluationRunner:
             rotation_velocity_scale=rotation_velocity_scale,
             return_rank_features=return_rank_features,
             conditions=conditions,
+            condition_guidance=condition_guidance,
+            condition_guidance_scale=condition_guidance_scale,
             deepternary_dockq_paths={
                 "protein1_pdb": str(paths["protein1"]),
                 "protein2_pdb": str(paths["protein2"]),
@@ -238,6 +269,12 @@ class EvaluationRunner:
                                           if init_mode == "expert_anchor" else None),
             "anchor_selection": (anchor_selection
                                   if init_mode == "expert_anchor" else None),
+            "binary_pose_candidates": (binary_pose_candidates
+                                         if init_mode == "binary_pose" else None),
+            "deepternary_pose": (str(Path(deepternary_pose).resolve())
+                                  if init_mode == "deepternary_pose" else None),
+            "condition_guidance": condition_guidance,
+            "condition_guidance_scale": float(condition_guidance_scale),
             "generative_process": "sdpi_flow_v1",
             "t_anchor": (t_anchor if t_anchor is not None else
                          1.0),

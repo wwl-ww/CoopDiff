@@ -27,6 +27,20 @@ def test_index_entry_and_paths(tmp_path):
     assert all(path.is_file() for path in paths.values())
 
 
+def test_index_paths_preserve_scoring_only_templates(tmp_path):
+    entry = {"case": "demo"}
+    keys = ("protein1", "protein2", "ligand", "metric_protein1",
+            "metric_protein2", "complex")
+    for key in keys:
+        path = tmp_path / f"{key}.pdb"
+        path.write_text("ATOM\n", encoding="utf-8")
+        entry[key] = path.name
+    paths = evaluation_common.resolve_entry_paths(entry, tmp_path)
+    assert tuple(paths) == keys
+    assert paths["metric_protein1"].name == "metric_protein1.pdb"
+    assert paths["metric_protein2"].name == "metric_protein2.pdb"
+
+
 def test_legacy_checkpoint_preflight_rejects_missing_lora():
     payload = {
         "checkpoint_version": 17,

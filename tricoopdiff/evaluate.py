@@ -589,6 +589,8 @@ def evaluate_model(
     rotation_velocity_scale: float = 1.0,
     return_rank_features: bool = False,
     conditions=None,
+    condition_guidance: str = 'full',
+    condition_guidance_scale: float = 1.0,
 ) -> dict:
     """
     Sample a conformational ensemble and score structure quality vs the native
@@ -639,6 +641,8 @@ def evaluate_model(
         rotation_velocity_scale=rotation_velocity_scale,
         return_rank_features=return_rank_features,
         conditions=conditions,
+        condition_guidance=condition_guidance,
+        condition_guidance_scale=condition_guidance_scale,
     )
 
     ref_lig = ligand_data['coords'][0].detach().cpu().numpy()  # [N_lig, 3] native
@@ -836,6 +840,9 @@ def evaluate_model(
         'n_exact_dockq_walkers': len(exact_indices),
         'invalid_seeds': invalid_seeds,
         'selection_metric': selection_metric,
+        'best_selection_protocol': 'native_metric_oracle' if walkers else None,
+        'oracle_best_seed': walkers[best_idx]['seed'] if walkers else None,
+        'model_top1_available': False,
         'protac_rmsd_std': float(protac_rmsds.std()) if len(protac_rmsds) > 1 else 0.0,
     }
     if len(pred_ligs) > 1:

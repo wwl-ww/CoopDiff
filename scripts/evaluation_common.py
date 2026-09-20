@@ -19,10 +19,12 @@ def load_index_entry(index_path, case):
 
 
 def resolve_entry_paths(entry, project_root):
-    """Resolve and validate the three structure paths in an index entry."""
+    """Resolve model inputs plus any explicit scoring-only templates."""
     root = Path(project_root)
     resolved = {}
-    for key in ("protein1", "protein2", "ligand"):
+    required = ("protein1", "protein2", "ligand")
+    optional = ("metric_protein1", "metric_protein2", "complex")
+    for key in (*required, *(name for name in optional if name in entry)):
         value = Path(entry[key])
         path = value if value.is_absolute() else root / value
         if not path.is_file():

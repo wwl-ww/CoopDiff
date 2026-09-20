@@ -147,6 +147,25 @@ def summarize(rows, metric):
     }
 
 
+def native_free_top1(selected, by_id):
+    """Score the selector's first candidate without using native information."""
+    if not selected:
+        return None
+    row = by_id.get(repr(selected[0]['candidate_id']))
+    if row is None:
+        return None
+    return {
+        'candidate_id': row['candidate_id'],
+        'pool_index': row['pool_index'],
+        'source': row['source'],
+        'initial_dockq': row['initial_dockq'],
+        'refined_dockq': row.get('refined_dockq'),
+        'safe_dockq': row['safe_dockq'],
+        'safe_stage': row['safe_stage'],
+        'selection_used_native': False,
+    }
+
+
 def resolve_case_inputs(entry, project_root, native_root):
     """Resolve model inputs and every structure used by exact scoring."""
     root = Path(project_root)
@@ -608,6 +627,7 @@ def main():
                     "initial": summarize(selected_rows, "initial_dockq"),
                     "refined": summarize(selected_rows, "refined_dockq"),
                     "safe_union": summarize(selected_rows, "safe_dockq"),
+                    "native_free_top1": native_free_top1(selected, by_id),
                 }
             if args.refine_full_pool:
                 arm_reports["full_pool_256"] = {
@@ -682,8 +702,15 @@ def main():
             values = [{"value": report["arms"][name][stage]["best"]}
                       for report in case_reports if name in report["arms"]]
             leaderboards[name][stage] = summarize(values, "value")
+        top1_rows = [report['arms'][name]['native_free_top1']
+                     for report in case_reports if name in report['arms']
+                     and report['arms'][name]['native_free_top1'] is not None]
+        leaderboards[name]['native_free_top1'] = {
+            stage: summarize(top1_rows, f'{stage}_dockq')
+            for stage in ('initial', 'refined', 'safe')
+        }
     atomic_json({
-        "scope": "case-best oracle; not native-free ranked top1",
+        "scope": "case-best oracle plus selector-native-free top1",
         "config": manifest, "requested_cases": len(entries),
         "completed_cases": completed_cases, "failures": failures,
         "leaderboards": leaderboards,

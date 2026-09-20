@@ -41,6 +41,9 @@ def test_walker_metrics_preserve_seeds_and_exact_failures():
     assert 'metric failed' in report['walkers'][1]['exact_dockq_error']
     assert all('pred' not in row and 'pred_poi' not in row for row in report['walkers'])
     assert report['structure']['dockq_best'] == .5
+    assert report['ensemble']['best_selection_protocol'] == 'native_metric_oracle'
+    assert report['ensemble']['oracle_best_seed'] == 7
+    assert report['ensemble']['model_top1_available'] is False
 
 
 def test_rank_features_are_saved_only_when_requested():
