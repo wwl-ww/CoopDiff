@@ -24,6 +24,7 @@ from tricoopdiff.expert_anchors import DualExpertAnchorInitializer, FixedCandida
 from tricoopdiff.ranking_archive import (ARCHIVE_VERSION, GEOMETRY_NAMES, PROBE_TIME, cpu_tree,
                                        probe_state, select_archive_candidates, state_hash)
 from tricoopdiff.sampler import sample_single
+from tricoopdiff.structural_ranking_runtime import StructuralRankingRuntime
 
 
 def atomic_json(value, path):
@@ -57,11 +58,16 @@ def main():
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--walkers', type=int, default=32)
     parser.add_argument('--steps', type=int, default=20)
+    parser.add_argument('--selector-checkpoint', type=Path,
+                        help='experimental native-free structural Top-K; default remains balanced random')
+    parser.add_argument('--selector-task', choices=('quality', 'future'), default='quality')
     parser.add_argument('--seed', type=int, default=31000)
     parser.add_argument('--shard-index', type=int, default=0)
     parser.add_argument('--num-shards', type=int, default=1)
     parser.add_argument('--case-limit', type=int, help='Smoke-only limit on the index prefix')
     args = parser.parse_args()
+    if args.selector_task == 'future' and args.selector_checkpoint is None:
+        parser.error('future selection requires a trained selector checkpoint')
     if not (1 <= args.walkers <= 256 and args.steps > 0 and 0 <= args.shard_index < args.num_shards):
         parser.error('invalid walker/step/shard budget')
     root = args.project_root.resolve()
@@ -95,6 +101,11 @@ def main():
                            if 'diffdock' not in p.relative_to(ROOT).parts},
         'native_reference_available_to_generator': False,
     }
+    selector = (StructuralRankingRuntime(args.selector_checkpoint.resolve(), manifest,
+                                         task=args.selector_task, device=args.device)
+                if args.selector_checkpoint is not None else None)
+    if selector is not None:
+        manifest['selection'] = dict(selector.provenance)
     output.mkdir(parents=True, exist_ok=True)
     existing = output / 'manifest.json'
     if existing.exists() and json.loads(existing.read_text()) != manifest:
@@ -136,7 +147,6 @@ def main():
                                                      proposal_attempts=8, conformer_policy='etkdgv3_random')
             candidates, generation = generate_hybrid_candidates(
                 initializer, e3['coords'][0], poi['coords'][0], ligand, seed=args.seed)
-            selected, probability = select_archive_candidates(candidates, args.walkers, args.seed + 3_000_000)
             pool = []
             for candidate in candidates:
                 state = cpu_tree({'ligand': candidate['ligand'][0], 'poi': candidate['poi'][0],
@@ -147,6 +157,13 @@ def main():
                              'acceptable': bool(candidate.get('acceptable', False)),
                              'fit_rmsd': candidate.get('fit_rmsd'),
                              'fallback': candidate.get('fallback')})
+            selection_details = None
+            if selector is None:
+                selected, probability = select_archive_candidates(candidates, args.walkers, args.seed + 3_000_000)
+            else:
+                selected, selection_details = selector.select(
+                    {'e3_data': e3, 'poi_data': poi, 'ligand_data': ligand}, pool, args.walkers)
+                probability = None
             pairs = []
             for index in selected:
                 candidate, initial = candidates[index], pool[index]['state']
@@ -173,7 +190,7 @@ def main():
                                       'body_frame': torch.as_tensor(sampled['body_frame'])})
                     final_features = probe_state(runner.model, runner.diffusion, e3, poi, ligand, final, source)
                 pairs.append({'pool_index': index, 'source': source, 'candidate_id': candidate['candidate_id'],
-                              'inclusion_probability': probability[source],
+                              'inclusion_probability': probability[source] if probability is not None else None,
                               'initial_state_sha256': state_hash(initial),
                               'initial_features': first_features, 'final': final, 'final_features': final_features,
                               'final_state_sha256': state_hash(final) if final is not None else None,
@@ -186,6 +203,10 @@ def main():
                        'input_graphs': cpu_tree({'e3_data': e3, 'poi_data': poi, 'ligand_data': ligand}),
                        'mapping_contract': 'featurized order with hashed input templates and RDKit mol',
                        'generation': generation}
+            if selection_details is not None:
+                archive['selection_details'] = selection_details
+                archive['structural_post_ranking'] = (selector.rank_pairs(archive['input_graphs'], pool, pairs)
+                    if selector.final_supported else {'unavailable': 'initial-only trained checkpoint'})
             temporary = destination.with_suffix(f'.pt.tmp.{os.getpid()}')
             torch.save(archive, temporary)
             temporary.replace(destination)

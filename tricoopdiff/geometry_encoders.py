@@ -279,7 +279,8 @@ class TernaryGeometryEncoder(nn.Module):
 
     def forward(self, node_features: torch.Tensor, node_coords: torch.Tensor,
                 node_types: torch.Tensor, batch: torch.Tensor = None,
-                lig_edge_index: torch.Tensor = None, node_residual: torch.Tensor = None) -> dict:
+                lig_edge_index: torch.Tensor = None, node_residual: torch.Tensor = None,
+                return_node_features: bool = False) -> dict:
         if batch is None:
             batch = torch.zeros(
                 node_features.shape[0], dtype=torch.long,
@@ -384,9 +385,12 @@ class TernaryGeometryEncoder(nn.Module):
                 local_pair_tokens[1], geometry_token,
             ))))
             ligand_token_outputs.append(ligand_tokens)
-        return {
+        result = {
             "global": torch.stack(global_outputs, dim=0),
             "e3l": torch.stack(e3l_outputs, dim=0),
             "pol": torch.stack(pol_outputs, dim=0),
             "ligand_tokens": ligand_token_outputs,
         }
+        if return_node_features:
+            result['node_features'] = features
+        return result
