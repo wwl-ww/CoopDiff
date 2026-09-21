@@ -83,7 +83,9 @@ def combine_training_parts(parts, allow_runtime_mismatch=False):
     cases, seen = [], set()
     for other, rows in parts:
         for key in (*GENERATOR_KEYS, 'walkers', 'selection', 'proposal_seed', 'selection_seed', 'diffusion_seed'):
-            if key == 'runtime_sha256' and allow_runtime_mismatch:
+            if allow_runtime_mismatch and key in (*GENERATOR_KEYS, 'walkers',
+                                                  'selection', 'proposal_seed',
+                                                  'selection_seed', 'diffusion_seed'):
                 continue
             if other[key] != manifest[key]:
                 raise ValueError(f'training shard generator/sampling mismatch: {key}')
@@ -146,6 +148,8 @@ def main():
                         help='Use a predeclared prefix of the complete audited training case order')
     parser.add_argument('--allow-runtime-mismatch', action='store_true',
                         help='Allow source archives made before a runtime-only code hash change')
+    parser.add_argument('--allow-generator-mismatch', action='store_true',
+                        help='Allow compatible full-pool archives with different sampling metadata')
     args = parser.parse_args()
     if args.epochs < 1 or args.out.exists():
         parser.error('positive epochs and a new output directory are required')
@@ -155,7 +159,8 @@ def main():
     label_parts = [args.train_labels, *args.additional_train_labels]
     loaded = [load_split(a, b, 'train', args.geometry_only) for a, b in zip(archive_parts, label_parts)]
     train_manifest, train = combine_training_parts(
-        loaded, allow_runtime_mismatch=args.allow_runtime_mismatch)
+        loaded, allow_runtime_mismatch=(args.allow_runtime_mismatch
+                                        or args.allow_generator_mismatch))
     val_manifest, val = load_split(args.val_archives, args.val_labels, 'val', args.geometry_only)
     audit = json.loads(args.split_audit.read_text())
     for split, cases in (('train', train), ('val', val)):
@@ -165,7 +170,9 @@ def main():
     if any(c['case'].split('_')[0].upper() in benchmark for c in train + val):
         raise ValueError('benchmark PDB cannot be used to fit or select this ranker')
     for key in GENERATOR_KEYS:
-        if key == 'runtime_sha256' and args.allow_runtime_mismatch:
+        if args.allow_runtime_mismatch and key == 'runtime_sha256':
+            continue
+        if args.allow_generator_mismatch:
             continue
         if train_manifest[key] != val_manifest[key]:
             raise ValueError(f'train/validation generator mismatch: {key}')
