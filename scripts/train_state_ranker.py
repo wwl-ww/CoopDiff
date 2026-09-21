@@ -150,6 +150,8 @@ def main():
                         help='Allow source archives made before a runtime-only code hash change')
     parser.add_argument('--allow-generator-mismatch', action='store_true',
                         help='Allow compatible full-pool archives with different sampling metadata')
+    parser.add_argument('--post-only', action='store_true',
+                        help='Train and select on refined final states only')
     args = parser.parse_args()
     if args.epochs < 1 or args.out.exists():
         parser.error('positive epochs and a new output directory are required')
@@ -196,7 +198,14 @@ def main():
         for i in order:
             case = train[i]
             output = model(((case['features'] - mean) / scale).to(args.device))
-            loss = state_quality_loss(output, case['dockq'].to(args.device))
+            if args.post_only:
+                mask = torch.tensor([stage == 'final' for stage in case['stages']],
+                                    dtype=torch.bool, device=args.device)
+                loss = state_quality_loss(
+                    {key: value[mask] for key, value in output.items()},
+                    case['dockq'][mask].to(args.device))
+            else:
+                loss = state_quality_loss(output, case['dockq'].to(args.device))
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -207,8 +216,11 @@ def main():
             history[-1].update(train_loss=train_metrics['loss'],
                                train_leaderboards=train_metrics['leaderboards'],
                                validation_leaderboards=metrics['leaderboards'])
-        if best is None or metrics['loss'] < best['metrics']['loss']:
+        selection_value = (metrics['leaderboards']['final']['mean_top1']
+                           if args.post_only else metrics['loss'])
+        if best is None or selection_value > best.get('selection_value', float('-inf')):
             best = {'epoch': epoch, 'metrics': metrics,
+                    'selection_value': selection_value,
                     'state_dict': {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}}
     diagnostics = None
     if args.diagnostics:
@@ -232,6 +244,7 @@ def main():
     torch.save(export_quality_checkpoint(checkpoint), args.out / 'inference.pt')
     (args.out / 'report.json').write_text(json.dumps({
         'scope': 'internal pipeline smoke, not untouched benchmark or generator holdout',
+        'post_only': args.post_only,
         'best_epoch': best['epoch'], 'features': 'geometry_only' if args.geometry_only else 'frozen_plus_geometry',
         'selection': 'minimum internal validation composite loss', 'metrics': best['metrics'],
         'train_cases': len(train), 'val_cases': len(val),
