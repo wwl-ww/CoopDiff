@@ -33,6 +33,8 @@ from .conditional_consensus import (ARCHITECTURE, CONDITION_CONTRACT,
                                     ConditionedConsensusCoopDiff, ConditionedConsensusFuse)
 from .diffdock.utils.torus import SCORE_NORM_VERSION
 from .equivariant_clamp import validate_clamp_mode
+from .mixed_source_training import (FreeSourceObjective, CONTRACT as MIXED_CONTRACT,
+                                    FORMAT as MIXED_FORMAT, validate_source_training)
 
 
 FORMAT = 'anchored_consensus_training_v3'
@@ -94,9 +96,14 @@ def validate_anchored_checkpoint(payload):
         expected.update(format='anchored_consensus_training_v9', architecture=PRIOR_ACTION_ARCHITECTURE)
     bianchor = uses_bianchor(payload.get('model_config', {}))
     if bianchor:
-        if payload.get('conditioning_task') != 'dual_binary':
-            raise ValueError('BiAnchor currently requires the dual_binary initialization task')
+        if payload.get('conditioning_task') not in ('dual_binary', 'dual_assembly'):
+            raise ValueError('BiAnchor requires a supported binary or assembly initialization task')
         expected.update(format=BIANCHOR_FORMAT, source_policy=BIANCHOR_POLICY)
+    if payload.get('source_training') is not None:
+        if not bianchor:
+            raise ValueError('three-source training requires the three-row vocabulary')
+        validate_source_training(payload['source_training'], payload.get('global_step'))
+        expected['format'] = MIXED_FORMAT
     for name, value in expected.items():
         if payload.get(name) != value:
             raise ValueError(f'anchored checkpoint contract mismatch: {name}')
@@ -237,7 +244,8 @@ class AnchoredTrainer:
     def __init__(self, model, *, parent_checkpoint_sha256, training_index_sha256,
                  lr=1e-4, weight_decay=1e-4, ema_decay=.999, cartesian_weight=.1, grad_clip=10.,
                  validation_contract=None, binary_bounds=None, conditioning_task='dual_binary', prior_config=None,
-                 prior_library_identity=None, binary_metric=PARAMETER_METRIC, data_schedule=INDEX_ORDER):
+                 prior_library_identity=None, binary_metric=PARAMETER_METRIC, data_schedule=INDEX_ORDER,
+                 three_source=False):
         if not isinstance(model, ConditionedConsensusCoopDiff):
             raise ValueError('anchored trainer requires the conditioned consensus network')
         if model.trifuse.config.get('source_conditioning') is not True:
@@ -257,8 +265,8 @@ class AnchoredTrainer:
         self.binary_bounds = copy.deepcopy(binary_bounds)
         self.task_contract = task_contract(conditioning_task, binary_bounds)
         self.conditioning_task = conditioning_task
-        if uses_bianchor(model.trifuse.config) and conditioning_task != 'dual_binary':
-            raise ValueError('BiAnchor currently requires the dual_binary initialization task')
+        if uses_bianchor(model.trifuse.config) and conditioning_task not in ('dual_binary', 'dual_assembly'):
+            raise ValueError('BiAnchor requires a supported binary or assembly initialization task')
         validate_prior_config(prior_config)
         self.prior_config = copy.deepcopy(prior_config)
         self.prior_library_identity = copy.deepcopy(prior_library_identity)
@@ -275,6 +283,45 @@ class AnchoredTrainer:
         self.optimizer = torch.optim.AdamW(model.trifuse.parameters(), lr=lr, weight_decay=weight_decay)
         self.ema = {key: value.detach().clone() for key, value in model.trifuse.state_dict().items()}
         self.global_step = 0
+        if three_source and not uses_bianchor(model.trifuse.config):
+            raise ValueError('three-source training requires explicit BiAnchor vocabulary')
+        self.source_training = (dict(contract=copy.deepcopy(MIXED_CONTRACT),
+                                     updates=dict(sdpi=0, bitseed=0, bianchor=0), fallbacks=0)
+                                if three_source else None)
+        self.free_objective = FreeSourceObjective(model) if three_source else None
+
+    def next_source(self):
+        if self.source_training is None:
+            return 'bianchor'
+        counts = self.source_training['updates']
+        return min(counts, key=counts.get)
+
+    def step_free(self, *, requested_source, **batch):
+        if self.source_training is None:
+            raise ValueError('free-source updates require the explicit mixed contract')
+        actual = batch.get('source')
+        if (requested_source not in ('sdpi', 'bitseed') or actual not in ('sdpi', 'bitseed')
+                or requested_source == 'sdpi' and actual != 'sdpi'
+                or requested_source == 'bitseed' and batch.get('coupling_override') is None):
+            raise ValueError('free update lacks an audited actual source/coupling')
+        if (any(p.requires_grad for p in self.model.expert.parameters())
+                or self.environment != expert_environment()):
+            raise ValueError('free-source expert/runtime contract changed')
+        self.model.train()
+        self.model.expert.eval()
+        self.optimizer.zero_grad(set_to_none=True)
+        result = self._apply_losses(self.free_objective.compute_loss(**batch), actual)
+        self.source_training['fallbacks'] += int(actual != requested_source)
+        return result
+
+    @torch.no_grad()
+    def evaluate_free(self, **batch):
+        if (self.free_objective is None or self.model.training
+                or self.environment != expert_environment()
+                or batch.get('source') not in ('sdpi', 'bitseed')):
+            raise ValueError('free validation requires mixed eval mode and a real free source')
+        result = self.free_objective.compute_loss(**batch)
+        return {k: float(v) for k, v in result.items() if k.startswith('loss_')}
 
     @contextmanager
     def ema_mode(self):
@@ -306,6 +353,14 @@ class AnchoredTrainer:
 
     def record_validation(self, report):
         """Select only a fixed cohort under the declared development protocol."""
+        if self.source_training is not None:
+            free = report.get('free_sources', {})
+            means, counts = free.get('mean_loss_by_source', {}), free.get('evaluated_by_source', {})
+            if (set(means) != {'sdpi', 'bitseed'} or set(counts) != {'sdpi', 'bitseed'}
+                    or any(type(n) is not int or n < 1 for n in counts.values())
+                    or any(not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0
+                           for v in means.values()) or not _sha(free.get('cohort_sha256'))):
+                raise ValueError('mixed validation requires separate real SDPI and BiT cohorts')
         if (report.get('binary_metric', PARAMETER_METRIC) != self.binary_metric
                 or report.get('conditioning_task', 'dual_binary') != self.conditioning_task):
             raise ValueError('validation task or binary metric mismatch')
@@ -338,6 +393,12 @@ class AnchoredTrainer:
             self.model, sample.flow, ligand['coords'][0], poi['coords'][0], sample.prior_angles,
             e3, poi, ligand, time, dt, conditions=sample.conditions, source=anchored_source(self.model),
             cartesian_weight=self.runtime['cartesian_weight'], binary_metric=self.binary_metric)
+        return self._apply_losses(losses, 'bianchor')
+
+    def _apply_losses(self, losses, source):
+        """One shared optimizer/EMA update, regardless of the trajectory family."""
+        if not torch.isfinite(losses['loss_total']):
+            raise FloatingPointError('nonfinite training objective')
         losses['loss_total'].backward()
         if any(p.grad is not None for p in self.model.expert.parameters()):
             raise RuntimeError('frozen expert received a gradient')
@@ -353,8 +414,11 @@ class AnchoredTrainer:
                 else:
                     self.ema[key].copy_(value)
         self.global_step += 1
+        if self.source_training is not None:
+            self.source_training['updates'][source] += 1
         joint = losses.get('model_output', {}).get('anchored_joint_motion', {})
-        return {**{key: float(value.detach()) for key, value in losses.items() if key.startswith('loss_')},
+        return {**{key: float(value.detach() if torch.is_tensor(value) else value)
+                   for key, value in losses.items() if key.startswith('loss_')},
                 **{f'joint_{key}': float(value) for key, value in joint.items()
                    if key.endswith('_rms')},
                 'gradient_norm_before_clipping': float(norm), 'global_step': self.global_step}
@@ -384,6 +448,8 @@ class AnchoredTrainer:
             payload.update(format='anchored_consensus_training_v9', architecture=PRIOR_ACTION_ARCHITECTURE)
         if uses_bianchor(self.model.trifuse.config):
             payload.update(format=BIANCHOR_FORMAT, source_policy=BIANCHOR_POLICY)
+        if self.source_training is not None:
+            payload.update(format=MIXED_FORMAT, source_training=copy.deepcopy(self.source_training))
         payload['validation_contract'] = copy.deepcopy(self.validation_contract)
         payload['validation_state'] = dict(self.validation_state)
         payload['rng_state'] = {'cpu': torch.get_rng_state(),
@@ -395,6 +461,10 @@ class AnchoredTrainer:
         """Restore optimizer and EMA only when data, parent, network and runtime agree."""
         validate_anchored_checkpoint(payload)
         validate_expert_base_identity(payload, self.model.expert)
+        saved_mix = payload.get('source_training')
+        if ((saved_mix is None) != (self.source_training is None)
+                or saved_mix is not None and saved_mix['contract'] != self.source_training['contract']):
+            raise ValueError('resume cannot change the initialization source mix; use warm-start')
         if payload.get('action_adapter') != self.action_adapter:
             raise ValueError('resume cannot add or remove the body-aware action adapter')
         if payload.get('binary_bounds') != self.binary_bounds:
@@ -422,6 +492,7 @@ class AnchoredTrainer:
         self.ema = {key: value.detach().to(reference[key]).clone()
                     for key, value in payload['ema_trifuse_state_dict'].items()}
         self.global_step = payload['global_step']
+        self.source_training = copy.deepcopy(saved_mix)
         self.validation_state = dict(payload['validation_state'])
         torch.set_rng_state(payload['rng_state']['cpu'].cpu())
         if device.type == 'cuda':

@@ -31,7 +31,9 @@ from tricoopdiff.chemical_prior_contract import ChemicalPriorLibrary, chemical_p
 from tricoopdiff.anchored_data_schedule import epoch_entries, INDEX_ORDER, CLUSTER_ORDER
 from tricoopdiff.anchored_training_metric import PARAMETER_METRIC, PHYSICAL_METRIC
 from tricoopdiff.anchored_action_adapter import install_action_adapter
-from tricoopdiff.bianchor_source import install_bianchor_source, uses_bianchor
+from tricoopdiff.bianchor_source import anchored_source, install_bianchor_source, uses_bianchor
+from tricoopdiff.mixed_source_training import prepare_free_batch, evaluate_free_sources
+from tricoopdiff.online_endpoints import LazyTrainingEndpointStore
 from tricoopdiff.anchored_validation import (VALIDATION_POLICY, VALIDATION_TIMES,
                                            evaluate_panel, validate_index_pair)
 
@@ -49,6 +51,10 @@ def main():
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--resume', type=Path)
+    parser.add_argument('--three-source', action='store_true',
+                        help='Share one optimizer/EMA across real SDPI, BiTSeed and BiAnchor trajectories')
+    parser.add_argument('--bitseed-cache-dir', type=Path,
+                        help='Dedicated immutable C=1/M=1 endpoint cache for three-source training')
     parser.add_argument('--init-source', choices=('legacy_zero', 'bianchor'),
                         help='New dual_binary runs default to BiAnchor; resume inherits checkpoint semantics')
     parser.add_argument('--warm-start', type=Path,
@@ -85,8 +91,12 @@ def main():
         args.init_source = saved_source
     elif args.init_source is None:
         args.init_source = 'bianchor' if args.conditioning_task == 'dual_binary' else 'legacy_zero'
-    if args.init_source == 'bianchor' and args.conditioning_task != 'dual_binary':
-        parser.error('BiAnchor currently requires --conditioning-task dual_binary')
+    if args.init_source == 'bianchor' and args.conditioning_task not in ('dual_binary', 'dual_assembly'):
+        parser.error('BiAnchor requires dual_binary or dual_assembly conditioning')
+    if args.three_source and (args.init_source != 'bianchor' or args.bitseed_cache_dir is None):
+        parser.error('three-source training requires BiAnchor vocabulary and --bitseed-cache-dir')
+    if saved is not None and bool(saved.get('source_training')) != args.three_source:
+        parser.error('resume cannot change the source mix; use --warm-start')
     started = wall_clock.monotonic()
     if args.max_seconds is not None and not 0 < args.max_seconds < float('inf'):
         parser.error('max-seconds must be positive and finite')
@@ -170,6 +180,7 @@ def main():
     if args.init_source == 'bianchor':
         install_bianchor_source(runner.model)
     trainer = AnchoredTrainer(runner.model, parent_checkpoint_sha256=parent_sha,
+                              three_source=args.three_source,
                               training_index_sha256=hashlib.sha256(args.index.read_bytes()).hexdigest(),
                               lr=args.lr, validation_contract=validation_contract, binary_bounds=bounds,
                               conditioning_task=args.conditioning_task,
@@ -177,12 +188,16 @@ def main():
                               prior_config=(chemical_prior_config(seed=args.seed, count=args.chemical_prior_count,
                                                                  uniform_probability=args.uniform_torsion_probability,
                                                                  assembly=args.conditioning_task == 'dual_assembly')
-                                            if args.chemical_prior_manifest else None),
+                                            if (args.chemical_prior_manifest or args.conditioning_task == 'dual_assembly')
+                                            else None),
                               prior_library_identity=(
                                   {'train': hashlib.sha256(args.chemical_prior_manifest.read_bytes()).hexdigest(),
                                    'validation': (hashlib.sha256(args.val_chemical_prior_manifest.read_bytes()).hexdigest()
                                                   if args.val_chemical_prior_manifest else None)}
                                   if args.chemical_prior_manifest else None))
+    endpoint_store = (LazyTrainingEndpointStore(args.bitseed_cache_dir, runner.model.expert,
+                                               binary_steps=20, base_seed=args.seed, wait_seconds=0)
+                      if args.three_source else None)
     prior_library = (ChemicalPriorLibrary(args.chemical_prior_manifest, trainer.prior_config,
         index_sha256=trainer.index_sha) if args.chemical_prior_manifest else None)
     val_prior_library = (ChemicalPriorLibrary(args.val_chemical_prior_manifest, trainer.prior_config,
@@ -234,11 +249,20 @@ def main():
                                 lambda entry: load(entry, args.val_cache_dir),
                                 index_sha256=validation_contract['index_sha256'], seed=args.seed,
                                 prior_library=val_prior_library)
+        if args.three_source:
+            free = evaluate_free_sources(trainer, validation_entries,
+                                         lambda entry: load(entry, args.val_cache_dir),
+                                         endpoint_store, seed=args.seed)
+            report['free_sources'] = free
+            report['mean_loss_by_source'] = {**free['mean_loss_by_source'], 'bianchor': report['mean_loss']}
+            report['cohort_sha256'] = hashlib.sha256(
+                (report['cohort_sha256'] + free['cohort_sha256']).encode()).hexdigest()
         improved = trainer.record_validation(report)
         with (args.out / f'validation_step_{trainer.global_step}.json').open('x') as handle:
             json.dump({**report, 'improved': improved}, handle, indent=2, allow_nan=False)
         print(json.dumps({'validation': report['mean_loss'], 'evaluated': report['evaluated'],
                           'rejected': report['rejected'], 'step': trainer.global_step,
+                          **({'by_source': report['mean_loss_by_source']} if args.three_source else {}),
                           'improved': improved}), flush=True)
 
     if validation_contract is not None and not args.resume:
@@ -254,6 +278,7 @@ def main():
 
     signal.signal(signal.SIGUSR1, request_save_and_stop)
     since_success = 0
+    source_attempts_without_success = 0
     visits = epoch_entries(entries, clusters, seed=args.seed, epoch=epoch, policy=args.data_schedule)
     with (args.out / 'metrics.jsonl').open('x', buffering=1) as log:
         while ((args.max_updates == 0 or trainer.global_step - initial_step < args.max_updates)
@@ -264,25 +289,42 @@ def main():
             generator = torch.Generator(device=args.device).manual_seed(case_seed)
             e3, poi, ligand, _ = load(entry)
             record = {'case': entry['case'], 'epoch': epoch, 'case_index': cursor, 'case_seed': case_seed}
-            try:
-                sample = prepare_task_sample(args.conditioning_task,
-                    e3, poi, ligand, generator=generator, evidence_id=f'training:{entry["case"]}',
-                    binary_bounds=bounds)
-                if sample is not None and prior_library is not None:
-                    sample = apply_training_prior(sample, ligand, prior_library.get(entry['case'], ligand['mol']),
-                        generator=generator, config=trainer.prior_config)
-            except ValueError as error:
-                sample = None
-                record['rejection'] = str(error)
-            # Model/backward exceptions are fatal, not relabeled as data skips.
-            if sample is None:
-                since_success += 1
-                record.update(status='skipped', rejection=record.get('rejection', 'no_chemical_cut_pair'))
-            else:
-                time = float(torch.rand((), device=args.device, generator=generator).clamp_min(1e-4))
-                metrics = trainer.step(sample, e3, poi, ligand, time=time, dt=.05)
-                record.update(status='updated', time=time, audit=sample.audit, **metrics)
+            requested = trainer.next_source()
+            record['requested_source'] = requested
+            if args.three_source and requested != 'bianchor':
+                batch, audit = prepare_free_batch(
+                    dict(case=entry['case'], e3_data=e3, poi_data=poi, ligand_data=ligand),
+                    requested, endpoint_store, seed=case_seed)
+                metrics = trainer.step_free(requested_source=requested, **batch)
+                record.update(status='updated', audit=audit, actual_source=batch['source'], **metrics)
                 since_success = 0
+            else:
+                try:
+                    sample = prepare_task_sample(args.conditioning_task,
+                        e3, poi, ligand, generator=generator, evidence_id=f'training:{entry["case"]}',
+                        binary_bounds=bounds)
+                    if sample is not None and prior_library is not None:
+                        sample = apply_training_prior(sample, ligand, prior_library.get(entry['case'], ligand['mol']),
+                            generator=generator, config=trainer.prior_config)
+                except ValueError as error:
+                    sample = None
+                    record['rejection'] = str(error)
+                # Model/backward exceptions are fatal, not relabeled as data skips.
+                if sample is None:
+                    since_success += 1
+                    record.update(status='skipped', rejection=record.get('rejection', 'no_chemical_cut_pair'))
+                else:
+                    time = float(torch.rand((), device=args.device, generator=generator).clamp_min(1e-4))
+                    metrics = trainer.step(sample, e3, poi, ligand, time=time, dt=.05)
+                    record.update(status='updated', time=time, audit=sample.audit,
+                                  actual_source=anchored_source(runner.model), **metrics)
+                    since_success = 0
+            if args.three_source:
+                succeeded = record.get('actual_source') == requested and record['status'] == 'updated'
+                source_attempts_without_success = 0 if succeeded else source_attempts_without_success + 1
+                record['source_updates'] = dict(trainer.source_training['updates'])
+                if source_attempts_without_success >= 128:
+                    raise RuntimeError(f'128 attempts without a real {requested} update; refusing false coverage')
             cursor += 1
             if cursor == len(visits):
                 cursor, epoch = 0, epoch + 1
