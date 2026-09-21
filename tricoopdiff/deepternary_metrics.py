@@ -163,8 +163,8 @@ def compute_fullatom_dockq(
             return {
                 "dockq": 0.0,
                 "fnat": 0.0,
-                "irms": float("inf"),
-                "lrms": float("inf"),
+                "irms": None,
+                "lrms": None,
                 "method": "DeepTernary/DockQ/dockq_util.py::cal_dockq",
                 "degenerate_interface": True,
             }
