@@ -200,9 +200,9 @@ def main():
             output = model(((case['features'] - mean) / scale).to(args.device))
             if args.post_only:
                 mask = torch.tensor([stage == 'final' for stage in case['stages']],
-                                    dtype=torch.bool, device=args.device)
+                                    dtype=torch.bool)
                 loss = state_quality_loss(
-                    {key: value[mask] for key, value in output.items()},
+                    {key: value[mask.to(args.device)] for key, value in output.items()},
                     case['dockq'][mask].to(args.device))
             else:
                 loss = state_quality_loss(output, case['dockq'].to(args.device))
