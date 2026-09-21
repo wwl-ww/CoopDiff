@@ -16,6 +16,8 @@ from .anchored_joint_motion import ACTION_POLICY
 from .bounded_binary_flow import BOUNDED_FLOW_VERSION
 from .bounded_binary_training import BOUNDED_TRAINING_CONTRACT, validate_binary_bounds
 from .bounded_joint_motion import BOUNDED_ACTION_POLICY
+from .bianchor_source import (anchored_source, uses_bianchor,
+                              SOURCE_POLICY as BIANCHOR_POLICY, FORMAT as BIANCHOR_FORMAT)
 from .anchored_fragments import FRAGMENT_POLICY
 from .anchored_training import TRAINING_CONTRACT
 from .anchored_tasks import task_contract, validate_task_sample
@@ -90,6 +92,11 @@ def validate_anchored_checkpoint(payload):
                         architecture='conditioned_consensus_v8_with_coupled_linker_action_v2')
     if adapter == PRIOR_ACTION_POLICY:
         expected.update(format='anchored_consensus_training_v9', architecture=PRIOR_ACTION_ARCHITECTURE)
+    bianchor = uses_bianchor(payload.get('model_config', {}))
+    if bianchor:
+        if payload.get('conditioning_task') != 'dual_binary':
+            raise ValueError('BiAnchor currently requires the dual_binary initialization task')
+        expected.update(format=BIANCHOR_FORMAT, source_policy=BIANCHOR_POLICY)
     for name, value in expected.items():
         if payload.get(name) != value:
             raise ValueError(f'anchored checkpoint contract mismatch: {name}')
@@ -132,6 +139,10 @@ def validate_anchored_checkpoint(payload):
             raise ValueError(f'missing anchored checkpoint field: {name}')
     if payload['model_config'].get('source_conditioning') is not True:
         raise ValueError('anchored source policy requires the source-conditioned network')
+    for key in ('trifuse_state_dict', 'ema_trifuse_state_dict'):
+        embedding = payload[key].get('source_embedding.weight')
+        if embedding is None or embedding.ndim != 2 or embedding.shape[0] != (3 if bianchor else 2):
+            raise ValueError('source embedding rows disagree with checkpoint vocabulary')
     runtime = payload.get('runtime_config', {})
     for name in ('lr', 'weight_decay', 'ema_decay', 'cartesian_weight', 'grad_clip'):
         if (not isinstance(runtime.get(name), (int, float))
@@ -246,6 +257,8 @@ class AnchoredTrainer:
         self.binary_bounds = copy.deepcopy(binary_bounds)
         self.task_contract = task_contract(conditioning_task, binary_bounds)
         self.conditioning_task = conditioning_task
+        if uses_bianchor(model.trifuse.config) and conditioning_task != 'dual_binary':
+            raise ValueError('BiAnchor currently requires the dual_binary initialization task')
         validate_prior_config(prior_config)
         self.prior_config = copy.deepcopy(prior_config)
         self.prior_library_identity = copy.deepcopy(prior_library_identity)
@@ -287,7 +300,7 @@ class AnchoredTrainer:
         validate_task_sample(sample, self.conditioning_task, self.binary_bounds, self.prior_config)
         losses = anchored_target_loss(
             self.model, sample.flow, ligand['coords'][0], poi['coords'][0], sample.prior_angles,
-            e3, poi, ligand, time, dt, conditions=sample.conditions, source=0,
+            e3, poi, ligand, time, dt, conditions=sample.conditions, source=anchored_source(self.model),
             cartesian_weight=self.runtime['cartesian_weight'], binary_metric=self.binary_metric)
         return {key: float(value) for key, value in losses.items() if key.startswith('loss_')}
 
@@ -323,7 +336,7 @@ class AnchoredTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         losses = anchored_target_loss(
             self.model, sample.flow, ligand['coords'][0], poi['coords'][0], sample.prior_angles,
-            e3, poi, ligand, time, dt, conditions=sample.conditions, source=0,
+            e3, poi, ligand, time, dt, conditions=sample.conditions, source=anchored_source(self.model),
             cartesian_weight=self.runtime['cartesian_weight'], binary_metric=self.binary_metric)
         losses['loss_total'].backward()
         if any(p.grad is not None for p in self.model.expert.parameters()):
@@ -369,6 +382,8 @@ class AnchoredTrainer:
         payload['expert_environment'] = dict(self.environment)
         if self.action_adapter == PRIOR_ACTION_POLICY:
             payload.update(format='anchored_consensus_training_v9', architecture=PRIOR_ACTION_ARCHITECTURE)
+        if uses_bianchor(self.model.trifuse.config):
+            payload.update(format=BIANCHOR_FORMAT, source_policy=BIANCHOR_POLICY)
         payload['validation_contract'] = copy.deepcopy(self.validation_contract)
         payload['validation_state'] = dict(self.validation_state)
         payload['rng_state'] = {'cpu': torch.get_rng_state(),

@@ -19,6 +19,7 @@ from train_entry import _load_score_model_args
 from tricoopdiff.anchored_consensus import sample_anchored
 from tricoopdiff.anchored_flow import AnchoredTorsionFlow
 from tricoopdiff.anchored_trainer import build_anchored_model, validate_anchored_checkpoint
+from tricoopdiff.bianchor_source import anchored_source
 from tricoopdiff.binary_pose_constraints import BinaryPoseInitializer
 from tricoopdiff.binary_chart_bank import build_binary_chart_bank, reference_conformer_schedule
 from tricoopdiff.bounded_binary_flow import BoundedBinaryTorsionFlow, ball_map
@@ -178,7 +179,7 @@ def main():
             reused_from, result = prediction_cache[cache_key]
         else:
             result = sample_anchored(model, flow, prior, e3, poi, ligand,
-                                     steps=args.steps, conditions=conditions, source=0)
+                                     steps=args.steps, conditions=conditions, source=anchored_source(model))
             if cache_key is not None:
                 prediction_cache[cache_key] = walker, result
         if args.allow_chemical_repeats:
@@ -225,6 +226,7 @@ def main():
               'checkpoint_sha256': hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),
               'condition_manifest_sha256': hashlib.sha256(args.condition_manifest.read_bytes()).hexdigest(),
               'generative_process': flow.version, 'source_policy': payload['source_policy'],
+              'initialization_source': anchored_source(model),
               'action_policy': payload['action_policy'],
               'action_adapter': payload.get('action_adapter'),
               'conditioning_task': payload.get('conditioning_task', 'dual_binary'),

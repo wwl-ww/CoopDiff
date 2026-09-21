@@ -31,6 +31,7 @@ from tricoopdiff.chemical_prior_contract import ChemicalPriorLibrary, chemical_p
 from tricoopdiff.anchored_data_schedule import epoch_entries, INDEX_ORDER, CLUSTER_ORDER
 from tricoopdiff.anchored_training_metric import PARAMETER_METRIC, PHYSICAL_METRIC
 from tricoopdiff.anchored_action_adapter import install_action_adapter
+from tricoopdiff.bianchor_source import install_bianchor_source, uses_bianchor
 from tricoopdiff.anchored_validation import (VALIDATION_POLICY, VALIDATION_TIMES,
                                            evaluate_panel, validate_index_pair)
 
@@ -48,6 +49,8 @@ def main():
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--resume', type=Path)
+    parser.add_argument('--init-source', choices=('legacy_zero', 'bianchor'),
+                        help='New dual_binary runs default to BiAnchor; resume inherits checkpoint semantics')
     parser.add_argument('--warm-start', type=Path,
                         help='Explicit trained EMA weight transfer; new optimizer, validation and task clock')
     parser.add_argument('--reset-action-adapter', action='store_true',
@@ -73,6 +76,17 @@ def main():
     parser.add_argument('--coupled-linker-action', action='store_true',
                         help='Install periodic and cross-bond linker action attention (checkpoint v7)')
     args = parser.parse_args()
+    saved = torch.load(args.resume, map_location='cpu', weights_only=False) if args.resume else None
+    if saved is not None:
+        validate_anchored_checkpoint(saved)
+        saved_source = 'bianchor' if uses_bianchor(saved['model_config']) else 'legacy_zero'
+        if args.init_source is not None and args.init_source != saved_source:
+            parser.error('resume cannot change initialization source; use --warm-start')
+        args.init_source = saved_source
+    elif args.init_source is None:
+        args.init_source = 'bianchor' if args.conditioning_task == 'dual_binary' else 'legacy_zero'
+    if args.init_source == 'bianchor' and args.conditioning_task != 'dual_binary':
+        parser.error('BiAnchor currently requires --conditioning-task dual_binary')
     started = wall_clock.monotonic()
     if args.max_seconds is not None and not 0 < args.max_seconds < float('inf'):
         parser.error('max-seconds must be positive and finite')
@@ -144,10 +158,17 @@ def main():
     parent_sha = runner.checkpoint_sha256
     if args.warm_start:
         if not args.resume:
-            warm_start_anchored_weights(runner.model, torch.load(
-                args.warm_start, map_location='cpu', weights_only=False),
+            warm = torch.load(args.warm_start, map_location='cpu', weights_only=False)
+            validate_anchored_checkpoint(warm)
+            if uses_bianchor(warm['model_config']):
+                if args.init_source != 'bianchor':
+                    raise ValueError('cannot discard the trained BiAnchor source')
+                install_bianchor_source(runner.model)
+            warm_start_anchored_weights(runner.model, warm,
                 reset_action_adapter=args.reset_action_adapter)
         parent_sha = hashlib.sha256(args.warm_start.read_bytes()).hexdigest()
+    if args.init_source == 'bianchor':
+        install_bianchor_source(runner.model)
     trainer = AnchoredTrainer(runner.model, parent_checkpoint_sha256=parent_sha,
                               training_index_sha256=hashlib.sha256(args.index.read_bytes()).hexdigest(),
                               lr=args.lr, validation_contract=validation_contract, binary_bounds=bounds,
@@ -169,7 +190,6 @@ def main():
     epoch, cursor = 0, 0
     torch.manual_seed(args.seed)
     if args.resume:
-        saved = torch.load(args.resume, map_location='cpu', weights_only=False)
         if saved.get('scope') != args.scope or saved.get('progress', {}).get('seed') != args.seed:
             raise ValueError('resume cannot change scope or seed')
         progress = trainer.restore(saved)

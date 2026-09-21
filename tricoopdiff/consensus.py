@@ -25,15 +25,15 @@ SOURCE_NAMES = ('sdpi', 'bitseed')
 SOURCE_CONTRACT_VERSION = 'candidate_source_conditioning_v1'
 
 
-def candidate_source_tensor(source, reference):
+def candidate_source_tensor(source, reference, names=SOURCE_NAMES):
     """Normalize one immutable trajectory source to a ``[1]`` class tensor."""
     if isinstance(source, str):
-        if source not in SOURCE_NAMES:
+        if source not in names:
             raise ValueError(f'unknown candidate source: {source!r}')
-        source = SOURCE_NAMES.index(source)
+        source = names.index(source)
     value = torch.as_tensor(source, device=reference.device, dtype=torch.long).reshape(-1)
-    if value.shape != (1,) or not bool(((value >= 0) & (value < len(SOURCE_NAMES))).all()):
-        raise ValueError('candidate source must be one SDPI/BiTSeed class')
+    if value.shape != (1,) or not bool(((value >= 0) & (value < len(names))).all()):
+        raise ValueError(f'candidate source must be one of {names}')
     return value
 
 
@@ -48,12 +48,19 @@ class ConsensusFuse(nn.Module):
     supports_conditions = False
 
     def __init__(self, node_dim=128, input_dim=None, num_transformer_layers=3,
-                 dropout=0.1, source_conditioning=False,
+                 dropout=0.1, source_conditioning=False, source_names=None,
                  **unused_legacy_dimensions):
         super().__init__()
+        self.source_names = SOURCE_NAMES if source_names is None else tuple(source_names)
+        if self.source_names not in (SOURCE_NAMES, (*SOURCE_NAMES, 'bianchor')):
+            raise ValueError('unsupported initialization source vocabulary')
+        if source_names is not None and not source_conditioning:
+            raise ValueError('explicit source vocabulary requires source conditioning')
         self.config = dict(node_dim=node_dim, input_dim=input_dim or node_dim,
                            num_transformer_layers=num_transformer_layers, dropout=dropout,
                            source_conditioning=bool(source_conditioning))
+        if source_names is not None:
+            self.config['source_names'] = list(self.source_names)
         self.pooling = TernaryGeometryEncoder(self.config['input_dim'], node_dim)
         self.transformer = TokenNegotiator(node_dim, num_transformer_layers, dropout)
         self.evidence_encoder = nn.Sequential(
@@ -64,7 +71,7 @@ class ConsensusFuse(nn.Module):
             # from different common weights.
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(0)
-                self.source_embedding = nn.Embedding(len(SOURCE_NAMES), node_dim)
+                self.source_embedding = nn.Embedding(len(self.source_names), node_dim)
                 self.source_gate_head = nn.Linear(node_dim, 4, bias=False)
                 nn.init.normal_(self.source_gate_head.weight, std=0.01)
         else:
@@ -107,7 +114,7 @@ class ConsensusFuse(nn.Module):
         evidence = self.evidence_encoder(torch.cat((diffusion_state, gram.flatten(1)), -1))
         if condition_context is not None:
             evidence = evidence + condition_context
-        source_index = candidate_source_tensor(source, evidence)
+        source_index = candidate_source_tensor(source, evidence, self.source_names)
         source_context = None
         if self.source_embedding is not None:
             source_context = self.source_embedding(source_index)
