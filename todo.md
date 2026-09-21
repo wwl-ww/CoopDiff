@@ -4,6 +4,28 @@
 
 ## rank 分支当前执行（2026-09-20）
 
+2026-09-21新增setwise/trajectory内部对照。修复setwise训练入口缺失NumPy导入后，
+在完整train32/val8、256初态、64预算上用union future value训练三seed；验证集
+selected-best分别为0.16641/0.17179/0.16976，完整池oracle为0.19774，oracle
+retention为0.8747/0.8867/0.8586。三seed均只保留2个>=0.23机会中的1个，且
+checkpoint仍在反复使用的val8上选择，不能称为独立泛化结果。匹配full-pool archive
+重新离线提取trajectory特征后，paired set ranker的Union Top1仅0.03251、0/8命中，
+不采用为终排。当前方向是保留setwise作为256→64候选方案，停止扩展该trajectory
+Top1原型。train128标签manifest按合同不重复保存case列表；128个标签文件已由archive
+case列表和逐文件哈希校验，下一步直接做160例训练和冻结评估。
+
+数据规模对照已排后台队列：`results/ranking_data_scale_20260920/`，GPU0为train32
+基线100轮（等更新次数控制），GPU1/2待完整train160标签后分别跑原模型/局部消息传递
+20轮。指定640/3200更新及同20轮三种对照口径。当前额外128已有119例归档、0标签，
+不提前用不完整子集训练。三卡上一轮均已完成，接触交互组最终Union Top1=0.048188，
+仍0/8命中；完整协议与局限见架构文档。未新增Git提交。
+
+最新新增三卡：物理GPU0/1/2已后台启动同协议20轮界面架构消融，分别为局部消息
+传递后pooled读出、接触token独立汇总、接触token交互后汇总。目录
+`results/ranking_contact_architecture32_20260920/`，完整配置见架构文档。
+相关10项测试与真实256候选梯度烟测通过；GPU5纯回归与5/7补采保持运行。
+两组上一轮epoch20拟合审计已完成，train Top1均约0.188，val仅0.041/0.027。
+
 结构排序实现与完整证据统一见 [Ranking模型架构](doc/Ranking模型架构.md)。下文model-v3为历史工作记录，不能以其中“尚未实现future”覆盖当前状态。
 
 - 已实现共享结构编码器、独立quality/future头；quality全排初末态，future只看初态、全排实际末态效用。收益缺失不造标签。Final/Union共用quality分数。
@@ -14,6 +36,13 @@
 - 两卡夜间各运行约10.05小时。train32全池轨迹和标签已齐；额外train128补采/标签于9月20日在GPU5/7恢复，见 `results/ranking_extension_resume_20260920_gpu{5,7}.log`。不停止该任务，不重生成候选。
 - 下一步先补齐独立训练case，再在同一数据上比较纯排序与明确几何误差辅助监督；不把query token、联合训练或更大架构未经验证地宣布为修复。
 - 已核查现有完整标签同时保存 `fnat/irms/lrms`，不必重新生成轨迹或另跑结构评分即可建立几何辅助监督。首个干净对照优先复用这些分解指标；ligand双侧结合标签不在其中，不能假装已经具备。
+- 已实现三分量辅助头/MSE及标签契约；20480个真实标签核查通过，真实全池梯度烟测通过。GPU5纯排序、GPU7排序＋分量监督的20-epoch配对实验已后台启动，目录 `results/ranking_components32_20260920/`。同train32/val8、seed7315、C40 EMA初始化；两组均关闭future/budget任务以隔离变量。效果待固定epoch20评估，不停止原补采队列。
+- 并行诊断已启动：`results/ranking_generalization_audit_20260920/`。CPU support任务核对train32/val8来源标签覆盖、配体大小、PDB/group隔离，并拟合固定alpha=1的简单坐标特征ridge基线；CPU intervention任务检查既有all组epoch20的来源交换/置零和局部几何扰动。两者有冻结runtime、逐case输出及完成标志，不占用额外GPU。尚未完成蛋白家族同源性审计，也未启动相同编码器的纯回归训练；不能把简单ridge称为等架构loss消融。
+- 上述CPU审计均已完成。删除来源embedding未解决Top1命中；模型对整体刚体变换近似不变，对32个明显几何破坏探针均降分，但细粒度质量辨别仍未验证。等编码器纯DockQ回归模式已实现并通过测试，后台串行队列 `results/ranking_regression32_20260920/` 等GPU5 baseline完整20轮结束后启动；当前是等待，不是已训练。协议和完整数值见架构文档。
+- 局部质量审计已后台启动，`results/ranking_local_quality_20260920/`：固定旧all组epoch20，train32/val8按同来源同阶段的坐标最近邻比较真实质量顺序，并检查>=0.23正负结构判别率；邻居不按真值挑选，输出实际距离。不占用GPU，不改变运行中的训练快照。
+- 局部审计40例已完成：同来源同阶段正负判别率train约95.0%（11例）、val约43.3%（仅2例）；多数坐标最近邻仍>=10Å，不能夸大局部覆盖。CPU冻结表示ridge探针已后台启动于 `results/ranking_frozen_probe_20260920/`，排除来源/阶段embedding，只用train拟合读出，进一步诊断表示与读出问题。
+- 最新：三分量对照已完成20轮，val8 Union Top1纯排序0.041407、辅助0.027391，均0/8命中；不采用辅助方案为默认。冻结表示探针也已完成，train/val Union Top1为0.185073/0.022717，未解决泛化。两组新模型train/val拟合审计在CPU后台运行；修复评估入口避免使用未监督future头。纯DockQ回归已自动接续GPU5并进入第6轮。额外train128完整归档92例、标签尚未开始，原队列继续。
+- 全仓CPU回归84文件、395项通过、0失败；随后新增future评估开关测试1项通过。尚未新增Git提交。
 - 用户于9月20日授权适当分批提交当前代码；不自动push或合并。未纳入当前主线验收的setwise/trajectory原型暂留工作区。
 - 提交前工作区CPU回归：81个测试文件、384项通过、0失败（含暂未提交的原型测试）；日志 `results/rank_precommit_20260920.log`。主线按模型训练、实验工具、文档分批提交，实验产物不入Git。
 

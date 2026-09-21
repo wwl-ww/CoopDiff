@@ -1,5 +1,60 @@
 # Ranking 模型架构
 
+## 2026-09-20：数据规模与更新次数对照
+
+三卡界面消融已全部完成20轮：pooled/contact-independent/contact-interaction的
+val Union Top1为0.046876/0.040274/0.048188，均>=0.23命中0/8。
+交互组最终略高但不构成可靠泛化突破；不再以该8例内部验证选择更多新模块。
+
+扩展train128目前119例完整归档，0例标签；原5/7队列将在各自补采完成后评分。
+新后台队列`results/ranking_data_scale_20260920/`复用授权的0/1/2卡：
+
+| GPU | 训练组 | 总轮数 | 状态前提 |
+| --- | --- | ---: | --- |
+| 0 | 原train32、无新增界面分支 | 100 | 原数据齐全，预检后启动 |
+| 1 | train32＋额外128、原模型 | 20 | 全160例完整归档及标签齐全 |
+| 2 | 同train160、两层局部消息传递＋pooled | 20 | 同上 |
+
+保持C40 EMA初始化、seed7315、lr3e-4、decision/top_weight1、辅助/future/budget全0，
+val8与256候选全池不变，每case一次更新。预先指定两种比较：
+train32 epoch20 vs train160 epoch4（640更新）；train32 epoch100 vs train160 epoch20
+（3200更新）。同时报告同20轮结果，但不能把它当等计算量的数据消融。
+GPU2选择较简单的既有消息传递作为结构对照，不宣称它是验证集最优。
+
+每组冻结runtime并记录plan/launch；等待数据时不占GPU，齐全后先运行完整checksum、
+标签覆盖、PDB/group隔离预检，再确认目标GPU无计算进程。预检失败则停止并记录失败，
+不自动删case或换数据。每组持有非阻塞文件锁防重复启动。队列基础测试通过。
+这仍是内部验证；未新增独立外部测试或完成家族同源性审计。
+
+## 2026-09-20：三卡界面架构消融（已后台启动）
+
+用户新增授权三张卡，检查空闲后使用物理GPU0/1/2，不改变5/7现有任务。
+输出`results/ranking_contact_architecture32_20260920/`，各组源码冻结、命令与PID
+见launch.json。统一train32/val8全池、seed7315、C40 EMA编码器初始化、h128、
+lr3e-4、20epochs、chunk4、decision全排序＋top_weight1；所有辅助/future/budget
+权重为0。主比较固定epoch20，不在反复使用的val8上挑best宣布成功。
+
+| GPU | 读出 | 作用 |
+| --- | --- | --- |
+| 0 | pooled | 两层局部消息传递后，按组分汇总的既有界面基线 |
+| 1 | contacts-independent | 相同消息传递；保留局部接触token，query注意力汇总 |
+| 2 | contacts | 与GPU1相同，但汇总前增加一层接触token自注意力 |
+
+每个E3-L/POI-L/E3-POI界面最多取32个最近的无向接触（12Å内kNN图），包含
+两端化学表示、关系类型、距离RBF；ligand键参加消息传递但不作为界面token。
+方向按组分类型规范化；距离边界精确平局仍有离散选边歧义。两种contact组
+共同参数逐项初始化一致，independent组跳过且冻结交互层，dropout均为0。
+新分支仍作为原global context的门控残差，不是全原子网络，也不是彻底移除
+原编码器的替代模型。蛋白仍为Cα；不能据此宣称解决侧链化学信息缺失。
+
+相关10项测试通过；真实256候选/512状态反向烟测17.34秒，PyTorch峰值allocated
+约167MiB（非整卡显存），报告`results/contact_readout_smoke_20260920.json`。
+这仅证明可运行，不证明泛化收益。train160仍待补采和完整标签，不混入本轮。
+
+此前两组epoch20拟合审计已完成：纯排序train/val Union Top1为0.188723/0.041407；
+三分量辅助为0.188396/0.027391。两者训练集都接近oracle0.189428，继续支持
+泛化失败而非不能拟合；不能据此排除数据分布因素。
+
 ## 2026-09-20：十小时实验结果与当前判断
 
 GPU5/7队列分别完成10.049/10.055小时，两组均完成20epochs，之后继续补采。
@@ -29,7 +84,7 @@ oracle均值0.197744，>=0.23机会为2/8。这里随机基线只用于候选保
 0.189428；selector保留oracle均为0.189428，>=0.23机会均命中11/11。
 验证集则全池排序和选64后的排序都失败，因此当前主要证据指向泛化不足，
 不是模型在训练集上无法学习质量。训练样本仅32个独立case，不能直接锁定
-是数据量、分布还是表示问题。没有启动新一轮模型训练。
+是数据量、分布还是表示问题。该审计自身未更新模型；后续对照见下文。
 
 后续先在相同训练case上比较纯排序监督与明确几何质量辅助监督，保持数据量
 和结构编码器可比，再决定是否增加生成器内部特征。不是根据这8例反复使用
@@ -48,8 +103,149 @@ oracle均值0.197744，>=0.23机会为2/8。这里随机基线只用于候选保
 `1/(1+(irms/1.5)^2)`、`1/(1+(lrms/8.5)^2)`；三者均值恰好对应本地
 DockQ实现（`DeepTernary/DockQ/dockq_util.py:363`）。它们是同一目标的可解释
 分解，不是额外独立真值或新信息来源；价值需通过相同数据/编码器对照验证。
-这些标签并不等于ligand两端的结合质量，后者尚需单独定义。本段是后续方案，
-尚未实现新的辅助头或启动该对照。
+这些标签并不等于ligand两端的结合质量，后者尚需单独定义。
+
+### 几何分量辅助监督：实现与配对实验
+
+9月20日已实现可选三输出sigmoid辅助头，读取与quality排序头相同的结构表示，
+以三个有界分量的MSE监督编码器；标签detach且不进入结构输入。部署排序仍使用
+原有score，不把辅助分数未经验证地替代排序。默认component_weight=0，旧checkpoint
+保持兼容。部分标签、非法值及分量均值与DockQ不一致均拒绝训练。
+
+train32/val8共20480个初末态标签通过分解一致性检查。真实256候选、512状态
+反向烟测通过，chunk4约19.45秒，PyTorch峰值allocated约140MiB（不是整卡占用）。
+证据：`results/ranking_component_smoke_20260920.json`。
+
+已后台启动同数据、同seed7315、同C40 EMA编码器初始化的两组20-epoch对照：
+
+| GPU | 实验 | component_weight |
+| --- | --- | ---: |
+| 5 | 纯全排序基线 | 0 |
+| 7 | 全排序＋几何分量监督 | 1 |
+
+其余统一：hidden_dim128、interface_layers0、lr3e-4、decision目标、top_weight1、
+quality_weight0、archived-pairs、quality_walker_scope=all、chunk4。
+两组future_weight与budget_weight均为0，隔离质量学习问题；不与上一轮future联合
+训练直接当作单变量对照。共享权重初始化和每epoch样本顺序保持一致。
+主比较预定固定epoch20的Initial/Final/Union Top1、>=0.23/0.49命中、oracle与差距；
+辅助MAE只作诊断。不能根据各组best或这8例反复使用的内部验证宣布泛化成功。
+
+输出：`results/ranking_components32_20260920/{baseline,components}`；
+完整命令/PID/源码哈希在`launch.json`，源码冻结在`runtime/`。
+原GPU5/7补采队列继续运行，不停止、不修改其运行快照。本次对照尚无效果结论。
+更新：上述两组已完整完成20epochs。固定epoch20的val8结果如下：
+
+| 目标 | Initial Top1 | Final Top1 | Union Top1 | Union >=0.23 |
+| --- | ---: | ---: | ---: | ---: |
+| 纯排序 | 0.026210 | 0.043175 | 0.041407 | 0/8 |
+| 排序＋三分量辅助 | 0.023703 | 0.024923 | 0.027391 | 0/8 |
+
+本轮不支持采用三分量辅助监督为默认，不能把训练loss下降视为成功。
+两组固定epoch20的train32/val8复评在CPU后台运行，输出
+`results/ranking_components_fit_audit_20260920/{baseline,components}.json`。
+评估入口已修复为按checkpoint实际监督记录决定是否评估future：本轮两组
+future都未训练，不再把其随机头当作selector报告。该修复有专门回归测试；
+此前夜间两组future确实受监督，原报告不受此问题影响。
+本次相关CPU回归23个文件、132项通过，包括全池训练、精确梯度回放、分量标签、
+旧checkpoint兼容性和结构几何测试；不等同于已重跑全仓所有测试。
+
+### 并行泛化诊断
+
+入口 `scripts/audit_ranker_generalization.py`，固定已完成夜间all组epoch20，不读取
+正在变化的best模型。train32/val8数据seal与checkpoint核对，运行前检查PDB/group隔离。
+结果目录 `results/ranking_generalization_audit_20260920/`，CPU两进程并行，逐case写入，
+只有顶层complete=true才表示全部完成。
+
+- support：分来源/阶段统计标签均值、oracle、>=0.23/0.49结构数；记录配体原子数。
+  用15项候选几何特征拟合固定alpha=1的ridge，仅训练集标准化/拟合，每case等总权重；
+  同时报告固定接触覆盖率规则。蛋白采用Cα，不能将距离代理称为全原子clash或能量。
+- intervention：验证8例原始分数与来源交换、统一SDPI、来源embedding置零对照，
+  报各来源Top64占比、来源内准确率和选64后Union oracle；只改变标志，不改变结构。
+  这是分布外敏感性实验，不等价于重新训练无source模型。
+- 几何扰动：每case每阶段/来源取规范顺序首个结构，不按真值挑选；比较整体刚体
+  变换与POI/ligand单独移远100Å的分数变化。扰动后未重算DockQ，不能沿用原标签
+  声称准确率或严格单调质量关系。
+
+新增3项CPU测试通过。家族同源性、等架构纯DockQ回归及更细粒度表示探针仍待实施；
+当前诊断不覆盖这些问题，也不据8例重复验证宣称独立泛化有效。
+
+support任务已完成40例：简单ridge的验证Initial/Final/Union Top1为
+0.022620/0.020784/0.021536，固定接触规则为0.035966/0.029345/0.036472，
+两者Union >=0.23均0/8。未发现简单几何基线能解决当前问题。
+train32中SDPI有12/4096、BiTSeed有55/12288个初末态结构达到0.23，分别覆盖3、11例；
+val8中分别为3/1024、3/3072，分别覆盖1、1例。初末态相关，不能当成独立样本数；
+这一分布差异需要结合完整来源干预再判断，不能只凭Top64来源比例断言捷径。
+
+来源/几何干预已完成8例（固定夜间all组epoch20）：原始、交换来源、统一SDPI、
+来源embedding置零的Union Top1分别0.038516/0.037974/0.039003/0.039003，
+全部>=0.23命中0/8。按初态quality选64的Union retained oracle分别为
+0.112245/0.127744/0.133546/0.133546；这不是future选择器指标。
+32个几何探针的整体刚体变换最大分数误差4.77e-6；POI、ligand分别移远100Å时
+各32/32探针降分，均值变化-5.4568/-4.8328。只证明对明显破坏敏感，不证明
+能区分近邻basin或细微的高质量结构。干预结果不支持仅靠删除来源标志修复泛化。
+
+### 等编码器纯回归对照（已启动）
+
+新增`--objective regression --top-weight 0`，直接以`sigmoid(score)`与DockQ的MSE
+训练原scalar head和编码器，不新增头；推理仍按原score排序（sigmoid单调）。
+强制archived-pairs、all、全池有效末态齐全，且quality/component/future/budget权重
+全为0。在本次每例256初态＋256末态的条件下，两阶段等权、每case等权。
+不宣称回归值已校准；仍不开放未监督的q_hat/p23/p49。
+
+使用同train32/val8、C40 EMA初始化、seed7315、lr3e-4、20epochs与chunk4；这是
+监督目标对照，不做验证调参。MSE与排序loss尺度不同，不能直接比较loss数值。
+队列目录`results/ranking_regression32_20260920/`，GPU5当前baseline进程退出且
+确认epoch20历史记录及checkpoint存在后启动。进程start-time防止PID复用误判；
+若前置实验不完整则退出并记录blocked，不自动抢卡。源码已冻结；队列已确认
+前置baseline完成20epochs，并自动启动GPU5纯回归训练，目前进入第6轮。
+新增回归梯度/训练推理2项与既有decision/replay5项测试通过。
+
+### 同来源、同阶段的局部质量审计（已完成）
+
+`audit_ranker_generalization.py --mode local`已在CPU后台启动，固定夜间all组epoch20，
+同时检查train32和val8。输出`results/ranking_local_quality_20260920/local.json`，
+只有complete=true才表示全40例完成。不修改训练或原始结构。
+
+每个case内按stage/source分组，以固定E3参考系中的POI Cα和ligand原子坐标找
+最近邻；距离为两种组分均方位移等权平均后开方，不做native对齐。邻居只由坐标
+决定，去重无向对后比较真实DockQ差与分数差；DockQ差<=1e-4视为不可比较，
+分数平局记0.5。报告实际距离，不能将稀疏池中的“最近”自动称为相近basin。
+另报告每组>=0.23结构与低于阈值结构的成对判别率；没有正/负样本时为null，
+不是零分。比较应分别报告距离区间和case级平均，不能把相关候选对当独立样本。
+4项审计测试通过，包含邻居选择不依赖标签以及来源分组隔离。
+
+全40例已完成。以下先在每case内汇总可比近邻对，再对有支持的case等权平均：
+
+| 几何距离 | train准确率（case数/对数） | val准确率（case数/对数） |
+| --- | --- | --- |
+| <2Å | 0.4583（4/31） | 0.6923（1/13） |
+| 2–5Å | 0.6944（10/141） | 0.5376（4/36） |
+| 5–10Å | 0.6056（28/1547） | 0.5108（7/404） |
+| >=10Å | 0.6679（32/10256） | 0.6153（8/2567） |
+
+大多数最近邻仍>=10Å，不能据此声称已充分覆盖局部basin。仅看DockQ差>.01时，
+val的<5Å区间只剩1例6对、准确率0.5，细粒度结论尤其不稳。
+同stage/source的>=0.23正负判别率，先组内再case等权，train为0.950474（11例），
+val为0.433418（2例）。4I0P的BiTSeed初态/终态分别0.1728/0.3053；2BVR的SDPI
+分别0.6048/0.6508。支持“好结构辨别泛化差”，但只有2个阳性验证case，不能
+将几千候选对当作几千独立样本，或锁定唯一架构原因。
+
+### 冻结表示探针（已完成）
+
+`--mode probe`在CPU后台读取同一epoch20模型，截取readout之前的global/E3-L/POI-L/
+ligand四个结构token，明确排除stage/source embedding。编码器和所有原模型权重冻结，
+仅训练集标准化后拟合固定alpha=1的ridge，按原Initial/Final/Union口径评估。
+它检验当前表示能否由另一简单读出方式利用，不是等架构重训练，也不能用负结果证明
+表示中绝无有效信息。输出`results/ranking_frozen_probe_20260920/probe.json`；新增
+测试确认相同结构不同stage/source得到完全相同的探针特征、无梯度且hook正确清理。
+
+探针全40例已完成：训练Initial/Final/Union Top1为0.155004/0.157381/0.185073，
+Union >=0.23为10/32；验证为0.022210/0.024208/0.022717，命中0/8。
+重新拟合简单读出仍表现出明显训练/验证差距，不支持“只替换读出头即可修复”。
+这不等于证明编码器是唯一原因；样本量、训练分布及监督目标仍需区分。
+全仓CPU回归完成84个文件、395项通过、0失败，日志
+`results/rank_regression_cpu_20260920.log`（包括未提交的历史原型）；随后新增
+future评估开关测试另有1项通过。
 
 ## 2026-09-17：决策目标修复（代码已实现，效果待验证）
 
@@ -472,3 +668,25 @@ tests/test_structural_ranker.py与tests/test_structural_full_ranking.py共10项�
 固定取第12轮完整配对回放，预算8/32/64的保留末态oracle均值0.10174/0.12207/0.14047，Final实际Top-1为0.05880/0.06240/0.05767；各预算均保住并选中2BVR的高质量末态。64预算的保留均值超过均匀随机解析期望0.12213，但未经置信区间检验。4I0P仍失败：初态oracle排第23并进入64，两个高质量末态对应的walker却被初筛排除；其最终质量排名为第53和230。因此初态质量、未来价值、最终质量三者不能用一项指标替代。
 
 在原两个训练因素的基础上补齐组合项 `results/structural_future_top160_20260917/ema/`：GPU7，C40 EMA、同160/8数据、seed7315、20epoch、hidden128、lr3e-4、interface_layers=0；future_weight=1，top_weight=1（quality及future各自全排序＋最佳档监督），quality_weight=0。与quality-only/top、dual-head/no-top共同区分两个训练目标因素，而不是扫描权重或更换网络宽度。新组合使用数学等价的后缀扫描损失实现，前述旧组仍用封存实现；不声称浮点逐位一致。尚无组合组效果结论。
+
+### Setwise预算筛选与trajectory终排对照（2026-09-21）
+
+在不重跑生成器的前提下，使用完整train32/val8归档验证两个跨walker原型。setwise
+selector以全部256个初态几何及实际来源为上下文，直接监督固定精修协议下的Union
+future value，并选择64个walker。三组seed 7315/7316/7317的验证selected-best分别为
+0.16641、0.17179、0.16976；完整池oracle均值0.19774，对应case-macro oracle
+retention为0.8747、0.8867、0.8586。三组均只保留2个DockQ>=0.23机会中的1个。
+这比旧train32质量初筛约0.1329的selected-best高，但checkpoint仍按同一val8选择，
+只能作为内部机制证据，不能宣称独立泛化或部署效果。
+
+trajectory set ranker同时读取配对初态、有效末态、位移特征、来源及失败标记，再预测
+Final/Union顺序和Union回退阶段。为避免混用旧64-pair特征，重新从当前full-pool
+archive离线提取并绑定manifest哈希的train32特征。50轮、seed7315的最佳内部验证
+Union Top1为0.03251，Final Top1为0.03068，二者均0/8命中DockQ>=0.23；Union
+oracle为0.19774。该原型没有解决终排问题，不作为后续默认方向。
+
+结果目录为`results/ranking_setwise32_20260921/`、
+`results/ranking_trajectory_features_20260921/`和
+`results/ranking_trajectory_set32_20260921/`。下一步仅扩展有正信号的setwise预算筛选；
+train128标签manifest按合同不重复保存case列表；128个标签文件已由archive case列表、
+archive manifest哈希和逐文件哈希校验，可直接进入train160与冻结checkpoint评估。
