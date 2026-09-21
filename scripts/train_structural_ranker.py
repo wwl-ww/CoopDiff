@@ -16,7 +16,7 @@ import torch
 
 from tricoopdiff.structural_ranker import (
     StructuralQualityRanker, rank_states, structural_ranking_loss, decision_ranking_loss,
-    budget_retention_loss, selected_walker_mask,
+    budget_retention_loss, selected_walker_mask, component_quality_loss, dockq_regression_loss,
 )
 from tricoopdiff.initial_selector import selector_retention
 from tricoopdiff.ranking_backward import backward_list
@@ -184,9 +184,14 @@ def evaluate(model, dataset, device, *, shuffle_repeats=0, shuffle_seed=7315, fu
     rows = []
     for i in range(len(dataset)):
         case = dataset[i]
-        scores = score_case(model, case, device)['score'].cpu()
+        prediction = score_case(model, case, device)
+        scores = prediction['score'].cpu()
         row = {'case': case['case'], 'within_stage_source': ordering_metrics(
             scores, case['labels'], groups=list(zip(case['stages'], case['sources'])))}
+        if 'components' in prediction and case.get('component_mask', torch.tensor(False)).all():
+            components = prediction['components'].cpu()
+            row['component_mae'] = (components - case['component_targets']).abs().mean(0).tolist()
+            row['component_dockq_mae'] = float((components.mean(-1) - case['labels']).abs().mean())
         if not initial_only:
             row['refinement_selection'] = refinement_selection_metrics(
                 scores, case['labels'], case['identities'], case['sources'])
@@ -233,6 +238,13 @@ def evaluate(model, dataset, device, *, shuffle_repeats=0, shuffle_seed=7315, fu
             }
         rows.append(row)
     summary = {'rows': rows, 'cases': len(rows)}
+    component_rows = [row for row in rows if 'component_mae' in row]
+    if component_rows:
+        summary['component_quality'] = {
+            'cases': len(component_rows),
+            'mae': {key: sum(row['component_mae'][i] for row in component_rows) / len(component_rows)
+                    for i, key in enumerate(('fnat', 'irms_quality', 'lrms_quality'))},
+            'dockq_mae': sum(row['component_dockq_mae'] for row in component_rows) / len(component_rows)}
     replay_keys = ['refinement_selection'] if not initial_only else []
     if future_enabled:
         replay_keys.append('future_refinement_selection')
@@ -346,6 +358,7 @@ def main(argv=None):
                         help='optional soft training budget; finish/checkpoint the current epoch before stopping')
     parser.add_argument('--save-epoch-checkpoints', action='store_true')
     parser.add_argument('--hidden-dim', type=int, default=128)
+    parser.add_argument('--interface-readout', choices=('pooled', 'contacts', 'contacts-independent'), default='pooled')
     parser.add_argument('--interface-layers', type=int, default=0,
                         help='local interface message-passing layers; 0 is the pooled baseline')
     parser.add_argument('--encoder-checkpoint', type=Path)
@@ -353,6 +366,8 @@ def main(argv=None):
     parser.add_argument('--seed', type=int, default=7315)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--quality-weight', type=float, default=0.)
+    parser.add_argument('--component-weight', type=float, default=0.,
+                        help='MSE on fnat/bounded iRMS/bounded LRMS; first ablation uses all archived pairs')
     parser.add_argument('--backward-chunk-size', type=int, default=0,
                         help='exact two-pass list gradient replay; 0 retains ordinary autograd')
     parser.add_argument('--future-weight', type=float, default=0.,
@@ -360,7 +375,7 @@ def main(argv=None):
     parser.add_argument('--future-target', choices=('final', 'union'), default='final')
     parser.add_argument('--budget-weight', type=float, default=0.,
                         help='future top64 best-tier retention; requires complete training pool outcomes')
-    parser.add_argument('--objective', choices=('decision', 'legacy'), default='decision',
+    parser.add_argument('--objective', choices=('decision', 'legacy', 'regression'), default='decision',
                         help='decision balances Initial/Final/eligible Union full-list losses')
     parser.add_argument('--checkpoint-task', choices=('quality', 'future'), default='quality')
     parser.add_argument('--quality-walker-scope', choices=('all', 'future-top64'), default='all',
@@ -371,6 +386,17 @@ def main(argv=None):
     parser.add_argument('--shuffle-repeats', type=int, default=32,
                         help='within-flag geometry diagnostic draws; 0 disables')
     args = parser.parse_args(argv)
+    if args.interface_readout != 'pooled' and (args.interface_layers < 1 or args.hidden_dim % 4):
+        parser.error('contact readout requires interface layers and hidden_dim divisible by four')
+    if args.objective == 'regression' and (
+            args.top_weight or args.quality_weight or args.component_weight or args.future_weight
+            or args.budget_weight or args.candidate_scope != 'archived-pairs'
+            or args.quality_walker_scope != 'all'):
+        parser.error('pure regression requires archived-pairs/all and zero top/quality/component/future/budget weights')
+    if not math.isfinite(args.component_weight) or args.component_weight < 0:
+        parser.error('component weight must be finite and nonnegative')
+    if args.component_weight and (args.candidate_scope != 'archived-pairs' or args.quality_walker_scope != 'all'):
+        parser.error('component auxiliary currently requires archived-pairs and all-walker quality supervision')
     if not math.isfinite(args.max_hours) or args.max_hours < 0:
         parser.error('max hours must be finite and nonnegative')
     if args.backward_chunk_size < 0:
@@ -411,6 +437,17 @@ def main(argv=None):
     train = shards[0] if len(shards) == 1 else StructuralArchiveCollection(shards)
     val = make_dataset(args.val_archives, args.val_labels, 'val', args.val_initial_labels)
     coverage = audit_datasets(train, val)
+    if args.objective == 'regression':
+        for dataset in (train, val):
+            for i in range(len(dataset)):
+                case = dataset[i]
+                if sum(s == 'final' for s in case['stages']) != case['pool_size']:
+                    raise ValueError('paired regression ablation requires complete full-pool outcomes')
+    if args.component_weight:
+        for dataset in (train, val):
+            for i in range(len(dataset)):
+                if not bool(dataset[i]['component_mask'].all()):
+                    raise ValueError('component supervision requires complete fnat/irms/lrms labels')
     if args.checkpoint_task == 'future' or args.quality_walker_scope == 'future-top64':
         for index in range(len(val)):
             case = val[index]
@@ -436,6 +473,10 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     config = {'input_dim': train[0]['graphs'][0]['node_features'].shape[1], 'hidden_dim': args.hidden_dim,
               'interface_layers': args.interface_layers}
+    if args.interface_readout != 'pooled':
+        config['interface_readout'] = args.interface_readout
+    if args.component_weight:
+        config['component_aux'] = True
     model = StructuralQualityRanker(**config)
     initialization = (initialize_encoder(model, args.encoder_checkpoint, args.encoder_weights)
                       if args.encoder_checkpoint is not None else 'random')
@@ -516,10 +557,12 @@ def main(argv=None):
         total = 0.
         quality_total, future_total, future_cases = 0., 0., 0
         budget_total = 0.
+        component_total = 0.
         for position, index in enumerate(order, 1):
             case = train[index]
             optimizer.zero_grad(set_to_none=True)
-            objective = decision_ranking_loss if args.objective == 'decision' else structural_ranking_loss
+            objective = {'decision': decision_ranking_loss, 'legacy': structural_ranking_loss,
+                         'regression': dockq_regression_loss}[args.objective]
             scope_args = {'stages': case['stages'], 'union_eligible': case.get('union_eligible')} if args.objective == 'decision' else {}
             if args.quality_walker_scope == 'future-top64':
                 allocation_case = future_utility_case(case, target=args.future_target)
@@ -527,10 +570,16 @@ def main(argv=None):
                     allocation_scores = score_case(model, allocation_case, args.device)['score']
                 eligible = selected_walker_mask(allocation_scores, allocation_case['identities'], case['identities'])
                 scope_args.update(union_eligible=eligible, final_eligible=eligible)
+            component_values = []
             def quality_objective(output):
-                return objective(output, case['labels'].to(args.device), **scope_args,
+                value = objective(output, case['labels'].to(args.device), **scope_args,
                                  quality_weight=args.quality_weight, top_weight=args.top_weight,
                                  tie_tolerance=args.tie_tolerance)
+                if args.component_weight:
+                    auxiliary = component_quality_loss(output, case['component_targets'].to(args.device))
+                    component_values.append(float(auxiliary.detach()))
+                    value = value + args.component_weight * auxiliary
+                return value
             if args.backward_chunk_size:
                 loss, _ = backward_list(model, case, args.device, quality_objective,
                                         chunk_size=args.backward_chunk_size)
@@ -542,6 +591,7 @@ def main(argv=None):
             if not torch.isfinite(loss):
                 raise FloatingPointError('nonfinite ranking loss')
             quality_total += float(loss.detach())
+            component_total += sum(component_values)
             if args.future_weight:
                 future = future_utility_case(case, target=args.future_target)
                 if future is not None:
@@ -583,6 +633,8 @@ def main(argv=None):
                            shuffle_seed=args.seed, future_enabled=args.future_weight > 0,
                            future_target=args.future_target)
         record = {'epoch': epoch, 'train_loss': total / len(train), 'validation': metrics}
+        if args.component_weight:
+            record['component_train_loss'] = component_total / len(train)
         if args.future_weight:
             record.update(quality_train_loss=quality_total / len(train),
                           future_train_loss=future_total / future_cases if future_cases else None,
@@ -598,6 +650,8 @@ def main(argv=None):
                    'head_supervision': {'rank': True, 'quality_aux': args.quality_weight > 0,
                                         'future': args.future_weight > 0},
                    'epoch': epoch, 'metadata': metadata, 'validation': metrics}
+        if args.component_weight:
+            payload['head_supervision']['components'] = True
         if key > best:
             best = key
             best_payload = payload

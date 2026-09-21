@@ -67,6 +67,24 @@ def adapt_initial_pool(archive, labels=None):
     return result
 
 
+def dockq_components(label):
+    """Return bounded DockQ decomposition, or None for old scalar-only labels."""
+    keys = ('fnat', 'irms', 'lrms')
+    if not any(key in label for key in keys):
+        return None
+    if not all(key in label for key in keys):
+        raise ValueError('partial DockQ component labels')
+    fnat, irms, lrms = (float(label[key]) for key in keys)
+    if (not all(math.isfinite(x) for x in (fnat, irms, lrms))
+            or not 0 <= fnat <= 1 or irms < 0 or lrms < 0):
+        raise ValueError('invalid DockQ component labels')
+    values = [fnat, (1. / math.hypot(1., irms / 1.5)) ** 2,
+              (1. / math.hypot(1., lrms / 8.5)) ** 2]
+    if abs(sum(values) / 3 - float(label['dockq'])) > 1e-5:
+        raise ValueError('DockQ scalar disagrees with its components')
+    return values
+
+
 def adapt_case(archive, labels=None):
     """Adapt archived pairs; optional training labels stay outside graph inputs."""
     if archive['protocol'] != ARCHIVE_VERSION or (labels is not None and archive['case'] != labels['case']):
@@ -78,6 +96,7 @@ def adapt_case(archive, labels=None):
         raise ValueError('labels must cover each archived pair exactly once')
     inputs = archive['input_graphs']
     graphs, stages, sources, targets, identities = [], [], [], [], []
+    components, component_mask = [], []
     for index, pair in sorted(pairs.items()):
         if type(index) is not int or not 0 <= index < len(archive['pool']):
             raise ValueError('invalid pool index')
@@ -106,6 +125,9 @@ def adapt_case(archive, labels=None):
                 if not math.isfinite(value) or not 0 <= value <= 1:
                     raise ValueError('invalid DockQ label')
                 targets.append(value)
+                terms = dockq_components(target[stage])
+                components.append(terms if terms is not None else [0., 0., 0.])
+                component_mask.append(terms is not None)
             graphs.append(state_graph(inputs, state))
             stages.append(stage); sources.append(pair['source'])
             identities.append((index, stage))
@@ -116,6 +138,8 @@ def adapt_case(archive, labels=None):
             'labeled_initials': len(pairs) if labels is not None else 0}
     if labels is not None:
         result['labels'] = torch.tensor(targets)
+        result['component_targets'] = torch.tensor(components)
+        result['component_mask'] = torch.tensor(component_mask, dtype=torch.bool)
     return result
 
 

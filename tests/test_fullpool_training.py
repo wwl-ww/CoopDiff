@@ -2,6 +2,7 @@
 
 import copy
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -14,7 +15,7 @@ from scripts.train_structural_ranker import main, selection_score
 from tricoopdiff.structural_ranker import StructuralQualityRanker
 
 
-def test_fullpool_budget_training_and_checkpoint():
+def test_fullpool_budget_training_and_checkpoint(component_weight=0.):
     with tempfile.TemporaryDirectory(prefix='fullpool-training-') as temporary:
         root = Path(temporary)
         arguments = []
@@ -39,6 +40,13 @@ def test_fullpool_budget_training_and_checkpoint():
                 targets.append({'pool_index': index, 'valid': True,
                                 'initial': {'dockq': .1 + .2 * index / 256.},
                                 'final': {'dockq': .8 * (255 - index) / 256.}})
+                if component_weight:
+                    for stage in ('initial', 'final'):
+                        target = targets[-1][stage]
+                        value = max(.001, target['dockq'])
+                        target.update(dockq=value, fnat=value,
+                                      irms=1.5 * math.sqrt(1. / value - 1),
+                                      lrms=8.5 * math.sqrt(1. / value - 1))
             manifest = {'cases': [case], 'checkpoint_sha256': 'synthetic', 'steps': 20,
                         'pool': {'size': 256}, 'selection': 'complete_existing_pool_v1'}
             archive['manifest'] = manifest
@@ -58,12 +66,17 @@ def test_fullpool_budget_training_and_checkpoint():
                           '--save-epoch-checkpoints', '--hidden-dim', '16',
                           '--shuffle-repeats', '0', '--future-weight', '1', '--future-target', 'union',
                           '--budget-weight', '1', '--checkpoint-task', 'future', '--backward-chunk-size', '4',
-                          '--quality-walker-scope', 'future-top64'])
+                          '--quality-walker-scope', 'all' if component_weight else 'future-top64',
+                          '--component-weight', str(component_weight)])
         checkpoint = torch.load(out / 'best.pt', weights_only=False)
         assert checkpoint['epoch'] == 1 and (out / 'epoch_001.pt').exists()
         assert not (out / 'epoch_002.pt').exists(), 'soft deadline must stop at the saved epoch boundary'
         record = json.loads((out / 'history.jsonl').read_text())
         assert record['budget_train_loss'] > 0
+        if component_weight:
+            assert record['component_train_loss'] > 0
+            assert checkpoint['head_supervision']['components']
+            assert checkpoint['validation']['component_quality']['cases'] == 1
         assert checkpoint['metadata']['primary'] == 'future_top64_union_selected_best'
         metrics = checkpoint['validation']
         assert metrics['future_refinement_selection']['complete_pair_coverage_cases'] == 1
@@ -77,5 +90,10 @@ def test_fullpool_budget_training_and_checkpoint():
         print(f'Full-pool integration: 256 candidates, 512 quality states; budget loss={record["budget_train_loss"]:.6f}')
 
 
+def test_component_auxiliary_fullpool_training():
+    test_fullpool_budget_training_and_checkpoint(component_weight=.5)
+
+
 if __name__ == '__main__':
     test_fullpool_budget_training_and_checkpoint()
+    test_component_auxiliary_fullpool_training()

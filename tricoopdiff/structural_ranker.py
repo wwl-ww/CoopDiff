@@ -22,7 +22,8 @@ SOURCES = ('sdpi', 'bitseed')
 class StructuralQualityRanker(nn.Module):
     """Independent trainable structural encoder and common state-quality head."""
 
-    def __init__(self, input_dim, hidden_dim=128, *, encoder=None, interface_layers=0):
+    def __init__(self, input_dim, hidden_dim=128, *, encoder=None, interface_layers=0, component_aux=False,
+                 interface_readout='pooled'):
         super().__init__()
         if input_dim < len(lig_feature_dims[0]) or hidden_dim < 4:
             raise ValueError('invalid structural ranker dimensions')
@@ -55,8 +56,12 @@ class StructuralQualityRanker(nn.Module):
         self.register_buffer('upper', torch.tensor([.23, .49, 1.]))
         # Instantiate after baseline heads so a fixed seed preserves their
         # initialization in the architecture ablation.
-        self.interface = InterfaceMessagePassing(hidden_dim, interface_layers) if interface_layers else None
+        if interface_readout not in ('pooled', 'contacts', 'contacts-independent') or (not interface_layers and interface_readout != 'pooled'):
+            raise ValueError('contact readout requires interface layers')
+        self.interface = InterfaceMessagePassing(hidden_dim, interface_layers, readout=interface_readout) if interface_layers else None
         self.interface_gate = nn.Parameter(torch.tensor(-2.1972246)) if interface_layers else None
+        # Added last so existing encoder/ranking initialization stays unchanged.
+        self.component_head = nn.Linear(hidden_dim, 3) if component_aux else None
 
     def forward(self, *, node_features, node_coords, node_types, lig_edge_index,
                 stage, source, task='quality'):
@@ -115,10 +120,13 @@ class StructuralQualityRanker(nn.Module):
         probabilities = torch.softmax(logits[:, :3], dim=-1)
         means = self.lower + (self.upper - self.lower) * torch.sigmoid(logits[:, 3:])
         quality = (probabilities * means).sum(-1)
-        return {'score': score, 'q_hat': quality,
+        result = {'score': score, 'q_hat': quality,
                 'bin_logits': logits[:, :3], 'bin_probabilities': probabilities,
                 'bin_means': means, 'p23': probabilities[:, 1:].sum(-1),
                 'p49': probabilities[:, 2]}
+        if self.component_head is not None:
+            result['components'] = torch.sigmoid(self.component_head(context))
+        return result
 
     def forward_list(self, graphs, *, stages, sources, task='quality'):
         """Score one case's valid structures without detaching rank gradients.
@@ -223,6 +231,31 @@ def structural_ranking_loss(output, labels, *, quality_weight=0., top_weight=0.,
             raise ValueError('future output has no current-quality auxiliary head')
         ranking = ranking + quality_weight * structural_quality_loss(output, labels)
     return ranking
+
+
+def dockq_regression_loss(output, labels, **kwargs):
+    """Same scalar head, sigmoid-MSE supervision; no listwise or auxiliary loss."""
+    if kwargs.get('quality_weight', 0) or kwargs.get('top_weight', 0):
+        raise ValueError('pure regression requires zero quality/top weights')
+    score = output['score']
+    if (score.ndim != 1 or labels.shape != score.shape or not labels.numel()
+            or not torch.isfinite(labels).all() or not torch.isfinite(score).all()
+            or not bool(((labels >= 0) & (labels <= 1)).all())):
+        raise ValueError('finite scalar scores and bounded DockQ targets required')
+    return nn.functional.mse_loss(torch.sigmoid(score), labels.detach())
+
+
+def component_quality_loss(output, targets):
+    """Supervise fnat and bounded iRMS/LRMS quality, not a second ranking label.
+
+    Components are the three terms whose mean is DockQ. The deployed ordering
+    still uses rank_head; this auxiliary must not silently replace its score.
+    """
+    if ('components' not in output or targets.shape != output['components'].shape
+            or targets.ndim != 2 or targets.shape[1] != 3 or not targets.numel()
+            or not torch.isfinite(targets).all() or not bool(((targets >= 0) & (targets <= 1)).all())):
+        raise ValueError('complete bounded DockQ component targets required')
+    return nn.functional.mse_loss(output['components'], targets.detach())
 
 
 def selected_walker_mask(scores, initial_identities, identities, *, keep=64):

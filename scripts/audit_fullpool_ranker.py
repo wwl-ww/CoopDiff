@@ -12,6 +12,15 @@ import torch
 from train_structural_ranker import evaluate
 from tricoopdiff.structural_ranker import StructuralQualityRanker
 from tricoopdiff.structural_ranking_data import StructuralArchiveDataset, audit_datasets, file_digest
+from tricoopdiff.structural_ranking_runtime import checkpoint_capabilities
+
+
+def evaluation_options(checkpoint):
+    """Never evaluate an untrained future head as a usable selector."""
+    capabilities = checkpoint_capabilities(checkpoint)
+    config = checkpoint['metadata']['arguments']
+    return {'future_enabled': capabilities['future'],
+            'future_target': config.get('future_target', 'final')}
 
 
 def main():
@@ -25,6 +34,7 @@ def main():
     digest = file_digest(args.checkpoint)
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     config = checkpoint['metadata']['arguments']
+    options = evaluation_options(checkpoint)
     if config['candidate_scope'] != 'archived-pairs' or len(config['train_archives']) != 1:
         raise ValueError('this diagnostic requires one full-pool training shard')
     train = StructuralArchiveDataset(config['train_archives'][0], config['train_labels'][0], 'train')
@@ -41,8 +51,7 @@ def main():
               'quality_walker_scope': config['quality_walker_scope']}
     for name, dataset in (('train', train), ('val', val)):
         print(f'EVALUATE {name} cases={len(dataset)}', flush=True)
-        report[name] = evaluate(model, dataset, args.device, future_enabled=True,
-                                future_target=config['future_target'])
+        report[name] = evaluate(model, dataset, args.device, **options)
     report['seconds'] = time.monotonic() - started
     if file_digest(args.checkpoint) != digest:
         raise ValueError('checkpoint changed during diagnostic')

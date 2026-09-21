@@ -297,6 +297,13 @@ def test_checkpoint_capabilities_reject_untrained_or_inconsistent_heads():
                   'head_supervision': {'rank': True, 'quality_aux': False, 'future': False}}
     capabilities = checkpoint_capabilities(checkpoint)
     assert capabilities['rank'] and not capabilities['quality_aux'] and not capabilities['future']
+    component = copy.deepcopy(checkpoint)
+    component['config'] = {'component_aux': True}
+    component['metadata']['arguments']['component_weight'] = 1.
+    component['head_supervision']['components'] = True
+    assert checkpoint_capabilities(component)['components']
+    component['config']['component_aux'] = False
+    rejected(lambda: checkpoint_capabilities(component))
     for alteration in ('no_steps', 'untrained', 'wrong_aux', 'future'):
         bad = copy.deepcopy(checkpoint)
         if alteration == 'no_steps': bad['optimizer_steps'] = 0

@@ -42,11 +42,16 @@ class InterfaceMessagePassing(nn.Module):
     geometry encoder. Distances alone in this branch are reflection invariant.
     """
 
-    def __init__(self, hidden_dim, layers=2, neighbors=4, cutoff=12.):
+    def __init__(self, hidden_dim, layers=2, neighbors=4, cutoff=12., readout='pooled'):
         super().__init__()
         if layers < 1 or neighbors < 1 or cutoff <= 0:
             raise ValueError('invalid interface message-passing configuration')
         self.neighbors, self.cutoff = neighbors, float(cutoff)
+        if readout not in ('pooled', 'contacts', 'contacts-independent'):
+            raise ValueError('unknown interface readout')
+        if readout != 'pooled' and hidden_dim % 4:
+            raise ValueError('contact attention requires hidden_dim divisible by four')
+        self.readout_mode = readout
         self.register_buffer('centers', torch.linspace(0., cutoff, 16))
         self.relation_embedding = nn.Embedding(4, hidden_dim)
         self.messages = nn.ModuleList([
@@ -58,6 +63,19 @@ class InterfaceMessagePassing(nn.Module):
                           nn.SiLU(), nn.Linear(hidden_dim, hidden_dim)) for _ in range(layers)])
         self.readout = nn.Sequential(nn.LayerNorm(3 * hidden_dim),
                                      nn.Linear(3 * hidden_dim, hidden_dim), nn.SiLU())
+        if readout != 'pooled':
+            self.contact_project = nn.Sequential(nn.LayerNorm(3 * hidden_dim + 16),
+                                                nn.Linear(3 * hidden_dim + 16, hidden_dim), nn.SiLU())
+            # Instantiate identically in both contact arms; independent skips interaction.
+            self.contact_interaction = nn.TransformerEncoderLayer(
+                hidden_dim, 4, dim_feedforward=2 * hidden_dim, dropout=0.,
+                batch_first=True, norm_first=True)
+            self.contact_query = nn.Parameter(torch.randn(1, 1, hidden_dim) * .02)
+            self.contact_attention = nn.MultiheadAttention(hidden_dim, 4, dropout=0., batch_first=True)
+            self.contact_norm = nn.LayerNorm(hidden_dim)
+            self.readout.requires_grad_(False)
+            if readout == 'contacts-independent':
+                self.contact_interaction.requires_grad_(False)
 
     def forward(self, features, coords, types, ligand_bonds):
         edges, relations = interface_edges(coords, types, ligand_bonds,
@@ -76,6 +94,23 @@ class InterfaceMessagePassing(nn.Module):
             aggregate = torch.zeros_like(current).index_add(0, target, values) / degree.clamp_min(1)
             residual = update(torch.cat((current, aggregate), -1))
             current = current + residual * active[:, None]
+        if self.readout_mode != 'pooled':
+            selected = []
+            # At most 32 undirected contacts per physical interface, no native labels.
+            # Bond edges affect messages above but are not interface readout tokens.
+            for kind in (1, 2, 3):
+                ids = ((relations == kind) & (types[source] < types[target])).nonzero().flatten()
+                if len(ids):
+                    selected.append(ids[torch.argsort(distances[ids], stable=True)[:32]])
+            if not selected:
+                return features.new_zeros(1, features.shape[1])
+            ids = torch.cat(selected)
+            tokens = self.contact_project(torch.cat(
+                (current[source[ids]], current[target[ids]], relation[ids], rbf[ids]), -1))[None]
+            if self.readout_mode == 'contacts':
+                tokens = self.contact_interaction(tokens)
+            pooled, _ = self.contact_attention(self.contact_query, tokens, tokens, need_weights=False)
+            return self.contact_norm(pooled[:, 0])
         pooled = []
         for component in range(3):
             mask = active & (types == component)

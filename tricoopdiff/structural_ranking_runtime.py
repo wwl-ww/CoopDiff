@@ -19,13 +19,16 @@ def checkpoint_capabilities(checkpoint):
     if supervision is None:
         return {'rank': True, 'quality_aux': False, 'future': False,
                 'provenance': 'legacy_quality_task_only', 'probabilities_calibrated': False}
-    if (set(supervision) != {'rank', 'quality_aux', 'future'}
+    if (set(supervision) not in ({'rank', 'quality_aux', 'future'}, {'rank', 'quality_aux', 'future', 'components'})
             or any(type(value) is not bool for value in supervision.values())
             or not supervision['rank']
             or type(checkpoint.get('optimizer_steps')) is not int
             or checkpoint['optimizer_steps'] < 1):
         raise ValueError('invalid quality-checkpoint supervision contract')
     arguments = checkpoint['metadata']['arguments']
+    if (supervision.get('components', False) != (arguments.get('component_weight', 0) > 0)
+            or bool(checkpoint.get('config', {}).get('component_aux', False)) != supervision.get('components', False)):
+        raise ValueError('component head supervision/configuration mismatch')
     if supervision['quality_aux'] != (arguments['quality_weight'] > 0):
         raise ValueError('auxiliary supervision contradicts training configuration')
     if supervision['future'] != (arguments.get('future_weight', 0) > 0):
