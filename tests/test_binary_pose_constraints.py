@@ -86,3 +86,126 @@ def test_initializer_reuses_seeded_etkdg_not_input_native_coordinates():
     assert first[3]['native_information_used'] is False
     assert max(first[3]['side_fit_rmsd']) < .15
     assert 'protein_ca_pairs_below_8A' in first[3]['geometry']
+
+
+def test_binary_initializer_connects_to_anchored_chart_without_native_target():
+    from tricoopdiff.anchored_flow import AnchoredTorsionFlow
+
+    data = ligand_input('CCCCCC')
+    e3 = torch.tensor([[0., 0., 0.], [2., 0., 0.], [0., 3., 0.]])
+    poi = e3 + 8
+    broad = TernaryInitializer().initialize(e3, poi, data, seed=19)[0][0]
+    initializer = BinaryPoseInitializer(
+        BinaryPoseSide(e3, broad[:3], ((0, 1, 2),)),
+        BinaryPoseSide(poi, broad[3:], ((3, 4, 5),)), max_candidates=2)
+    chart, audit = AnchoredTorsionFlow.from_binary_initializer(
+        initializer, e3, poi, data, seed=19, max_fit_rmsd=.15)
+    assert audit['selected_atom_maps'] == [[0, 1, 2], [3, 4, 5]]
+    assert len(chart.plan.bonds) == 1
+    moved, receptor, _ = chart.decode(chart.ligand.new_tensor([.7]))
+    assert torch.equal(moved[:3], chart.ligand[:3])
+    assert torch.allclose(torch.cdist(moved[3:], receptor),
+                          torch.cdist(chart.ligand[3:], chart.poi), atol=1e-5)
+    changed = {**data, 'coords': data['coords'] + 1000}
+    repeated, _ = AnchoredTorsionFlow.from_binary_initializer(
+        initializer, e3, poi, changed, seed=19, max_fit_rmsd=.15)
+    assert torch.equal(chart.ligand, repeated.ligand)
+    assert torch.equal(chart.poi, repeated.poi)
+
+
+def test_binary_initializer_body_maps_current_poi_frame():
+    data = ligand_input('CCCCCC')
+    e3 = torch.tensor([[0., 0., 0.], [2., 0., 0.], [0., 3., 0.]])
+    poi = e3 + 8
+    broad = TernaryInitializer().initialize(e3, poi, data, seed=19)[0][0]
+    initializer = BinaryPoseInitializer(
+        BinaryPoseSide(e3, broad[:3], ((0, 1, 2),)),
+        BinaryPoseSide(poi, broad[3:], ((3, 4, 5),)), max_candidates=2)
+    rotation = torch.tensor([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
+    current = transform(poi, rotation, torch.tensor([7., -3., 9.]))
+    _, placed, body, _ = initializer.initialize(e3, current, data, seed=19)
+    predicted = (current - current.mean(0)) @ body[0].T
+    assert torch.allclose(predicted, placed[0] - placed[0].mean(0), atol=1e-5), \
+        'body rotation must start in the current POI frame, not the binary asset frame'
+
+
+def test_anchored_chart_rejects_nonrigid_e3_frame_mismatch():
+    from tricoopdiff.anchored_flow import AnchoredTorsionFlow
+
+    data = ligand_input('CCCCCC')
+    e3 = torch.tensor([[0., 0., 0.], [2., 0., 0.], [0., 3., 0.]])
+    poi = e3 + 8
+    broad = TernaryInitializer().initialize(e3, poi, data, seed=19)[0][0]
+    initializer = BinaryPoseInitializer(
+        BinaryPoseSide(e3, broad[:3], ((0, 1, 2),)),
+        BinaryPoseSide(poi, broad[3:], ((3, 4, 5),)), max_candidates=1)
+    changed = e3.clone()
+    changed[0, 0] += 1
+    try:
+        AnchoredTorsionFlow.from_binary_initializer(
+            initializer, changed, poi, data, seed=19, max_fit_rmsd=.15)
+    except ValueError as error:
+        assert 'side1 protein' in str(error)
+    else:
+        raise AssertionError('incompatible E3 structure must not become a hard constraint')
+
+
+def test_candidate_gate_precedes_ranking_and_never_falls_back():
+    from unittest.mock import patch
+
+    data = ligand_input('CCCCCC')
+    ligand, e3, poi, side1, side2 = fixture()
+    initializer = BinaryPoseInitializer(side1, side2, max_candidates=2)
+    row = assemble_binary_pose_candidates(ligand, e3, side1, side2)[0]
+
+    def gate(candidate, maps):
+        assert maps == (side1.atom_maps[0], side2.atom_maps[0])
+        if candidate['map_pair_index'] == 0:
+            raise ValueError('distorted covalent bonds')
+        return {'valid': True}
+
+    def reject_all(candidate, maps):
+        raise ValueError('distorted covalent bonds')
+
+    with patch('tricoopdiff.binary_pose_constraints.embed_with_fixed_binary_ends',
+               return_value=ligand), patch(
+                   'tricoopdiff.binary_pose_constraints.assemble_binary_pose_candidates',
+                   side_effect=lambda *args, **kwargs: [dict(row)]):
+        # Identical scores: the unfiltered legacy path selects candidate zero.
+        assert initializer.initialize(e3, poi, data, seed=19)[3]['selected_map_pair_index'] == 0
+        result = initializer.initialize(e3, poi, data, seed=19, candidate_validator=gate)
+        audit = result[3]
+        assert audit['selected_map_pair_index'] == 1
+        assert audit['candidate_count'] == 1 and len(audit['constraint_rejections']) == 1
+        assert audit['constraint_audit'] == {'valid': True}
+        try:
+            initializer.initialize(e3, poi, data, seed=19, candidate_validator=reject_all)
+        except ValueError as error:
+            assert 'no valid two-end candidates' in str(error)
+            assert 'distorted covalent bonds' in str(error)
+        else:
+            raise AssertionError('all rejected candidates must fail closed')
+
+
+def test_chart_filters_stretched_linker_before_selecting_reference():
+    from unittest.mock import patch
+    from tricoopdiff.anchored_flow import AnchoredTorsionFlow
+
+    data = ligand_input('CCCCCC')
+    e3 = torch.tensor([[0., 0., 0.], [2., 0., 0.], [0., 3., 0.]])
+    poi = e3 + 8
+    valid = TernaryInitializer().initialize(e3, poi, data, seed=19)[0][0]
+    invalid = valid.clone()
+    invalid[3:] += 10
+    initializer = BinaryPoseInitializer(
+        BinaryPoseSide(e3, valid[:3], ((0, 1, 2),)),
+        BinaryPoseSide(poi, valid[3:], ((3, 4, 5),)), max_candidates=2)
+    with patch('tricoopdiff.binary_pose_constraints.embed_with_fixed_binary_ends',
+               side_effect=[invalid, valid]):
+        chart, audit = AnchoredTorsionFlow.from_binary_initializer(
+            initializer, e3, poi, data, seed=19, max_fit_rmsd=.15)
+    assert audit['selected_map_pair_index'] == 1
+    assert audit['candidate_count'] == 1
+    assert 'distorted covalent bonds' in audit['constraint_rejections'][0]['error']
+    assert audit['constraint_audit']['policy'] == 'anchored_validity_before_clash_selection_v1'
+    assert torch.allclose(chart.ligand, valid, atol=1e-5)

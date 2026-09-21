@@ -136,7 +136,13 @@ class BinaryPoseInitializer:
         self.max_candidates = max_candidates
 
     @torch.no_grad()
-    def initialize(self, e3_coords, poi_coords, ligand_data, seed=None):
+    def initialize(self, e3_coords, poi_coords, ligand_data, seed=None, *,
+                   candidate_validator=None):
+        """Assemble candidates; an optional validator rejects before clash scoring.
+
+        The validator receives a candidate and its atom-map pair, returning an
+        audit mapping or raising ValueError. Legacy callers retain their policy.
+        """
         if seed is None:
             raise ValueError('binary-pose initialization requires an explicit seed')
         from rdkit import Chem
@@ -150,6 +156,7 @@ class BinaryPoseInitializer:
                      for right in self.side2.atom_maps]
         candidates = []
         failures = []
+        rejected = []
         # Chemical symmetry maps and linker conformers are independent sources
         # of ambiguity.  Cycle over every legal map pair while drawing multiple
         # seeded ETKDG conformers, rather than producing only one conformer when
@@ -167,16 +174,23 @@ class BinaryPoseInitializer:
                     conformer.to(e3_coords.device), e3_coords, left, right,
                     max_candidates=1)[0]
                 candidate['map_pair_index'] = index
+                if candidate_validator is not None:
+                    try:
+                        candidate['constraint_audit'] = candidate_validator(candidate, pair)
+                    except ValueError as error:
+                        rejected.append({'map_pair_index': index, 'error': str(error)})
+                        continue
                 candidates.append(candidate)
             except ValueError as error:
                 failures.append({'map_pair_index': index, 'error': str(error)})
         if not candidates:
-            raise ValueError(f'all two-end constrained embeddings failed: {failures}')
+            raise ValueError(f'no valid two-end candidates: embedding failures={failures}; '
+                             f'constraint rejections={rejected}')
         binary_poi = _coords(self.side2.protein_coords, 'side2.protein',
                              dtype=poi_coords.dtype, device=poi_coords.device)
         if binary_poi.shape != poi_coords.shape:
             raise ValueError('binary side2 protein must follow current POI node order')
-        _, _, poi_input_rmsd = proper_rigid_fit(binary_poi, poi_coords)
+        poi_input_rotation, _, poi_input_rmsd = proper_rigid_fit(binary_poi, poi_coords)
         if float(poi_input_rmsd) > 1e-3:
             raise ValueError('binary side2 protein coordinates differ from current POI input')
 
@@ -208,6 +222,7 @@ class BinaryPoseInitializer:
                        candidate['map2_index'])
             scored.append((penalty, candidate, geometry))
         _, selected, geometry = min(scored, key=lambda value: value[0])
+        selected_pair = map_pairs[selected['map_pair_index'] % len(map_pairs)]
         metadata = {
             'init_mode': 'binary_pose',
             'version': 'known_binary_pose_initializer_v1',
@@ -217,11 +232,16 @@ class BinaryPoseInitializer:
             'binary_pose_knowledge': True,
             'candidate_count': len(candidates),
             'embedding_failures': failures,
+            'constraint_rejections': rejected,
+            'constraint_audit': selected.get('constraint_audit'),
             'selected_map_pair_index': selected['map_pair_index'],
             'selected_maps': [selected['map1_index'], selected['map2_index']],
+            'selected_atom_maps': [list(mapping) for mapping in selected_pair],
             'side_fit_rmsd': [selected['side1_fit_rmsd'], selected['side2_fit_rmsd']],
+            'e3_frame_rmsd': selected['e3_frame_rmsd'],
             'poi_input_rmsd': float(poi_input_rmsd), 'geometry': geometry,
         }
         return (selected['ligand_coords'].unsqueeze(0),
                 selected['poi_coords'].unsqueeze(0),
-                selected['poi_rotation'].unsqueeze(0), metadata)
+                (selected['poi_rotation'] @ poi_input_rotation.to(selected['poi_rotation']).T)
+                .unsqueeze(0), metadata)

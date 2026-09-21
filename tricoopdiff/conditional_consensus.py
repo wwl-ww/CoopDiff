@@ -118,7 +118,9 @@ class ConditionedConsensusFuse(ConsensusFuse):
         chemical = reference.new_zeros((len(reference), self.config['node_dim']))
         chemical[types != 2] = self.pooling.protein_feature_proj(reference[types != 2])
         chemical[types == 2] = self.pooling.ligand_feature_encoder(reference[types == 2])
-        interface_nodes, interface_basis, interface_forces = self.condition_interface(graph, chemical)
+        adapter_enabled = hasattr(self, 'anchored_action_adapter')
+        interface_output = self.condition_interface(graph, chemical, return_full_directions=adapter_enabled)
+        interface_nodes, interface_basis, interface_forces = interface_output[:3]
         geometry_nodes = geometry_nodes + interface_nodes
         geometry_basis = torch.cat((geometry_basis, interface_basis), dim=1)
         forces = forces + interface_forces
@@ -146,6 +148,7 @@ class ConditionedConsensusFuse(ConsensusFuse):
         torsion_residual = (self.condition_torsion_head(bond_context)
                             * torsion_directions).sum(-1).unsqueeze(0)
         return {**graph, 'condition_node_residual': delta,
+                **({'anchored_interface_directions': interface_output[3]} if adapter_enabled else {}),
                 'condition_velocity_residual': vector_residual * self.condition_scale,
                 'condition_torsion_residual': torsion_residual * self.condition_scale}, context, gate_bias
 

@@ -20,7 +20,7 @@ class InterfaceGeometryEncoder(nn.Module):
                                      nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
         self.direction = nn.Linear(hidden_dim, 1)
 
-    def forward(self, graph, chemical_nodes):
+    def forward(self, graph, chemical_nodes, *, return_full_directions=False):
         coords, types = graph['node_coords'], graph['node_types']
         nodes = torch.zeros_like(chemical_nodes)
         force = torch.zeros_like(coords)
@@ -63,4 +63,5 @@ class InterfaceGeometryEncoder(nn.Module):
             mask = types == group
             basis.append(force[mask].mean(0))
             basis.append(torch.cross((coords[mask] - center) / 10., force[mask], dim=-1).mean(0))
-        return nodes, torch.stack(basis).unsqueeze(0), ligand_forces
+        result = (nodes, torch.stack(basis).unsqueeze(0), ligand_forces)
+        return (*result, force) if return_full_directions else result

@@ -151,7 +151,7 @@ class ConsensusFuse(nn.Module):
         conflicts = torch.stack([
             1 - torch.nn.functional.cosine_similarity(raw[i], raw[i + 2], dim=-1)
             for i in (0, 1)], dim=-1)
-        return {
+        result = {
             'normalized_velocity': predictions,
             # Invariant negotiated context reserved for a separately supervised
             # pose ranker. It is not consumed by the diffusion loss.
@@ -167,6 +167,12 @@ class ConsensusFuse(nn.Module):
             'torsion_coordination': {'e3l_weight': tor_gate, 'residual': tor_residual},
             'confidence': self.judge_head(context), 'state': self.state_head(context),
         }
+        if 'anchored_interface_directions' in graph:
+            direction = graph['anchored_interface_directions']
+            result['anchored_action_context'] = {'global': context, 'bond': bond_context,
+                'edge_index': graph['lig_edge_index'],
+                'ligand_directions': direction[types == 2], 'poi_directions': direction[types == 1]}
+        return result
 
 
 class ConsensusCoopDiff(nn.Module):

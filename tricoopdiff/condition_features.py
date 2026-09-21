@@ -102,6 +102,22 @@ def validate_atom_maps(molecule, side):
 
 
 def build_condition_features(molecule, protein_sizes, sides=(None, None), *, linker_indices=(), protac=True):
+    """Build deployment features; native-supervised conditions are forbidden."""
+    return _build_condition_features(molecule, protein_sizes, sides,
+                                     linker_indices=linker_indices, protac=protac,
+                                     allowed_provenance=DEPLOYABLE_PROVENANCE)
+
+
+def build_training_condition_features(molecule, protein_sizes, sides):
+    """Explicit training-only entry using the same geometry encoding as deployment."""
+    if any(side is None or side.provenance != 'training_native_supervision' for side in sides):
+        raise ValueError('training-only builder requires two native-supervised sides')
+    return _build_condition_features(molecule, protein_sizes, sides,
+                                     allowed_provenance=('training_native_supervision',))
+
+
+def _build_condition_features(molecule, protein_sizes, sides=(None, None), *,
+                              linker_indices=(), protac=True, allowed_provenance):
     """Build role/mask/local-distance features; unspecified ligand atoms stay unknown.
 
 Roles are multi-hot E3 end / POI end / linker / unknown. Overlapping ends are
@@ -122,7 +138,7 @@ annotations, never inferred as every atom outside an incomplete fragment.
         if side is None:
             maps.append(())
             continue
-        if side.provenance not in DEPLOYABLE_PROVENANCE or not isinstance(side.evidence_id, str) or not side.evidence_id.strip():
+        if side.provenance not in allowed_provenance or not isinstance(side.evidence_id, str) or not side.evidence_id.strip():
             raise ValueError('conditions require explicit allowed provenance and evidence ID')
         if not 0 <= side.confidence <= 1:
             raise ValueError('condition confidence must be finite in [0,1]')

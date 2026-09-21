@@ -39,7 +39,7 @@ def interrupted(signum, frame):
 
 def run_task(command, name, root, environment, state, deadline):
     """Only this foreground child may occupy this queue's GPU."""
-    if time.time() >= deadline:
+    if deadline is not None and time.time() >= deadline:
         return False
     record = {'name': name, 'command': command, 'start_unix': time.time(),
               'log': str(root / f'{name}.log')}
@@ -53,7 +53,7 @@ def run_task(command, name, root, environment, state, deadline):
         record['pid'] = child.pid
         atomic_json(root / 'status.json', state)
         try:
-            child.wait(timeout=max(.01, deadline - time.time()))
+            child.wait(timeout=None if deadline is None else max(.01, deadline - time.time()))
         except subprocess.TimeoutExpired:
             stop_child(child)
             record['deadline_interrupted'] = True
