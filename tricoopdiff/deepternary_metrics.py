@@ -152,7 +152,22 @@ def compute_fullatom_dockq(
             *(line for line in lig_pred_lines if line.startswith(("ATOM", "HETATM", "CONECT"))),
         ]
         pred_path.write_text("\n".join(records) + "\n")
-        fnat, irms, lrms, dockq = cal_dockq(str(pred_path), str(native_complex_pdb))
+        try:
+            fnat, irms, lrms, dockq = cal_dockq(str(pred_path), str(native_complex_pdb))
+        except AssertionError as error:
+            # DeepTernary's legacy implementation raises this when a random
+            # initial pose has no interface residues in common with native.
+            # That is a valid zero-quality prediction, not a corrupt native.
+            if str(error) not in {'length of native is zero', 'length of model is zero'}:
+                raise
+            return {
+                "dockq": 0.0,
+                "fnat": 0.0,
+                "irms": float("inf"),
+                "lrms": float("inf"),
+                "method": "DeepTernary/DockQ/dockq_util.py::cal_dockq",
+                "degenerate_interface": True,
+            }
     return {
         "dockq": float(dockq),
         "fnat": float(fnat),
