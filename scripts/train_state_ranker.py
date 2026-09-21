@@ -75,7 +75,7 @@ def quality_class_support(cases):
             'warning': 'states from one case are correlated; low loss alone does not prove top1 quality'}
 
 
-def combine_training_parts(parts):
+def combine_training_parts(parts, allow_runtime_mismatch=False):
     """Join separately sealed case shards, never rewrite their source manifests."""
     if not parts:
         raise ValueError('at least one training shard is required')
@@ -83,6 +83,8 @@ def combine_training_parts(parts):
     cases, seen = [], set()
     for other, rows in parts:
         for key in (*GENERATOR_KEYS, 'walkers', 'selection', 'proposal_seed', 'selection_seed', 'diffusion_seed'):
+            if key == 'runtime_sha256' and allow_runtime_mismatch:
+                continue
             if other[key] != manifest[key]:
                 raise ValueError(f'training shard generator/sampling mismatch: {key}')
         for row in rows:
@@ -142,6 +144,8 @@ def main():
     parser.add_argument('--additional-train-labels', type=Path, nargs='*', default=[])
     parser.add_argument('--train-limit', type=int,
                         help='Use a predeclared prefix of the complete audited training case order')
+    parser.add_argument('--allow-runtime-mismatch', action='store_true',
+                        help='Allow source archives made before a runtime-only code hash change')
     args = parser.parse_args()
     if args.epochs < 1 or args.out.exists():
         parser.error('positive epochs and a new output directory are required')
@@ -150,7 +154,8 @@ def main():
     archive_parts = [args.train_archives, *args.additional_train_archives]
     label_parts = [args.train_labels, *args.additional_train_labels]
     loaded = [load_split(a, b, 'train', args.geometry_only) for a, b in zip(archive_parts, label_parts)]
-    train_manifest, train = combine_training_parts(loaded)
+    train_manifest, train = combine_training_parts(
+        loaded, allow_runtime_mismatch=args.allow_runtime_mismatch)
     val_manifest, val = load_split(args.val_archives, args.val_labels, 'val', args.geometry_only)
     audit = json.loads(args.split_audit.read_text())
     for split, cases in (('train', train), ('val', val)):
@@ -160,6 +165,8 @@ def main():
     if any(c['case'].split('_')[0].upper() in benchmark for c in train + val):
         raise ValueError('benchmark PDB cannot be used to fit or select this ranker')
     for key in GENERATOR_KEYS:
+        if key == 'runtime_sha256' and args.allow_runtime_mismatch:
+            continue
         if train_manifest[key] != val_manifest[key]:
             raise ValueError(f'train/validation generator mismatch: {key}')
     if {c['case'].split('_')[0].upper() for c in train} & {c['case'].split('_')[0].upper() for c in val}:
