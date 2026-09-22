@@ -20,7 +20,8 @@ def expected_random_winner(values, priority, keep):
     return expectation
 
 
-def refinement_selection_metrics(scores, labels, identities, sources, budgets=(8, 32, 64),
+def refinement_selection_metrics(scores, labels, identities, sources,
+                                 budgets=(1, 4, 8, 16, 32, 64),
                                  selection_scores=None):
     """Report only observed valid pairs; never impute unrefined/failed outcomes.
 

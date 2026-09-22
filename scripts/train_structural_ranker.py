@@ -255,7 +255,7 @@ def evaluate(model, dataset, device, *, shuffle_repeats=0, shuffle_seed=7315, fu
             'complete_pair_coverage_cases': sum(r['complete_pair_coverage'] for r in replays),
             'budgets': {},
         }
-        for budget in ('8', '32', '64'):
+        for budget in ('1', '4', '8', '16', '32', '64'):
             available = [r['budgets'][budget] for r in replays if budget in r['budgets']]
             summary[replay_key]['budgets'][budget] = {
                 'available_cases': len(available),
