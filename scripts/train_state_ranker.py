@@ -75,7 +75,7 @@ def quality_class_support(cases):
             'warning': 'states from one case are correlated; low loss alone does not prove top1 quality'}
 
 
-def combine_training_parts(parts, allow_runtime_mismatch=False):
+def combine_training_parts(parts, allow_generator_mismatch=False):
     """Join separately sealed case shards, never rewrite their source manifests."""
     if not parts:
         raise ValueError('at least one training shard is required')
@@ -83,7 +83,7 @@ def combine_training_parts(parts, allow_runtime_mismatch=False):
     cases, seen = [], set()
     for other, rows in parts:
         for key in (*GENERATOR_KEYS, 'walkers', 'selection', 'proposal_seed', 'selection_seed', 'diffusion_seed'):
-            if allow_runtime_mismatch and key in (*GENERATOR_KEYS, 'walkers',
+            if allow_generator_mismatch and key in (*GENERATOR_KEYS, 'walkers',
                                                   'selection', 'proposal_seed',
                                                   'selection_seed', 'diffusion_seed'):
                 continue
@@ -146,8 +146,6 @@ def main():
     parser.add_argument('--additional-train-labels', type=Path, nargs='*', default=[])
     parser.add_argument('--train-limit', type=int,
                         help='Use a predeclared prefix of the complete audited training case order')
-    parser.add_argument('--allow-runtime-mismatch', action='store_true',
-                        help='Allow source archives made before a runtime-only code hash change')
     parser.add_argument('--allow-generator-mismatch', action='store_true',
                         help='Allow compatible full-pool archives with different sampling metadata')
     parser.add_argument('--post-only', action='store_true',
@@ -161,8 +159,7 @@ def main():
     label_parts = [args.train_labels, *args.additional_train_labels]
     loaded = [load_split(a, b, 'train', args.geometry_only) for a, b in zip(archive_parts, label_parts)]
     train_manifest, train = combine_training_parts(
-        loaded, allow_runtime_mismatch=(args.allow_runtime_mismatch
-                                        or args.allow_generator_mismatch))
+        loaded, allow_generator_mismatch=args.allow_generator_mismatch)
     val_manifest, val = load_split(args.val_archives, args.val_labels, 'val', args.geometry_only)
     audit = json.loads(args.split_audit.read_text())
     for split, cases in (('train', train), ('val', val)):
@@ -172,8 +169,6 @@ def main():
     if any(c['case'].split('_')[0].upper() in benchmark for c in train + val):
         raise ValueError('benchmark PDB cannot be used to fit or select this ranker')
     for key in GENERATOR_KEYS:
-        if args.allow_runtime_mismatch and key == 'runtime_sha256':
-            continue
         if args.allow_generator_mismatch:
             continue
         if train_manifest[key] != val_manifest[key]:
