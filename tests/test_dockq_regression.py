@@ -9,7 +9,10 @@ sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).res
 import torch
 from test_structural_ranker import fixture
 from test_structural_ranking_data import archive_fixture
-from tricoopdiff.structural_ranker import StructuralQualityRanker, dockq_regression_loss
+from tricoopdiff.structural_ranker import (
+    StructuralQualityRanker, dockq_regression_loss, pairwise_ranking_loss,
+    regression_pairwise_loss,
+)
 from tricoopdiff.structural_ranking_data import file_digest
 from tricoopdiff.ranking_backward import backward_list
 from scripts.train_structural_ranker import main
@@ -31,6 +34,17 @@ def test_regression_replay_and_target_detach():
     for (name, a), (_, b) in zip(model.named_parameters(), replay.named_parameters()):
         if a.grad is not None:
             assert torch.allclose(a.grad, b.grad, atol=2e-6, rtol=2e-4), name
+
+
+def test_pairwise_and_combined_objectives_reward_correct_order():
+    labels = torch.tensor([.1, .8, .4])
+    correct = {'score': torch.tensor([-2., 2., 0.], requires_grad=True)}
+    reversed_order = {'score': torch.tensor([2., -2., 0.], requires_grad=True)}
+    assert pairwise_ranking_loss(correct, labels) < pairwise_ranking_loss(reversed_order, labels)
+    combined = regression_pairwise_loss(correct, labels)
+    assert torch.isfinite(combined)
+    combined.backward()
+    assert correct['score'].grad.abs().sum() > 0
 
 
 def test_regression_training_and_inference():

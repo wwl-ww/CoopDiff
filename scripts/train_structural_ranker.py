@@ -17,6 +17,7 @@ import torch
 from tricoopdiff.structural_ranker import (
     StructuralQualityRanker, rank_states, structural_ranking_loss, decision_ranking_loss,
     budget_retention_loss, selected_walker_mask, component_quality_loss, dockq_regression_loss,
+    pairwise_ranking_loss, regression_pairwise_loss,
 )
 from tricoopdiff.initial_selector import selector_retention
 from tricoopdiff.ranking_backward import backward_list
@@ -375,7 +376,9 @@ def main(argv=None):
     parser.add_argument('--future-target', choices=('final', 'union'), default='final')
     parser.add_argument('--budget-weight', type=float, default=0.,
                         help='future top64 best-tier retention; requires complete training pool outcomes')
-    parser.add_argument('--objective', choices=('decision', 'legacy', 'regression'), default='decision',
+    parser.add_argument('--objective',
+                        choices=('decision', 'legacy', 'regression', 'pairwise',
+                                 'regression-pairwise'), default='decision',
                         help='decision balances Initial/Final/eligible Union full-list losses')
     parser.add_argument('--checkpoint-task', choices=('quality', 'future'), default='quality')
     parser.add_argument('--quality-walker-scope', choices=('all', 'future-top64'), default='all',
@@ -388,11 +391,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.interface_readout != 'pooled' and (args.interface_layers < 1 or args.hidden_dim % 4):
         parser.error('contact readout requires interface layers and hidden_dim divisible by four')
-    if args.objective == 'regression' and (
+    if args.objective in ('regression', 'pairwise', 'regression-pairwise') and (
             args.top_weight or args.quality_weight or args.component_weight or args.future_weight
             or args.budget_weight or args.candidate_scope != 'archived-pairs'
             or args.quality_walker_scope != 'all'):
-        parser.error('pure regression requires archived-pairs/all and zero top/quality/component/future/budget weights')
+        parser.error('regression/pairwise ablations require archived-pairs/all and zero auxiliary weights')
     if not math.isfinite(args.component_weight) or args.component_weight < 0:
         parser.error('component weight must be finite and nonnegative')
     if args.component_weight and (args.candidate_scope != 'archived-pairs' or args.quality_walker_scope != 'all'):
@@ -562,7 +565,9 @@ def main(argv=None):
             case = train[index]
             optimizer.zero_grad(set_to_none=True)
             objective = {'decision': decision_ranking_loss, 'legacy': structural_ranking_loss,
-                         'regression': dockq_regression_loss}[args.objective]
+                         'regression': dockq_regression_loss,
+                         'pairwise': pairwise_ranking_loss,
+                         'regression-pairwise': regression_pairwise_loss}[args.objective]
             scope_args = {'stages': case['stages'], 'union_eligible': case.get('union_eligible')} if args.objective == 'decision' else {}
             if args.quality_walker_scope == 'future-top64':
                 allocation_case = future_utility_case(case, target=args.future_target)

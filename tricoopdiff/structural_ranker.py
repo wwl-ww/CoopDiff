@@ -245,6 +245,30 @@ def dockq_regression_loss(output, labels, **kwargs):
     return nn.functional.mse_loss(torch.sigmoid(score), labels.detach())
 
 
+def pairwise_ranking_loss(output, labels, *, tie_tolerance=1e-4, **kwargs):
+    """Logistic ordering over all clearly separated within-case pairs."""
+    if kwargs.get('quality_weight', 0) or kwargs.get('top_weight', 0):
+        raise ValueError('pure pairwise ranking requires zero quality/top weights')
+    score = output['score']
+    if (score.ndim != 1 or labels.shape != score.shape or not labels.numel()
+            or not torch.isfinite(labels).all() or not torch.isfinite(score).all()
+            or not bool(((labels >= 0) & (labels <= 1)).all())
+            or not math.isfinite(tie_tolerance) or tie_tolerance < 0):
+        raise ValueError('finite scalar scores and bounded DockQ targets required')
+    differences = labels.detach()[:, None] - labels.detach()[None, :]
+    better = differences > tie_tolerance
+    if not bool(better.any()):
+        return score.sum() * 0
+    margins = score[:, None] - score[None, :]
+    return nn.functional.softplus(-margins[better]).mean()
+
+
+def regression_pairwise_loss(output, labels, **kwargs):
+    """Equal-weight DockQ regression and within-case pairwise ordering."""
+    return dockq_regression_loss(output, labels, **kwargs) + pairwise_ranking_loss(
+        output, labels, **kwargs)
+
+
 def component_quality_loss(output, targets):
     """Supervise fnat and bounded iRMS/LRMS quality, not a second ranking label.
 
