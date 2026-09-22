@@ -399,6 +399,12 @@ class AnchoredTrainer:
         """One shared optimizer/EMA update, regardless of the trajectory family."""
         if not torch.isfinite(losses['loss_total']):
             raise FloatingPointError('nonfinite training objective')
+        threshold = os.environ.get('TRICOOPDIFF_SKIP_LOSS_ABOVE')
+        if threshold is not None and float(losses['loss_total'].detach()) > float(threshold):
+            self.optimizer.zero_grad(set_to_none=True)
+            return {**{key: float(value.detach() if torch.is_tensor(value) else value)
+                       for key, value in losses.items() if key.startswith('loss_')},
+                    'skipped_high_loss': True, 'skip_threshold': float(threshold)}
         losses['loss_total'].backward()
         if any(p.grad is not None for p in self.model.expert.parameters()):
             raise RuntimeError('frozen expert received a gradient')

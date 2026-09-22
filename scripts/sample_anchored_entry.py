@@ -115,6 +115,17 @@ def main():
             seed=args.seed, max_candidates=args.binary_candidates, max_fit_rmsd=args.max_fit_rmsd,
             translation_bound=bounds['translation'][0], rotation_bound=bounds['rotation'][0])
         strict = flow.strict
+    elif assembly:
+        # AssemblyFlow deployments do not require two binary pose sides.  Reuse
+        # the audited training initializer so missing binary manifests are not
+        # misrouted into BinaryPoseInitializer.
+        from tricoopdiff.assembly_flow import prepare_assembly_sample
+        assembly_sample = prepare_assembly_sample(
+            e3, poi, ligand, generator=torch.Generator(device='cpu').manual_seed(args.seed),
+            evidence_id=f'deployment:{case}')
+        initialization = {'selected_atom_maps': assembly_sample.audit['selected_atom_maps']}
+        flow = assembly_sample.flow
+        strict = flow.strict
     else:
         initializer = BinaryPoseInitializer(*sides, max_candidates=args.binary_candidates)
         if reference_policy == 'bank':

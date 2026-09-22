@@ -19,6 +19,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('prediction', 'case-dir', 'deepternary-root', 'out'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--allow-smoke', action='store_true',
+                        help='Score implementation-smoke predictions explicitly; not a formal accuracy claim')
     args = parser.parse_args()
     if args.out.exists():
         raise FileExistsError('choose a new score output')
@@ -26,7 +28,7 @@ def main():
     prediction = json.loads(raw)
     if prediction['case'] != args.case_dir.name:
         raise ValueError('prediction and reference case do not match')
-    if prediction['checkpoint_scope'] != 'training':
+    if prediction['checkpoint_scope'] != 'training' and not args.allow_smoke:
         raise ValueError('implementation smoke is not a trained prediction')
     if prediction['coordinate_frame'] != 'featurized E3 frame; E3 coordinates included':
         raise ValueError('unsupported prediction coordinate frame')

@@ -34,6 +34,8 @@ def main():
                         help='Explicit stratified mixture ensemble; distinct from the historical iid component protocol')
     parser.add_argument('--allow-chemical-repeats', action='store_true',
                         help='Allow audited chemical cycles and reuse identical trajectories')
+    parser.add_argument('--allow-smoke', action='store_true',
+                        help='Permit evaluation of implementation-smoke checkpoints; not accuracy evidence')
     parser.add_argument('--conserved-core-chemistry-report', type=Path,
                         help='Explicit experimental extra binary-core conditions; separately recorded protocol')
     args = parser.parse_args()
@@ -84,6 +86,9 @@ def main():
             commands[0].append('--stratified-mixture')
         if args.allow_chemical_repeats:
             commands[0].append('--allow-chemical-repeats')
+        if args.allow_smoke:
+            commands[0].append('--allow-smoke')
+            commands[1].append('--allow-smoke')
         try:
             for name, command in zip(('sampling', 'scoring'), commands):
                 with (output / f'{name}.log').open('x') as log:
