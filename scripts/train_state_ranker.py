@@ -152,8 +152,6 @@ def main():
                         help='Allow compatible full-pool archives with different sampling metadata')
     parser.add_argument('--post-only', action='store_true',
                         help='Train and select on refined final states only')
-    parser.add_argument('--confidence-mode', action='store_true',
-                        help='Use DiffDock-style DockQ-threshold confidence loss')
     args = parser.parse_args()
     if args.epochs < 1 or args.out.exists():
         parser.error('positive epochs and a new output directory are required')
@@ -205,14 +203,7 @@ def main():
                                     dtype=torch.bool)
                 selected = {key: value[mask.to(args.device)] for key, value in output.items()}
                 labels = case['dockq'][mask].to(args.device)
-                if args.confidence_mode:
-                    positive = (labels >= .23).float()
-                    loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                        selected['score'], positive)
-                    loss = loss + .25 * torch.nn.functional.smooth_l1_loss(
-                        selected['q_hat'], labels)
-                else:
-                    loss = state_quality_loss(selected, labels)
+                loss = state_quality_loss(selected, labels)
             else:
                 loss = state_quality_loss(output, case['dockq'].to(args.device))
             optimizer.zero_grad(set_to_none=True)
@@ -254,7 +245,6 @@ def main():
     (args.out / 'report.json').write_text(json.dumps({
         'scope': 'internal pipeline smoke, not untouched benchmark or generator holdout',
         'post_only': args.post_only,
-        'confidence_mode': args.confidence_mode,
         'best_epoch': best['epoch'], 'features': 'geometry_only' if args.geometry_only else 'frozen_plus_geometry',
         'selection': 'minimum internal validation composite loss', 'metrics': best['metrics'],
         'train_cases': len(train), 'val_cases': len(val),
