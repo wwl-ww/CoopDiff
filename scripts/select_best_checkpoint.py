@@ -63,7 +63,6 @@ def main():
         "checkpoint_sha256": sha256_file(checkpoint),
         "checkpoint_version": payload["checkpoint_version"],
         "global_step": payload.get("global_step"),
-        "lora_tensor_count": len(payload["expert_lora_state_dict"]),
         "best_epoch": best["epoch"],
         "best_validation_loss": best["val_loss"],
         "completed_epochs": len(epochs),

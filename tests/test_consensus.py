@@ -141,7 +141,6 @@ def _checkpoint_payload(version):
         'checkpoint_version': version,
         'architecture': 'residual_consensus_v2',
         'generative_process': 'sdpi_flow_v1',
-        'expert_lora_config': None, 'expert_lora_state_dict': {},
         'trifuse_state_dict': {'weight': torch.ones(1)},
         'ema_trifuse_state_dict': {'weight': torch.ones(1)},
         'model_config': {'node_dim': 32},

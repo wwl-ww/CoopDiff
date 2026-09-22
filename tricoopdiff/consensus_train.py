@@ -111,7 +111,6 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             'checkpoint_version': CONSENSUS_CHECKPOINT_VERSION,
             'architecture': ARCHITECTURE, 'generative_process': FLOW_VERSION,
             'expert_base_identity': expert_base_identity(self.model.expert),
-            'expert_lora_config': None, 'expert_lora_state_dict': {},
             'model_config': self.model.trifuse.config,
             'runtime_config': {
                 'torus_score_norm_version': SCORE_NORM_VERSION,
