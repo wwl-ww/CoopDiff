@@ -72,12 +72,12 @@ def dockq_components(label):
     keys = ('fnat', 'irms', 'lrms')
     if not any(key in label for key in keys):
         return None
+    if not all(key in label for key in keys):
+        raise ValueError('partial DockQ component labels')
     # Older sealed labels may carry the component keys with null values while
     # retaining a valid scalar DockQ target. Treat those as scalar-only labels.
     if any(label.get(key) is None for key in keys):
         return None
-    if not all(key in label for key in keys):
-        raise ValueError('partial DockQ component labels')
     fnat, irms, lrms = (float(label[key]) for key in keys)
     if (not all(math.isfinite(x) for x in (fnat, irms, lrms))
             or not 0 <= fnat <= 1 or irms < 0 or lrms < 0):
