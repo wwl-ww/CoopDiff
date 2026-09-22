@@ -121,7 +121,7 @@ def main():
         # misrouted into BinaryPoseInitializer.
         from tricoopdiff.assembly_flow import prepare_assembly_sample
         assembly_sample = prepare_assembly_sample(
-            e3, poi, ligand, generator=torch.Generator(device='cpu').manual_seed(args.seed),
+            e3, poi, ligand, generator=torch.Generator(device=args.device).manual_seed(args.seed),
             evidence_id=f'deployment:{case}')
         initialization = {'selected_atom_maps': assembly_sample.audit['selected_atom_maps']}
         flow = assembly_sample.flow
