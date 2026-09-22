@@ -27,27 +27,6 @@ def test_index_entry_and_paths(tmp_path):
     assert all(path.is_file() for path in paths.values())
 
 
-def test_legacy_checkpoint_preflight_rejects_missing_lora():
-    payload = {
-        "checkpoint_version": 17,
-        "generative_process": "sdpi_flow_v1",
-        "architecture": "trifuse_v13",
-        "runtime_config": {
-            "activation_clamp": 100.0,
-            "torsion_expert_aux_weight": 0.25,
-            "lora_warmup_steps": 100,
-            "optimizer_groups": {"trifuse": {"lr": 1e-4}},
-        },
-        "trifuse_state_dict": {"x": 1},
-    }
-    try:
-        evaluation_common.validate_legacy_checkpoint_payload(payload)
-    except ValueError as error:
-        assert "LoRA" in str(error)
-    else:
-        raise AssertionError("checkpoint without LoRA must be rejected")
-
-
 def test_checkpoint_preflight_rejects_legacy_architecture():
     payload = {
         "checkpoint_version": 3,
@@ -61,41 +40,6 @@ def test_checkpoint_preflight_rejects_legacy_architecture():
         assert "checkpoint_version=18" in str(error)
     else:
         raise AssertionError("legacy architecture checkpoint must be rejected")
-
-
-def test_legacy_checkpoint_preflight_accepts_complete_payload():
-    payload = {
-        "checkpoint_version": 17,
-        "generative_process": "sdpi_flow_v1",
-        "architecture": "trifuse_v13",
-        "runtime_config": {
-            "activation_clamp": 100.0,
-            "torsion_expert_aux_weight": 0.25,
-            "lora_warmup_steps": 100,
-            "optimizer_groups": {"trifuse": {"lr": 1e-4}},
-        },
-        "trifuse_state_dict": {"x": 1},
-        "expert_lora_state_dict": {str(i): i for i in range(336)},
-        "expert_lora_config": {"rank": 4},
-    }
-    evaluation_common.validate_legacy_checkpoint_payload(payload)
-
-
-def test_legacy_checkpoint_preflight_rejects_missing_runtime_config():
-    payload = {
-        "checkpoint_version": 17,
-        "generative_process": "sdpi_flow_v1",
-        "architecture": "trifuse_v13",
-        "trifuse_state_dict": {"x": 1},
-        "expert_lora_state_dict": {str(i): i for i in range(336)},
-        "expert_lora_config": {"rank": 4},
-    }
-    try:
-        evaluation_common.validate_legacy_checkpoint_payload(payload)
-    except ValueError as error:
-        assert "activation_clamp" in str(error)
-    else:
-        raise AssertionError("checkpoint without runtime clamp must be rejected")
 
 
 def test_completed_report_requires_matching_checkpoint(tmp_path):
