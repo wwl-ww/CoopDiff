@@ -81,13 +81,14 @@ class LazyTrainingEndpointStore:
 
     def __init__(self, cache_dir, expert, *, binary_steps=20,
                  base_seed=ONLINE_TRAINING_BASE_SEED, read_only=False,
-                 wait_seconds=3600.):
+                 wait_seconds=3600., replace_mismatched=False):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.expert = expert
         self.binary_steps = int(binary_steps)
         self.base_seed = int(base_seed)
         self.read_only = bool(read_only)
+        self.replace_mismatched = bool(replace_mismatched)
         self.wait_seconds = float(wait_seconds)
         if self.wait_seconds < 0:
             raise ValueError('endpoint cache wait_seconds must be nonnegative')
@@ -119,6 +120,9 @@ class LazyTrainingEndpointStore:
         if payload.get("protocol") != self.protocol or payload.get("case") != case:
             raise ValueError(f"{case}: lazy endpoint cache contract mismatch")
         if payload.get("input_signature") != input_signature:
+            if self.replace_mismatched and not self.read_only:
+                path.unlink()
+                return None
             raise ValueError(
                 f"{case}: endpoint input signature missing or mismatched; "
                 "use a new endpoint cache directory (old cache left unchanged)"

@@ -202,7 +202,7 @@ def main():
                                                binary_steps=20,
                                                base_seed=(args.seed if args.bitseed_base_seed is None
                                                           else args.bitseed_base_seed),
-                                               wait_seconds=0)
+                                               wait_seconds=0, replace_mismatched=True)
                       if args.three_source else None)
     prior_library = (ChemicalPriorLibrary(args.chemical_prior_manifest, trainer.prior_config,
         index_sha256=trainer.index_sha) if args.chemical_prior_manifest else None)
