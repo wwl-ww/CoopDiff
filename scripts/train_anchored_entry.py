@@ -55,6 +55,8 @@ def main():
                         help='Share one optimizer/EMA across real SDPI, BiTSeed and BiAnchor trajectories')
     parser.add_argument('--bitseed-cache-dir', type=Path,
                         help='Dedicated immutable C=1/M=1 endpoint cache for three-source training')
+    parser.add_argument('--bitseed-base-seed', type=int,
+                        help='Endpoint-generation seed; defaults to the training seed')
     parser.add_argument('--init-source', choices=('legacy_zero', 'bianchor'),
                         help='New dual_binary runs default to BiAnchor; resume inherits checkpoint semantics')
     parser.add_argument('--warm-start', type=Path,
@@ -110,7 +112,8 @@ def main():
     bounds = (None if args.binary_translation_bound is None else
               {'translation': [args.binary_translation_bound] * 2,
                'rotation': [args.binary_rotation_bound] * 2})
-    if args.max_updates < 0 or min(args.save_every, args.log_every) < 1 or args.seed < 0:
+    if (args.max_updates < 0 or min(args.save_every, args.log_every) < 1 or args.seed < 0
+            or args.bitseed_base_seed is not None and args.bitseed_base_seed < 0):
         parser.error('update budget and seed must be nonnegative; intervals must be positive')
     if args.out.exists():
         raise FileExistsError('training/resume must publish into a new run directory')
@@ -196,7 +199,10 @@ def main():
                                                   if args.val_chemical_prior_manifest else None)}
                                   if args.chemical_prior_manifest else None))
     endpoint_store = (LazyTrainingEndpointStore(args.bitseed_cache_dir, runner.model.expert,
-                                               binary_steps=20, base_seed=args.seed, wait_seconds=0)
+                                               binary_steps=20,
+                                               base_seed=(args.seed if args.bitseed_base_seed is None
+                                                          else args.bitseed_base_seed),
+                                               wait_seconds=0)
                       if args.three_source else None)
     prior_library = (ChemicalPriorLibrary(args.chemical_prior_manifest, trainer.prior_config,
         index_sha256=trainer.index_sha) if args.chemical_prior_manifest else None)
