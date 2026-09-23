@@ -58,6 +58,9 @@ def main():
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--walkers', type=int, default=32)
     parser.add_argument('--steps', type=int, default=20)
+    parser.add_argument('--bitseed-candidates', type=int, default=192)
+    parser.add_argument('--sdpi-candidates', type=int, default=64)
+    parser.add_argument('--conformers', type=int, default=4)
     parser.add_argument('--selector-checkpoint', type=Path,
                         help='experimental native-free structural Top-K; default remains balanced random')
     parser.add_argument('--selector-task', choices=('quality', 'future'), default='quality')
@@ -68,7 +71,12 @@ def main():
     args = parser.parse_args()
     if args.selector_task == 'future' and args.selector_checkpoint is None:
         parser.error('future selection requires a trained selector checkpoint')
-    if not (1 <= args.walkers <= 256 and args.steps > 0 and 0 <= args.shard_index < args.num_shards):
+    pool_size = args.bitseed_candidates + args.sdpi_candidates
+    if (not 1 <= args.walkers <= pool_size or args.steps < 1
+            or args.bitseed_candidates < 0 or args.sdpi_candidates < 0
+            or args.conformers < 1 or args.bitseed_candidates % args.conformers
+            or args.bitseed_candidates // args.conformers > 64
+            or not 0 <= args.shard_index < args.num_shards):
         parser.error('invalid walker/step/shard budget')
     root = args.project_root.resolve()
     # Vendored runtime imports may change CWD; resolve CLI assets at project root.
@@ -87,7 +95,8 @@ def main():
         'cases': [e['case'] for e in entries], 'walkers': args.walkers, 'steps': args.steps,
         'proposal_seed': args.seed, 'selection_seed': args.seed + 3_000_000,
         'diffusion_seed': 'proposal_seed + 2000000 + pool_index',
-        'pool': {'bitseed': 192, 'sdpi': 64, 'conformers': 4, 'poses_per_side': 8,
+        'pool': {'bitseed': args.bitseed_candidates, 'sdpi': args.sdpi_candidates,
+                 'conformers': args.conformers, 'poses_per_side': 8,
                  'binary_steps': 20, 'retry_limit': 2, 'consecutive_failure_limit': 3},
         'selection': 'uniform_without_replacement_within_actual_source_balanced_v1',
         'probe': {'time': PROBE_TIME, 'dt': 0., 'geometry_names': list(GEOMETRY_NAMES),
@@ -146,7 +155,10 @@ def main():
             initializer = DualExpertAnchorInitializer(runner.expert, e3, poi, binary_steps=20,
                                                      proposal_attempts=8, conformer_policy='etkdgv3_random')
             candidates, generation = generate_hybrid_candidates(
-                initializer, e3['coords'][0], poi['coords'][0], ligand, seed=args.seed)
+                initializer, e3['coords'][0], poi['coords'][0], ligand, seed=args.seed,
+                conformer_count=args.conformers,
+                bitseed_candidate_budget=args.bitseed_candidates,
+                sdpi_candidate_budget=args.sdpi_candidates)
             pool = []
             for candidate in candidates:
                 state = cpu_tree({'ligand': candidate['ligand'][0], 'poi': candidate['poi'][0],

@@ -15,8 +15,10 @@ def test_decomposition_and_invalid_labels():
     assert dockq_components({'dockq': .2}) is None
     label = {'dockq': 1./3, 'fnat': .3, 'irms': 3., 'lrms': 8.5}
     assert torch.allclose(torch.tensor(dockq_components(label)), torch.tensor([.3, .2, .5]))
-    for change in ({'irms': -1}, {'fnat': 2}, {'lrms': float('nan')}, {'dockq': .9}):
+    for change in ({'dockq': .9},):
         rejected(lambda: dockq_components({**label, **change}))
+    for change in ({'irms': -1}, {'fnat': 2}, {'lrms': float('nan')}):
+        assert dockq_components({**label, **change}) is None
     rejected(lambda: dockq_components({'dockq': .2, 'fnat': .2}))
 
 

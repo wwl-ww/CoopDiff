@@ -269,6 +269,97 @@ def regression_pairwise_loss(output, labels, **kwargs):
         output, labels, **kwargs)
 
 
+def hard_top_pairwise_loss(scores, labels, *, negatives=16, top_fraction=.05,
+                           tie_tolerance=1e-4):
+    """Compare the true top tail only with the model's highest-scored mistakes."""
+    _validate_ranking_inputs(scores, labels, tie_tolerance)
+    if (type(negatives) is not int or negatives < 1 or not math.isfinite(top_fraction)
+            or not 0 < top_fraction <= 1):
+        raise ValueError('invalid hard-negative configuration')
+    count = max(1, math.ceil(len(labels) * top_fraction))
+    positive_ids = torch.argsort(labels.detach(), descending=True, stable=True)[:count]
+    positive = torch.zeros_like(labels, dtype=torch.bool)
+    positive[positive_ids] = True
+    negative_ids = (~positive).nonzero().flatten()
+    if not len(negative_ids):
+        return scores.sum() * 0
+    hard = negative_ids[torch.argsort(
+        scores.detach()[negative_ids], descending=True, stable=True)[:negatives]]
+    margins = scores[positive_ids, None] - scores[hard][None, :]
+    return nn.functional.softplus(-margins).mean()
+
+
+def top_tier_classification_loss(output, labels, *, threshold=.23):
+    """Case-balanced classification of acceptable DockQ candidates."""
+    if ('p23' not in output or output['p23'].shape != labels.shape
+            or not 0 < threshold < 1):
+        raise ValueError('top-tier classification requires aligned quality output')
+    target = labels.detach() >= threshold
+    probability = output['p23'].clamp(1e-6, 1 - 1e-6)
+    losses = []
+    if bool(target.any()):
+        losses.append(-probability[target].log().mean())
+    if bool((~target).any()):
+        losses.append(-(1 - probability[~target]).log().mean())
+    return torch.stack(losses).mean()
+
+
+def top_focused_ranking_loss(output, labels, *, hard_weight=0., tier_weight=0.,
+                             hard_negatives=16, tie_tolerance=1e-4, **kwargs):
+    """Top1 listwise mass plus optional hard-negative and acceptable-tier terms."""
+    if (kwargs.get('quality_weight', 0) or kwargs.get('top_weight', 0)
+            or not math.isfinite(hard_weight) or hard_weight < 0
+            or not math.isfinite(tier_weight) or tier_weight < 0):
+        raise ValueError('invalid top-focused objective weights')
+    value = best_tier_loss(output['score'], labels, tie_tolerance=tie_tolerance)
+    if hard_weight:
+        value = value + hard_weight * hard_top_pairwise_loss(
+            output['score'], labels, negatives=hard_negatives,
+            tie_tolerance=tie_tolerance)
+    if tier_weight:
+        value = value + tier_weight * top_tier_classification_loss(output, labels)
+    return value
+
+
+def decision_top_focused_loss(output, labels, stages, *, final_only=False,
+                              union_eligible=None, **kwargs):
+    """Apply the top-focused objective per decision scope, or to Final only."""
+    if len(stages) != labels.numel() or any(stage not in STAGES for stage in stages):
+        raise ValueError('aligned initial/final stages required')
+    initial = torch.tensor([stage == 'initial' for stage in stages], device=labels.device)
+    if final_only:
+        masks = [~initial]
+    else:
+        eligible = torch.ones_like(initial) if union_eligible is None else union_eligible.to(labels.device)
+        if eligible.shape != labels.shape or eligible.dtype != torch.bool:
+            raise ValueError('boolean aligned Union eligibility required')
+        masks = [initial, ~initial, eligible]
+    losses = [top_focused_ranking_loss(
+        {key: value[mask] for key, value in output.items()}, labels[mask], **kwargs)
+        for mask in masks if bool(mask.any())]
+    return torch.stack(losses).mean()
+
+
+def final_listwise_loss(output, labels, stages, *, tie_tolerance=1e-4, **kwargs):
+    """Full-list ranking restricted to observed Final states."""
+    mask = torch.tensor([stage == 'final' for stage in stages], device=labels.device)
+    if not bool(mask.any()):
+        return output['score'].sum() * 0
+    return structural_ranking_loss(
+        {key: value[mask] for key, value in output.items()}, labels[mask],
+        tie_tolerance=tie_tolerance)
+
+
+def final_regression_pairwise_loss(output, labels, stages, *, tie_tolerance=1e-4, **kwargs):
+    """DockQ regression plus pairwise ordering restricted to Final states."""
+    mask = torch.tensor([stage == 'final' for stage in stages], device=labels.device)
+    if not bool(mask.any()):
+        return output['score'].sum() * 0
+    return regression_pairwise_loss(
+        {key: value[mask] for key, value in output.items()}, labels[mask],
+        tie_tolerance=tie_tolerance)
+
+
 def component_quality_loss(output, targets):
     """Supervise fnat and bounded iRMS/LRMS quality, not a second ranking label.
 

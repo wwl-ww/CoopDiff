@@ -68,7 +68,7 @@ def adapt_initial_pool(archive, labels=None):
 
 
 def dockq_components(label):
-    """Return bounded DockQ decomposition, or None for old scalar-only labels."""
+    """Return a valid bounded DockQ decomposition, otherwise scalar-only."""
     keys = ('fnat', 'irms', 'lrms')
     if not any(key in label for key in keys):
         return None
@@ -81,7 +81,7 @@ def dockq_components(label):
     fnat, irms, lrms = (float(label[key]) for key in keys)
     if (not all(math.isfinite(x) for x in (fnat, irms, lrms))
             or not 0 <= fnat <= 1 or irms < 0 or lrms < 0):
-        raise ValueError('invalid DockQ component labels')
+        return None
     values = [fnat, (1. / math.hypot(1., irms / 1.5)) ** 2,
               (1. / math.hypot(1., lrms / 8.5)) ** 2]
     if abs(sum(values) / 3 - float(label['dockq'])) > 1e-5:

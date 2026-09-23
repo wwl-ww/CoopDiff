@@ -17,7 +17,8 @@ import torch
 from tricoopdiff.structural_ranker import (
     StructuralQualityRanker, rank_states, structural_ranking_loss, decision_ranking_loss,
     budget_retention_loss, selected_walker_mask, component_quality_loss, dockq_regression_loss,
-    pairwise_ranking_loss, regression_pairwise_loss,
+    pairwise_ranking_loss, regression_pairwise_loss, decision_top_focused_loss,
+    final_listwise_loss, final_regression_pairwise_loss,
 )
 from tricoopdiff.initial_selector import selector_retention
 from tricoopdiff.ranking_backward import backward_list
@@ -83,6 +84,30 @@ def score_case(model, case, device):
               for graph in case['graphs']]
     return model.forward_list(graphs, stages=case['stages'], sources=case['sources'],
                               task=case.get('ranking_task', 'quality'))
+
+
+class PdbFilteredDataset:
+    """Read-only dataset view excluding explicitly held-out PDB entries."""
+
+    def __init__(self, dataset, excluded_pdbs):
+        self.dataset = dataset
+        self.indices = [i for i, case in enumerate(dataset.cases)
+                        if case.split('_', 1)[0].upper() not in excluded_pdbs]
+        self.cases = [dataset.cases[i] for i in self.indices]
+        for name in ('candidate_scope', 'manifest', 'manifest_digest',
+                     'label_manifest_digest', 'split'):
+            setattr(self, name, getattr(dataset, name))
+
+    @property
+    def seals(self):
+        return {case: self.dataset.seals[case] for case in self.cases
+                if case in self.dataset.seals}
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        return self.dataset[self.indices[index]]
 
 
 def ordering_metrics(scores, labels, *, tie_tolerance=1e-4, groups=None):
@@ -327,7 +352,8 @@ def evaluate(model, dataset, device, *, shuffle_repeats=0, shuffle_seed=7315, fu
     return summary
 
 
-def selection_score(metrics, candidate_scope, future_target=None, quality_walker_scope='all'):
+def selection_score(metrics, candidate_scope, future_target=None, quality_walker_scope='all',
+                    checkpoint_scope='union'):
     if future_target is not None or quality_walker_scope == 'future-top64':
         replay = metrics['future_refinement_selection']
         if replay['complete_pair_coverage_cases'] != metrics['cases']:
@@ -339,7 +365,7 @@ def selection_score(metrics, candidate_scope, future_target=None, quality_walker
         return value
     if candidate_scope == 'initial-pool':
         return metrics['initial_selection']['mean_selected_best']
-    return metrics['union']['mean_top1_available']
+    return metrics[checkpoint_scope]['mean_top1_available']
 
 
 def main(argv=None):
@@ -349,6 +375,8 @@ def main(argv=None):
     for name in ('val-archives', 'val-labels', 'out'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--audit-only', action='store_true')
+    parser.add_argument('--exclude-validation-pdbs-from-train', action='store_true',
+                        help='remove training cases whose PDB occurs in validation')
     parser.add_argument('--candidate-scope', choices=('archived-pairs', 'initial-pool', 'joint'), default='archived-pairs')
     parser.add_argument('--train-initial-labels', type=Path, nargs='+')
     parser.add_argument('--val-initial-labels', type=Path)
@@ -378,9 +406,16 @@ def main(argv=None):
                         help='future top64 best-tier retention; requires complete training pool outcomes')
     parser.add_argument('--objective',
                         choices=('decision', 'legacy', 'regression', 'pairwise',
-                                 'regression-pairwise'), default='decision',
+                                 'regression-pairwise', 'top1', 'top1-hard',
+                                 'top1-hard-tier', 'final-listwise', 'final-top1',
+                                 'final-top1-hard', 'final-top1-tier',
+                                 'final-top1-hard-tier', 'final-regression-pairwise'), default='decision',
                         help='decision balances Initial/Final/eligible Union full-list losses')
     parser.add_argument('--checkpoint-task', choices=('quality', 'future'), default='quality')
+    parser.add_argument('--checkpoint-scope', choices=('union', 'final'), default='union')
+    parser.add_argument('--hard-weight', type=float, default=.5)
+    parser.add_argument('--tier-weight', type=float, default=.5)
+    parser.add_argument('--hard-negatives', type=int, default=16)
     parser.add_argument('--quality-walker-scope', choices=('all', 'future-top64'), default='all',
                         help='train Final/Union on current native-free selector allocation; Initial stays full-pool')
     parser.add_argument('--top-weight', type=float, default=1.,
@@ -391,13 +426,19 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.interface_readout != 'pooled' and (args.interface_layers < 1 or args.hidden_dim % 4):
         parser.error('contact readout requires interface layers and hidden_dim divisible by four')
-    if args.objective in ('regression', 'pairwise', 'regression-pairwise') and (
+    if args.objective in ('regression', 'pairwise', 'regression-pairwise', 'final-regression-pairwise') and (
             args.top_weight or args.quality_weight or args.component_weight or args.future_weight
             or args.budget_weight or args.candidate_scope != 'archived-pairs'
             or args.quality_walker_scope != 'all'):
         parser.error('regression/pairwise ablations require archived-pairs/all and zero auxiliary weights')
     if not math.isfinite(args.component_weight) or args.component_weight < 0:
         parser.error('component weight must be finite and nonnegative')
+    if (not math.isfinite(args.hard_weight) or args.hard_weight < 0
+            or not math.isfinite(args.tier_weight) or args.tier_weight < 0
+            or args.hard_negatives < 1):
+        parser.error('invalid top-focused loss configuration')
+    if args.objective.startswith('final-') and args.checkpoint_scope != 'final':
+        parser.error('final-only training requires Final checkpoint selection')
     if args.component_weight and (args.candidate_scope != 'archived-pairs' or args.quality_walker_scope != 'all'):
         parser.error('component auxiliary currently requires archived-pairs and all-walker quality supervision')
     if not math.isfinite(args.max_hours) or args.max_hours < 0:
@@ -439,13 +480,19 @@ def main(argv=None):
               for i, (a, l) in enumerate(zip(args.train_archives, args.train_labels))]
     train = shards[0] if len(shards) == 1 else StructuralArchiveCollection(shards)
     val = make_dataset(args.val_archives, args.val_labels, 'val', args.val_initial_labels)
+    if args.exclude_validation_pdbs_from_train:
+        held_out = {case.split('_', 1)[0].upper() for case in val.cases}
+        train = PdbFilteredDataset(train, held_out)
+        if not len(train):
+            raise ValueError('validation PDB exclusion removed every training case')
     coverage = audit_datasets(train, val)
     if args.objective == 'regression':
         for dataset in (train, val):
             for i in range(len(dataset)):
                 case = dataset[i]
-                if sum(s == 'final' for s in case['stages']) != case['pool_size']:
-                    raise ValueError('paired regression ablation requires complete full-pool outcomes')
+                if sum(s == 'final' for s in case['stages']) != sum(
+                        s == 'initial' for s in case['stages']):
+                    raise ValueError('paired regression ablation requires each archived initial to have a final')
     if args.component_weight:
         for dataset in (train, val):
             for i in range(len(dataset)):
@@ -532,7 +579,7 @@ def main(argv=None):
         return
     model = model.to(args.device)
     model.future_head.requires_grad_(args.future_weight > 0)
-    if args.quality_weight == 0:
+    if args.quality_weight == 0 and args.objective not in ('top1-hard-tier', 'final-top1-hard-tier'):
         model.quality_head.requires_grad_(False)
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr)
     best, best_payload, first_epoch = -math.inf, None, 1
@@ -541,7 +588,8 @@ def main(argv=None):
         optimizer.load_state_dict(resumed['optimizer'])
         state = resumed['resume_state']
         best_payload = state['best_payload']
-        best = selection_score(best_payload['validation'], args.candidate_scope, selection_target, args.quality_walker_scope)
+        best = selection_score(best_payload['validation'], args.candidate_scope, selection_target,
+                               args.quality_walker_scope, args.checkpoint_scope)
         atomic_checkpoint(best_payload, args.out / 'best.pt')
         first_epoch = resumed['epoch'] + 1
         random.setstate(state['python_rng'])
@@ -567,8 +615,30 @@ def main(argv=None):
             objective = {'decision': decision_ranking_loss, 'legacy': structural_ranking_loss,
                          'regression': dockq_regression_loss,
                          'pairwise': pairwise_ranking_loss,
-                         'regression-pairwise': regression_pairwise_loss}[args.objective]
-            scope_args = {'stages': case['stages'], 'union_eligible': case.get('union_eligible')} if args.objective == 'decision' else {}
+                         'regression-pairwise': regression_pairwise_loss,
+                         'top1': decision_top_focused_loss,
+                         'top1-hard': decision_top_focused_loss,
+                         'top1-hard-tier': decision_top_focused_loss,
+                         'final-top1-hard-tier': decision_top_focused_loss,
+                         'final-listwise': final_listwise_loss,
+                         'final-top1': decision_top_focused_loss,
+                         'final-top1-hard': decision_top_focused_loss,
+                         'final-top1-tier': decision_top_focused_loss,
+                         'final-top1-hard-tier': decision_top_focused_loss,
+                         'final-regression-pairwise': final_regression_pairwise_loss}[args.objective]
+            top_focused = args.objective in ('top1', 'top1-hard', 'top1-hard-tier',
+                                             'final-top1', 'final-top1-hard',
+                                             'final-top1-tier', 'final-top1-hard-tier')
+            scope_args = ({'stages': case['stages'], 'union_eligible': case.get('union_eligible')}
+                          if args.objective == 'decision' or top_focused else {})
+            if top_focused:
+                scope_args.update(
+                    final_only=args.objective.startswith('final-'),
+                    hard_weight=args.hard_weight if args.objective in ('top1-hard', 'top1-hard-tier',
+                                                                        'final-top1-hard', 'final-top1-hard-tier') else 0.,
+                    tier_weight=args.tier_weight if args.objective in ('top1-hard-tier', 'final-top1-tier',
+                                                                        'final-top1-hard-tier') else 0.,
+                    hard_negatives=args.hard_negatives)
             if args.quality_walker_scope == 'future-top64':
                 allocation_case = future_utility_case(case, target=args.future_target)
                 with torch.no_grad():
@@ -648,11 +718,13 @@ def main(argv=None):
                 record['budget_train_loss'] = budget_total / future_cases
         with (args.out / 'history.jsonl').open('a') as handle:
             handle.write(json.dumps(record) + '\n')
-        key = selection_score(metrics, args.candidate_scope, selection_target, args.quality_walker_scope)
+        key = selection_score(metrics, args.candidate_scope, selection_target,
+                              args.quality_walker_scope, args.checkpoint_scope)
         payload = {'architecture': 'structural_quality_ranker', 'config': config,
                    'state_dict': {name: value.detach().cpu().clone() for name, value in model.state_dict().items()},
                    'optimizer_steps': epoch * len(train),
-                   'head_supervision': {'rank': True, 'quality_aux': args.quality_weight > 0,
+                   'head_supervision': {'rank': True, 'quality_aux': (args.quality_weight > 0 or
+                                        args.objective in ('top1-hard-tier', 'final-top1-tier', 'final-top1-hard-tier')),
                                         'future': args.future_weight > 0},
                    'epoch': epoch, 'metadata': metadata, 'validation': metrics}
         if args.component_weight:

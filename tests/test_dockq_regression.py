@@ -11,7 +11,8 @@ from test_structural_ranker import fixture
 from test_structural_ranking_data import archive_fixture
 from tricoopdiff.structural_ranker import (
     StructuralQualityRanker, dockq_regression_loss, pairwise_ranking_loss,
-    regression_pairwise_loss,
+    regression_pairwise_loss, hard_top_pairwise_loss,
+    top_tier_classification_loss, top_focused_ranking_loss,
 )
 from tricoopdiff.structural_ranking_data import file_digest
 from tricoopdiff.ranking_backward import backward_list
@@ -45,6 +46,20 @@ def test_pairwise_and_combined_objectives_reward_correct_order():
     assert torch.isfinite(combined)
     combined.backward()
     assert correct['score'].grad.abs().sum() > 0
+
+
+def test_top_focused_objectives_reward_top_order_and_tier_calibration():
+    labels = torch.tensor([.1, .8, .4, .05])
+    correct = {'score': torch.tensor([-2., 3., 1., -3.], requires_grad=True),
+               'p23': torch.tensor([.1, .9, .8, .1], requires_grad=True)}
+    wrong = {'score': -correct['score'].detach(),
+             'p23': 1 - correct['p23'].detach()}
+    assert hard_top_pairwise_loss(correct['score'], labels, negatives=2) < hard_top_pairwise_loss(wrong['score'], labels, negatives=2)
+    assert top_tier_classification_loss(correct, labels) < top_tier_classification_loss(wrong, labels)
+    loss = top_focused_ranking_loss(correct, labels, hard_weight=.5, tier_weight=.5)
+    loss.backward()
+    assert correct['score'].grad.abs().sum() > 0
+    assert correct['p23'].grad.abs().sum() > 0
 
 
 def test_regression_training_and_inference():
