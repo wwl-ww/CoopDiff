@@ -1,0 +1,16 @@
+<ROSETTASCRIPTS>
+  <SCOREFXNS>
+    <ScoreFunction name="ref2015" weights="ref2015"/>
+  </SCOREFXNS>
+  <MOVERS>
+    <!-- AB is the two proteins; X is the intact ligand. This measures the
+         ligand-versus-protein interface without cutting the linker. -->
+    <InterfaceAnalyzerMover name="ia" scorefxn="ref2015" interface="AB_X"
+        pack_input="false" pack_separated="false" interface_sc="true"
+        use_jobname="false" tracer="false"/>
+  </MOVERS>
+  <PROTOCOLS>
+    <Add mover="ia"/>
+  </PROTOCOLS>
+  <OUTPUT scorefxn="ref2015"/>
+</ROSETTASCRIPTS>
