@@ -43,6 +43,11 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
     seed_training(args.seed, device)
+    # TernaryDataLoader isolates featurization RNG with torch.random.fork_rng;
+    # initialize CUDA first so the selected device has a registered generator
+    # even when the process starts from a cold cache.
+    if device.type == 'cuda':
+        torch.cuda.init()
     score_args = _load_score_model_args(args.expert_model_dir)
 
     train_loader = TernaryDataLoader(
