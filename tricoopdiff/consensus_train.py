@@ -117,6 +117,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 'activation_clamp': self.activation_clamp,
                 'activation_clamp_mode': self.activation_clamp_mode,
                 'residual_weight': self.residual_weight, 'ema_decay': self.ema_decay,
+                'ab_consistency_weight': self.ab_consistency_weight,
                 'optimizer_groups': self.optimizer_config,
                 'flow_time_contract': 'shared_flow_expert_clock_v1',
                 'candidate_source_contract': SOURCE_CONTRACT_VERSION,
@@ -150,6 +151,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                              'construct the trainer with that explicit mode to resume')
         expected = {'activation_clamp': self.activation_clamp,
                     'residual_weight': self.residual_weight, 'ema_decay': self.ema_decay,
+                    'ab_consistency_weight': self.ab_consistency_weight,
                     'optimizer_groups': self.optimizer_config}
         if payload['checkpoint_version'] in (
                 PREVIOUS_CONSENSUS_CHECKPOINT_VERSION,
@@ -162,7 +164,8 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         if payload['checkpoint_version'] == CONSENSUS_CHECKPOINT_VERSION:
             expected['training_endpoint_protocol'] = self.training_endpoint_protocol
         for key, value in expected.items():
-            if payload['runtime_config'].get(key) != value:
+            saved_value = payload['runtime_config'].get(key, 0.0 if key == 'ab_consistency_weight' else None)
+            if saved_value != value:
                 raise ValueError(f'consensus checkpoint runtime mismatch: {key}')
         self.model.trifuse.load_state_dict(payload['trifuse_state_dict'])
         self.ema = {name: value.clone() for name, value in payload['ema_trifuse_state_dict'].items()}

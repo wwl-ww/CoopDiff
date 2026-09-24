@@ -23,7 +23,8 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from .model import TriCoopDiff
-from .sdpi_flow import SDPIFlow
+from .sdpi_flow import SDPIFlow, _rotation_exp
+from .rigid import assemble_interface_pair
 
 
 class NonFiniteTrainingError(FloatingPointError):
@@ -46,6 +47,7 @@ class TriCoopDiffTrainer:
         device: str = 'cuda',
         activation_clamp: float = 100.0,
         torsion_expert_aux_weight: float = 0.25,
+        ab_consistency_weight: float = 0.0,
     ):
         if not isinstance(diffusion, SDPIFlow):
             raise ValueError('training requires SDPIFlow, not the legacy DSM process')
@@ -64,6 +66,9 @@ class TriCoopDiffTrainer:
         if torsion_expert_aux_weight < 0:
             raise ValueError("torsion_expert_aux_weight must be non-negative")
         self.torsion_expert_aux_weight = float(torsion_expert_aux_weight)
+        if ab_consistency_weight < 0:
+            raise ValueError("ab_consistency_weight must be non-negative")
+        self.ab_consistency_weight = float(ab_consistency_weight)
         # Only TriFuse is trainable; experts are frozen
         parameter_groups = [{
             'params': list(model.trifuse.parameters()),
@@ -171,6 +176,54 @@ class TriCoopDiffTrainer:
             losses[name] = ((predicted - tor_target).square().mean()
                             if predicted.numel() else t.new_zeros(()))
             record_rms(name.removeprefix('loss_'), predicted, tor_target)
+        # The ordinary flow losses supervise E3--L and POI--L independently.
+        # This auxiliary term composes both predicted rigid updates and compares
+        # the resulting ternary pose against the composed target update.  It is
+        # deliberately optional so existing checkpoints remain reproducible.
+        if self.ab_consistency_weight > 0:
+            pred_vel = self.diffusion.velocities(predictions, e3_data['coords'], poi_data['coords'])
+            target_norm = {
+                'e3_ligand': {
+                    'tr': targets['e3_ligand']['tr'] / scales[0],
+                    'rot': targets['e3_ligand']['rot'] / np.pi,
+                },
+                'poi_ligand': {
+                    'tr': targets['poi_ligand']['tr'] / scales[1],
+                    'rot': targets['poi_ligand']['rot'] / np.pi,
+                },
+                'torsion': tor_target,
+            }
+            target_vel = self.diffusion.velocities(
+                target_norm, e3_data['coords'], poi_data['coords'])
+
+            def compose_body(pose, velocities):
+                old_center = pose[0].mean(dim=0, keepdim=True)
+                dt_value = 1.0 / float(self.diffusion.inference_steps)
+                transforms = []
+                for branch in ('e3_ligand', 'poi_ligand'):
+                    rot = _rotation_exp(-dt_value * velocities[branch]['rot'])
+                    center = old_center - dt_value * velocities[branch]['tr']
+                    offset = center - (rot @ old_center.unsqueeze(-1)).squeeze(-1)
+                    transforms.append((rot, offset))
+                # assemble_interface_pair uses D_A ∘ inverse(D_B), exactly the
+                # body-frame update used by SDPIFlow.step().
+                _, increment = assemble_interface_pair(
+                    poi_data['coords'], *transforms[0], *transforms[1])
+                return increment @ body, increment, transforms
+
+            pred_body, pred_increment, pred_transforms = compose_body(ligand, pred_vel)
+            target_body, target_increment, target_transforms = compose_body(ligand, target_vel)
+            pred_poi, _ = assemble_interface_pair(
+                poi, *pred_transforms[0], *pred_transforms[1])
+            target_poi, _ = assemble_interface_pair(
+                poi, *target_transforms[0], *target_transforms[1])
+            # Body rotation captures relative orientation; normalized POI
+            # coordinates capture the associated relative translation.
+            coord_scale = scales.mean().detach().clamp_min(1.0)
+            losses['loss_ab_consistency'] = (
+                (pred_body - target_body).square().mean()
+                + ((pred_poi - target_poi) / coord_scale).square().mean()
+            )
         if any(not torch.isfinite(value) for value in losses.values()):
             raise NonFiniteTrainingError(f"case={case}: non-finite SDPI velocity loss")
         total = (losses['loss_e3l_tr'] + losses['loss_e3l_rot']
@@ -179,6 +232,8 @@ class TriCoopDiffTrainer:
         if 'residual_penalty' in output:
             losses['loss_residual'] = output['residual_penalty']
             total = total + self.residual_weight * losses['loss_residual']
+        if 'loss_ab_consistency' in losses:
+            total = total + self.ab_consistency_weight * losses['loss_ab_consistency']
         if diagnostics:
             return {'loss_total': total, 'components': losses, 'rms': rms}
         return {'loss_total': total, 'loss_score': total.item(),

@@ -88,6 +88,10 @@ def parse_args(argv=None):
         help="Weight for per-expert torsion losses in addition to joint torsion",
     )
     p.add_argument('--residual-weight', type=float, default=1e-3)
+    p.add_argument(
+        '--ab-consistency-weight', type=float, default=0.0,
+        help='Weight for composed E3--POI pose consistency loss',
+    )
     p.add_argument('--ema-decay', type=float, default=0.999)
     # Phase
     p.add_argument("--phase", type=int, default=1, choices=[1],
@@ -466,6 +470,7 @@ def build_trainer(args, device, input_dim=None):
         activation_clamp_mode=args.activation_clamp_mode,
         torsion_expert_aux_weight=args.torsion_expert_aux_weight,
         residual_weight=args.residual_weight,
+        ab_consistency_weight=args.ab_consistency_weight,
         ema_decay=args.ema_decay,
         training_source_mix=(
             'sdpi_only' if getattr(args, 'training_arm', 'A1') == 'A1'
