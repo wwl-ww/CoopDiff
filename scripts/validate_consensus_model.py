@@ -18,13 +18,14 @@ import tricoopdiff.diffdock_compat  # noqa: E402,F401
 import numpy as np
 import torch
 
-from tricoopdiff.consensus import ConsensusCoopDiff, ConsensusFuse
-from tricoopdiff.consensus_train import ConsensusTrainer
-from tricoopdiff.expert_factory import build_diffdock_expert
+from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse, production_model_config
+from tricoopdiff.train import ConsensusTrainer
+from tricoopdiff.models.expert import build_diffdock_expert
 from tricoopdiff.initialization import TernaryInitializer
+from tricoopdiff.initialization.endpoints import reachable_ligand_target
 from tricoopdiff.sampler import sample_single
 from tricoopdiff.sdpi_flow import SDPIFlow
-from tricoopdiff.reproducibility import configure_inference_reproducibility
+from tricoopdiff.runtime import configure_inference_reproducibility
 
 
 def main():
@@ -49,12 +50,18 @@ def main():
     native_snapshot = {k: batch[k]['coords'].clone() for k in ('e3_data', 'poi_data', 'ligand_data')}
     expert = build_diffdock_expert(args.expert_model_dir, args.device)
     expert_snapshot = {n: p.detach().cpu().clone() for n, p in expert.named_parameters()}
-    fuse = ConsensusFuse(input_dim=batch['e3_data']['features'].shape[-1], dropout=0)
+    fuse = ConsensusFuse(**production_model_config(128, batch['e3_data']['features'].shape[-1], 3))
     model = ConsensusCoopDiff(expert, fuse).to(args.device)
     flow = SDPIFlow()
     trainer = ConsensusTrainer(model, flow, device=args.device, lr=1e-4, ema_decay=0.9)
-    fixed = {**batch, 'coupling_override': payload['coupling'],
-             't_override': torch.tensor([payload['time']], device=args.device)}
+    ligand, poi, body, _ = TernaryInitializer(no_torsion=expert.model.no_torsion).initialize(
+        batch['e3_data']['coords'][0], batch['poi_data']['coords'][0], batch['ligand_data'], seed=17)
+    target, _ = reachable_ligand_target(batch['ligand_data'], ligand, poi,
+                                      batch['poi_data']['coords'], no_torsion=expert.model.no_torsion)
+    fixed = {**batch, 'coupling_override': {
+        'initial_state': {'ligand': ligand, 'poi': poi, 'body_frame': body},
+        'target_ligand': target}}
+
     history = []
     for step in range(4):
         result = trainer.train_step(**copy.deepcopy(fixed))

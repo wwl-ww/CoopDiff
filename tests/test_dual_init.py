@@ -10,11 +10,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tricoopdiff.dual_init import (  # noqa: E402
+from tricoopdiff.initialization.endpoints import (  # noqa: E402
     CachedEndpointStore, DUAL_INIT_CACHE_VERSION, validate_endpoint_cache,
 )
-from tricoopdiff.online_endpoints import (  # noqa: E402
-    LazyTrainingEndpointStore, ONLINE_TRAINING_ENDPOINT_PROTOCOL,
+from tricoopdiff.initialization.endpoints import (  # noqa: E402
+    LazyTrainingEndpointStore, RESAMPLED_TRAINING_ENDPOINT_PROTOCOL,
     endpoint_input_signature,
 )
 
@@ -61,6 +61,11 @@ def test_cache_roundtrip_preserves_deterministic_coupling():
         second, _ = store.coupling('demo', occurrence=4)
         assert second['angles'][0] == 0
         assert record['actual_source'] == 'bitseed'
+        record['coupling']['angles'][0] = 88
+        record['actual_source'] = 'sdpi'
+        third, fresh_record = store.coupling('demo', occurrence=4)
+        assert third['angles'][0] == 0 and fresh_record['actual_source'] == 'bitseed', (
+            'returned metadata must not expose mutable cached training state')
 
 
 def test_fallback_cannot_be_relabelled_as_bitseed():
@@ -86,11 +91,13 @@ def test_lazy_training_protocol_is_exactly_one_pose_per_expert():
     with tempfile.TemporaryDirectory() as directory:
         store = LazyTrainingEndpointStore(directory, expert)
         assert store.protocol == {
-            'version': ONLINE_TRAINING_ENDPOINT_PROTOCOL,
+            'version': RESAMPLED_TRAINING_ENDPOINT_PROTOCOL,
             'conformers': 1, 'poses_per_side': 1, 'binary_steps': 20,
             'binary_retry_limit': 1, 'selection': 'single_pair_no_ranking',
             'fallback': 'sdpi_v1_on_any_invalid_expert_side',
             'base_seed': 41000,
+            'expert_runtime': store.protocol['expert_runtime'],
+            'generation_version': 'raw_target_projection_v4',
             'frozen_expert': {
                 'diffdock_commit': 'test', 'score_checkpoint_sha256': 'abc',
                 'no_torsion': False,
@@ -117,6 +124,54 @@ def _lazy_store(directory):
     return LazyTrainingEndpointStore(directory, expert)
 
 
+def test_resampled_endpoints_use_occurrence_and_keep_validation_fixed():
+    from unittest.mock import patch
+    from tricoopdiff.initialization.endpoints import RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
+
+    with tempfile.TemporaryDirectory() as directory:
+        expert = _lazy_store(directory).expert
+        store = LazyTrainingEndpointStore(directory, expert)
+        assert store.protocol['version'] == RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
+
+        def generate(case, batch, signature, occurrence):
+            record = deepcopy(payload()['entries'][0])
+            record['endpoint']['ligand'] += occurrence
+            record['target_ligand'] = np.zeros((4, 3))
+            return record
+
+        with patch.object(store, '_generate', side_effect=generate) as generation:
+            a, _ = store.coupling('demo', occurrence=0, batch=_input_batch())
+            repeated, _ = store.coupling('demo', occurrence=0, batch=_input_batch())
+            b, _ = store.coupling('demo', occurrence=1, batch=_input_batch())
+            validation, _ = store.coupling('demo', occurrence=0, batch=_input_batch())
+        assert generation.call_count == 3
+        assert np.array_equal(a['initial_state']['ligand'], repeated['initial_state']['ligand'])
+        assert not np.array_equal(a['initial_state']['ligand'], b['initial_state']['ligand'])
+        assert np.array_equal(a['initial_state']['ligand'], validation['initial_state']['ligand'])
+        assert store._path('demo', 0) != store._path('demo', 1)
+        assert len(store._records) == 1, 'resampling must not accumulate every occurrence in RAM'
+
+
+def test_cache_contract_includes_and_rechecks_actual_expert_policy():
+    from types import SimpleNamespace
+    from tricoopdiff.models.expert import configure_expert_policy
+
+    with tempfile.TemporaryDirectory() as directory:
+        expert = _lazy_store(directory).expert
+        expert.model = SimpleNamespace()
+        configure_expert_policy(expert, 100., 'irrep_norm')
+        a = LazyTrainingEndpointStore(directory, expert)
+        configure_expert_policy(expert, 1., 'componentwise')
+        b = LazyTrainingEndpointStore(directory, expert)
+        assert a.protocol != b.protocol
+        try:
+            a.coupling('demo', batch=_input_batch())
+        except ValueError as error:
+            assert 'runtime changed' in str(error)
+        else:
+            raise AssertionError('a cache must not outlive a change in expert policy')
+
+
 def test_endpoint_signature_tracks_geometry_chemistry_and_atom_order():
     batch = _input_batch()
     signature = endpoint_input_signature(batch)
@@ -141,14 +196,21 @@ def test_lazy_cache_checks_disk_and_memory_inputs_without_overwriting():
         store = _lazy_store(directory)
         batch = _input_batch()
         path = store._path('demo')
-        torch.save({'case': 'demo', 'protocol': store.protocol,
-                    'record': payload()['entries'][0],
-                    'input_signature': endpoint_input_signature(batch)}, path)
+        record = deepcopy(payload()['entries'][0])
+        record['occurrence'] = 0
+        record['target_ligand'] = np.zeros((4, 3))
+        torch.save({'case': 'demo', 'occurrence': 0, 'protocol': store.protocol,
+                    'record': record, 'input_signature': endpoint_input_signature(batch)}, path)
         original = path.read_bytes()
-        first, _ = store.coupling('demo', batch=batch)
-        first['angles'][0] = 99
-        again, _ = store.coupling('demo', batch=deepcopy(batch))
-        assert again['angles'][0] == 0
+        first, record = store.coupling('demo', batch=batch)
+        first['initial_state']['ligand'][0, 0] = 99
+        record['endpoint']['ligand'][0, 0] = 88
+        record['target_ligand'][0, 0] = 77
+        record['actual_source'] = 'sdpi'
+        again, fresh_record = store.coupling('demo', batch=deepcopy(batch))
+        assert again['initial_state']['ligand'][0, 0] == 0
+        assert again['target_ligand'][0, 0] == 0 and fresh_record['actual_source'] == 'bitseed', (
+            'returned metadata changed deterministic cached inputs, labels or source')
         changed = deepcopy(batch)
         changed['ligand_data']['coords'] = torch.ones(1, 6, 3)
         for reader in (store, _lazy_store(directory)):

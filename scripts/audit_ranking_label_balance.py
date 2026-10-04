@@ -10,8 +10,8 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 import torch
 
 from evaluation_common import sha256_file
-from tricoopdiff.ranking_audit import join_labels, label_support
-from tricoopdiff.ranking_inference import archive_rows
+from tricoopdiff.ranking.ranking_audit import join_labels, label_support
+from tricoopdiff.ranking.ranking_inference import archive_rows
 
 
 def main():

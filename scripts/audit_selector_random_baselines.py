@@ -9,7 +9,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from tricoopdiff.initial_selector import POOL_LABEL_VERSION, exact_random_selection
+from tricoopdiff.ranking.initial_selector import POOL_LABEL_VERSION, exact_random_selection
 
 
 QUOTAS = {

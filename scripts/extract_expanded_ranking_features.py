@@ -15,19 +15,16 @@ import torch
 
 from evaluation_common import evaluation_input_signature, sha256_file
 from tricoopdiff.diffdock.datasets.parse_chi import get_coords
-from tricoopdiff.expanded_geometry import (EXPANDED_GEOMETRY_NAMES, apply_fitted_rigid,
+from tricoopdiff.ranking.ranking_archive import (EXPANDED_GEOMETRY_NAMES, apply_fitted_rigid,
                                            expanded_geometry_features)
-from tricoopdiff.ranking_archive import GEOMETRY_NAMES
-from tricoopdiff.ranking_inference import archive_rows
+from tricoopdiff.ranking.ranking_archive import GEOMETRY_NAMES
+from tricoopdiff.ranking.ranking_inference import archive_rows
+from tricoopdiff.runtime import atomic_json
 
 
 PROTOCOL = 'native_free_heavy_atom_ranking_features_v1'
 
 
-def atomic_json(value, path):
-    temporary = path.with_suffix(path.suffix + f'.tmp.{os.getpid()}')
-    temporary.write_text(json.dumps(value, indent=2) + '\n')
-    temporary.replace(path)
 
 
 def protein_coordinates(path):

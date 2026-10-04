@@ -49,7 +49,7 @@ def main():
     if not saves or abs(saves[-1] - best["val_loss"]) > 5e-4:
         raise SystemExit("FATAL: last Saved best marker is not minimum validation loss")
     checkpoint = Path(args.checkpoint).resolve()
-    payload = torch.load(checkpoint, map_location="cpu")
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     validate_checkpoint_payload(payload)
     if args.steps_per_epoch is not None:
         expected_step = best["epoch"] * args.steps_per_epoch

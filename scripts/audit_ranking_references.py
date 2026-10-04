@@ -17,7 +17,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 from evaluation_common import evaluation_input_signature, sha256_file
-from tricoopdiff.deepternary_metrics import (
+from tricoopdiff.metrics.dockq import (
     _featurized_ca_coords, _ligand_records, compute_fullatom_dockq,
 )
 
@@ -60,7 +60,7 @@ def main():
                'scope': 'native-frame positive control only; not generated candidates or ranker labels',
                'references_sha256': {str(path): sha256_file(path) for path in args.label_refs},
                'source_sha256': {str(path): sha256_file(path) for path in [Path(__file__),
-                   ROOT / 'tricoopdiff/deepternary_metrics.py'] + sorted(
+                   ROOT / 'tricoopdiff/metrics/dockq.py'] + sorted(
                        (project_root / 'DeepTernary/DockQ').rglob('*.py'))}, 'rows': rows}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open('x') as handle:

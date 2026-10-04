@@ -11,9 +11,9 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 import torch
 
 from train_future_selector import load_cases
-from tricoopdiff.initial_selector import (diversity_aware_indices,
+from tricoopdiff.ranking.initial_selector import (diversity_aware_indices,
                                           future_selector_retention_at_indices)
-from tricoopdiff.pose_ranking import StateQualityRanker
+from tricoopdiff.ranking.ranking_inference import StateQualityRanker
 
 
 PENALTIES = (0., .025, .05, .1, .2)

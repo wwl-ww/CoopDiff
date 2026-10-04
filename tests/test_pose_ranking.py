@@ -1,6 +1,6 @@
 import torch
 
-from tricoopdiff.pose_ranking import (
+from tricoopdiff.ranking.ranking_inference import (
     PoseRanker, listwise_ranking_loss, selected_pose_metrics,
 )
 

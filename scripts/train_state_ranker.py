@@ -11,9 +11,9 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 import torch
 
 from evaluation_common import sha256_file
-from tricoopdiff.pose_ranking import StateQualityRanker, state_quality_loss
-from tricoopdiff.ranking_audit import join_labels
-from tricoopdiff.ranking_inference import GENERATOR_KEYS, archive_rows, export_quality_checkpoint, feature_vector
+from tricoopdiff.ranking.ranking_inference import StateQualityRanker, state_quality_loss
+from tricoopdiff.ranking.ranking_audit import join_labels
+from tricoopdiff.ranking.ranking_inference import GENERATOR_KEYS, archive_rows, export_quality_checkpoint, feature_vector
 
 
 def load_split(archives, labels, split, geometry_only=False):

@@ -9,7 +9,7 @@ from rdkit import Chem
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tricoopdiff.condition_manifest import (MANIFEST_VERSION, canonical_isomeric_smiles,
+from tricoopdiff.conditioning.condition_features import (MANIFEST_VERSION, canonical_isomeric_smiles,
                                             load_condition_manifest)
 
 

@@ -44,7 +44,7 @@ def main():
                        TRANSFORMERS_OFFLINE='1', PYTHONDONTWRITEBYTECODE='1')
     reports = {}
     import torch
-    from tricoopdiff.ranking_inference import export_quality_checkpoint
+    from tricoopdiff.ranking.ranking_inference import export_quality_checkpoint
     for mode in ('r0_fixed_geometry', 'ranker_geometry', 'ranker_frozen_geometry'):
         predictions = args.out / mode
         command = [sys.executable, str(ROOT / 'scripts/rank_pose_archive.py'),

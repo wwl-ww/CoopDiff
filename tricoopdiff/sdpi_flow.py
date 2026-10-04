@@ -12,13 +12,17 @@ import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 
-from .diffusion import InterfaceDiffusion, so3_score_norm
-from .initialization import receptor_prior, sample_binary_pose, validate_ligand_graph
-from .rigid import assemble_interface_pair
+from tricoopdiff.models.expert import expert_t_to_sigma, so3_score_norm
+from tricoopdiff.initialization import receptor_prior, sample_binary_pose, validate_ligand_graph
+from tricoopdiff.geometry.rigid import (apply_rigid, assemble_interface_pair,
+                                      is_proper_rotation, proper_rigid_fit, rotation_exp)
 
 
 FLOW_VERSION = 'sdpi_flow_v1'
 CHECKPOINT_VERSION = 17
+INDEPENDENT_RIGID_MODE = 'independent_centroids_v1'
+LEGACY_RIGID_MODE = 'dual_interfaces_v1'
+CONTINUOUS_TORSION_MODE = 'continuous_horizontal_v1'
 
 
 def _check_coords(coords):
@@ -27,38 +31,14 @@ def _check_coords(coords):
         raise ValueError('SDPI flow coordinates must be finite [1, N, 3] with N > 0')
 
 
-def _rotation_exp(vector):
-    """SO(3) exponential without small-angle division or dtype conversion."""
-    matrix = vector.new_zeros((*vector.shape[:-1], 3, 3))
-    x, y, z = vector.unbind(-1)
-    matrix[..., 0, 1], matrix[..., 0, 2] = -z, y
-    matrix[..., 1, 0], matrix[..., 1, 2] = z, -x
-    matrix[..., 2, 0], matrix[..., 2, 1] = -y, x
-    return torch.linalg.matrix_exp(matrix)
-
-
-def _align(moving, target):
-    """Proper Kabsch fit in float64, row-vector convention."""
-    cm, ct = moving.mean(0), target.mean(0)
-    u, _, vt = np.linalg.svd((moving - cm).T @ (target - ct))
-    correction = np.eye(3)
-    correction[-1, -1] = np.linalg.det(u @ vt)
-    rotation = (u @ correction @ vt).T
-    return (moving - cm) @ rotation.T + ct
-
-
 def _raw_torsions(coords, bonds, masks, angles):
-    from .diffdock.utils.torsion import modify_conformer_torsion_angles
+    from tricoopdiff.diffdock.utils.torsion import modify_conformer_torsion_angles
 
     if not len(bonds):
         return coords.copy()
     return modify_conformer_torsion_angles(
         coords.copy(), torch.as_tensor(bonds), masks, angles, as_numpy=True,
     )
-
-
-def _torsion_shape(coords, bonds, masks, angles):
-    return _align(_raw_torsions(coords, bonds, masks, angles), coords)
 
 
 def _horizontal_torsion_velocity(coords, bonds, masks, angular_velocity):
@@ -102,16 +82,15 @@ class SDPIFlow:
         if not isinstance(inference_steps, int) or isinstance(inference_steps, bool) or inference_steps < 1:
             raise ValueError('inference_steps must be a positive integer')
         self.inference_steps = inference_steps
-        self._expert_conditioning = InterfaceDiffusion(inference_steps=inference_steps)
 
     def t_to_sigma(self, t_tr, t_rot, t_tor):
         """Native expert preconditioning; these are NOT flow noise variances."""
-        return self._expert_conditioning.t_to_sigma(t_tr, t_rot, t_tor)
+        return expert_t_to_sigma(t_tr, t_rot, t_tor)
 
     def get_inference_schedule(self, steps, t_start=1.0):
         if t_start != 1:
             raise ValueError('SDPI flow must start at its prior endpoint t=1')
-        return self._expert_conditioning.get_inference_schedule(steps, t_start)
+        return self.get_refinement_schedule(steps, t_start)
 
     def get_refinement_schedule(self, steps, t_start):
         """Return a truncated clock for an externally generated fixed proposal.
@@ -122,9 +101,49 @@ class SDPIFlow:
         """
         if not isinstance(t_start, (int, float)) or not 0.0 < float(t_start) <= 1.0:
             raise ValueError('refinement t_start must be in (0, 1]')
-        return self._expert_conditioning.get_inference_schedule(
-            steps, float(t_start),
-        )
+        if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
+            raise ValueError('refinement steps must be a positive integer')
+        clock = np.linspace(float(t_start), 0., steps + 1)
+        return {name + '_schedule': clock.copy() for name in ('tr', 'rot', 'tor')}
+
+    def reverse_times(self, reference, steps=None, t_start=1.0):
+        """One shared deterministic clock for endpoint training and sampling."""
+        steps = self.inference_steps if steps is None else steps
+        if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
+            raise ValueError('reverse steps must be a positive integer')
+        if not math.isfinite(float(t_start)) or not 0 < float(t_start) <= 1:
+            raise ValueError('reverse start time must be in (0, 1]')
+        clock = torch.linspace(float(t_start), 0., steps + 1,
+                               device=reference.device, dtype=reference.dtype)
+        for index in range(steps):
+            yield clock[index:index + 1], (clock[index] - clock[index + 1]).reshape(1)
+
+    def forward_state(self, model, e3_data, poi_data, ligand_data,
+                      ligand, poi, body, t, dt, source=0, conditions=None):
+        """Read the same current geometry and expert clock in both execution paths.
+
+        Template coordinates supply fixed conditioning scales; moving coordinates
+        supply graph geometry. Input dictionaries are never mutated.
+        """
+        conditioning = self.conditioning(t, dt, e3_data['coords'], poi_data['coords'])
+        crop = None
+        if bool(getattr(model.expert.model, 'dynamic_max_cross', False)):
+            tr_sigma, _, _ = self.t_to_sigma(t, t, t)
+            crop = tr_sigma * 3 + 20
+        condition_kwargs = {'conditions': conditions} if conditions is not None else {}
+        output = model(e3_data, {**poi_data, 'coords': poi},
+                       {**ligand_data, 'coords': ligand}, t_e3l=t, t_pol=t,
+                       r_e3_to_poi=body, diffusion_state=conditioning,
+                       receptor_crop_cutoff=crop, source=source, **condition_kwargs)
+        if (getattr(getattr(model, 'trifuse', None), 'direct_ternary_motion', False)
+                and output.get('normalized_velocity', {}).get('rigid_output_mode')
+                != INDEPENDENT_RIGID_MODE):
+            raise ValueError('direct model must execute independent centroid motion')
+        if (getattr(getattr(model, 'trifuse', None), 'continuous_torsion', False)
+                and output.get('normalized_velocity', {}).get('torsion_update_mode')
+                != CONTINUOUS_TORSION_MODE):
+            raise ValueError('continuous torsion model must execute its horizontal update')
+        return output
 
     @staticmethod
     def scales(e3_coords, poi_coords):
@@ -148,7 +167,7 @@ class SDPIFlow:
         """
         if 'normalized_velocity' in output:
             return output['normalized_velocity']
-        from .diffdock.utils import torus
+        from tricoopdiff.diffdock.utils import torus
 
         tr, rot, tor = self.t_to_sigma(t, t, t)
         rot_norm = so3_score_norm(rot).reshape(-1, 1)
@@ -170,7 +189,133 @@ class SDPIFlow:
             result[name] = {'tr': normalized[name]['tr'] * scales[i],
                             'rot': normalized[name]['rot'] * math.pi}
         result['torsion'] = normalized['torsion'] * math.pi
+        if 'rigid_output_mode' in normalized:
+            result['rigid_output_mode'] = normalized['rigid_output_mode']
+        if 'torsion_update_mode' in normalized:
+            result['torsion_update_mode'] = normalized['torsion_update_mode']
         return result
+
+    @staticmethod
+    def independent_targets(targets, ligand, poi):
+        """Express the same forward path in ligand/POI centroid coordinates."""
+        a, b = targets['e3_ligand'], targets['poi_ligand']
+        angular = a['rot'] - b['rot']
+        lever = poi.mean(1) - ligand.mean(1)
+        return {'e3_ligand': dict(a),
+                'poi_ligand': {'tr': a['tr'] - b['tr'] + torch.cross(angular, lever, dim=-1),
+                               'rot': angular},
+                'torsion': targets['torsion'],
+                'rigid_output_mode': INDEPENDENT_RIGID_MODE}
+
+    @staticmethod
+    def rigid_step(ligand, poi, body, velocities, dt, freeze_poi=False):
+        """Shared differentiable rigid decoder for production and training."""
+        mode = velocities.get('rigid_output_mode', LEGACY_RIGID_MODE)
+        if mode not in (LEGACY_RIGID_MODE, INDEPENDENT_RIGID_MODE):
+            raise ValueError(f'unknown rigid output mode: {mode!r}')
+        transforms = []
+        for index, branch in enumerate(('e3_ligand', 'poi_ligand')):
+            velocity = velocities[branch]
+            for component in ('tr', 'rot'):
+                if velocity[component].shape != (1, 3) or not torch.isfinite(velocity[component]).all():
+                    raise ValueError('rigid velocities must be finite [1, 3]')
+            pivot = (poi if mode == INDEPENDENT_RIGID_MODE and index == 1 else ligand).mean(1)
+            rotation = rotation_exp(-dt[:, None] * velocity['rot'])
+            offset = pivot - dt[:, None] * velocity['tr'] - (rotation @ pivot[..., None]).squeeze(-1)
+            transforms.append((rotation, offset))
+        (ra, ta), (rb, tb) = transforms
+        rigid = ligand @ ra.transpose(-1, -2) + ta[:, None]
+        if not freeze_poi:
+            if mode == INDEPENDENT_RIGID_MODE:
+                poi = poi @ rb.transpose(-1, -2) + tb[:, None]
+                body = rb @ body
+            else:
+                poi, increment = assemble_interface_pair(poi, ra, ta, rb, tb)
+                body = increment @ body
+        return rigid, poi, body
+
+    @staticmethod
+    def differentiable_step(ligand, poi, body, velocities, dt, ligand_data,
+                            freeze_poi=False):
+        """Execute the production rigid/torsion contract without detaching inputs."""
+        _check_coords(ligand)
+        _check_coords(poi)
+        if (body.shape != (1, 3, 3) or not is_proper_rotation(body)
+                or dt.shape != (1,) or not torch.isfinite(dt).all()
+                or not bool((dt > 0).all())):
+            raise ValueError('body must be a proper [1,3,3] rotation and dt finite positive [1]')
+        rigid, poi, body = SDPIFlow.rigid_step(ligand, poi, body, velocities, dt, freeze_poi)
+        _check_coords(rigid)
+        _check_coords(poi)
+        if not torch.isfinite(body).all():
+            raise FloatingPointError('non-finite flow body frame')
+        torsion = velocities['torsion']
+        torsion_mode = velocities.get('torsion_update_mode')
+        if torsion_mode not in (None, CONTINUOUS_TORSION_MODE):
+            raise ValueError(f'unknown torsion update mode: {torsion_mode!r}')
+        # A no_torsion expert can disable torsions even when the chemical graph
+        # contains rotatable bonds. Match the production empty-output contract.
+        if torsion.shape == (1, 0):
+            return rigid, poi, body
+        bonds = ligand_data['edge_index'].T[ligand_data['edge_mask']].to(
+            device=ligand.device, dtype=torch.long)
+        masks = ligand_data['mask_rotate']
+        if isinstance(masks, (list, tuple)):
+            masks = masks[0]
+        if masks is None and not len(bonds):
+            masks = torch.empty(0, ligand.shape[1], dtype=torch.bool, device=ligand.device)
+        else:
+            masks = torch.as_tensor(masks, dtype=torch.bool, device=ligand.device)
+        if (torsion.shape != (1, len(bonds)) or not torch.isfinite(torsion).all()
+                or masks.shape != (len(bonds), ligand.shape[1])):
+            raise ValueError('finite torsion velocities and ligand graph sizes must agree')
+        raw = rigid
+        displacement = torch.zeros_like(rigid) if torsion_mode == CONTINUOUS_TORSION_MODE else None
+        gauge_prior = torch.zeros_like(rigid[:, 0]) if displacement is not None else None
+        for index, (u, v) in enumerate(bonds):
+            axis = raw[:, u] - raw[:, v]
+            norm = torch.linalg.vector_norm(axis, dim=-1, keepdim=True)
+            if bool((norm <= 1e-10).any()):
+                raise ValueError('degenerate torsion axis')
+            if displacement is not None:
+                initial_axis = rigid[:, u] - rigid[:, v]
+                initial_axis = initial_axis / torch.linalg.vector_norm(initial_axis, dim=-1, keepdim=True)
+                angle = initial_axis * (-dt * torsion[:, index])[:, None]
+                gauge_prior = gauge_prior + .5 * angle
+                displacement = displacement + torch.linalg.cross(
+                    angle[:, None].expand_as(rigid), rigid - rigid[:, v:v + 1], dim=-1,
+                ) * masks[index][None, :, None]
+            rotation = rotation_exp(axis / norm * (-dt * torsion[:, index])[:, None])
+            pivot = raw[:, v:v + 1]
+            moved = (raw - pivot) @ rotation.transpose(-1, -2) + pivot
+            raw = torch.where(masks[index][None, :, None], moved, raw)
+        if len(bonds):
+            if displacement is None:
+                rotation, translation, _ = proper_rigid_fit(raw, rigid)
+                rigid = apply_rigid(raw, rotation, translation)
+            else:
+                # An exact finite Kabsch gauge is discontinuous at legitimate
+                # folded conformers with rank-deficient cross-covariance.
+                # Instead retract the local horizontal torsion tangent: remove
+                # its mean motion and rigid spin, without changing shape DOFs.
+                center = rigid.mean(1, keepdim=True)
+                centered = (rigid - center).double()
+                identity = torch.eye(3, dtype=torch.float64, device=rigid.device)[None]
+                inertia = centered.square().sum((1, 2))[:, None, None] * identity
+                inertia = inertia - centered.transpose(1, 2) @ centered
+                torque = torch.linalg.cross(centered, displacement.double(), dim=-1).sum(1)
+                # Symmetric half-side gauge keeps the ridge prior covariant
+                # under bond reversal plus complementary rotation fragments.
+                # A zero-spin prior would leave an orientation-dependent
+                # first-order residual, even though the ideal projection does not.
+                ridge = inertia.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(torch.finfo(torch.float64).tiny) * 1e-6
+                spin = torch.linalg.solve(inertia + ridge[:, None, None] * identity,
+                                          (torque + ridge[:, None] * gauge_prior.double())[:, :, None]).squeeze(-1)
+                rotation = rotation_exp(-spin).to(rigid.dtype)
+                rigid = (raw - raw.mean(1, keepdim=True)) @ rotation.transpose(-1, -2) + center
+        _check_coords(rigid)
+        _check_coords(poi)
+        return rigid, poi, body
 
     @staticmethod
     def sample_coupling(e3_coords, poi_coords, ligand_data, no_torsion=False):
@@ -227,44 +372,6 @@ class SDPIFlow:
 
     @staticmethod
     def step(ligand, poi, body, velocities, dt, ligand_data, freeze_poi=False):
-        """Reverse Lie-Euler step; dt>0 means integrate from t to t-dt."""
-        _check_coords(ligand)
-        _check_coords(poi)
-        if dt.shape != (1,) or not torch.isfinite(dt).all() or not bool((dt > 0).all()):
-            raise ValueError('flow step must be one finite positive dt')
-        old_center = ligand.mean(1)
-        transforms = []
-        for branch in ('e3_ligand', 'poi_ligand'):
-            velocity = velocities[branch]
-            for component in ('tr', 'rot'):
-                if velocity[component].shape != (1, 3) or not torch.isfinite(velocity[component]).all():
-                    raise ValueError('rigid velocities must be finite [1, 3]')
-            rotation = _rotation_exp(-dt[:, None] * velocity['rot'])
-            center = old_center - dt[:, None] * velocity['tr']
-            offset = center - (rotation @ old_center[..., None]).squeeze(-1)
-            transforms.append((rotation, offset))
-        (ra, ta), (rb, tb) = transforms
-        rigid = ligand @ ra.transpose(-1, -2) + ta[:, None]
-        if not freeze_poi:
-            poi, increment = assemble_interface_pair(poi, ra, ta, rb, tb)
-            body = increment @ body
-        torsion = velocities['torsion']
-        n_bonds = int(ligand_data['edge_mask'].sum())
-        if (torsion.ndim != 2 or torsion.shape[0] != 1 or torsion.shape[1] not in (0, n_bonds)
-                or not torch.isfinite(torsion).all()):
-            raise ValueError('torsion velocities must be finite [1, n_rot] (or empty for no_torsion)')
-        angles = (-dt[:, None] * torsion).detach().cpu().double().numpy()[0]
-        if len(angles):
-            bonds = ligand_data['edge_index'].T[ligand_data['edge_mask']].detach().cpu().numpy()
-            masks = ligand_data['mask_rotate']
-            if isinstance(masks, (list, tuple)):
-                masks = masks[0]
-            if torch.is_tensor(masks):
-                masks = masks.detach().cpu().numpy()
-            moved = _torsion_shape(rigid[0].detach().cpu().double().numpy(), bonds, masks, angles)
-            rigid = torch.as_tensor(moved, dtype=ligand.dtype, device=ligand.device)[None]
-        _check_coords(rigid)
-        _check_coords(poi)
-        if not torch.isfinite(body).all():
-            raise FloatingPointError('non-finite flow body frame')
-        return rigid, poi, body
+        """Inference and training execute the same reverse Lie-Euler decoder."""
+        return SDPIFlow.differentiable_step(
+            ligand, poi, body, velocities, dt, ligand_data, freeze_poi)

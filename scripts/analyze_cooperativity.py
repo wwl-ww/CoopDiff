@@ -11,7 +11,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from tricoopdiff.ensemble_analysis import (  # noqa: E402
+from tricoopdiff.metrics.ensemble import (  # noqa: E402
     cooperativity_from_ddg,
     cooperativity_ranking,
 )

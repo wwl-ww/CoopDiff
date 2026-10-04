@@ -5,11 +5,13 @@ import json
 import math
 from pathlib import Path
 
+from tricoopdiff.runtime import sha256_file
+
 
 def load_index_entry(index_path, case):
     """Return one uniquely named entry from a ternary JSON index."""
     payload = json.loads(Path(index_path).read_text(encoding="utf-8"))
-    entries = payload.get("entries", payload)
+    entries = payload["entries"] if isinstance(payload, dict) else payload
     matches = [entry for entry in entries if entry.get("case") == case]
     if not matches:
         raise KeyError(f"case {case!r} is absent from {index_path}")
@@ -35,7 +37,7 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=None):
     """The model-v2 production evaluator accepts only consensus checkpoints."""
     if not isinstance(payload, dict):
         raise ValueError('checkpoint must contain a mapping')
-    from tricoopdiff.consensus_train import validate_consensus_checkpoint
+    from tricoopdiff.train import validate_consensus_checkpoint
     validate_consensus_checkpoint(payload)
 
 
@@ -93,22 +95,47 @@ def completed_report(path, case, checkpoint, expected_config=None,
         report = json.loads(destination.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    config = report.get("run_config", {})
-    ensemble = report.get("ensemble", {})
+    if not isinstance(report, dict):
+        return False
+    config, ensemble, structure = [report.get(key, {}) for key in
+                                  ('run_config', 'ensemble', 'structure')]
+    if not all(isinstance(value, dict) for value in (config, ensemble, structure)):
+        return False
+    valid = ensemble.get('n_valid_walkers', 0)
+    total = ensemble.get('n_walkers', valid)
+    if type(valid) is not int or type(total) is not int or not 0 < valid <= total:
+        return False
     core_matches = bool(
         report.get("case") == case
         and config.get("trifuse_checkpoint") == checkpoint
-        and ensemble.get("n_valid_walkers", 0) > 0
     )
-    dockq = report.get("structure", {}).get("dockq_best")
+    dockq = structure.get("dockq_best")
     exact_dockq_matches = (
         not require_exact_dockq
-        or (isinstance(dockq, (int, float)) and math.isfinite(dockq))
+        or (type(dockq) in (int, float) and math.isfinite(dockq) and 0 <= dockq <= 1
+            and type(ensemble.get('n_exact_dockq_walkers')) is int
+            and ensemble['n_exact_dockq_walkers'] == valid)
     )
-    if require_exact_dockq and 'n_exact_dockq_walkers' in ensemble:
-        exact_dockq_matches &= (
-            ensemble['n_exact_dockq_walkers'] == ensemble.get('n_valid_walkers', 0)
-        )
+    if require_exact_dockq and exact_dockq_matches:
+        walkers = report.get('walkers')
+        invalid = ensemble.get('invalid_seeds', [])
+        if not isinstance(walkers, list) or len(walkers) != valid or not isinstance(invalid, list):
+            return False
+        if any(not isinstance(row, dict) for row in walkers):
+            return False
+        seeds = [row.get('seed') for row in walkers] + invalid
+        if (len(seeds) != total or any(type(value) is not int for value in seeds)
+                or len(set(seeds)) != total):
+            return False
+        if type(config.get('seed')) is int and set(seeds) != set(range(config['seed'], config['seed'] + total)):
+            return False
+        for row in walkers:
+            if any(type(row.get(key)) not in (int, float) or not math.isfinite(row[key])
+                   for key in ('dockq', 'dockq_fnat', 'dockq_lrms', 'dockq_irms')):
+                return False
+            if (not 0 <= row['dockq'] <= 1 or not 0 <= row['dockq_fnat'] <= 1
+                    or min(row['dockq_lrms'], row['dockq_irms']) < 0):
+                return False
     expected_walkers = (expected_config or {}).get("n_walkers")
     walker_count_matches = (
         expected_walkers is None
@@ -117,15 +144,6 @@ def completed_report(path, case, checkpoint, expected_config=None,
     return core_matches and exact_dockq_matches and walker_count_matches and all(
         config.get(key) == value for key, value in (expected_config or {}).items()
     )
-
-
-def sha256_file(path, chunk_size=1024 * 1024):
-    """Return a reproducibility hash without loading a large file into RAM."""
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(chunk_size), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def evaluation_input_signature(paths, native_complex_pdb=None):

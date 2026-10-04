@@ -10,6 +10,7 @@ from e3nn import o3
 from e3nn.nn import BatchNorm
 from e3nn.o3 import TensorProduct, Linear
 from torch_scatter import scatter
+from torch.utils.checkpoint import checkpoint
 
 from .layers import FCBlock
 
@@ -134,15 +135,8 @@ def tp_scatter_simple(tp, fc_layer, node_attr, edge_index, edge_attr, edge_sh,
     assert isinstance(edge_attr, torch.Tensor), \
         "This function is only for a single edge group, so edge_attr must be a tensor and not a list."
 
-    _device = node_attr.device
-    _dtype = node_attr.dtype
-    edge_src, edge_dst = edge_index
-    out_irreps = fc_layer(edge_attr).to(_device).to(_dtype)
-    out_irreps.mul_(edge_weight)
-    tp = tp(node_attr[edge_dst], edge_sh, out_irreps)
-    out_nodes = out_nodes or node_attr.shape[0]
-    out = scatter(tp, edge_src, dim=0, dim_size=out_nodes, reduce=reduce)
-    return out
+    return tp_scatter_multigroup(tp, fc_layer, node_attr, edge_index,
+                                [edge_attr], edge_sh, out_nodes, reduce, edge_weight)
 
 
 def tp_scatter_multigroup(tp: o3.TensorProduct, fc_layer: Union[nn.Module, nn.ModuleList],
@@ -189,10 +183,14 @@ def tp_scatter_multigroup(tp: o3.TensorProduct, fc_layer: Union[nn.Module, nn.Mo
     _device = node_attr.device
     _dtype = node_attr.dtype
     edge_src, edge_dst = edge_index
-    edge_attr_lengths = [_edge_attr.shape[0] for _edge_attr in edge_attr_groups]
-    total_rows = sum(edge_attr_lengths)
+    total_rows = sum(attributes.shape[0] for attributes in edge_attr_groups)
     assert total_rows == edge_index.shape[1], "Sum of edge_attr_groups must be equal to edge_index.shape[1]"
-    num_edge_groups = len(edge_attr_groups)
+    # Keep *all* edges. Subdivide their tensor products, not the graph itself.
+    # Frozen experts can have GiB-wide per-edge weight matrices on large cases.
+    edge_chunk_size = 1024
+    chunks = ((fc_layer[index] if isinstance(fc_layer, nn.ModuleList) else fc_layer, chunk)
+              for index, attributes in enumerate(edge_attr_groups)
+              for chunk in attributes.split(edge_chunk_size))
     edge_weight_is_indexable = hasattr(edge_weight, '__getitem__')
 
     out_nodes = out_nodes or node_attr.shape[0]
@@ -201,31 +199,34 @@ def tp_scatter_multigroup(tp: o3.TensorProduct, fc_layer: Union[nn.Module, nn.Mo
     div_factors = torch.zeros(out_nodes, device=_device, dtype=_dtype)
 
     _nan_trace = os.environ.get("NAN_TRACE")
-    _fc_max = 0.0
     _tp_max = 0.0
     _sh_max = 0.0
 
     cur_start = 0
-    for ii in range(num_edge_groups):
-        cur_length = edge_attr_lengths[ii]
+    for cur_fc, attributes in chunks:
+        cur_length = attributes.shape[0]
         cur_end = cur_start + cur_length
         cur_edge_range = slice(cur_start, cur_end)
         cur_edge_src, cur_edge_dst = edge_src[cur_edge_range], edge_dst[cur_edge_range]
 
-        cur_fc = fc_layer[ii] if isinstance(fc_layer, nn.ModuleList) else fc_layer
-        cur_out_irreps = cur_fc(edge_attr_groups[ii])
-        if edge_weight_is_indexable:
-            cur_out_irreps.mul_(edge_weight[cur_edge_range])
+        weight = edge_weight[cur_edge_range] if edge_weight_is_indexable else edge_weight
+        inputs = (node_attr[cur_edge_dst, :], attributes, edge_sh[cur_edge_range, :])
+        # Bind the module per chunk: backward recomputation must not read the
+        # loop's final module when convolution groups use different weights.
+        def compute(nodes, attributes, harmonics, weights, module=cur_fc):
+            return tp(nodes, harmonics, module(attributes) * weights)
+        needs_grad = torch.is_grad_enabled() and (
+            any(value.requires_grad for value in inputs)
+            or any(parameter.requires_grad for parameter in cur_fc.parameters()))
+        if needs_grad and total_rows > edge_chunk_size:
+            summand = checkpoint(compute, *inputs, weight, use_reentrant=False)
         else:
-            cur_out_irreps.mul_(edge_weight)
+            summand = compute(*inputs, weight)
 
         if _nan_trace:
-            if cur_out_irreps.numel() > 0:
-                _fc_max = max(_fc_max, float(cur_out_irreps.abs().max().item()))
             if edge_sh[cur_edge_range].numel() > 0:
                 _sh_max = max(_sh_max, float(edge_sh[cur_edge_range].abs().max().item()))
 
-        summand = tp(node_attr[cur_edge_dst, :], edge_sh[cur_edge_range, :], cur_out_irreps)
         # We take a simple sum, and then add up the count of edges which contribute,
         # so that we can take the mean later.
         final_out += scatter(summand, cur_edge_src, dim=0, dim_size=out_nodes, reduce="sum")
@@ -237,11 +238,11 @@ def tp_scatter_multigroup(tp: o3.TensorProduct, fc_layer: Union[nn.Module, nn.Mo
 
         cur_start = cur_end
 
-        del cur_out_irreps, summand
+        del summand
 
     if _nan_trace:
         sys.stderr.write(
-            f"[TRACE TP] fc_max={_fc_max:.3e} sh_max={_sh_max:.3e} tp_max={_tp_max:.3e} "
+            f"[TRACE TP] sh_max={_sh_max:.3e} tp_max={_tp_max:.3e} "
             f"div_min={div_factors.min().item():.3e} finite={torch.isfinite(final_out).all().item()}\n")
         sys.stderr.flush()
 

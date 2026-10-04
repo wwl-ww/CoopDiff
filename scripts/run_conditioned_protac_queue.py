@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import time
+from tricoopdiff.runtime import atomic_json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,11 +27,6 @@ def supported_checkpoint_name(name):
         CHECKPOINT_NAME.fullmatch(name))
 
 
-def atomic_json(value, path):
-    path = Path(path)
-    temporary = path.with_suffix(path.suffix + f'.tmp.{os.getpid()}')
-    temporary.write_text(json.dumps(value, indent=2) + '\n')
-    temporary.replace(path)
 
 
 def evaluation_command(args, task, destination):

@@ -9,9 +9,9 @@ from rdkit import Chem
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'scripts'), str(ROOT / 'tests')]
-from tricoopdiff.condition_features import (SideCondition, ProtacConditionEncoder,
+from tricoopdiff.conditioning.condition_features import (SideCondition, ProtacConditionEncoder,
                                             build_condition_features, build_supervised_contact_features)
-from tricoopdiff.protac_conditions import fragment_matches
+from tricoopdiff.conditioning.condition_features import fragment_matches
 from prepare_protac_binary_chemistry import restore_side
 from test_restore_ligand_chemistry import fixture
 

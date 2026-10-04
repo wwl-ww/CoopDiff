@@ -39,12 +39,13 @@ import torch
 from evaluation_common import evaluation_input_signature, resolve_entry_paths, sha256_file
 from evaluation_runner import EvaluationRunner
 from featurize_common import featurize_complex
-from tricoopdiff.deepternary_metrics import compute_fullatom_dockq
-from tricoopdiff.expert_anchors import (
+from tricoopdiff.metrics.dockq import compute_fullatom_dockq
+from tricoopdiff.initialization.candidates import (
     DualExpertAnchorInitializer, FixedCandidateInitializer,
     generate_hybrid_candidates, select_hybrid_walkers,
 )
 from tricoopdiff.sampler import sample_single
+from tricoopdiff.runtime import atomic_json
 
 
 ROOT = Path(_runtime_args.project_root or Path(__file__).resolve().parent.parent).resolve()
@@ -95,11 +96,6 @@ def parser():
     return result
 
 
-def atomic_json(payload, destination):
-    destination = Path(destination)
-    temporary = destination.with_suffix(destination.suffix + f".tmp.{os.getpid()}")
-    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(destination)
 
 
 def source(candidate):
@@ -181,7 +177,7 @@ def preflight_condition_manifests(condition_paths, case_inputs):
         raise ValueError('condition preflight requires one manifest per case')
     from rdkit import Chem
     import prody as pr
-    from tricoopdiff.condition_manifest import load_condition_manifest
+    from tricoopdiff.conditioning.condition_features import load_condition_manifest
     from tricoopdiff.diffdock.datasets.parse_chi import get_coords
     from tricoopdiff.diffdock.datasets.process_mols import read_molecule
 
@@ -350,13 +346,12 @@ def main():
         "entrypoint_sha256": sha256_file(Path(__file__)),
         "runtime_source_sha256": {
             name: sha256_file(RUNTIME_ROOT / name) for name in (
-                "tricoopdiff/consensus.py", "tricoopdiff/sampler.py",
-                "tricoopdiff/sdpi_flow.py", "tricoopdiff/expert_anchors.py",
+                "tricoopdiff/models/consensus.py", "tricoopdiff/sampler.py",
+                "tricoopdiff/sdpi_flow.py", "tricoopdiff/initialization/candidates.py",
                 "scripts/evaluation_runner.py", "scripts/featurize_common.py",
-                "scripts/evaluation_common.py", "tricoopdiff/deepternary_metrics.py",
-            ) + (("tricoopdiff/conditional_consensus.py",
-                  "tricoopdiff/conditioned_consensus_train.py",
-                  "tricoopdiff/condition_manifest.py")
+                "scripts/evaluation_common.py", "tricoopdiff/metrics/dockq.py",
+            ) + (("tricoopdiff/conditioning/conditioned_consensus_train.py",
+                  "tricoopdiff/conditioning/condition_features.py")
                  if args.allow_conditioned_checkpoint else ())
         },
         "smoke_one_per_source": args.smoke_one_per_source,
@@ -444,7 +439,7 @@ def main():
             conditions, condition_audit = None, None
             if condition_paths:
                 from rdkit import Chem
-                from tricoopdiff.condition_manifest import load_condition_manifest
+                from tricoopdiff.conditioning.condition_features import load_condition_manifest
                 conditions, condition_audit = load_condition_manifest(
                     condition_paths[case], case=case,
                     molecule=Chem.Mol(ligand_data['mol']),

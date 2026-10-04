@@ -51,6 +51,13 @@ def load_row(path):
     conformational = ensemble.get("conformational_analysis", {})
     config = report.get("run_config", {})
     checkpoint = config.get("trifuse_checkpoint")
+    valid = ensemble.get('n_valid_walkers')
+    rejected = ensemble.get('n_nan_walkers')
+    exact = ensemble.get('n_exact_dockq_walkers')
+    dockq = structure.get('dockq_best')
+    requested = config.get('n_walkers', ensemble.get('n_walkers'))
+    if requested is None and type(valid) is int and type(rejected) is int:
+        requested = valid + rejected
     mode = "trained" if checkpoint else "zero_film"
     if config.get("freeze_poi"):
         mode += "_freeze_poi"
@@ -60,12 +67,17 @@ def load_row(path):
         "mode": mode,
         "checkpoint": checkpoint,
         "seed": config.get("seed"),
-        "n_walkers": config.get("n_walkers"),
+        "n_walkers": requested,
         "steps": config.get("steps"),
         "n_valid_walkers": ensemble.get("n_valid_walkers"),
         "n_nan_walkers": ensemble.get("n_nan_walkers"),
+        "n_exact_dockq_walkers": exact,
         "selection_metric": ensemble.get("selection_metric"),
-        "exact_dockq": structure.get("dockq_best") is not None,
+        "exact_dockq": (type(valid) is int and valid > 0 and type(exact) is int
+                        and type(rejected) is int and rejected >= 0
+                        and type(requested) is int and valid + rejected == requested
+                        and exact == valid and type(dockq) in (int, float)
+                        and math.isfinite(dockq) and 0 <= dockq <= 1),
         "ensemble_n_clusters": conformational.get("n_clusters"),
         "ensemble_dominant_fraction": conformational.get("dominant_fraction"),
         "ensemble_mean_pairwise_rmsd": conformational.get("mean_pairwise_rmsd"),
@@ -88,14 +100,15 @@ def summarize_rows(rows):
     """Aggregate valid numeric metrics and list failed cases."""
     failed = [row["case"] for row in rows if not row.get("n_valid_walkers")]
     requested = sum(
-        (row.get("n_valid_walkers") or 0) + (row.get("n_nan_walkers") or 0)
+        (row.get('n_walkers') if row.get('n_walkers') is not None else
+         (row.get("n_valid_walkers") or 0) + (row.get("n_nan_walkers") or 0))
         for row in rows
     )
     valid = sum(row.get("n_valid_walkers") or 0 for row in rows)
     metrics = {}
     for metric in METRICS:
         values = [float(row[metric]) for row in rows
-                  if isinstance(row.get(metric), (int, float))
+                  if type(row.get(metric)) in (int, float)
                   and math.isfinite(row[metric])]
         if values:
             metrics[metric] = {

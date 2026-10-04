@@ -6,18 +6,23 @@
 # keep the (broken-on-GPU) native kernels.
 from . import diffdock_compat  # noqa: F401
 
-from .graphs import build_subgraph_e3l, build_subgraph_pol, build_trifuse_graph
-from .diffusion import InterfaceDiffusion
+from tricoopdiff.inputs.graphs import build_subgraph_e3l, build_subgraph_pol, build_trifuse_graph
 
 __all__ = [
     'TriCoopDiff', 'build_subgraph_e3l', 'build_subgraph_pol',
-    'build_trifuse_graph', 'InterfaceDiffusion',
+    'build_trifuse_graph', 'SDPIFlow', 'InterfaceDiffusion',
 ]
 
 
 def __getattr__(name):
     """Keep the historical public model import without eagerly loading FiLM."""
     if name == 'TriCoopDiff':
-        from .model import TriCoopDiff
+        from tricoopdiff.legacy.model import TriCoopDiff
         return TriCoopDiff
+    if name == 'SDPIFlow':
+        from tricoopdiff.sdpi_flow import SDPIFlow
+        return SDPIFlow
+    if name == 'InterfaceDiffusion':
+        from tricoopdiff.legacy.diffusion import InterfaceDiffusion
+        return InterfaceDiffusion
     raise AttributeError(f'module {__name__!r} has no attribute {name!r}')

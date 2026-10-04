@@ -14,7 +14,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from tricoopdiff.pose_ranking import (  # noqa: E402
+from tricoopdiff.ranking.ranking_inference import (  # noqa: E402
     PoseRanker, listwise_ranking_loss, selected_pose_metrics,
 )
 

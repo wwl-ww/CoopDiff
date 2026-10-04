@@ -13,12 +13,12 @@ from rdkit import Chem
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'tests')]
 from test_consensus import fixture
-from tricoopdiff.condition_features import SideCondition, build_condition_features
-from tricoopdiff.conditional_consensus import (ConditionedConsensusFuse, ConditionedConsensusCoopDiff,
+from tricoopdiff.conditioning.condition_features import SideCondition, build_condition_features
+from tricoopdiff.conditioning.conditioned_consensus_train import (ConditionedConsensusFuse, ConditionedConsensusCoopDiff,
                                               load_prototype_checkpoint)
-from tricoopdiff.consensus import BRANCHES, ConsensusCoopDiff, ConsensusFuse
-from tricoopdiff.consensus_train import validate_consensus_checkpoint
-from tricoopdiff.diffusion import so3_exp
+from tricoopdiff.models.consensus import BRANCHES, ConsensusCoopDiff, ConsensusFuse
+from tricoopdiff.train import validate_consensus_checkpoint
+from tricoopdiff.geometry.rigid import rotation_exp as so3_exp
 
 
 def conditions():

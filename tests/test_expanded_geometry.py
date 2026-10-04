@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from tricoopdiff.expanded_geometry import (EXPANDED_GEOMETRY_NAMES,
+from tricoopdiff.ranking.ranking_archive import (EXPANDED_GEOMETRY_NAMES,
                                            apply_fitted_rigid,
                                            expanded_geometry_features)
 

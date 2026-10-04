@@ -14,10 +14,10 @@ import torch
 from rdkit import Chem
 
 from evaluation_common import sha256_file
-from tricoopdiff.condition_features import SideCondition, build_condition_features
-from tricoopdiff.conditional_consensus import ConditionedConsensusFuse, load_prototype_checkpoint
-from tricoopdiff.consensus import BRANCHES, ConsensusFuse
-from tricoopdiff.consensus_train import validate_consensus_checkpoint
+from tricoopdiff.conditioning.condition_features import SideCondition, build_condition_features
+from tricoopdiff.conditioning.conditioned_consensus_train import ConditionedConsensusFuse, load_prototype_checkpoint
+from tricoopdiff.models.consensus import BRANCHES, ConsensusFuse
+from tricoopdiff.train import validate_consensus_checkpoint
 
 
 def velocity_vector(result):
@@ -91,8 +91,8 @@ def main():
               'weight_field': 'ema_trifuse_state_dict', 'model_config': base.config,
               'device': 'cpu', 'optimizer_steps': 0, 'checkpoint_roundtrip_exact': True, 'checks': checks,
               'code_sha256': {str(p.relative_to(ROOT)): sha256_file(p) for p in (
-                  Path(__file__), ROOT / 'tricoopdiff/conditional_consensus.py', ROOT / 'tricoopdiff/consensus.py',
-                  ROOT / 'tricoopdiff/condition_features.py', ROOT / 'tricoopdiff/geometry_encoders.py')}}
+                  Path(__file__), ROOT / 'tricoopdiff/conditioning/conditioned_consensus_train.py', ROOT / 'tricoopdiff/models/consensus.py',
+                  ROOT / 'tricoopdiff/conditioning/condition_features.py', ROOT / 'tricoopdiff/models/consensus.py')}}
     (args.out / 'report.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
     print(json.dumps(checks, indent=2))
 

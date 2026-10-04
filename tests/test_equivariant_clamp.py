@@ -7,7 +7,7 @@ import torch
 from e3nn import o3
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tricoopdiff.equivariant_clamp import clamp_irrep_features, validate_clamp_mode
+from tricoopdiff.geometry.equivariant_clamp import clamp_irrep_features, validate_clamp_mode
 
 
 def test_saturated_irreps_remain_rotation_equivariant():

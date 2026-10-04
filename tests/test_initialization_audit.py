@@ -8,7 +8,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tricoopdiff.initialization_audit import (
+from tricoopdiff.initialization.audit import (
     conditional_translation_kl, invariant_atom_pairs, invariant_geometry_gap,
 )
 

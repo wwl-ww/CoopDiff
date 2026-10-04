@@ -7,7 +7,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tricoopdiff.offpath_experiments import (
+from tricoopdiff.experiments.offpath_experiments import (
     BoundedJointEndpointRolloutTrainer,
     BodyFrameTransportRolloutTrainer,
     GAUGE_CORRECT_CONTRACT_MODE,
@@ -21,7 +21,7 @@ from tricoopdiff.offpath_experiments import (
     transport_poi_body_frame_targets,
     transport_targets_with_recomputed_gauge,
 )
-from tricoopdiff.sdpi_flow import _rotation_exp
+from tricoopdiff.geometry.rigid import rotation_exp as _rotation_exp
 
 
 def rotation(vector):

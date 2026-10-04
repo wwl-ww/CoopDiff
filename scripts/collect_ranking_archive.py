@@ -20,16 +20,13 @@ import torch
 from evaluation_common import evaluation_input_signature, resolve_entry_paths, sha256_file
 from evaluation_runner import EvaluationRunner
 from featurize_common import featurize_complex
-from tricoopdiff.expert_anchors import DualExpertAnchorInitializer, FixedCandidateInitializer, generate_hybrid_candidates
-from tricoopdiff.ranking_archive import (ARCHIVE_VERSION, GEOMETRY_NAMES, PROBE_TIME, cpu_tree,
+from tricoopdiff.initialization.candidates import DualExpertAnchorInitializer, FixedCandidateInitializer, generate_hybrid_candidates
+from tricoopdiff.ranking.ranking_archive import (ARCHIVE_VERSION, GEOMETRY_NAMES, PROBE_TIME, cpu_tree,
                                        probe_state, select_archive_candidates, state_hash)
 from tricoopdiff.sampler import sample_single
+from tricoopdiff.runtime import atomic_json
 
 
-def atomic_json(value, path):
-    temporary = path.with_suffix(path.suffix + f'.tmp.{os.getpid()}')
-    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + '\n')
-    temporary.replace(path)
 
 
 def inference_entries(path):

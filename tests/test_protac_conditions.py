@@ -7,7 +7,7 @@ import numpy as np
 from rdkit import Chem
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tricoopdiff.protac_conditions import attachment_bonds, fragment_matches, local_pocket, mapping_diagnostics
+from tricoopdiff.conditioning.condition_features import attachment_bonds, fragment_matches, local_pocket, mapping_diagnostics
 
 
 def test_fragment_atom_permutation_preserves_equivalent_mappings():

@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 
 import evaluate_selected_refinement as evaluation
-from tricoopdiff.condition_manifest import MANIFEST_VERSION, canonical_isomeric_smiles
+from tricoopdiff.conditioning.condition_features import MANIFEST_VERSION, canonical_isomeric_smiles
 
 
 def _metrics(dockq):

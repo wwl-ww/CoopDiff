@@ -12,16 +12,16 @@ from rdkit import Chem
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 
-from tricoopdiff.condition_augmentation import ConditionFeatureDropout
-from tricoopdiff.conditioned_consensus_train import (
+from tricoopdiff.conditioning.condition_augmentation import ConditionFeatureDropout
+from tricoopdiff.conditioning.conditioned_consensus_train import (
     CHECKPOINT_FORMAT,
     ConditionedConsensusTrainer,
     supervised_condition_batch,
     validate_conditioned_checkpoint,
 )
-from tricoopdiff.conditional_consensus import ConditionedConsensusCoopDiff, ConditionedConsensusFuse
-from tricoopdiff.consensus import ConsensusFuse
-from tricoopdiff.consensus_train import validate_consensus_checkpoint
+from tricoopdiff.conditioning.conditioned_consensus_train import ConditionedConsensusCoopDiff, ConditionedConsensusFuse
+from tricoopdiff.models.consensus import ConsensusFuse
+from tricoopdiff.train import validate_consensus_checkpoint
 from tricoopdiff.sdpi_flow import SDPIFlow
 from evaluation_runner import EvaluationRunner
 
