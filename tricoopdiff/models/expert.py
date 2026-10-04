@@ -1,9 +1,9 @@
 """
 Frozen DiffDock two-body expert wrapper.
 
-Wraps DiffDock's CGModel with all parameters frozen. Exposes per-layer outputs
-for FiLM modulation injection. The expert processes two physically disconnected
-subgraphs (E3-L and POI-L) in separate forward passes.
+Wraps DiffDock's CGModel with all parameters frozen. Production ternary models
+read independently computed node features from E3-L and POI-L. Legacy per-layer
+FiLM orchestration remains available for historical checkpoint implementations.
 
 Each subgraph contains one protein and ligand, preserving DiffDock's input
 schema. This does not guarantee that generated poses are in-distribution.
@@ -35,9 +35,10 @@ def configure_expert_policy(expert, limit, mode):
     """Own numerical stabilization on the expert instance, never process state."""
     if not math.isfinite(limit) or limit <= 0:
         raise ValueError('expert activation clamp must be finite and positive')
+    mode = validate_clamp_mode(mode)
     model = getattr(expert, 'model', expert)
     model.activation_clamp = float(limit)
-    model.activation_clamp_mode = validate_clamp_mode(mode)
+    model.activation_clamp_mode = mode
 
 
 def expert_runtime_identity(expert):
@@ -85,15 +86,10 @@ def torus_score_norm(sigma):
 
 class FrozenDiffDock(nn.Module):
     """
-    Wrapper around DiffDock's CGModel that:
-    1. Freezes all parameters (no gradient)
-    2. Exposes per-layer outputs for FiLM injection
-    3. Provides a step_conv_layer() interface for external orchestration
+    Frozen weights with differentiable scores and SO(3)-invariant node features.
 
-    The TriCoopDiff model orchestrates:
-    - Running the embedding phase once
-    - Running each conv layer individually, applying FiLM between layers
-    - Running the final score heads
+    ``forward_features`` reads native final-layer scalars without changing the
+    expert computation. Per-layer FiLM APIs are retained for legacy models.
     """
 
     def __init__(self, cg_model: nn.Module, num_conv_layers: int = 11):
@@ -295,11 +291,43 @@ class FrozenDiffDock(nn.Module):
         }
 
     def forward(self, data):
-        """
-        Standard forward (without FiLM). Used for verification that
-        FiLM is transparent when zero-initialized and for L0 ablation.
-        """
+        """Native score forward; feature reads and legacy checks use this path."""
         return self.model(data)
+
+    @property
+    def node_scalar_dim(self) -> int:
+        """Number of final-layer 0e and 0o channels (proper-rotation scalars)."""
+        irreps = o3.Irreps(self.model.conv_layers[-1].out_irreps)
+        return sum(multiplicity for multiplicity, irrep in irreps if irrep.l == 0)
+
+    def forward_features(self, data):
+        """Return native scores and scalar nodes in ligand/cropped-receptor order.
+
+        Coordinates retain autograd through the frozen expert. The temporary
+        read-only hook does not replace native forward or alter checkpoint keys.
+        Odd scalars are SO(3) invariant, not invariant under reflections.
+        """
+        layer = self.model.conv_layers[-1]
+        irreps = o3.Irreps(layer.out_irreps)
+        sections = [section for (_, irrep), section in zip(irreps, irreps.slices())
+                    if irrep.l == 0]
+        if not sections:
+            raise ValueError('expert final layer has no scalar node channels')
+        captured = []
+        hook = layer.register_forward_hook(lambda module, inputs, output: captured.append(output))
+        try:
+            tr, rot, tor = self.model(data)[:3]
+        finally:
+            hook.remove()
+        if len(captured) != 1 or captured[0].ndim != 2 or captured[0].shape[1] != irreps.dim:
+            raise ValueError('expert final-layer node output does not match its irreps')
+        scalars = torch.cat([captured[0][:, section] for section in sections], dim=-1)
+        # Native CGModel applies its clamp after the hook. Both supported clamp
+        # policies are identical on individual scalar irreps.
+        limit = self.model.activation_clamp
+        if limit:
+            scalars = scalars.clamp(min=-float(limit), max=float(limit))
+        return tr, rot, tor, scalars
 
 
 def _set_time_embeddings(data, t, model):

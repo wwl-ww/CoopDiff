@@ -353,6 +353,8 @@ def main():
             if batch_idx % args.log_interval == 0:
                 print(f"  Epoch {epoch} | Batch {batch_idx} | "
                       f"loss={loss_dict['loss_total']:.4f} | "
+                      f"endpoint_main={loss_dict.get('loss_endpoint_main', loss_dict['loss_total']):.4f} | "
+                      f"near_target={loss_dict.get('loss_near_target', 0.):.4f} | "
                       f"ligand_geometry={loss_dict['loss_ligand_geometry']:.4f} | "
                       f"protein_geometry={loss_dict['loss_protein_geometry']:.4f}")
 
@@ -384,11 +386,14 @@ def main():
 
         # Log
         train_loss_avg = np.mean([d['loss_total'] for d in train_losses]) if train_losses else float('nan')
+        train_main_avg = np.mean([d.get('loss_endpoint_main', d['loss_total']) for d in train_losses])
+        train_near_avg = np.mean([d.get('loss_near_target', 0.) for d in train_losses])
         train_ligand_avg = np.mean([d['loss_ligand_geometry'] for d in train_losses])
         train_protein_avg = np.mean([d['loss_protein_geometry'] for d in train_losses])
         dt = time.time() - t0
         print(f"  Epoch {epoch}/{args.epochs} | "
               f"train_loss={train_loss_avg:.4f} | "
+              f"endpoint_main={train_main_avg:.4f} | near_target={train_near_avg:.4f} | "
               f"ligand_geometry={train_ligand_avg:.4f} | "
               f"protein_geometry={train_protein_avg:.4f} | "
               f"val_loss={val_loss:.4f} | "
@@ -458,7 +463,8 @@ def build_trainer(args, device, input_dim=None):
 
     model_config = production_model_config(args.node_dim, input_dim,
                                            args.num_transformer_layers,
-                                           args.training_arm == 'C')
+                                           args.training_arm == 'C',
+                                           expert_scalar_dim=frozen_expert.node_scalar_dim)
     if args.resume:
         # Resume means reconstruct the saved architecture, not reinterpret it
         # using today's defaults. The trainer subsequently checks every runtime
@@ -469,6 +475,10 @@ def build_trainer(args, device, input_dim=None):
         if saved['runtime_config'].get('training_objective') != 'real_initialization_reachable_endpoint_v2':
             raise ValueError('historical checkpoints are inference/weight sources, not production resumes')
         model_config = dict(saved['model_config'])
+        if model_config.get('model_profile') == 'ternary_endpoint_v2':
+            raise ValueError('v2 used the historical coupled near-target recipe; load weights only, not a production resume')
+        if model_config.get('model_profile') == 'ternary_endpoint_v3':
+            raise ValueError('v3 used the historical torsion decoder; load weights only, not a production resume')
         if not model_config.get('model_profile'):
             raise ValueError('an older custom checkpoint cannot resume as the production profile')
         if model_config['input_dim'] != input_dim:
@@ -518,6 +528,8 @@ def build_trainer(args, device, input_dim=None):
     )
 
     args.training_objective = trainer.training_objective
+    args.training_recipe = trainer.training_recipe
+    args.ema_update_contract = trainer.ema_update_contract
     return model, diffusion, trainer
 
 
@@ -583,13 +595,17 @@ def prepare_source_batch(batch, global_step, training_arm, endpoint_store):
 
 
 def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None,
-             native_root='DeepTernary/data/TernaryDB/pdbs'):
+             native_root='DeepTernary/data/TernaryDB/pdbs', weights='ema'):
     """Run a deterministic validation pass without perturbing training RNG."""
     from tricoopdiff.train import REAL_ENDPOINT_OBJECTIVE, REAL_VALIDATION_DOCKQ_PROTOCOL
     exact_dockq = getattr(trainer, 'training_objective', None) == REAL_ENDPOINT_OBJECTIVE
     scores = {'sdpi': [], 'bitseed': []}
     per_case = []
-    ema_context = trainer.ema_parameters() if hasattr(trainer, 'ema_parameters') else nullcontext()
+    if weights not in ('raw', 'ema'):
+        raise ValueError('validation weights must be raw or ema')
+    weight_kwargs = {'weights': weights} if hasattr(trainer, 'ema_parameters') else {}
+    ema_context = (trainer.ema_parameters()
+                   if weights == 'ema' and hasattr(trainer, 'ema_parameters') else nullcontext())
     with ema_context, evaluation_context(trainer.model):
         losses = {'sdpi': [], 'bitseed': []}
         fallback_count = 0
@@ -599,7 +615,7 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
             metric_kwargs = ({'dockq_context': validation_metric_context(
                 val_loader.entries_by_case[batch['case']], native_root)} if exact_dockq else {})
             try:
-                loss_dict = trainer.validate_step(**{**batch, 'source': 0}, **metric_kwargs)
+                loss_dict = trainer.validate_step(**{**batch, 'source': 0}, **weight_kwargs, **metric_kwargs)
             except FloatingPointError as error:
                 raise RuntimeError(f"validation failed: {error}") from error
             if not np.isfinite(loss_dict['loss_total']):
@@ -612,6 +628,7 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
                 scores['sdpi'].append(loss_dict['dockq'])
                 per_case.append({'case': batch['case'], 'source': 'sdpi',
                                  'loss': loss_dict['loss_total'],
+                                 'loss_endpoint_main': loss_dict.get('loss_endpoint_main', loss_dict['loss_total']),
                                  **{key: loss_dict[key] for key in ('dockq', 'fnat', 'irms', 'lrms')}})
             if training_arm in ('B', 'C'):
                 if endpoint_store is None:
@@ -627,7 +644,7 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
                         **batch,
                         'source': 1 if actual_source == 'bitseed' else 0,
                         'coupling_override': coupling,
-                    }, **metric_kwargs)
+                    }, **weight_kwargs, **metric_kwargs)
                 except FloatingPointError as error:
                     raise RuntimeError(
                         f"BiTSeed validation failed: {error}"
@@ -642,6 +659,7 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
                     scores[actual_source].append(endpoint_loss['dockq'])
                     per_case.append({'case': batch['case'], 'source': actual_source,
                                      'loss': endpoint_loss['loss_total'],
+                                     'loss_endpoint_main': endpoint_loss.get('loss_endpoint_main', endpoint_loss['loss_total']),
                                      **{key: endpoint_loss[key] for key in ('dockq', 'fnat', 'irms', 'lrms')}})
                 fallback_count += int(actual_source == 'sdpi')
     by_source = {
@@ -651,8 +669,13 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
     selection = float(np.mean(list(by_source.values()))) if by_source else float('nan')
     result = {
         'selection_loss': selection, 'by_source': by_source,
+        'selection_loss_component': 'loss_endpoint_main' if exact_dockq else 'loss_total',
         'source_counts': {source: len(values) for source, values in losses.items()},
         'bitseed_fallback_count': fallback_count,
+        'weights': weights if hasattr(trainer, 'ema_parameters') else 'raw',
+        'ema_updates': getattr(trainer, 'global_step', 0),
+        'ema_update_contract': getattr(trainer, 'ema_update_contract', 'legacy_unrecorded'),
+        'effective_ema_decay': getattr(trainer, 'effective_ema_decay', None),
     }
     if exact_dockq:
         dockq_by_source = {source: float(np.mean(values)) for source, values in scores.items() if values}

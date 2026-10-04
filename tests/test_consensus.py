@@ -19,7 +19,9 @@ def fixture():
              'node_types': torch.tensor([0] * 5 + [1] * 6 + [2] * 4),
              'lig_edge_index': torch.tensor([[0, 1, 1, 2, 2, 3], [1, 0, 2, 1, 3, 2]]),
              'lig_edge_mask': torch.tensor([False, False, True, False, False, False]),
-             'lig_mask_rotate': torch.tensor([[False, False, True, True]])}
+             'lig_mask_rotate': torch.tensor([[False, False, True, True]]),
+             'lig_edge_attr': torch.nn.functional.one_hot(torch.zeros(6, dtype=torch.long), 4).float(),
+             'expert_node_features': torch.cat((torch.randn(15, 116), torch.ones(15, 2)), -1)}
     proposals = {b: {c: torch.randn(1, 1 if c == 'tor' else 3)
                       for c in ('tr', 'rot', 'tor')} for b in BRANCHES}
     fuse = ConsensusFuse(node_dim=32, input_dim=16, num_transformer_layers=1, dropout=0).eval()
@@ -708,6 +710,300 @@ def test_ternary_contacts_and_gradients_survive_large_common_translation():
         (output['global'].square().mean() + output['ligand_tokens'][0].square().mean()).backward()
     assert torch.isfinite(coords.grad).all() and torch.isfinite(translated.grad).all()
     assert torch.allclose(coords.grad, translated.grad, atol=1e-6), 'translation changed geometric gradients'
+
+
+def test_endpoint_v2_body_motion_identity_equivariance_and_feature_gradient():
+    from tricoopdiff.models.consensus import production_model_config
+
+    _, graph, proposals, state = fixture()
+    fuse = ConsensusFuse(**production_model_config(32, 16, 1)).eval()
+    zero = fuse(graph, proposals, state)['normalized_velocity']
+    assert all(torch.count_nonzero(zero[b][c]) == 0 for b in BRANCHES for c in ('tr', 'rot'))
+    assert torch.count_nonzero(zero['torsion']) == 0
+    for head in (fuse.motion_head, fuse.direct_torsion_head):
+        torch.nn.init.normal_(head[-1].weight, std=.08)
+    graph['expert_node_features'].requires_grad_()
+    graph['node_coords'].requires_grad_()
+    base = fuse(graph, proposals, state)
+    rotation = so3_exp(torch.tensor([[.4, -.2, .8]]))[0]
+    moved_proposals = {b: {c: value @ rotation.T if c != 'tor' else value
+                           for c, value in proposal.items()} for b, proposal in proposals.items()}
+    moved = fuse({**graph, 'node_coords': graph['node_coords'] @ rotation.T + 10},
+                 moved_proposals, state)
+    assert torch.allclose(base['rank_features'], moved['rank_features'], atol=3e-5)
+    for branch in BRANCHES:
+        for component in ('tr', 'rot'):
+            assert torch.allclose(moved['normalized_velocity'][branch][component],
+                                  base['normalized_velocity'][branch][component] @ rotation.T,
+                                  atol=3e-5), (branch, component)
+    assert torch.allclose(base['normalized_velocity']['torsion'], moved['normalized_velocity']['torsion'], atol=3e-5)
+    loss = sum(base['normalized_velocity'][b][c].square().sum() for b in BRANCHES for c in ('tr', 'rot'))
+    loss.backward()
+    assert torch.isfinite(graph['node_coords'].grad).all()
+    assert torch.isfinite(graph['expert_node_features'].grad).all()
+    assert graph['expert_node_features'].grad.abs().sum() > 0
+
+
+def test_endpoint_v2_expert_node_identity_visibility_and_scatter_gradients():
+    from types import SimpleNamespace
+    from tricoopdiff.models.consensus import ConsensusCoopDiff, production_model_config
+
+    class FeatureExpert(torch.nn.Module):
+        node_scalar_dim = 2
+        num_conv_layers = 1
+
+        def __init__(self):
+            super().__init__()
+            self.model = SimpleNamespace(dynamic_max_cross=True)
+
+        def forward_features(self, graph):
+            coords = torch.cat((graph['ligand'].pos, graph['receptor'].pos))
+            identities = torch.cat((graph['ligand'].x[:, 0], graph['receptor'].x[:, 0]))
+            scalars = torch.stack((coords.square().sum(-1), identities), -1)
+            zero = coords.new_zeros(1, 3)
+            return zero, zero, coords.new_zeros(1), scalars
+
+    fuse = ConsensusFuse(**production_model_config(32, 16, 1, expert_scalar_dim=2)).eval()
+    model = ConsensusCoopDiff(FeatureExpert(), fuse)
+    positions = torch.zeros(12, 3)
+    positions[:, 0] = torch.tensor(list(range(9)) + [100, 101, 102])
+    features = torch.zeros(1, 12, 16)
+    features[0, :, 0] = torch.arange(12)
+    edges = torch.stack((torch.arange(11), torch.arange(1, 12)))
+    edges = torch.cat((edges, edges.flip(0)), -1)
+    e3 = {'coords': positions[None].clone().requires_grad_(),
+          'features': features, 'edge_index': edges}
+    poi = {'coords': (positions[None] + torch.tensor([0., 2., 0.])).requires_grad_(),
+           'features': features + 100, 'edge_index': edges}
+    _, graph, _, state = fixture()
+    ligand = {'coords': torch.tensor([[[0., 0., 0.], [1., 1., 0.],
+                                       [2., 0., 1.], [3., 1., 1.]]], requires_grad=True),
+              'features': torch.zeros(1, 4, 16), 'edge_index': graph['lig_edge_index'],
+              'edge_attr': graph['lig_edge_attr'], 'edge_mask': graph['lig_edge_mask'],
+              'mask_rotate': graph['lig_mask_rotate']}
+    captured = []
+    hook = fuse.register_forward_pre_hook(lambda module, args: captured.append(args[0]))
+    try:
+        model(e3, poi, ligand, torch.tensor([.5]), receptor_crop_cutoff=torch.tensor([4.]),
+              diffusion_state=state)
+    finally:
+        hook.remove()
+    observed = captured[0]['expert_node_features']
+    assert observed.shape == (28, 6)
+    e3_read, poi_read, ligand_read = observed[:12], observed[12:24], observed[24:]
+    for read, marker_column, visibility_column, offset in ((e3_read, 1, 4, 0), (poi_read, 3, 5, 100)):
+        visible = read[:, visibility_column].bool()
+        assert visible.any() and not visible[-3:].any(), 'far crop nodes must be explicitly invisible'
+        assert torch.equal(read[visible, marker_column], torch.arange(12)[visible].float() + offset)
+        assert read[~visible, :4].count_nonzero() == 0
+    assert e3_read[:, 2:4].count_nonzero() == 0 and poi_read[:, :2].count_nonzero() == 0
+    assert torch.equal(ligand_read[:, -2:], torch.ones(4, 2))
+    observed[:, :4].sum().backward()
+    for coords in (e3['coords'], poi['coords'], ligand['coords']):
+        assert coords.grad is not None and torch.isfinite(coords.grad).all()
+        assert coords.grad.abs().sum() > 0, 'frozen feature scatter must retain coordinate Jacobians'
+
+
+def test_endpoint_v2_internal_axes_unlock_collinear_external_rotation():
+    from tricoopdiff.models.consensus import production_model_config
+
+    fuse = ConsensusFuse(**production_model_config(32, 16, 1)).eval()
+    coords = torch.tensor([[-10., 0., 0.], [10., 0., 0.],
+                           [1., 1., 1.], [-1., 1., -1.],
+                           [1., -1., -1.], [-1., -1., 1.]])
+    types = torch.tensor([0, 1, 2, 2, 2, 2])
+    features = torch.zeros(6, 32)
+    features[2:, :4] = torch.eye(4)
+    with torch.no_grad():
+        fuse.body_queries.weight.zero_()
+        fuse.body_queries.weight[:, :4] = 3 * torch.eye(4)
+        fuse.motion_head[-1].bias[10] = 1
+    proposals = {branch: {'tr': torch.zeros(1, 3), 'rot': torch.zeros(1, 3)} for branch in BRANCHES}
+    translation, rotation = fuse._body_motion(features, coords, types, 2, proposals,
+                                              torch.zeros(1, 32))
+    assert translation.count_nonzero() == 0
+    assert rotation[0, 0].abs() > .01, 'internal shape must permit spin along the external center line'
+    transform = so3_exp(torch.tensor([[.2, .7, -.1]]))[0]
+    _, moved = fuse._body_motion(features, coords @ transform.T + 5, types, 2,
+                                 proposals, torch.zeros(1, 32))
+    assert torch.allclose(moved, rotation @ transform.T, atol=2e-6)
+
+
+def test_continuous_geometry_is_se3_and_atom_permutation_invariant():
+    from tricoopdiff.models.consensus import TernaryGeometryEncoder
+
+    generator = torch.Generator().manual_seed(941)
+    encoder = TernaryGeometryEncoder(16, 16, joint_geometry=True, spatial_geometry=True,
+                                     continuous_geometry=True).double().eval()
+    features = torch.randn(9, 16, generator=generator, dtype=torch.float64)
+    coords = (torch.randn(9, 3, generator=generator, dtype=torch.float64) * 4).requires_grad_()
+    types = torch.arange(3).repeat_interleave(3)
+    edges = torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]])
+    expected = encoder(features, coords, types, lig_edge_index=edges)
+    rotation = so3_exp(coords.new_tensor([.3, -.5, .2]))
+    moved = (coords.detach() @ rotation.T + coords.new_tensor([11., -7., 4.])).requires_grad_()
+    transformed = encoder(features, moved, types, lig_edge_index=edges)
+    for key in ('global', 'e3l', 'pol'):
+        assert torch.allclose(expected[key], transformed[key], atol=1e-10, rtol=0.), key
+    assert torch.allclose(expected['ligand_tokens'][0], transformed['ligand_tokens'][0],
+                          atol=1e-10, rtol=0.)
+    permutations = [torch.tensor([2, 0, 1]), torch.tensor([1, 2, 0]), torch.tensor([2, 1, 0])]
+    permutation = torch.cat([value + 3 * index for index, value in enumerate(permutations)])
+    reordered = encoder(features[permutation], coords[permutation], types,
+                         lig_edge_index=permutations[2].argsort()[edges])
+    assert torch.allclose(expected['global'], reordered['global'], atol=1e-10, rtol=0.)
+    assert torch.allclose(expected['ligand_tokens'][0][permutations[2]],
+                          reordered['ligand_tokens'][0], atol=1e-10, rtol=0.)
+    for output in (expected, transformed):
+        (output['global'].square().sum() + output['ligand_tokens'][0].square().sum()).backward()
+    assert torch.isfinite(coords.grad).all() and torch.isfinite(moved.grad).all()
+    assert torch.allclose(coords.grad @ rotation.T, moved.grad, atol=1e-9, rtol=0.)
+
+
+def test_continuous_radius_edges_vanish_with_zero_boundary_derivative():
+    from tricoopdiff.models.consensus import TernaryGeometryEncoder
+
+    encoder = TernaryGeometryEncoder(16, 8, joint_geometry=True, continuous_geometry=True).double()
+    for radius, types in ((12., torch.tensor([0, 0, 1, 2])),
+                          (24., torch.tensor([0, 1, 2]))):
+        base = torch.zeros(len(types), 3, dtype=torch.float64)
+        base[:, 0] = torch.arange(len(types), dtype=torch.float64) * 60
+        base[1, 0] = radius
+        features = torch.randn(len(types), 8, dtype=torch.float64)
+        values, gradients, edge_counts = [], [], []
+        for offset in (-1e-3, 0., 1e-3):
+            coords = base.clone()
+            coords[1, 0] += offset
+            coords.requires_grad_()
+            output, info = encoder._joint_contacts(features, coords, types)
+            (output.square().sum() + coords.sum() * 0).backward()
+            values.append(output.detach())
+            gradients.append(coords.grad)
+            edge_counts.append(len(info['receiver']))
+            assert torch.isfinite(output).all() and torch.isfinite(coords.grad).all()
+            assert bool(((info['weight'] >= 0) & (info['weight'] <= 1)).all())
+        assert edge_counts == [2, 0, 0], 'radius topology did not match the explicit support'
+        assert (values[0] - values[1]).abs().max() < 1e-6
+        assert (gradients[0] - gradients[1]).abs().max() < 1e-3
+        assert torch.equal(values[1], values[2])
+
+
+def test_continuous_contact_descriptors_do_not_jump_at_thresholds_or_distance_ties():
+    from tricoopdiff.models.consensus import TernaryGeometryEncoder
+
+    encoder = TernaryGeometryEncoder(16, 8, continuous_geometry=True).double()
+    values = []
+    for offset in (-1e-6, 0., 1e-6):
+        distances = (torch.tensor([4., 4., 8., 12.], dtype=torch.float64) + offset).requires_grad_()
+        descriptor = encoder._pair_descriptor(distances)
+        descriptor.sum().backward()
+        assert torch.isfinite(distances.grad).all()
+        values.append(descriptor)
+    assert (values[0] - values[2]).abs().max() < 1e-6
+
+
+def test_continuous_weighted_rbf_chunking_matches_direct_values_and_gradients():
+    from tricoopdiff.models.consensus import TernaryGeometryEncoder
+
+    encoder = TernaryGeometryEncoder(16, 8, continuous_geometry=True).double()
+    generator = torch.Generator().manual_seed(946)
+    distances = (torch.rand(90, 100, generator=generator, dtype=torch.float64) * 30).requires_grad_()
+    weights = torch.rand(90, 100, generator=generator, dtype=torch.float64).requires_grad_()
+    for per_row in (False, True):
+        actual = encoder._weighted_rbf(distances, weights, per_row=per_row)
+        rbf = torch.exp(-.5 * ((distances[..., None] - encoder.rbf_centers) / encoder.rbf_width).square())
+        expected = (rbf * weights[..., None]).sum(1)
+        if not per_row:
+            expected = expected.sum(0)
+        assert torch.allclose(actual, expected, atol=1e-11, rtol=0.)
+        actual_grad = torch.autograd.grad(actual.square().sum(), (distances, weights), retain_graph=True)
+        expected_grad = torch.autograd.grad(expected.square().sum(), (distances, weights), retain_graph=True)
+        for left, right in zip(actual_grad, expected_grad):
+            assert torch.isfinite(left).all()
+            assert torch.allclose(left, right, atol=1e-9, rtol=1e-11)
+
+
+def test_continuous_joint_message_chunks_match_unbounded_reference_backward():
+    from tricoopdiff.models.consensus import TernaryGeometryEncoder
+
+    generator = torch.Generator().manual_seed(947)
+    encoder = TernaryGeometryEncoder(16, 8, joint_geometry=True, continuous_geometry=True).double()
+    features = torch.randn(99, 8, generator=generator, dtype=torch.float64).requires_grad_()
+    coords = torch.randn(99, 3, generator=generator, dtype=torch.float64).requires_grad_()
+    types = torch.arange(3).repeat_interleave(33)
+    actual, info = encoder._joint_contacts(features, coords, types)
+    receiver, sender, weight = info['receiver'], info['sender'], info['weight']
+    assert len(receiver) > 8192, 'the chunk regression must cover more than one message chunk'
+    counts = features.new_zeros(99, 1).index_add(0, receiver, weight) + 1.
+    expected = features
+    for message, update in zip(encoder.messages, encoder.message_updates):
+        values = message(torch.cat((expected[receiver], expected[sender], info['geometry']), -1))
+        aggregate = torch.zeros_like(expected).index_add(0, receiver, values * weight) / counts
+        expected = expected + update(torch.cat((expected, aggregate), -1))
+    assert torch.allclose(actual, expected, atol=1e-11, rtol=0.)
+    actual_grad = torch.autograd.grad(actual.square().sum(), (features, coords), retain_graph=True)
+    expected_grad = torch.autograd.grad(expected.square().sum(), (features, coords))
+    for left, right in zip(actual_grad, expected_grad):
+        assert torch.isfinite(left).all()
+        assert torch.allclose(left, right, atol=1e-9, rtol=1e-10), (
+            'checkpoint recomputation captured a later layer or chunk')
+
+
+def test_endpoint_profiles_isolate_torsion_recipe_and_continuous_decoder():
+    from tricoopdiff.models.consensus import production_model_config, PRODUCTION_MODEL_PROFILE
+    from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, SDPIFlow
+
+    assert PRODUCTION_MODEL_PROFILE == 'ternary_endpoint_v4'
+    configs = {version: production_model_config(32, 16, 1, model_profile=f'ternary_endpoint_v{version}')
+               for version in (1, 2, 3, 4)}
+    assert production_model_config(32, 16, 1) == configs[4]
+    models = {version: ConsensusFuse(**config).eval() for version, config in configs.items()}
+    assert not models[1].endpoint_v2 and not models[1].pooling.continuous_geometry
+    assert 'expert_scalar_dim' not in configs[1]
+    for version in (2, 3, 4):
+        assert models[version].endpoint_v2 and models[version].pooling.continuous_geometry
+        assert configs[version]['expert_scalar_dim'] == 58
+    assert not models[2].endpoint_v3 and models[3].endpoint_v3 and models[4].endpoint_v3
+    assert all(not models[version].continuous_torsion for version in (1, 2, 3))
+    assert models[4].continuous_torsion
+    assert models[2].bond_context_encoder.phase_harmonics == 1
+    assert models[3].bond_context_encoder.phase_harmonics == 3
+    assert models[4].bond_context_encoder.phase_harmonics == 3
+    assert models[2].bond_context_encoder.net[1].in_features == 8 * 32 + 16 + 15
+    assert models[3].bond_context_encoder.net[1].in_features == 8 * 32 + 16 + 19
+    v2_state, v3_state = models[2].state_dict(), models[3].state_dict()
+    assert set(v2_state) == set(v3_state), 'new phase channels need not add disconnected modules'
+    changed_shapes = {name for name in v2_state if v2_state[name].shape != v3_state[name].shape}
+    assert changed_shapes == {'bond_context_encoder.net.0.weight', 'bond_context_encoder.net.0.bias',
+                              'bond_context_encoder.net.1.weight'}
+    v4_state = models[4].state_dict()
+    assert set(v3_state) == set(v4_state)
+    assert all(v3_state[name].shape == v4_state[name].shape for name in v3_state)
+    _, graph, proposals, state = fixture()
+    models[4].load_state_dict(v3_state, strict=True)
+    v3, v4 = (models[version](graph, proposals, state) for version in (3, 4))
+    assert 'torsion_update_mode' not in v3['normalized_velocity']
+    assert v4['normalized_velocity']['torsion_update_mode'] == CONTINUOUS_TORSION_MODE
+    velocities = SDPIFlow().velocities(v4['normalized_velocity'],
+                                       graph['node_coords'][graph['node_types'] == 0][None],
+                                       graph['node_coords'][graph['node_types'] == 1][None])
+    assert velocities['torsion_update_mode'] == CONTINUOUS_TORSION_MODE
+    for head in (models[2].motion_head, models[2].direct_torsion_head):
+        torch.nn.init.normal_(head[-1].weight, std=.05)
+    restored = ConsensusFuse(**configs[2]).eval()
+    restored.load_state_dict(models[2].state_dict(), strict=True)
+    original, loaded = (model(graph, proposals, state)['normalized_velocity']
+                        for model in (models[2], restored))
+    for branch in BRANCHES:
+        for component in ('tr', 'rot'):
+            assert torch.equal(original[branch][component], loaded[branch][component])
+    assert torch.equal(original['torsion'], loaded['torsion']), 'v2 loading must retain its original formula'
+    try:
+        models[3].load_state_dict(models[2].state_dict(), strict=True)
+    except RuntimeError as error:
+        assert 'size mismatch' in str(error)
+    else:
+        raise AssertionError('v2 phase weights must not masquerade as v3')
 
 
 if __name__ == '__main__':

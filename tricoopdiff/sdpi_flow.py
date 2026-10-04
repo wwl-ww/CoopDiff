@@ -22,6 +22,7 @@ FLOW_VERSION = 'sdpi_flow_v1'
 CHECKPOINT_VERSION = 17
 INDEPENDENT_RIGID_MODE = 'independent_centroids_v1'
 LEGACY_RIGID_MODE = 'dual_interfaces_v1'
+CONTINUOUS_TORSION_MODE = 'continuous_horizontal_v1'
 
 
 def _check_coords(coords):
@@ -138,6 +139,10 @@ class SDPIFlow:
                 and output.get('normalized_velocity', {}).get('rigid_output_mode')
                 != INDEPENDENT_RIGID_MODE):
             raise ValueError('direct model must execute independent centroid motion')
+        if (getattr(getattr(model, 'trifuse', None), 'continuous_torsion', False)
+                and output.get('normalized_velocity', {}).get('torsion_update_mode')
+                != CONTINUOUS_TORSION_MODE):
+            raise ValueError('continuous torsion model must execute its horizontal update')
         return output
 
     @staticmethod
@@ -186,6 +191,8 @@ class SDPIFlow:
         result['torsion'] = normalized['torsion'] * math.pi
         if 'rigid_output_mode' in normalized:
             result['rigid_output_mode'] = normalized['rigid_output_mode']
+        if 'torsion_update_mode' in normalized:
+            result['torsion_update_mode'] = normalized['torsion_update_mode']
         return result
 
     @staticmethod
@@ -243,6 +250,9 @@ class SDPIFlow:
         if not torch.isfinite(body).all():
             raise FloatingPointError('non-finite flow body frame')
         torsion = velocities['torsion']
+        torsion_mode = velocities.get('torsion_update_mode')
+        if torsion_mode not in (None, CONTINUOUS_TORSION_MODE):
+            raise ValueError(f'unknown torsion update mode: {torsion_mode!r}')
         # A no_torsion expert can disable torsions even when the chemical graph
         # contains rotatable bonds. Match the production empty-output contract.
         if torsion.shape == (1, 0):
@@ -260,18 +270,45 @@ class SDPIFlow:
                 or masks.shape != (len(bonds), ligand.shape[1])):
             raise ValueError('finite torsion velocities and ligand graph sizes must agree')
         raw = rigid
+        displacement = torch.zeros_like(rigid) if torsion_mode == CONTINUOUS_TORSION_MODE else None
         for index, (u, v) in enumerate(bonds):
             axis = raw[:, u] - raw[:, v]
             norm = torch.linalg.vector_norm(axis, dim=-1, keepdim=True)
             if bool((norm <= 1e-10).any()):
                 raise ValueError('degenerate torsion axis')
+            if displacement is not None:
+                initial_axis = rigid[:, u] - rigid[:, v]
+                initial_axis = initial_axis / torch.linalg.vector_norm(initial_axis, dim=-1, keepdim=True)
+                angle = initial_axis * (-dt * torsion[:, index])[:, None]
+                displacement = displacement + torch.linalg.cross(
+                    angle[:, None].expand_as(rigid), rigid - rigid[:, v:v + 1], dim=-1,
+                ) * masks[index][None, :, None]
             rotation = rotation_exp(axis / norm * (-dt * torsion[:, index])[:, None])
             pivot = raw[:, v:v + 1]
             moved = (raw - pivot) @ rotation.transpose(-1, -2) + pivot
             raw = torch.where(masks[index][None, :, None], moved, raw)
         if len(bonds):
-            rotation, translation, _ = proper_rigid_fit(raw, rigid)
-            rigid = apply_rigid(raw, rotation, translation)
+            if displacement is None:
+                rotation, translation, _ = proper_rigid_fit(raw, rigid)
+                rigid = apply_rigid(raw, rotation, translation)
+            else:
+                # An exact finite Kabsch gauge is discontinuous at legitimate
+                # folded conformers with rank-deficient cross-covariance.
+                # Instead retract the local horizontal torsion tangent: remove
+                # its mean motion and rigid spin, without changing shape DOFs.
+                center = rigid.mean(1, keepdim=True)
+                centered = (rigid - center).double()
+                identity = torch.eye(3, dtype=torch.float64, device=rigid.device)[None]
+                inertia = centered.square().sum((1, 2))[:, None, None] * identity
+                inertia = inertia - centered.transpose(1, 2) @ centered
+                torque = torch.linalg.cross(centered, displacement.double(), dim=-1).sum(1)
+                # Relative zero-spin prior makes the unidentifiable axis of a
+                # truly collinear ligand finite, without a world-space axis.
+                ridge = inertia.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(torch.finfo(torch.float64).tiny) * 1e-6
+                spin = torch.linalg.solve(inertia + ridge[:, None, None] * identity,
+                                          torque[:, :, None]).squeeze(-1)
+                rotation = rotation_exp(-spin).to(rigid.dtype)
+                rigid = (raw - raw.mean(1, keepdim=True)) @ rotation.transpose(-1, -2) + center
         _check_coords(rigid)
         _check_coords(poi)
         return rigid, poi, body

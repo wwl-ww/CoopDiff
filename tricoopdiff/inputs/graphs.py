@@ -110,6 +110,7 @@ def build_trifuse_graph(
     lig_edge_index: torch.Tensor = None,
     lig_edge_mask: torch.Tensor = None,
     lig_mask_rotate=None,
+    lig_edge_attr: torch.Tensor = None,
 ) -> dict:
     """
     Build the full ternary graph for TriFuse processing.
@@ -174,6 +175,7 @@ def build_trifuse_graph(
         'lig_edge_index': lig_edge_index,
         'lig_edge_mask': lig_edge_mask,
         'lig_mask_rotate': lig_mask_rotate,
+        'lig_edge_attr': lig_edge_attr,
     }
 
 
@@ -273,16 +275,6 @@ def crop_receptor_to_ligand(
                 keep_mask = torch.zeros_like(keep_mask)
                 keep_mask[distance_order[:k]] = True
                 cropped_edge_index = subgraph(keep_mask, rec_edge_index, relabel_nodes=True)[0]
-
-    # Align with native crop_beyond semantics: once the crop is stable, do not
-    # over-prune to a single residue if the geometric cutoff happened to miss all
-    # residues at this step. The interface expert already has a native-style
-    # fallback for fully empty cross graphs, so the crop should remain a genuine
-    # receptor neighborhood whenever internal edges exist.
-    if has_rec_graph and cropped_edge_index is not None and cropped_edge_index.shape[1] == 0 and keep_mask.sum() > 1:
-        keep_mask = torch.zeros_like(keep_mask)
-        keep_mask[distance_order[:min(receptor_coords.shape[0], max(target_min, 2))]] = True
-        cropped_edge_index = subgraph(keep_mask, rec_edge_index, relabel_nodes=True)[0]
 
     return {
         'coords': receptor_coords[keep_mask],

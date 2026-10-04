@@ -418,6 +418,164 @@ def test_sampler_restores_training_mode_and_rng_on_success_and_failure():
             assert torch.equal(torch.get_rng_state(), rng), 'sampling changed training RNG'
 
 
+def _folded_torsion_decoder_fixture(dtype=torch.float64):
+    ligand = torch.tensor([[[-1., 1., 0.], [0., 0., 0.], [1., 0., 0.], [2., 1., 0.]]], dtype=dtype)
+    poi = torch.tensor([[[0., 0., 2.], [1., 1., 2.], [2., 0., 3.]]], dtype=dtype)
+    data = {'edge_index': torch.tensor([[0, 1, 1, 2, 2, 3], [1, 0, 2, 1, 3, 2]]),
+            'edge_mask': torch.tensor([False, False, True, False, False, False]),
+            'mask_rotate': torch.tensor([[False, False, True, True]])}
+    return ligand, poi, torch.eye(3, dtype=dtype)[None], data
+
+
+def test_continuous_horizontal_torsion_preserves_tags_and_rejects_unknown_decoder():
+    from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
+
+    ligand, poi, body, data = _folded_torsion_decoder_fixture()
+    normalized = {'rigid_output_mode': INDEPENDENT_RIGID_MODE, 'torsion_update_mode': CONTINUOUS_TORSION_MODE,
+                  'e3_ligand': {'tr': ligand.new_zeros(1, 3), 'rot': ligand.new_zeros(1, 3)},
+                  'poi_ligand': {'tr': ligand.new_zeros(1, 3), 'rot': ligand.new_zeros(1, 3)},
+                  'torsion': ligand.new_zeros(1, 1)}
+    velocities = SDPIFlow().velocities(normalized, ligand, poi)
+    assert velocities['torsion_update_mode'] == CONTINUOUS_TORSION_MODE
+    velocities['torsion_update_mode'] = 'unknown'
+    try:
+        SDPIFlow.step(ligand, poi, body, velocities, ligand.new_ones(1), data)
+    except ValueError as error:
+        assert 'torsion update mode' in str(error)
+    else:
+        raise AssertionError('unknown finite-step torsion semantics were silently accepted')
+
+
+def test_continuous_horizontal_torsion_crosses_folded_rank_deficient_fit_without_pose_jump():
+    from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
+
+    for dtype in (torch.float32, torch.float64):
+        ligand, poi, body, data = _folded_torsion_decoder_fixture(dtype)
+        assert torch.linalg.matrix_rank(ligand[0] - ligand.mean(1)[0]) == 2
+        results = []
+        for offset in (-1e-3, 0., 1e-3):
+            angle = ligand.new_tensor([[np.pi + offset]], requires_grad=True)
+            velocities = {'rigid_output_mode': INDEPENDENT_RIGID_MODE,
+                          'torsion_update_mode': CONTINUOUS_TORSION_MODE,
+                          'e3_ligand': {'tr': ligand.new_zeros(1, 3), 'rot': ligand.new_zeros(1, 3)},
+                          'poi_ligand': {'tr': ligand.new_zeros(1, 3), 'rot': ligand.new_zeros(1, 3)},
+                          'torsion': angle}
+            result = SDPIFlow.step(ligand, poi, body, velocities, ligand.new_ones(1), data)
+            result[0].square().sum().backward()
+            assert torch.isfinite(angle.grad).all()
+            assert torch.allclose(result[0].mean(1), ligand.mean(1), atol=2e-6, rtol=0.)
+            u, v = data['edge_index']
+            expected = torch.linalg.vector_norm(ligand[:, u] - ligand[:, v], dim=-1)
+            actual = torch.linalg.vector_norm(result[0][:, u] - result[0][:, v], dim=-1)
+            assert torch.allclose(actual, expected, atol=2e-6, rtol=0.)
+            assert torch.equal(result[1], poi) and torch.equal(result[2], body)
+            results.append(result[0])
+        assert (results[0] - results[2]).abs().max() < .01, 'continuous torsion decoder jumped at pi'
+        velocities.pop('torsion_update_mode')
+        velocities['torsion'] = ligand.new_tensor([[np.pi]])
+        try:
+            SDPIFlow.step(ligand, poi, body, velocities, ligand.new_ones(1), data)
+        except ValueError as error:
+            assert 'underdetermined' in str(error)
+        else:
+            raise AssertionError('old untagged decoder no longer preserves its historical chart contract')
+
+
+def test_continuous_horizontal_torsion_is_equivariant_differentiable_and_safe_for_collinear_ligands():
+    from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
+    from tricoopdiff.geometry.rigid import rotation_exp
+
+    ligand, poi, body, data = _folded_torsion_decoder_fixture()
+    for collinear in (False, True):
+        current = ligand.clone()
+        if collinear:
+            current[:, :, 1:] = 0.
+        current.requires_grad_()
+        torsion = current.new_tensor([[2.]], requires_grad=True)
+        velocities = {'rigid_output_mode': INDEPENDENT_RIGID_MODE, 'torsion_update_mode': CONTINUOUS_TORSION_MODE,
+                      'e3_ligand': {'tr': current.new_tensor([[.2, -.3, .1]]), 'rot': current.new_tensor([[.1, .2, -.1]])},
+                      'poi_ligand': {'tr': current.new_tensor([[-.1, .2, .3]]), 'rot': current.new_tensor([[.3, -.1, .2]])},
+                      'torsion': torsion}
+        dt = current.new_tensor([.17])
+        expected = SDPIFlow.step(current, poi, body, velocities, dt, data)
+        rotation = rotation_exp(current.new_tensor([[.3, -.5, .7]]))[0]
+        shift = current.new_tensor([12., -3., 5.])
+        transformed_velocities = {**velocities}
+        for branch in ('e3_ligand', 'poi_ligand'):
+            transformed_velocities[branch] = {name: value @ rotation.T for name, value in velocities[branch].items()}
+        moved = SDPIFlow.step(current @ rotation.T + shift, poi @ rotation.T + shift,
+                             rotation[None] @ body, transformed_velocities, dt, data)
+        for first, second in zip(expected[:2], moved[:2]):
+            assert torch.allclose(first @ rotation.T + shift, second, atol=1e-9, rtol=0.)
+        assert torch.allclose(rotation[None] @ expected[2], moved[2], atol=1e-9, rtol=0.)
+        expected[0].square().sum().backward()
+        assert torch.isfinite(current.grad).all() and torch.isfinite(torsion.grad).all()
+
+
+def test_continuous_horizontal_multitorsion_decoder_matches_teacher_tangent():
+    from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE
+
+    flow, data, _, native_poi, coupling = fixture('CCCOCC')
+    for time in (.1, .47, .9):
+        t = torch.tensor([time], dtype=torch.float64)
+        ligand, poi, body, velocities = flow.path(data, native_poi, coupling, t)
+        velocities['torsion_update_mode'] = CONTINUOUS_TORSION_MODE
+        errors = []
+        for h in (1e-3, 5e-4):
+            dt = t.new_tensor([h])
+            actual = flow.step(ligand, poi, body, velocities, dt, data)
+            expected = flow.path(data, native_poi, coupling, t - dt)
+            errors.append(max(float((actual[index] - expected[index]).abs().max()) for index in (0, 1)))
+        assert errors[1] < .4 * errors[0] + 1e-10
+        assert errors[1] < 3e-4
+
+
+def test_continuous_torsion_model_and_sampler_callback_cannot_drop_update_tag():
+    from tricoopdiff.initialization.candidates import FixedCandidateInitializer
+    from tricoopdiff.sampler import sample_single
+    from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
+
+    ligand, poi, body, data = _folded_torsion_decoder_fixture()
+    data = {**data, 'coords': ligand}
+
+    class Predictor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.expert = SimpleNamespace(model=SimpleNamespace(no_torsion=False, dynamic_max_cross=False))
+            self.trifuse = SimpleNamespace(direct_ternary_motion=True, continuous_torsion=True)
+            self.omit = False
+
+        def forward(self, *args, **kwargs):
+            velocity = {'rigid_output_mode': INDEPENDENT_RIGID_MODE,
+                        'e3_ligand': {'tr': ligand.new_zeros(1, 3), 'rot': ligand.new_zeros(1, 3)},
+                        'poi_ligand': {'tr': ligand.new_zeros(1, 3), 'rot': ligand.new_zeros(1, 3)},
+                        'torsion': ligand.new_zeros(1, 1)}
+            if not self.omit:
+                velocity['torsion_update_mode'] = CONTINUOUS_TORSION_MODE
+            return {'normalized_velocity': velocity}
+
+    model = Predictor()
+    flow = SDPIFlow(inference_steps=1)
+    initializer = FixedCandidateInitializer({'ligand': ligand, 'poi': poi, 'rotation': body,
+                                             'candidate_id': ['sdpi', 0]}, no_torsion=False)
+    ed, pd = {'coords': ligand}, {'coords': poi}
+
+    def drop_tag(velocities, *args, **kwargs):
+        velocities = dict(velocities)
+        velocities.pop('torsion_update_mode')
+        return velocities
+
+    for omit in (True, False):
+        model.omit = omit
+        try:
+            sample_single(model, flow, initializer, ed, pd, data, device='cpu',
+                          init_mode='fixed_candidate', velocity_transform=None if omit else drop_tag)
+        except ValueError as error:
+            assert 'torsion' in str(error)
+        else:
+            raise AssertionError('continuous torsion motion silently fell back to the old Kabsch chart')
+
+
 if __name__ == '__main__':
     for name, function in list(globals().items()):
         if name.startswith('test_'):

@@ -32,7 +32,9 @@ TriCoopDiff 研究蛋白–配体–蛋白三元装配：两个冻结 DiffDock �
 
 历史 FiLM 和诊断实验保留用于复核已有结果，不由生产模型导入。评估的主指标仍是蛋白–蛋白完整原子 DockQ。集合多样性已统一为固定 E3 坐标系下的 RMSD，报告以 `fixed_e3_v1` 标记，不能与旧的对齐后多样性直接比较。
 
-新生产训练使用 v24 的 `real_initialization_reachable_endpoint_v2`：从推理同款 ETKDG-SDPI 或原始 BiTSeed 起点执行完整轨迹，不再把训练输入投影回晶体内部几何。配体监督目标投影到该起点的刚体＋torsion 可达空间；蛋白和蛋白界面仍监督真实终点。目标投影是可达坐标替代指标，不等价于恢复精确晶体键长；投影未收敛时明确报错。
+新生产模型为 `ternary_endpoint_v4`，checkpoint 为 v27：两个冻结专家提供逐节点标量特征和运动证据，三元场通过全局 attention、连续局部几何和内部形状／全局方向基独立决定刚体运动；torsion 读出包含化学键、两侧片段和按邻居特征加权的一至三阶有符号相位，避免把几何对称误当成化学对称；近共线相位采用连续置信度。v4 的 `continuous_horizontal_v1` torsion 更新保持真实键旋转，并以局部水平速度撤销平移／spin，不再对整步折叠构象求可能跳变的 Kabsch gauge。训练与采样共享这一一阶流更新器。旧 `ternary_endpoint_v1/v2/v3` 仍按原始参数、解码与行为构造，不允许静默升级加载；v2/25、v3/26 不作为新生产训练的续训来源。
+
+主监督保持 `real_initialization_reachable_endpoint_v2`：从推理同款 ETKDG-SDPI 或原始 BiTSeed 起点执行完整20步，不把训练输入投影回晶体内部几何。配体监督目标投影到该起点的刚体＋torsion 可达空间；蛋白和蛋白界面仍监督真实终点。v3/v4 以八样本周期分开安排来源、零／小扰动和辅助入口时刻，分别从 t=1／0.2 执行20／4步，以0.25权重复用终点损失；平均增加12步。验证拒绝训练辅助入口，日志分开报告主终点 loss 与辅助 loss。目标投影是可达坐标替代指标，不等价于恢复精确晶体键长；投影未收敛时明确报错。当前 batch_size 是串行微批的平均梯度累积，不是真正图并行。
 
 BiTSeed 生产训练按样本 occurrence 重采，验证固定 occurrence 0；缓存按 occurrence 分文件保存，RAM 每个 case 仅保留最新记录。缓存包含专家配置和实例数值策略，新协议不可复用旧缓存。重采会增加二元专家计算与磁盘占用，不再享有每 case 只生成一次的旧成本。
 
@@ -40,7 +42,7 @@ BiTSeed 生产训练按样本 occurrence 重采，验证固定 occurrence 0；�
 
 候选与流更新器要求 body frame 是合法 SO(3) 旋转，拒绝缩放、剪切和反射矩阵。可微刚体拟合 RMSD 在精确拟合零点保持有限梯度；验证和采样共用上下文恢复各子模块模式及 RNG。EMA 临时权重下禁止优化和保存/恢复训练状态，EMA 加载失败也会回滚原始权重。
 
-专家 clamp 属于实例，不受其他 trainer/runner 覆盖；专家 sigma 配置必须匹配生产 DiffDock-L 预条件器。v24 checkpoint 保存 Python、NumPy、Torch CPU/CUDA RNG 和专家运行身份；恢复要求相同 CUDA 拓扑。生产训练只保留此终点协议；旧 checkpoint 仅用于推理或作为新训练的权重来源，不再支持恢复旧生产训练。历史速度实验显式使用基础速度训练器；历史条件训练仅读取已有投影归档，不再在线生成旧协议缓存。
+专家 clamp 属于实例，不受其他 trainer/runner 覆盖；专家 sigma 配置必须匹配生产 DiffDock-L 预条件器。checkpoint 保存 Python、NumPy、Torch CPU/CUDA RNG 和专家运行身份；恢复要求相同 CUDA 拓扑。v25+ 保存训练 recipe 与 EMA 更新计数，v2/v3 EMA 按成功 optimizer 更新 warmup，验证默认使用 EMA 并明确权重口径。旧 v24/v1 的终点训练可按原架构、固定 EMA 和无辅助项续训；更早的历史监督不作为生产续训协议。历史速度实验显式使用基础速度训练器；历史条件训练仅读取已有投影归档，不再在线生成旧协议缓存。
 
 采样保留调用者 RNG。请求 rank features 时会额外读取最终构象，使用 `t=0, dt=0`，标记为 `final_pose_t0_dt0_v1`；不能与旧的最后一步更新前特征混用。
 

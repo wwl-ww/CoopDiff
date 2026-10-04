@@ -489,6 +489,90 @@ def test_frozen_expert_stays_eval():
     print("  [OK] Frozen expert remains in eval mode")
 
 
+def test_frozen_expert_features_preserve_scores_gradients_and_hook_cleanup():
+    import torch.nn as nn
+    from tricoopdiff.models.expert import FrozenDiffDock, configure_expert_policy
+    from tricoopdiff.geometry.equivariant_clamp import clamp_irrep_features
+
+    class FeatureLayer(nn.Module):
+        out_irreps = '2x0e + 1x1o + 1x0o'
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(2.))
+
+        def forward(self, coords):
+            return torch.cat((coords[:, :2] * self.weight, coords,
+                              coords.sum(-1, keepdim=True)), dim=-1)
+
+    class NativeExpert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv_layers = nn.ModuleList([FeatureLayer()])
+            self.ns, self.nv, self.sh_irreps, self.device = 2, 1, None, 'cpu'
+            self.fail = False
+
+        def forward(self, coords):
+            nodes = self.conv_layers[0](coords)
+            if self.fail:
+                raise RuntimeError('score head failure')
+            if self.activation_clamp_mode == 'irrep_norm':
+                nodes = clamp_irrep_features(nodes, self.conv_layers[0].out_irreps,
+                                            self.activation_clamp)
+            else:
+                nodes = nodes.clamp(-self.activation_clamp, self.activation_clamp)
+            # Native production CGModel also returns an auxiliary confidence.
+            return nodes[:, :3], nodes[:, 3:], nodes[:, -1], nodes.new_zeros(1)
+
+    expert = FrozenDiffDock(NativeExpert(), num_conv_layers=1)
+    assert expert.node_scalar_dim == 3
+    original_keys = set(expert.state_dict())
+    for mode in ('componentwise', 'irrep_norm'):
+        configure_expert_policy(expert, .75, mode)
+        coords = torch.tensor([[.1, .2, .3], [2., 3., 4.]], requires_grad=True)
+        ordinary = expert(coords)
+        tr, rot, tor, scalars = expert.forward_features(coords)
+        assert all(torch.equal(actual, expected)
+                   for actual, expected in zip((tr, rot, tor), ordinary[:3]))
+        expected = expert.model.conv_layers[0](coords)[:, [0, 1, 5]].clamp(-.75, .75)
+        assert torch.equal(scalars, expected), '0e/0o extraction must follow irrep sections'
+        assert scalars.shape == (2, expert.node_scalar_dim)
+        scalars.sum().backward()
+        assert torch.isfinite(coords.grad).all() and coords.grad.abs().sum() > 0
+        assert all(parameter.grad is None and not parameter.requires_grad
+                   for parameter in expert.parameters())
+        assert not expert.model.conv_layers[0]._forward_hooks
+        assert set(expert.state_dict()) == original_keys
+    expert.model.fail = True
+    try:
+        expert.forward_features(coords)
+    except RuntimeError as error:
+        assert 'score head failure' in str(error)
+    else:
+        raise AssertionError('feature read must not swallow native score failures')
+    assert not expert.model.conv_layers[0]._forward_hooks, 'failed reads must remove their hook'
+    expert.model.fail = False
+    assert expert.forward_features(coords)[3].shape == (2, 3)
+    print('  [OK] Frozen feature scores, coordinate gradients and hook cleanup')
+
+
+def test_failed_expert_policy_configuration_preserves_the_live_policy():
+    from types import SimpleNamespace
+    from tricoopdiff.models.expert import configure_expert_policy
+
+    expert = SimpleNamespace(model=SimpleNamespace(activation_clamp=10000.,
+                                                   activation_clamp_mode='irrep_norm'))
+    for limit, mode in ((1., 'invalid'), (float('nan'), 'componentwise'), (-1., 'componentwise')):
+        try:
+            configure_expert_policy(expert, limit, mode)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('invalid numerical policies must fail')
+        assert expert.model.activation_clamp == 10000.
+        assert expert.model.activation_clamp_mode == 'irrep_norm'
+
+
 def test_score_guard_handles_infinity():
     """Inference must detect non-finite scores without hiding their values."""
     from tricoopdiff.sampler import _nonfinite_components
@@ -574,6 +658,8 @@ if __name__ == "__main__":
     test_graph_construction()
     test_initializer_body_frame()
     test_frozen_expert_stays_eval()
+    test_frozen_expert_features_preserve_scores_gradients_and_hook_cleanup()
+    test_failed_expert_policy_configuration_preserves_the_live_policy()
     test_score_guard_handles_infinity()
     test_reflect_pipeline()
     test_deepternary_dockq_alignment()
