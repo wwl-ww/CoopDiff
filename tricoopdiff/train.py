@@ -23,7 +23,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from .model import TriCoopDiff
-from .sdpi_flow import SDPIFlow
+from .sdpi_flow import INDEPENDENT_RIGID_MODE, LEGACY_RIGID_MODE, SDPIFlow
 
 
 class NonFiniteTrainingError(FloatingPointError):
@@ -65,8 +65,15 @@ class TriCoopDiffTrainer:
             raise ValueError("torsion_expert_aux_weight must be non-negative")
         self.torsion_expert_aux_weight = float(torsion_expert_aux_weight)
         # Only TriFuse is trainable; experts are frozen
+        fuse_parameters = list(model.trifuse.parameters())
+        if getattr(model.trifuse, 'direct_ternary_motion', False):
+            for name in ('judge_head', 'state_head'):
+                head = getattr(model.trifuse, name, None)
+                if head is not None:
+                    head.requires_grad_(False)
+            fuse_parameters = [parameter for parameter in fuse_parameters if parameter.requires_grad]
         parameter_groups = [{
-            'params': list(model.trifuse.parameters()),
+            'params': fuse_parameters,
             'lr': lr,
             'name': 'trifuse',
         }]
@@ -83,6 +90,7 @@ class TriCoopDiffTrainer:
         )
 
         self.global_step = 0
+        self.samples_seen = 0
         self.resume_epoch = 0
         self.resume_best_val_loss = float('inf')
 
@@ -141,6 +149,11 @@ class TriCoopDiffTrainer:
             e3_data, poi_data, ligand_data, ligand, poi, body, t, dt, source, conditions,
         )
         predictions = self.diffusion.normalized_predictions(output, t)
+        output_mode = predictions.get('rigid_output_mode', LEGACY_RIGID_MODE)
+        if output_mode == INDEPENDENT_RIGID_MODE:
+            targets = self.diffusion.independent_targets(targets, ligand, poi)
+        elif output_mode != LEGACY_RIGID_MODE:
+            raise ValueError(f'unknown rigid training output mode: {output_mode!r}')
         scales = self.diffusion.scales(e3_data['coords'], poi_data['coords'])
         losses = {}
         rms = {}
@@ -180,19 +193,35 @@ class TriCoopDiffTrainer:
             losses['loss_residual'] = output['residual_penalty']
             total = total + self.residual_weight * losses['loss_residual']
         if diagnostics:
-            return {'loss_total': total, 'components': losses, 'rms': rms}
+            return {'loss_total': total, 'components': losses, 'rms': rms,
+                    'rigid_output_mode': output_mode}
         return {'loss_total': total, 'loss_score': total.item(),
                 **{name: value.item() for name, value in losses.items()}}
 
     def train_step(self, **batch) -> dict:
         """Forward + backward + optimizer step."""
+        return self.train_batch([batch])[0]
+
+    def train_batch(self, batches) -> list:
+        """Mean microbatch gradient, one optimizer step, bounded graph memory."""
+        if not batches:
+            raise ValueError('training batch must contain at least one complex')
         self.model.train()  # dropout / attention dropout active during training
-        self.optimizer.zero_grad()
-        loss_dict = self.compute_loss(**batch)
-        total = loss_dict['loss_total']
-        if not torch.isfinite(total):
-            raise NonFiniteTrainingError("non-finite total loss")
-        total.backward()
+        self.optimizer.zero_grad(set_to_none=True)
+        results = []
+        try:
+            for batch in batches:
+                loss_dict = self.compute_loss(**batch)
+                total = loss_dict['loss_total']
+                if not torch.isfinite(total):
+                    raise NonFiniteTrainingError('non-finite total loss')
+                (total / len(batches)).backward()
+                results.append({k: v.item() if torch.is_tensor(v) else v
+                                for k, v in loss_dict.items()})
+                del loss_dict, total
+        except Exception:
+            self.optimizer.zero_grad(set_to_none=True)
+            raise
         trainable = [
             parameter
             for group in self.optimizer.param_groups
@@ -205,10 +234,12 @@ class TriCoopDiffTrainer:
             raise NonFiniteTrainingError("non-finite trainable gradients")
         self.optimizer.step()
         self.global_step += 1
-
-        result = {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
-        result['lr'] = self.optimizer.param_groups[0]['lr']
-        return result
+        self.samples_seen += len(batches)
+        for result in results:
+            result['lr'] = self.optimizer.param_groups[0]['lr']
+            result['grad_norm'] = float(grad_norm)
+            result['optimizer_batch_size'] = len(batches)
+        return results
 
     @torch.no_grad()
     def validate_step(self, **batch) -> dict:

@@ -106,7 +106,7 @@ class EvaluationRunner:
         )
         self.model = None
         self.input_dim = None
-        self.diffusion = SDPIFlow()
+        self.diffusion = SDPIFlow(inference_steps=self.checkpoint['runtime_config'].get('inference_steps', 20))
         self.initializer = TernaryInitializer(
             no_torsion=getattr(self.score_model_args, "no_torsion", False),
             conformer_policy=conformer_policy,
@@ -245,7 +245,15 @@ class EvaluationRunner:
             "checkpoint_schema": (
                 "conditioned_consensus_training_v1_ema" if self.conditioned_checkpoint else
                 "experimental_factorial_v1_ema" if self.experimental_checkpoint else
-                "production_v18_ema"),
+                f"production_v{self.checkpoint['checkpoint_version']}_ema"),
+            "architecture": self.checkpoint['architecture'],
+            "rigid_output_mode": ("independent_centroids_v1"
+                                  if self.checkpoint['model_config'].get('direct_ternary_motion', False)
+                                  else "dual_interfaces_v1"),
+            "weight_origin": ("raw_no_ema"
+                              if self.checkpoint.get('checkpoint_kind') == 'inference_only'
+                              and self.checkpoint['runtime_config'].get('ema_decay') == 0
+                              else "ema"),
             "condition_manifest": (str(condition_path.resolve()) if condition_path else None),
             "condition_manifest_sha256": (sha256_file(condition_path) if condition_path else None),
             "condition_audit": condition_audit,

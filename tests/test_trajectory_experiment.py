@@ -32,6 +32,7 @@ from tricoopdiff.trajectory_experiment import (
     StagedPOITrajectoryTrainer,
     TrajectoryConsistencyTrainer,
     differentiable_sdpi_step,
+    remaining_centroid_loss,
     joint_endpoint_translation_loss,
     prior_replay_schedule,
     staged_poi_state_loss,
@@ -77,6 +78,46 @@ def test_differentiable_step_matches_production_solver():
             value - reference).abs().max()
 
 
+def test_remaining_centroid_loss_uses_exact_independent_motion_and_gradients():
+    from tricoopdiff.sdpi_flow import INDEPENDENT_RIGID_MODE
+
+    ligand, poi, body, data, velocities = example()
+    velocities['rigid_output_mode'] = INDEPENDENT_RIGID_MODE
+    time = ligand.new_tensor([.4])
+    scales = ligand.new_tensor([10., 15.])
+    target_ligand, target_poi, _ = SDPIFlow.step(ligand, poi, body, velocities, time, data)
+    loss = remaining_centroid_loss(ligand, poi, velocities, time, target_ligand, target_poi, scales)
+    assert loss < 1e-20, 'rotation and torsion must not change the supervised centroid'
+    rotation = torch.linalg.matrix_exp(torch.tensor([[0., -.3, .2], [.3, 0., -.1], [-.2, .1, 0.]], dtype=ligand.dtype))
+    moved = {**velocities, **{b: {**velocities[b], 'tr': velocities[b]['tr'] @ rotation.T}
+                            for b in ('e3_ligand', 'poi_ligand')}}
+    reference = remaining_centroid_loss(ligand, poi, velocities, time, ligand, poi, scales)
+    transformed = remaining_centroid_loss(ligand @ rotation.T + 10, poi @ rotation.T + 10,
+                                         moved, time, ligand @ rotation.T + 10,
+                                         poi @ rotation.T + 10, scales)
+    assert torch.allclose(reference, transformed, atol=1e-12)
+    for branch in ('e3_ligand', 'poi_ligand'):
+        velocities[branch]['tr'] = velocities[branch]['tr'].clone().requires_grad_()
+    loss = remaining_centroid_loss(ligand, poi, velocities, time, ligand, poi, scales)
+    loss.backward()
+    for branch in ('e3_ligand', 'poi_ligand'):
+        grad = velocities[branch]['tr'].grad
+        assert torch.isfinite(grad).all() and grad.abs().sum() > 0
+    zero = remaining_centroid_loss(ligand, poi, velocities, time * 0, ligand, poi, scales)
+    assert zero == 0 and torch.isfinite(zero), 'no inverse-time singularity is allowed'
+
+
+def test_remaining_centroid_loss_rejects_legacy_motion():
+    ligand, poi, _, _, velocities = example()
+    try:
+        remaining_centroid_loss(ligand, poi, velocities, ligand.new_tensor([.5]),
+                                ligand, poi, ligand.new_tensor([10., 15.]))
+    except ValueError as error:
+        assert 'independent' in str(error)
+    else:
+        raise AssertionError('dual-interface velocities do not independently move the POI centroid')
+
+
 def test_gradients_cross_two_differentiable_steps():
     ligand, poi, body, ligand_data, velocities = example()
     leaves = []
@@ -113,6 +154,16 @@ def test_differentiable_step_supports_no_torsion_graphs():
         ligand, poi, body, velocities, dt, ligand_data)
     for value, reference in zip(actual, expected):
         assert torch.allclose(value, reference, atol=1e-12, rtol=1e-12)
+
+
+def test_no_torsion_output_can_disable_existing_rotatable_bonds():
+    ligand, poi, body, ligand_data, velocities = example()
+    assert bool(ligand_data['edge_mask'].any())
+    velocities['torsion'] = ligand.new_empty((1, 0))
+    dt = ligand.new_tensor([.05])
+    actual = SDPIFlow.differentiable_step(ligand, poi, body, velocities, dt, ligand_data)
+    expected = SDPIFlow.step(ligand, poi, body, velocities, dt, ligand_data)
+    assert all(torch.allclose(a, b, atol=1e-12) for a, b in zip(actual, expected))
 
 
 def test_trajectory_contract_has_checkpoint_identity():

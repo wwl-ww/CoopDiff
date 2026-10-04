@@ -279,11 +279,14 @@ def sample_single(
             velocities[branch]['rot'] = (
                 velocities[branch]['rot'] * rotation_velocity_scale)
         if velocity_transform is not None:
+            original_mode = velocities.get('rigid_output_mode', 'dual_interfaces_v1')
             velocities = velocity_transform(
                 velocities, ligand_pos, poi_pos, r_e3_to_poi,
                 t_tr, dt_tr, ligand_data)
             if not isinstance(velocities, dict):
                 raise TypeError("velocity_transform must return a velocity dictionary")
+            if velocities.get('rigid_output_mode', 'dual_interfaces_v1') != original_mode:
+                raise ValueError('velocity_transform must preserve the rigid output mode')
         interface_scores = velocities
         s_q = {}
         sanitized_components = []
@@ -319,9 +322,12 @@ def sample_single(
             break
 
         add_noise = False  # deterministic reverse flow, not temperature SDE
+        step_velocities = {'e3_ligand': s_q, 'poi_ligand': s_pol, 'torsion': s_q['tor']}
+        if 'rigid_output_mode' in velocities:
+            step_velocities['rigid_output_mode'] = velocities['rigid_output_mode']
         ligand_pos, poi_pos, r_e3_to_poi = diffusion.step(
             ligand_pos, poi_pos, r_e3_to_poi,
-            {'e3_ligand': s_q, 'poi_ligand': s_pol, 'torsion': s_q['tor']},
+            step_velocities,
             dt_tr, ligand_data, freeze_poi=freeze_poi,
         )
 
@@ -334,6 +340,7 @@ def sample_single(
                 "add_noise": add_noise,
                 "sanitized_components": sanitized_components,
                 "freeze_poi": bool(freeze_poi),
+                "rigid_output_mode": velocities.get('rigid_output_mode', 'dual_interfaces_v1'),
                 "t": {
                     "tr": float(t_tr.item()),
                     "rot": float(t_rot.item()),

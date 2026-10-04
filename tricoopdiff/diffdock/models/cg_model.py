@@ -328,7 +328,10 @@ class CGModel(torch.nn.Module):
         lr_edge_attr = self.cross_edge_embedding(lr_edge_attr)
 
         node_attr = torch.cat([lig_node_attr, rec_node_attr], dim=0)
-        lr_edge_index[1] = lr_edge_index[1] + len(lig_node_attr)
+        # Cross-geometry autograd saves the original indices for coordinate
+        # gathers. Do not mutate them when switching to combined-node indices.
+        lr_edge_index = torch.stack((lr_edge_index[0],
+                                     lr_edge_index[1] + len(lig_node_attr)))
         edge_index = torch.cat([lig_edge_index, lr_edge_index, rec_edge_index + len(lig_node_attr),
                                 torch.flip(lr_edge_index, dims=[0])], dim=1)
         edge_attr = torch.cat([lig_edge_attr, lr_edge_attr, rec_edge_attr, lr_edge_attr], dim=0)

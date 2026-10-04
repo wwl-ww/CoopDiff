@@ -5,6 +5,7 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .diffdock.constants import lig_feature_dims
 
@@ -98,14 +99,20 @@ class TernaryGeometryEncoder(nn.Module):
     the nearest ``max_pair_tokens`` contacts and fuse both endpoint features
     with an RBF encoding of their separation.  Only scalar distances enter this
     controller, so the resulting context remains invariant to a common rigid
-    transform; equivariant rigid scores remain owned by the experts.
+    transform. Optional unpooled protein contacts retain directions and levers
+    for a separate equivariant motion head.
     """
 
     PAIRS = ((0, 2), (1, 2), (0, 1))  # E3-L, POI-L, E3-POI
+    RBF_CHUNK_SIZE = 65536
 
     def __init__(self, input_dim: int, hidden_dim: int = 128,
                  n_rbf: int = 16, max_distance: float = 40.0,
-                 max_pair_tokens: int = 24, contacts_per_ligand: int = 4):
+                 max_pair_tokens: int = 24, contacts_per_ligand: int = 4,
+                 joint_geometry: bool = False,
+                 global_node_context: bool = False,
+                 spatial_geometry: bool = False,
+                 global_node_attention: bool = False):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.n_rbf = n_rbf
@@ -163,12 +170,157 @@ class TernaryGeometryEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim * 2, hidden_dim),
         )
+        self.joint_geometry = bool(joint_geometry)
+        self.global_node_context = bool(global_node_context)
+        self.spatial_geometry = bool(spatial_geometry)
+        self.global_node_attention = bool(global_node_attention)
+        self.edge_geometry_dim = n_rbf + 1 + (8 if self.spatial_geometry else 0)
+        if self.global_node_context and not self.joint_geometry:
+            raise ValueError('global node context requires joint geometry')
+        if self.spatial_geometry and not self.joint_geometry:
+            raise ValueError('spatial geometry requires joint geometry')
+        if self.global_node_attention and not self.joint_geometry:
+            raise ValueError('global node attention requires joint geometry')
+        if self.joint_geometry:
+            self.messages = nn.ModuleList([
+                nn.Sequential(nn.Linear(2 * hidden_dim + self.edge_geometry_dim, hidden_dim),
+                              nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+                for _ in range(2)
+            ])
+            self.message_updates = nn.ModuleList([
+                nn.Sequential(nn.Linear(2 * hidden_dim, hidden_dim), nn.SiLU(),
+                              nn.LayerNorm(hidden_dim)) for _ in range(2)
+            ])
+            if self.global_node_attention:
+                heads = 4 if hidden_dim % 4 == 0 else 1
+                self.global_attention = nn.ModuleList([
+                    nn.MultiheadAttention(hidden_dim, heads, dropout=0., batch_first=True)
+                    for _ in range(2)
+                ])
+                self.global_attention_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(2)])
+                for attention in self.global_attention:
+                    nn.init.zeros_(attention.out_proj.weight)
+                    nn.init.zeros_(attention.out_proj.bias)
+            if self.global_node_context:
+                # Fixed E3/POI/ligand slots preserve component identity instead
+                # of averaging three interfaces into one indistinguishable token.
+                self.global_updates = nn.ModuleList([
+                    nn.Sequential(nn.LayerNorm(4 * hidden_dim),
+                                  nn.Linear(4 * hidden_dim, hidden_dim), nn.SiLU(),
+                                  nn.Linear(hidden_dim, hidden_dim))
+                    for _ in range(2)
+                ])
+                # An explicitly initialized upgrade is identity until learned.
+                for update in self.global_updates:
+                    nn.init.zeros_(update[-1].weight)
+                    nn.init.zeros_(update[-1].bias)
+
+    def _component_context(self, features, types):
+        """Differentiable summaries of every node, in fixed component order."""
+        tokens = []
+        for component in range(3):
+            nodes = features[types == component]
+            attention = torch.softmax(nodes @ self.component_queries[component], dim=0)
+            tokens.append((nodes.mean(0) + (nodes * attention[:, None]).sum(0)) / 2)
+        return torch.cat(tokens, dim=-1)
+
+    def _spatial_edge_geometry(self, coords, types, receiver, direction):
+        """Eight SE(3)-invariant features anchoring each edge in the full complex.
+
+        Ordered center distances and edge/center angles supply global position;
+        the own-center angle exposes radial versus tangential contacts. A signed
+        triple product distinguishes handedness without using laboratory axes.
+        All centers come from the current prediction, never the native target.
+        """
+        centers = torch.stack([coords[types == component].mean(0) for component in range(3)])
+        offsets = centers[None] - coords[receiver, None]
+        distances = torch.linalg.vector_norm(offsets, dim=-1)
+        # A node can coincide with a component center. Softening at 1 A avoids
+        # the 1/epsilon coordinate derivatives of a normalized zero vector.
+        axes = offsets / torch.sqrt(offsets.square().sum(-1, keepdim=True) + 1.0)
+        angles = (axes * direction[:, None]).sum(-1)
+        own_axis = axes[torch.arange(len(receiver), device=coords.device), types[receiver]]
+        radial_angle = (own_axis * direction).sum(-1, keepdim=True)
+        handedness = (torch.cross(axes[:, 0], axes[:, 1], dim=-1) * direction).sum(-1, keepdim=True)
+        return torch.cat((torch.log1p(distances / self.max_distance),
+                          angles, radial_angle, handedness), dim=-1)
+
+    def _joint_contacts(self, features, coords, types):
+        """Typed kNN messages, including every component even when far apart.
+
+        Edges point from receiver to sender. Distances encode scalar features;
+        directions are retained for the equivariant motion readout, not pooled.
+        """
+        receivers, senders = [], []
+        all_indices = torch.arange(len(coords), device=coords.device)
+        for component in range(3):
+            candidates = all_indices[types == component]
+            if not len(candidates):
+                raise ValueError('joint geometry requires all three components')
+            distances = torch.cdist(coords, coords[candidates])
+            distances = distances.masked_fill(all_indices[:, None] == candidates[None], float('inf'))
+            values, local = distances.topk(min(4, len(candidates)), largest=False, dim=1)
+            receiver = all_indices[:, None].expand_as(local)
+            valid = torch.isfinite(values)
+            receivers.append(receiver[valid])
+            senders.append(candidates[local[valid]])
+        receiver, sender = torch.cat(receivers), torch.cat(senders)
+        delta = coords[sender] - coords[receiver]
+        distance = torch.linalg.vector_norm(delta, dim=-1)
+        geometry = torch.cat((
+            torch.exp(-0.5 * ((distance[:, None] - self.rbf_centers) / self.rbf_width) ** 2),
+            torch.log1p(distance[:, None] / self.max_distance)), dim=-1)
+        direction = F.normalize(delta, dim=-1, eps=1e-8)
+        if self.spatial_geometry:
+            geometry = torch.cat((geometry, self._spatial_edge_geometry(
+                coords, types, receiver, direction)), dim=-1)
+        counts = features.new_zeros(len(coords), 1).index_add(
+            0, receiver, features.new_ones(len(receiver), 1)).clamp_min(1)
+        for layer, (message, update) in enumerate(zip(self.messages, self.message_updates)):
+            edge_features = message(torch.cat((features[receiver], features[sender], geometry), -1))
+            aggregate = torch.zeros_like(features).index_add(0, receiver, edge_features) / counts
+            features = features + update(torch.cat((features, aggregate), -1))
+            if self.global_node_attention:
+                # No pooled bottleneck: each node reads the detailed features of
+                # every other node. need_weights=False enables PyTorch's SDPA
+                # kernels instead of returning an N*N attention-weight tensor.
+                nodes = self.global_attention_norms[layer](features).unsqueeze(0)
+                attention, _ = self.global_attention[layer](nodes, nodes, nodes, need_weights=False)
+                features = features + attention[0]
+            if self.global_node_context:
+                context = self._component_context(features, types).expand(len(features), -1)
+                features = features + self.global_updates[layer](torch.cat((features, context), -1))
+        return features, {'receiver': receiver, 'sender': sender,
+                          'geometry': geometry,
+                          'direction': direction,
+                          'features': features}
+
+    def _distance_rbf_sum(self, distances):
+        offsets = distances[:, None] - self.rbf_centers[None, :]
+        return torch.exp(-0.5 * (offsets / self.rbf_width) ** 2).sum(0)
+
+    def _distance_histogram(self, distances):
+        """Exact all-pair histogram without retaining all N*M*RBF activations.
+
+        Checkpoint each chunk independently so backward also recomputes bounded
+        chunks, rather than rebuilding the full histogram activation at once.
+        Evaluation uses ordinary chunked operations and needs no checkpoint.
+        """
+        if distances.numel() <= self.RBF_CHUNK_SIZE:
+            return self._distance_rbf_sum(distances) / distances.numel()
+        total = distances.new_zeros(self.n_rbf)
+        for chunk in distances.split(self.RBF_CHUNK_SIZE):
+            if torch.is_grad_enabled() and chunk.requires_grad:
+                total = total + checkpoint(self._distance_rbf_sum, chunk,
+                                           use_reentrant=False)
+            else:
+                total = total + self._distance_rbf_sum(chunk)
+        return total / distances.numel()
 
     def _pair_descriptor(self, coords_a: torch.Tensor,
                          coords_b: torch.Tensor) -> torch.Tensor:
         distances = torch.cdist(coords_a, coords_b).reshape(-1)
-        offsets = distances[:, None] - self.rbf_centers[None, :]
-        rbf = torch.exp(-0.5 * (offsets / self.rbf_width) ** 2).mean(dim=0)
+        rbf = self._distance_histogram(distances)
         scale = self.max_distance
         statistics = torch.stack((
             distances.min() / scale,
@@ -187,7 +339,8 @@ class TernaryGeometryEncoder(nn.Module):
         features_b: torch.Tensor,
         coords_b: torch.Tensor,
         pair_index: int,
-    ) -> torch.Tensor:
+        return_contacts: bool = False,
+    ):
         """Pool the closest feature-labelled contacts for one interface."""
         distances = torch.cdist(coords_a, coords_b)
         n_pairs = distances.numel()
@@ -208,11 +361,14 @@ class TernaryGeometryEncoder(nn.Module):
         attention = torch.softmax(
             pair_features @ self.pair_queries[pair_index], dim=0,
         )
-        return (
+        pooled = (
             (pair_features * attention[:, None]).sum(dim=0)
             + pair_features.mean(dim=0)
             + pair_features.max(dim=0).values
         ) / 3.0
+        if return_contacts:
+            return pooled, pair_features, coords_a[index_a], coords_b[index_b]
+        return pooled
 
     def _ligand_centric_contacts(
         self,
@@ -279,7 +435,8 @@ class TernaryGeometryEncoder(nn.Module):
 
     def forward(self, node_features: torch.Tensor, node_coords: torch.Tensor,
                 node_types: torch.Tensor, batch: torch.Tensor = None,
-                lig_edge_index: torch.Tensor = None, node_residual: torch.Tensor = None) -> dict:
+                lig_edge_index: torch.Tensor = None, node_residual: torch.Tensor = None,
+                return_protein_pair_contacts: bool = False) -> dict:
         if batch is None:
             batch = torch.zeros(
                 node_features.shape[0], dtype=torch.long,
@@ -303,10 +460,17 @@ class TernaryGeometryEncoder(nn.Module):
             # Apply only after categorical atom encoding, never to raw category IDs.
             features = features + node_residual
 
+        joint = None
+        if self.joint_geometry:
+            if bool((batch != 0).any()):
+                raise ValueError('joint geometry currently requires one complex')
+            features, joint = self._joint_contacts(features, node_coords, node_types)
+
         global_outputs = []
         e3l_outputs = []
         pol_outputs = []
         ligand_token_outputs = []
+        protein_pair_outputs = []
         n_batch = int(batch.max().item()) + 1
         for batch_index in range(n_batch):
             batch_mask = batch == batch_index
@@ -360,13 +524,25 @@ class TernaryGeometryEncoder(nn.Module):
                     component_coords[2], lig_edge_index,
                 ),
             ), dim=-1))
+            protein_pair = self._local_pair_token(
+                component_features_by_type[0], component_coords[0],
+                component_features_by_type[1], component_coords[1], 2,
+                return_contacts=return_protein_pair_contacts,
+            )
+            if return_protein_pair_contacts:
+                pair_token, contact_tokens, left, right = protein_pair
+                protein_pair_outputs.append({
+                    'tokens': contact_tokens,
+                    'direction': F.normalize(right - left, dim=-1, eps=1e-8),
+                    # All rigid updates rotate about the ligand center.
+                    'lever': ((left + right) / 2 - component_coords[2].mean(0)) / 10.0,
+                })
+            else:
+                pair_token = protein_pair
             local_pair_tokens = [
                 e3_contacts.mean(dim=0),
                 pol_contacts.mean(dim=0),
-                self._local_pair_token(
-                    component_features_by_type[0], component_coords[0],
-                    component_features_by_type[1], component_coords[1], 2,
-                ),
+                pair_token,
             ]
             geometry = torch.cat((
                 *pair_descriptors, torch.stack(component_descriptors),
@@ -384,9 +560,14 @@ class TernaryGeometryEncoder(nn.Module):
                 local_pair_tokens[1], geometry_token,
             ))))
             ligand_token_outputs.append(ligand_tokens)
-        return {
+        result = {
             "global": torch.stack(global_outputs, dim=0),
             "e3l": torch.stack(e3l_outputs, dim=0),
             "pol": torch.stack(pol_outputs, dim=0),
             "ligand_tokens": ligand_token_outputs,
         }
+        if return_protein_pair_contacts:
+            result['protein_pair_contacts'] = protein_pair_outputs
+        if joint is not None:
+            result['joint_geometry'] = joint
+        return result

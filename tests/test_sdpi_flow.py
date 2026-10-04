@@ -88,6 +88,28 @@ def test_flow_oracle_roundtrip_refines_with_steps():
     assert errors[1] < errors[0] * 0.65, errors
 
 
+def test_independent_targets_match_actual_path_and_both_decoders():
+    from tricoopdiff.trajectory_experiment import differentiable_sdpi_step
+
+    for smiles in ('CCCOCC', 'c1ccccc1'):
+        flow, data, _, b, coupling = fixture(smiles)
+        for value in (.1, .47, .9):
+            time = torch.tensor([value], dtype=torch.float64)
+            ligand, poi, body, teacher = flow.path(data, b, coupling, time)
+            independent = flow.independent_targets(teacher, ligand, poi)
+            errors = []
+            for h in (1e-3, 5e-4):
+                dt = time.new_tensor([h])
+                actual = flow.step(ligand, poi, body, independent, dt, data)
+                expected = flow.path(data, b, coupling, time - dt)
+                errors.append(max(float((actual[i] - expected[i]).abs().max()) for i in (0, 1)))
+                # Decoder parity includes nonzero torsions and body-frame updates.
+                differentiable = differentiable_sdpi_step(ligand, poi, body, independent, dt, data)
+                assert all(torch.allclose(a, d, atol=1e-8) for a, d in zip(actual, differentiable))
+            assert errors[-1] < 3e-4, (smiles, value, errors)
+            assert errors[-1] < .4 * errors[0] + 1e-10, (smiles, value, errors)
+
+
 def test_flow_normalization_and_conditioning_agree():
     flow, data, a, b, _ = fixture()
     t = torch.tensor([0.6], dtype=torch.float64)

@@ -19,6 +19,8 @@ from .rigid import assemble_interface_pair
 
 FLOW_VERSION = 'sdpi_flow_v1'
 CHECKPOINT_VERSION = 17
+INDEPENDENT_RIGID_MODE = 'independent_centroids_v1'
+LEGACY_RIGID_MODE = 'dual_interfaces_v1'
 
 
 def _check_coords(coords):
@@ -170,7 +172,100 @@ class SDPIFlow:
             result[name] = {'tr': normalized[name]['tr'] * scales[i],
                             'rot': normalized[name]['rot'] * math.pi}
         result['torsion'] = normalized['torsion'] * math.pi
+        if 'rigid_output_mode' in normalized:
+            result['rigid_output_mode'] = normalized['rigid_output_mode']
         return result
+
+    @staticmethod
+    def independent_targets(targets, ligand, poi):
+        """Express the same forward path in ligand/POI centroid coordinates."""
+        a, b = targets['e3_ligand'], targets['poi_ligand']
+        angular = a['rot'] - b['rot']
+        lever = poi.mean(1) - ligand.mean(1)
+        return {'e3_ligand': dict(a),
+                'poi_ligand': {'tr': a['tr'] - b['tr'] + torch.cross(angular, lever, dim=-1),
+                               'rot': angular},
+                'torsion': targets['torsion'],
+                'rigid_output_mode': INDEPENDENT_RIGID_MODE}
+
+    @staticmethod
+    def rigid_step(ligand, poi, body, velocities, dt, freeze_poi=False):
+        """Shared differentiable rigid decoder for production and training."""
+        mode = velocities.get('rigid_output_mode', LEGACY_RIGID_MODE)
+        if mode not in (LEGACY_RIGID_MODE, INDEPENDENT_RIGID_MODE):
+            raise ValueError(f'unknown rigid output mode: {mode!r}')
+        transforms = []
+        for index, branch in enumerate(('e3_ligand', 'poi_ligand')):
+            velocity = velocities[branch]
+            for component in ('tr', 'rot'):
+                if velocity[component].shape != (1, 3) or not torch.isfinite(velocity[component]).all():
+                    raise ValueError('rigid velocities must be finite [1, 3]')
+            pivot = (poi if mode == INDEPENDENT_RIGID_MODE and index == 1 else ligand).mean(1)
+            rotation = _rotation_exp(-dt[:, None] * velocity['rot'])
+            offset = pivot - dt[:, None] * velocity['tr'] - (rotation @ pivot[..., None]).squeeze(-1)
+            transforms.append((rotation, offset))
+        (ra, ta), (rb, tb) = transforms
+        rigid = ligand @ ra.transpose(-1, -2) + ta[:, None]
+        if not freeze_poi:
+            if mode == INDEPENDENT_RIGID_MODE:
+                poi = poi @ rb.transpose(-1, -2) + tb[:, None]
+                body = rb @ body
+            else:
+                poi, increment = assemble_interface_pair(poi, ra, ta, rb, tb)
+                body = increment @ body
+        return rigid, poi, body
+
+    @staticmethod
+    def differentiable_step(ligand, poi, body, velocities, dt, ligand_data,
+                            freeze_poi=False):
+        """Execute the production rigid/torsion contract without detaching inputs."""
+        from .pose_anchors import proper_rigid_fit
+        from .rigid import apply_rigid
+
+        _check_coords(ligand)
+        _check_coords(poi)
+        if (body.shape != (1, 3, 3) or not torch.isfinite(body).all()
+                or dt.shape != (1,) or not torch.isfinite(dt).all()
+                or not bool((dt > 0).all())):
+            raise ValueError('finite body/dt must be [1,3,3]/[1] with positive dt')
+        rigid, poi, body = SDPIFlow.rigid_step(ligand, poi, body, velocities, dt, freeze_poi)
+        _check_coords(rigid)
+        _check_coords(poi)
+        if not torch.isfinite(body).all():
+            raise FloatingPointError('non-finite flow body frame')
+        torsion = velocities['torsion']
+        # A no_torsion expert can disable torsions even when the chemical graph
+        # contains rotatable bonds. Match the production empty-output contract.
+        if torsion.shape == (1, 0):
+            return rigid, poi, body
+        bonds = ligand_data['edge_index'].T[ligand_data['edge_mask']].to(
+            device=ligand.device, dtype=torch.long)
+        masks = ligand_data['mask_rotate']
+        if isinstance(masks, (list, tuple)):
+            masks = masks[0]
+        if masks is None and not len(bonds):
+            masks = torch.empty(0, ligand.shape[1], dtype=torch.bool, device=ligand.device)
+        else:
+            masks = torch.as_tensor(masks, dtype=torch.bool, device=ligand.device)
+        if (torsion.shape != (1, len(bonds)) or not torch.isfinite(torsion).all()
+                or masks.shape != (len(bonds), ligand.shape[1])):
+            raise ValueError('finite torsion velocities and ligand graph sizes must agree')
+        raw = rigid
+        for index, (u, v) in enumerate(bonds):
+            axis = raw[:, u] - raw[:, v]
+            norm = torch.linalg.vector_norm(axis, dim=-1, keepdim=True)
+            if bool((norm <= 1e-10).any()):
+                raise ValueError('degenerate torsion axis')
+            rotation = _rotation_exp(axis / norm * (-dt * torsion[:, index])[:, None])
+            pivot = raw[:, v:v + 1]
+            moved = (raw - pivot) @ rotation.transpose(-1, -2) + pivot
+            raw = torch.where(masks[index][None, :, None], moved, raw)
+        if len(bonds):
+            rotation, translation, _ = proper_rigid_fit(raw, rigid)
+            rigid = apply_rigid(raw, rotation, translation)
+        _check_coords(rigid)
+        _check_coords(poi)
+        return rigid, poi, body
 
     @staticmethod
     def sample_coupling(e3_coords, poi_coords, ligand_data, no_torsion=False):
@@ -232,22 +327,7 @@ class SDPIFlow:
         _check_coords(poi)
         if dt.shape != (1,) or not torch.isfinite(dt).all() or not bool((dt > 0).all()):
             raise ValueError('flow step must be one finite positive dt')
-        old_center = ligand.mean(1)
-        transforms = []
-        for branch in ('e3_ligand', 'poi_ligand'):
-            velocity = velocities[branch]
-            for component in ('tr', 'rot'):
-                if velocity[component].shape != (1, 3) or not torch.isfinite(velocity[component]).all():
-                    raise ValueError('rigid velocities must be finite [1, 3]')
-            rotation = _rotation_exp(-dt[:, None] * velocity['rot'])
-            center = old_center - dt[:, None] * velocity['tr']
-            offset = center - (rotation @ old_center[..., None]).squeeze(-1)
-            transforms.append((rotation, offset))
-        (ra, ta), (rb, tb) = transforms
-        rigid = ligand @ ra.transpose(-1, -2) + ta[:, None]
-        if not freeze_poi:
-            poi, increment = assemble_interface_pair(poi, ra, ta, rb, tb)
-            body = increment @ body
+        rigid, poi, body = SDPIFlow.rigid_step(ligand, poi, body, velocities, dt, freeze_poi)
         torsion = velocities['torsion']
         n_bonds = int(ligand_data['edge_mask'].sum())
         if (torsion.ndim != 2 or torsion.shape[0] != 1 or torsion.shape[1] not in (0, n_bonds)
