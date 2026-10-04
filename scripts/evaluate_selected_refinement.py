@@ -19,6 +19,16 @@ _bootstrap.add_argument("--runtime-root")
 _bootstrap.add_argument("--project-root")
 _runtime_args, _ = _bootstrap.parse_known_args()
 RUNTIME_ROOT = Path(_runtime_args.runtime_root or Path(__file__).resolve().parent.parent).resolve()
+
+
+def configure_runtime_cache(project_root):
+    """Keep numerical DiffDock tables tied to the asset repository."""
+    root = Path(project_root or Path(__file__).resolve().parent.parent).resolve()
+    os.environ.setdefault(
+        'TRICOOPDIFF_CACHE_DIR', str(root / 'results/runtime_cache/diffdock'))
+
+
+configure_runtime_cache(_runtime_args.project_root)
 sys.path.insert(0, str(RUNTIME_ROOT / "scripts"))
 sys.path.insert(0, str(RUNTIME_ROOT))
 import tricoopdiff.diffdock_compat  # noqa: E402,F401
@@ -29,16 +39,17 @@ import torch
 from evaluation_common import evaluation_input_signature, resolve_entry_paths, sha256_file
 from evaluation_runner import EvaluationRunner
 from featurize_common import featurize_complex
-from tricoopdiff.deepternary_metrics import compute_fullatom_dockq
-from tricoopdiff.expert_anchors import (
+from tricoopdiff.metrics.dockq import compute_fullatom_dockq
+from tricoopdiff.initialization.candidates import (
     DualExpertAnchorInitializer, FixedCandidateInitializer,
     generate_hybrid_candidates, select_hybrid_walkers,
 )
 from tricoopdiff.sampler import sample_single
+from tricoopdiff.runtime import atomic_json
 
 
 ROOT = Path(_runtime_args.project_root or Path(__file__).resolve().parent.parent).resolve()
-PROTOCOL = "bitseed_hybrid_selected_refinement_v3"
+PROTOCOL = "bitseed_hybrid_selected_refinement_v4"
 
 
 def parser():
@@ -66,20 +77,25 @@ def parser():
     result.add_argument("--binary-consecutive-failure-limit", type=int, default=3)
     result.add_argument("--max-refinements", type=int, help="Smoke-only cap on the union")
     result.add_argument(
+        "--arms",
+        default="sdpi_64,bitseed_diversity_64,geometry_64,diversity_64,hybrid_48_16,hybrid_56_8",
+        help="Comma-separated selector arms to refine and report",
+    )
+    result.add_argument(
         "--refine-full-pool", action="store_true",
         help="Refine all 256 candidates so every selector has a counterfactual final label",
     )
     result.add_argument("--allow-experimental-checkpoint", action="store_true")
+    result.add_argument("--allow-conditioned-checkpoint", action="store_true")
+    result.add_argument(
+        "--condition-manifest-dir",
+        help="Directory containing one <case>.json deploy manifest per case",
+    )
     result.add_argument("--no-resume", action="store_true",
                         help="Run without reusing case reports; requires no existing case outputs")
     return result
 
 
-def atomic_json(payload, destination):
-    destination = Path(destination)
-    temporary = destination.with_suffix(destination.suffix + f".tmp.{os.getpid()}")
-    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(destination)
 
 
 def source(candidate):
@@ -150,6 +166,49 @@ def resolve_case_inputs(entry, project_root, native_root):
     return paths, native.resolve(), metric_paths
 
 
+def preflight_condition_manifests(condition_paths, case_inputs):
+    """Validate every deploy manifest against actual graph inputs up front.
+
+    This is intentionally CPU-only and does not read native ternary structures.
+    It mirrors DiffDock's ProDy receptor-node selection so a modified residue or
+    stale manifest cannot waste completed refinements before failing on shape.
+    """
+    if set(condition_paths) != set(case_inputs):
+        raise ValueError('condition preflight requires one manifest per case')
+    from rdkit import Chem
+    import prody as pr
+    from tricoopdiff.conditioning.condition_features import load_condition_manifest
+    from tricoopdiff.diffdock.datasets.parse_chi import get_coords
+    from tricoopdiff.diffdock.datasets.process_mols import read_molecule
+
+    result = {}
+    for case, condition_path in condition_paths.items():
+        paths = case_inputs[case][0]
+        molecule = read_molecule(str(paths['ligand']), sanitize=True, remove_hs=True)
+        if molecule is None or not molecule.GetNumAtoms():
+            raise ValueError(f'{case}: condition preflight could not read ligand')
+        sizes = []
+        for key in ('protein1', 'protein2'):
+            protein = pr.parsePDB(str(paths[key]))
+            if protein is None or protein.ca is None:
+                raise ValueError(f'{case}: condition preflight found no {key} nodes')
+            coords = get_coords(protein)[:, 1, :]
+            if (coords.ndim != 2 or coords.shape[1:] != (3,) or not len(coords)
+                    or not np.isfinite(coords).all()):
+                raise ValueError(f'{case}: condition preflight found invalid {key} nodes')
+            sizes.append(len(coords))
+        _, audit = load_condition_manifest(
+            condition_path, case=case, molecule=Chem.Mol(molecule),
+            protein_sizes=tuple(sizes),
+        )
+        result[case] = {
+            'protein_sizes': sizes,
+            'ligand_atoms': molecule.GetNumAtoms(),
+            'available_sides': audit['available_sides'],
+        }
+    return result
+
+
 def validate_resume_output(output, manifest, *, resume=True):
     """Fail before any output writes if existing results cannot be safely reused."""
     output = Path(output)
@@ -205,8 +264,21 @@ def main():
     args = parser().parse_args()
     if args.smoke_one_per_source and args.max_refinements is not None:
         raise ValueError("source smoke cannot be combined with max-refinements")
+    if bool(args.allow_conditioned_checkpoint) != bool(args.condition_manifest_dir):
+        raise ValueError(
+            "conditioned checkpoints require both --allow-conditioned-checkpoint "
+            "and --condition-manifest-dir")
     if args.steps < 1 or args.max_refinements is not None and args.max_refinements < 1:
         raise ValueError("steps and max-refinements must be positive")
+    requested_arms = [name.strip() for name in args.arms.split(',') if name.strip()]
+    known_arms = {
+        'sdpi_64', 'bitseed_diversity_64', 'geometry_64',
+        'diversity_64', 'hybrid_48_16', 'hybrid_56_8',
+    }
+    if not requested_arms or len(set(requested_arms)) != len(requested_arms):
+        raise ValueError('at least one unique selector arm is required')
+    if set(requested_arms) - known_arms:
+        raise ValueError(f'unknown selector arms: {sorted(set(requested_arms) - known_arms)}')
     index_path = Path(args.index).resolve()
     payload = json.loads(index_path.read_text(encoding="utf-8"))
     entries = payload.get("entries", payload) if isinstance(payload, dict) else payload
@@ -233,6 +305,20 @@ def main():
         entry["case"]: resolve_case_inputs(entry, ROOT, native_root)
         for entry in entries
     }
+    condition_paths = {}
+    condition_preflight = {}
+    if args.condition_manifest_dir:
+        condition_dir = Path(args.condition_manifest_dir)
+        if not condition_dir.is_absolute():
+            condition_dir = (ROOT / condition_dir).resolve()
+        condition_paths = {
+            entry['case']: condition_dir / f'{entry["case"]}.json'
+            for entry in entries
+        }
+        missing = [str(path) for path in condition_paths.values() if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f'missing condition manifests: {missing}')
+        condition_preflight = preflight_condition_manifests(condition_paths, case_inputs)
     manifest = {
         "protocol": PROTOCOL,
         "scope": "native-free selection followed by oracle-scored CoopDiff refinement",
@@ -260,14 +346,22 @@ def main():
         "entrypoint_sha256": sha256_file(Path(__file__)),
         "runtime_source_sha256": {
             name: sha256_file(RUNTIME_ROOT / name) for name in (
-                "tricoopdiff/consensus.py", "tricoopdiff/sampler.py",
-                "tricoopdiff/sdpi_flow.py", "tricoopdiff/expert_anchors.py",
+                "tricoopdiff/models/consensus.py", "tricoopdiff/sampler.py",
+                "tricoopdiff/sdpi_flow.py", "tricoopdiff/initialization/candidates.py",
                 "scripts/evaluation_runner.py", "scripts/featurize_common.py",
-                "scripts/evaluation_common.py", "tricoopdiff/deepternary_metrics.py",
-            )
+                "scripts/evaluation_common.py", "tricoopdiff/metrics/dockq.py",
+            ) + (("tricoopdiff/conditioning/conditioned_consensus_train.py",
+                  "tricoopdiff/conditioning/condition_features.py")
+                 if args.allow_conditioned_checkpoint else ())
         },
         "smoke_one_per_source": args.smoke_one_per_source,
         "allow_experimental_checkpoint": args.allow_experimental_checkpoint,
+        "allow_conditioned_checkpoint": args.allow_conditioned_checkpoint,
+        "condition_manifests": {
+            case: {"path": str(path), "sha256": sha256_file(path)}
+            for case, path in condition_paths.items()
+        },
+        "condition_preflight": condition_preflight,
         "candidate_pool": {
             "bitseed": args.bitseed_candidates, "sdpi": args.sdpi_candidates,
             "conformers": args.conformers, "poses_per_side": args.poses_per_side,
@@ -275,14 +369,14 @@ def main():
             "binary_retry_limit": args.binary_retry_limit,
             "binary_consecutive_failure_limit": args.binary_consecutive_failure_limit,
         },
-        "arms": {
+        "arms": {name: value for name, value in {
             "sdpi_64": {"sdpi": 64},
             "bitseed_diversity_64": {"bitseed": 64},
             "geometry_64": {"source_quota": None, "diversity": False},
             "diversity_64": {"source_quota": None, "diversity": True},
             "hybrid_48_16": {"bitseed_quota": 48, "sdpi_quota": 16},
             "hybrid_56_8": {"bitseed_quota": 56, "sdpi_quota": 8},
-        },
+        }.items() if name in requested_arms},
         "steps": args.steps,
         "proposal_seed": args.seed,
         "diffusion_seed_schedule": "S_plus_2000000_plus_pool_index",
@@ -334,6 +428,7 @@ def main():
                 runner = EvaluationRunner(
                     ROOT, checkpoint, device=args.device, deepternary_root=deepternary_root,
                     allow_experimental_checkpoint=args.allow_experimental_checkpoint,
+                    allow_conditioned_checkpoint=args.allow_conditioned_checkpoint,
                 )
             e3_data, poi_data, ligand_data, input_dim = featurize_complex(
                 case, str(paths["protein1"]), str(paths["protein2"]),
@@ -341,6 +436,16 @@ def main():
                 cache_dir=str((ROOT / args.cache_dir).resolve()),
             )
             runner._ensure_model(input_dim)
+            conditions, condition_audit = None, None
+            if condition_paths:
+                from rdkit import Chem
+                from tricoopdiff.conditioning.condition_features import load_condition_manifest
+                conditions, condition_audit = load_condition_manifest(
+                    condition_paths[case], case=case,
+                    molecule=Chem.Mol(ligand_data['mol']),
+                    protein_sizes=(e3_data['coords'].shape[1],
+                                   poi_data['coords'].shape[1]),
+                )
             proposal_initializer = DualExpertAnchorInitializer(
                 runner.expert, e3_data, poi_data, binary_steps=args.binary_steps,
                 proposal_attempts=args.poses_per_side,
@@ -394,6 +499,7 @@ def main():
                 "hybrid_48_16": selected_48,
                 "hybrid_56_8": selected_56,
             }
+            arms = {name: arms[name] for name in requested_arms}
             pool_index = {repr(candidate["candidate_id"]): index
                           for index, candidate in enumerate(candidates)}
             selected_ids = {repr(candidate["candidate_id"])
@@ -444,6 +550,7 @@ def main():
                         e3_data, poi_data, ligand_data, steps=args.steps,
                         device=args.device, seed=diffusion_seed,
                         init_mode="fixed_candidate", t_anchor=1.0,
+                        conditions=conditions,
                     )
                 finally:
                     if hook is not None:
@@ -541,6 +648,7 @@ def main():
                     "hybrid_48_16": meta_48,
                     "hybrid_56_8": meta_56,
                 },
+                "condition_audit": condition_audit,
                 "union_requested_count": union_requested_count,
                 "union_evaluated_count": len(rows),
                 "arms": arm_reports,

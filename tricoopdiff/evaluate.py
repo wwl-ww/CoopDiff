@@ -1,11 +1,8 @@
-"""
-Evaluation metrics for TriCoopDiff.
+"""Sample and score ternary poses in the fixed E3 reference frame.
 
-Metrics categories:
-1. Structure quality: DockQ, RMSD (global/warhead/linker), clash rate, linker strain
-2. Ensemble quality: energy-probability Spearman ρ, diversity, resampling consistency
-3. Functional ranking: α-ranking Spearman ρ, Top-20% hit rate, productive AUC
-4. Comparison baselines: vs DeepTernary, vs docking (Vina/Glide/MM-PBSA)
+Protein-only full-atom DockQ is the benchmark metric. Approximate contact and
+ligand metrics are diagnostics, not substitutes for that protocol. Ensemble
+diversity uses fixed-frame poses; functional prediction is not implemented.
 """
 
 import numpy as np
@@ -65,7 +62,7 @@ def compute_clash_rate(
     Returns:
         dict with 'mean_clash_rate', 'max_clash_rate', 'std_clash_rate'
     """
-    from .reflect import detect_clashes
+    from tricoopdiff.geometry.reflect import detect_clashes
 
     clash_rates = []
     for coords in ensemble_coords:
@@ -97,8 +94,8 @@ def compute_deepternary_dockq(
     E3 is the receptor; PROTAC and POI are concatenated as the mobile partner.
     Fnat is recovery of native interface-node identities (not contact pairs),
     Lrms is measured in the fixed-E3 frame, and iRMS uses a Kabsch fit of the
-    native-interface nodes. This intentionally mirrors DeepTernary's benchmark
-    helper so the reported primary DockQ has the same meaning.
+    native-interface nodes. This is a diagnostic approximation, not the protein-only full-atom
+    DockQ used as the primary benchmark metric.
     """
     from scipy.spatial.distance import cdist
 
@@ -203,8 +200,11 @@ def _parse_native_complex(pdb_path: str) -> Optional[Dict[str, np.ndarray]]:
             ligand.append([x, y, z])
             lig_chains.add(chain)
         else:
+            # Match ProDy's default blank/A alternate-location selection.
+            if ln[16:17] not in (' ', 'A'):
+                continue
             atom_name = ln[12:16].strip()
-            resid = ln[22:26].strip()
+            resid = ln[22:27]  # insertion-coded residues are separate nodes
             chains.setdefault(chain, []).append((resid, atom_name, [x, y, z]))
 
     ligand = np.asarray(ligand, dtype=float)
@@ -267,8 +267,9 @@ def compute_poi_dockq(
         cutoff: contact distance cutoff (Å) between PROTAC atom and POI Cα.
 
     Returns:
-        dict with 'dockq' (Fnat in [0,1]) and contact counts, or None when the
-        native PDB is unavailable/unparseable.
+        Contact recovery ('dockq') only with matching atom counts. Otherwise
+        return 'contact_density_ratio' as a separate, non-correspondence
+        diagnostic; it is not Fnat. Return None for an unavailable native.
     """
     from scipy.spatial.distance import cdist
 
@@ -285,14 +286,14 @@ def compute_poi_dockq(
     n_pred = int((pred_d < cutoff).sum())
 
     if not (n_lig_ok and n_poi_ok):
-        # Correspondence broken → density ratio only (still non-NaN).
+        # A count ratio cannot measure recovery of specific native contacts.
         n_native = int((cdist(ref_lig, ref_poi) < cutoff).sum())
         if n_native == 0:
             return None
         return {
-            'dockq': float(min(n_pred, n_native) / n_native),
+            'contact_density_ratio': float(n_pred / n_native),
             'n_native_contacts': n_native,
-            'n_recovered_contacts': min(n_pred, n_native),
+            'n_recovered_contacts': None,
             'n_pred_contacts': n_pred,
             'atom_correspondence': False,
         }
@@ -321,15 +322,16 @@ def compute_poi_dockq(
 def compute_poi_com_dist(
     pred_poi: np.ndarray,
     native_complex_pdb: str,
+    featurized_e3_ca: Optional[np.ndarray] = None,
 ) -> Optional[Dict[str, float]]:
     """
     Frame-aware POI placement (E3-POI COM distance) vs the native complex.
 
     ``featurize_common`` centers the E3 at its COM (so the featurized E3 frame
     origin ≈ E3 COM), and the sampler emits POI relative to that same COM.
-    The native POI reduced to Cα (``_parse_native_complex``) is shifted by the
-    native E3 Cα COM to land in the same frame, so the E3-POI separation can be
-    compared directly.
+    When current E3 coordinates are supplied, native E3 is rigid-fitted into
+    that frame before measuring POI placement. The legacy two-argument call
+    assumes an E3-centered frame with the native orientation.
 
     Note: this intentionally does NOT report a Kabsch-aligned POI RMSD. The POI
     template is the native POI as a rigid body, so a Kabsch superposition always
@@ -347,6 +349,13 @@ def compute_poi_com_dist(
     if native is None or native['e3_ca'].shape[0] == 0:
         return None
     native_poi_e3 = native['poi_ca'] - native['e3_ca'].mean(axis=0)  # [N_poi, 3]
+    if featurized_e3_ca is not None:
+        if featurized_e3_ca.shape != native['e3_ca'].shape:
+            return None
+        from tricoopdiff.metrics.dockq import _fit_rigid
+
+        rotation, translation = _fit_rigid(native['e3_ca'], featurized_e3_ca)
+        native_poi_e3 = native['poi_ca'] @ rotation + translation
     if pred_poi.shape[0] != native_poi_e3.shape[0]:
         return None
     com_dist = float(np.linalg.norm(pred_poi.mean(axis=0) - native_poi_e3.mean(axis=0)))
@@ -447,124 +456,15 @@ def compute_e3_interface_dockq(
 # Ensemble Quality Metrics
 # ---------------------------------------------------------------------------
 
-def compute_ensemble_diversity(
-    ensemble_coords: List[np.ndarray],
-) -> Dict[str, float]:
-    """
-    Compute pairwise RMSD statistics across the ensemble.
+def compute_ensemble_diversity(ensemble_coords: List[np.ndarray]) -> Dict[str, float]:
+    """Pose diversity in the fixed E3 frame, not conformer-aligned diversity."""
+    from tricoopdiff.metrics.ensemble import analyze_ensemble
 
-    Returns:
-        dict with 'mean_pairwise_rmsd', 'std_pairwise_rmsd', 'n_clusters'
-    """
-    from scipy.cluster.hierarchy import fcluster, linkage
-
-    n = len(ensemble_coords)
-    if n < 2:
-        return {'mean_pairwise_rmsd': 0.0, 'std_pairwise_rmsd': 0.0, 'n_clusters': n}
-
-    # Compute all pairwise RMSDs
-    pairwise_rmsd = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            rmsd = compute_rmsd(ensemble_coords[i], ensemble_coords[j])
-            pairwise_rmsd.append(rmsd)
-
-    pairwise_rmsd = np.array(pairwise_rmsd)
-
-    # Clustering at 2Å cutoff. ``pairwise_rmsd`` is already the condensed (1-D)
-    # distance vector, so pass it straight to linkage (not squareform, which
-    # would produce a full matrix that linkage misreads as observations).
-    if len(pairwise_rmsd) > 0:
-        linkage_matrix = linkage(pairwise_rmsd, method='average')
-        clusters = fcluster(linkage_matrix, t=2.0, criterion='distance')
-        n_clusters = len(set(clusters))
-    else:
-        n_clusters = n
-
+    report = analyze_ensemble(ensemble_coords, rmsd_cutoff=2.)
     return {
-        'mean_pairwise_rmsd': float(np.mean(pairwise_rmsd)),
-        'std_pairwise_rmsd': float(np.std(pairwise_rmsd)),
-        'n_clusters': n_clusters,
+        **{key: report[key] for key in ('mean_pairwise_rmsd', 'std_pairwise_rmsd', 'n_clusters')},
+        'coordinate_frame': 'fixed_e3_v1',
     }
-
-
-# ---------------------------------------------------------------------------
-# Ensemble Analyzer
-# ---------------------------------------------------------------------------
-
-class EnsembleAnalyzer:
-    """Analyze conformational ensemble from multi-walker sampling."""
-
-    def __init__(self, ensemble_coords: list, atomic_numbers=None):
-        self.ensemble = ensemble_coords
-        self.n_walkers = len(ensemble_coords)
-
-    def full_report(self) -> dict:
-        return {
-            'diversity': self.diversity(),
-            'clustering': self.clustering(rmsd_cutoff=2.0),
-            'convergence': self.convergence(),
-            'top1_quality': self.top1_quality(),
-        }
-
-    def diversity(self) -> dict:
-        rmsds = []
-        for i in range(self.n_walkers):
-            for j in range(i+1, self.n_walkers):
-                rmsds.append(compute_rmsd(self.ensemble[i], self.ensemble[j]))
-        rmsds = np.array(rmsds)
-        return {
-            'mean_pairwise_rmsd': float(np.mean(rmsds)) if len(rmsds) > 0 else 0.0,
-            'std_pairwise_rmsd': float(np.std(rmsds)) if len(rmsds) > 0 else 0.0,
-            'n_walkers': self.n_walkers,
-        }
-
-    def clustering(self, rmsd_cutoff: float = 2.0) -> dict:
-        if self.n_walkers < 2:
-            return {'n_clusters': self.n_walkers, 'dominant_fraction': 1.0}
-        from scipy.cluster.hierarchy import fcluster, linkage
-        from scipy.spatial.distance import squareform
-
-        dist_mat = np.zeros((self.n_walkers, self.n_walkers))
-        for i in range(self.n_walkers):
-            for j in range(i+1, self.n_walkers):
-                d = compute_rmsd(self.ensemble[i], self.ensemble[j])
-                dist_mat[i,j] = d; dist_mat[j,i] = d
-
-        condensed = squareform(dist_mat)
-        labels = fcluster(linkage(condensed, method='average'), t=rmsd_cutoff, criterion='distance')
-        unique, counts = np.unique(labels, return_counts=True)
-        return {
-            'n_clusters': int(len(unique)),
-            'cluster_sizes': sorted(counts.tolist(), reverse=True),
-            'dominant_fraction': float(max(counts)/self.n_walkers),
-        }
-
-    def convergence(self) -> dict:
-        if self.n_walkers < 8:
-            return {'stabilized': False}
-        rng = np.random.RandomState(42)
-        sizes = [4, 8, 16, min(32, self.n_walkers)]
-        results = {}
-        for size in sizes:
-            if size > self.n_walkers: continue
-            vals = []
-            for _ in range(5):
-                idx = rng.choice(self.n_walkers, size, replace=False)
-                sub = [self.ensemble[i] for i in idx]
-                div = EnsembleAnalyzer(sub).diversity()
-                vals.append(div['mean_pairwise_rmsd'])
-            results[f'n{size}'] = {'mean': float(np.mean(vals)), 'std': float(np.std(vals))}
-        return {'stabilized': len(results) >= 2, 'subsample_analysis': results}
-
-    def top1_quality(self) -> dict:
-        if self.n_walkers < 2:
-            return {'top1_index': 0}
-        clustering = self.clustering()
-        return {
-            'top1_index': 0,
-            'dominant_fraction': clustering['dominant_fraction'],
-        }
 
 
 def evaluate_model(
@@ -588,6 +488,7 @@ def evaluate_model(
     translation_velocity_scale: float = 1.0,
     rotation_velocity_scale: float = 1.0,
     return_rank_features: bool = False,
+    conditions=None,
 ) -> dict:
     """
     Sample a conformational ensemble and score structure quality vs the native
@@ -606,7 +507,7 @@ def evaluate_model(
     Args:
         model: TriCoopDiff (already on ``device``).
         e3_data/poi_data/ligand_data: B=1 featurized dicts (featurize_common).
-        diffusion: InterfaceDiffusion.
+        diffusion: SDPIFlow.
         initializer: TernaryInitializer (default: fresh one).
         device: 'cuda' or 'cpu'.
         n_walkers: number of independent trajectories.
@@ -621,11 +522,11 @@ def evaluate_model(
     Returns:
         {'structure': {...}, 'ensemble': {...}, 'functional': {}, 'debug_trace': ...}
     """
-    from .diffusion import TernaryInitializer
-    from .sampler import sample_ensemble, sample_single
+    from tricoopdiff.initialization import TernaryInitializer
+    from tricoopdiff.sampler import sample_ensemble, sample_single
 
     if initializer is None:
-        initializer = TernaryInitializer()
+        initializer = TernaryInitializer(no_torsion=bool(getattr(model.expert.model, 'no_torsion', False)))
 
     ensemble = sample_ensemble(
         model, diffusion, initializer, e3_data, poi_data, ligand_data,
@@ -637,6 +538,7 @@ def evaluate_model(
         translation_velocity_scale=translation_velocity_scale,
         rotation_velocity_scale=rotation_velocity_scale,
         return_rank_features=return_rank_features,
+        conditions=conditions,
     )
 
     ref_lig = ligand_data['coords'][0].detach().cpu().numpy()  # [N_lig, 3] native
@@ -684,7 +586,7 @@ def evaluate_model(
             rec['approx_dockq'] = deepternary_m['dockq']
         if deepternary_dockq_paths is not None and native_complex_pdb is not None:
             try:
-                from .deepternary_metrics import compute_fullatom_dockq
+                from tricoopdiff.metrics.dockq import compute_fullatom_dockq
                 exact_m = compute_fullatom_dockq(
                     pred_ligand=pred,
                     pred_poi_ca=pred_poi,
@@ -711,10 +613,14 @@ def evaluate_model(
         if native_complex_pdb is not None:
             poi_m = compute_poi_dockq(pred_poi, pred, native_complex_pdb)
             if poi_m is not None:
-                rec['poi_dockq'] = poi_m['dockq']
+                rec['poi_atom_correspondence'] = poi_m['atom_correspondence']
+                if poi_m['atom_correspondence']:
+                    rec['poi_dockq'] = poi_m['dockq']
+                else:
+                    rec['poi_contact_density_ratio'] = poi_m['contact_density_ratio']
                 if poi_native_contacts is None:
                     poi_native_contacts = poi_m['n_native_contacts']
-            poi_c = compute_poi_com_dist(pred_poi, native_complex_pdb)
+            poi_c = compute_poi_com_dist(pred_poi, native_complex_pdb, e3_ca)
             if poi_c is not None:
                 rec['poi_com_dist'] = poi_c['poi_com_dist']
                 poi_native_com_dist = poi_c['native_e3_poi_com_dist']
@@ -839,7 +745,7 @@ def evaluate_model(
     if len(pred_ligs) > 1:
         ensemble_metrics['diversity'] = compute_ensemble_diversity(pred_ligs)
     if walkers:
-        from .ensemble_analysis import analyze_ensemble
+        from tricoopdiff.metrics.ensemble import analyze_ensemble
         ternary_poses = [
             np.concatenate([walker['pred'], walker['pred_poi']], axis=0)
             for walker in walkers
@@ -856,6 +762,9 @@ def evaluate_model(
             freeze_poi=freeze_poi,
             init_mode=init_mode,
             t_anchor=t_anchor,
+            translation_velocity_scale=translation_velocity_scale,
+            rotation_velocity_scale=rotation_velocity_scale,
+            conditions=conditions,
         )
 
     report = {

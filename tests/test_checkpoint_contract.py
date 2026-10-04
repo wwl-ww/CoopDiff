@@ -7,7 +7,7 @@ import warnings
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tricoopdiff.checkpoint_contract import (
+from tricoopdiff.models.expert import (
     expert_base_identity, validate_expert_base_identity,
 )
 

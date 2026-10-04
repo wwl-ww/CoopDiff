@@ -8,10 +8,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tricoopdiff.endpoint_kinematics import (
-    endpoint_internal_geometry, project_endpoint_coupling,
+from tricoopdiff.initialization.endpoints import (
+    endpoint_internal_geometry, project_endpoint_coupling, _fit_numpy_rigid,
 )
-from tricoopdiff.rigid import apply_rigid
+from tricoopdiff.geometry.rigid import apply_rigid, _ProperPolarRotation
 from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.sdpi_flow import _raw_torsions
 
@@ -20,6 +20,39 @@ EDGE_INDEX = np.array([
     [0, 1, 1, 2, 2, 3],
     [1, 0, 2, 1, 3, 2],
 ])
+
+
+def test_rigid_rotation_gradient_preserves_covariance_scale_law():
+    covariance = torch.tensor([[3., .1, .2], [.3, 2., .1], [.1, .2, 1.]],
+                              dtype=torch.float64)
+    probe = torch.tensor([[1., 2., 3.], [4., 2., 5.], [6., 7., 3.]],
+                         dtype=torch.float64)
+    reference_rotation = reference_gradient = None
+    for scale in (1., 1e-6, 1e-10):
+        value = (covariance * scale).requires_grad_()
+        rotation = _ProperPolarRotation.apply(value)
+        gradient, = torch.autograd.grad((rotation * probe).sum(), value)
+        if reference_rotation is None:
+            reference_rotation, reference_gradient = rotation, gradient
+        assert torch.allclose(rotation, reference_rotation, atol=1e-12, rtol=0.)
+        assert torch.allclose(gradient * scale, reference_gradient, atol=1e-12, rtol=0.), (
+            'a well-conditioned small covariance changed the rigid-fit gradient')
+        assert torch.autograd.gradcheck(_ProperPolarRotation.apply, (value,),
+                                        eps=scale * 1e-5, atol=1e-4, rtol=1e-4)
+
+
+def test_linear_rigid_fit_preserves_correspondence_under_roundoff():
+    source = np.array([[-1., 0., 0.], [1., 0., 0.]])
+    for perturbation in (-1e-12, 0., 1e-12):
+        target = source + [10., 2., 3.]
+        target[0, 0] += perturbation
+        rotation, translation, rmsd, underdetermined = _fit_numpy_rigid(source, target)
+        assert underdetermined and rmsd < 1e-10, 'roundoff reversed atom correspondence'
+        assert np.allclose(source @ rotation.T + translation, target, atol=1e-10)
+        assert np.isclose(np.linalg.det(rotation), 1.), 'rigid fit introduced a reflection'
+    rotation, translation, rmsd, underdetermined = _fit_numpy_rigid(source[:1], target[:1])
+    assert underdetermined and rmsd < 1e-10
+    assert np.allclose(source[:1] @ rotation.T + translation, target[:1])
 
 
 def test_rigid_endpoint_preserves_sdpi_internal_invariants():
@@ -141,6 +174,29 @@ def test_projected_torsion_endpoint_roundtrips_at_flow_time_one():
     assert torch.allclose(poi, endpoint_poi, atol=1e-8)
 
 
+def test_periodic_multitorsion_endpoint_projection_recovers_reachable_targets():
+    from test_sdpi_flow import fixture
+
+    flow, data, _, poi, coupling = fixture()
+    rng = np.random.default_rng(631)
+    rotation = torch.tensor([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]],
+                            dtype=torch.float64)
+    for _ in range(20):
+        angles = rng.uniform(-np.pi, np.pi, len(coupling['bonds']))
+        shape = _raw_torsions(data['coords'][0].numpy(), coupling['bonds'],
+                              coupling['masks'], angles)
+        endpoint = torch.as_tensor(shape)[None] @ rotation.T + 7.
+        projected_coupling, projected, report = project_endpoint_coupling(
+            data, poi, endpoint, poi)
+        assert report['ligand_projection_rmsd_angstrom'] < 1e-8, (
+            'a periodic torsion boundary/local minimum distorted an exactly reachable target')
+        assert np.all(np.abs(projected_coupling['angles']) <= np.pi)
+        ligand, _, _, _ = flow.path(data, poi, projected_coupling,
+                                    torch.ones(1, dtype=torch.float64))
+        assert torch.allclose(ligand, endpoint, atol=1e-8)
+        assert np.allclose(projected['ligand'], endpoint[0].numpy(), atol=1e-8)
+
+
 def test_single_atom_fallback_has_translation_only_roundtrip():
     native_ligand = torch.tensor([[[0.0, 0.0, 0.0]]], dtype=torch.float64)
     endpoint_ligand = torch.tensor([[[4.0, -2.0, 7.0]]], dtype=torch.float64)
@@ -166,6 +222,28 @@ def test_single_atom_fallback_has_translation_only_roundtrip():
     assert report['endpoint_exactly_represented']
     assert torch.allclose(ligand, endpoint_ligand, atol=1e-8)
     assert torch.allclose(poi, endpoint_poi, atol=1e-8)
+
+
+def test_torsion_projection_handles_reversed_reordered_rotors_and_global_frame():
+    from test_sdpi_flow import fixture
+
+    rotation = torch.tensor([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]],
+                            dtype=torch.float64)
+    for smiles in ('CC(C)CCOC(C)CC', 'c1ccccc1CCOCC'):
+        _, data, _, poi, _ = fixture(smiles)
+        selected = torch.where(data['edge_mask'])[0]
+        edges = data['edge_index'].clone()
+        edges[:, selected] = edges[:, selected].flip(0).flip(1)
+        masks = ~np.asarray(data['mask_rotate'])[::-1].copy()
+        source = data['coords'] @ rotation.T + 11.
+        data = {**data, 'coords': source, 'edge_index': edges, 'mask_rotate': masks}
+        angles = np.linspace(-3.1, 2.9, len(selected))
+        target = _raw_torsions(source[0].numpy(), edges[:, selected].T.numpy(),
+                               masks, angles) @ rotation.numpy().T - 6.
+        _, projected, report = project_endpoint_coupling(data, poi, target, poi)
+        assert report['endpoint_exactly_represented']
+        assert np.allclose(projected['ligand'], target, atol=1e-8), (
+            'projection phase signs depended on rotor order, side or absolute frame')
 
 
 if __name__ == "__main__":

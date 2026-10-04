@@ -2,10 +2,10 @@ import math
 
 import torch
 
-from tricoopdiff.pose_anchors import (
+from tricoopdiff.geometry.rigid import (
     joint_surface_anchors, proper_rigid_fit, surface_frame,
 )
-from tricoopdiff.expert_anchors import (
+from tricoopdiff.initialization.candidates import (
     FixedCandidateInitializer, generate_hybrid_candidates, generate_sdpi_candidates,
     select_balanced_pairs, select_hybrid_walkers, select_partial_pairs,
     select_pose_consensus,

@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import gc
+import time
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -31,6 +32,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 # torch_cluster / torch_scatter with pure-PyTorch fallbacks before the vendored
 # cg_model and the vendored process_mols bind those symbols at import time.
 import tricoopdiff.diffdock_compat  # noqa: F401
+from tricoopdiff.runtime import atomic_torch_save
 
 import numpy as np
 import torch
@@ -48,8 +50,9 @@ os.chdir(_PROJECT_ROOT)
 # shared-reference-frame fix) are invalidated instead of silently reused.
 # v6 fixes the directed k-NN convention and small-receptor self loops.
 # v7 also avoids distance cancellation for translated PDB coordinates.
+# v8 centers the exact retained ligand atoms, including isotope hydrogens.
 # v5 caches contain reversed directed receptor edges and cannot be reused.
-_FEATURIZE_CACHE_VERSION = 7
+_FEATURIZE_CACHE_VERSION = 8
 
 
 def _featurize_signature(protein1, protein2, ligand_path, score_model_args):
@@ -86,47 +89,29 @@ def _protein_ca_centroid(pdb_path):
     return center.astype(np.float32)
 
 
-def _ligand_heavy_centroid(ligand_path):
-    """Heavy-atom centroid of the ligand conformer in its crystal frame.
+def _ligand_centroid(ligand_path, remove_hs=True):
+    """Centroid of exactly the atoms retained by graph construction, float32 [3]."""
+    from tricoopdiff.diffdock.datasets.process_mols import read_molecule
 
-    The featurizer runs with ``remove_hs=True``, so hydrogens are dropped before
-    taking the mean to match the featurized (H-free) ligand. Returns float32 [3].
-    """
-    from rdkit import Chem
-
-    ext = Path(ligand_path).suffix.lower()
-    if ext == ".sdf":
-        mol = Chem.SDMolSupplier(ligand_path, removeHs=False, sanitize=False)[0]
-    elif ext == ".pdb":
-        mol = Chem.MolFromPDBFile(ligand_path, removeHs=False, sanitize=False)
-    elif ext == ".mol2":
-        mol = Chem.MolFromMol2File(ligand_path, removeHs=False, sanitize=False)
-    else:
-        mol = Chem.MolFromMolFile(ligand_path, removeHs=False, sanitize=False)
+    mol = read_molecule(str(ligand_path), sanitize=True, remove_hs=remove_hs)
     if mol is None or mol.GetNumConformers() == 0:
         raise RuntimeError(f"could not read ligand conformer from {ligand_path}")
-    conf = mol.GetConformer()
-    # Filter heavy atoms directly (atomic number > 1) to match remove_hs=True,
-    # without calling RemoveHs (which can trip on unsanitized PROTACs).
-    pos = np.asarray([
-        list(conf.GetAtomPosition(a.GetIdx()))
-        for a in mol.GetAtoms() if a.GetAtomicNum() > 1
-    ], dtype=np.float32)
-    if pos.shape[0] == 0:
-        raise RuntimeError(f"no heavy atoms found in ligand {ligand_path}")
+    pos = np.asarray(mol.GetConformer().GetPositions(), dtype=np.float32)
+    if pos.shape[0] == 0 or not np.isfinite(pos).all():
+        raise RuntimeError(f"invalid ligand coordinates in {ligand_path}")
     return pos.mean(axis=0)
 
 
-def _true_relative_offsets(protein1, protein2, ligand_path):
+def _true_relative_offsets(protein1, protein2, ligand_path, remove_hs=True):
     """True inter-molecule translations in the shared crystal frame.
 
     Returns ``(t_e3_to_poi, lig_offset)``, both float32 [3]:
       * ``t_e3_to_poi`` = POI Cα centroid − E3 Cα centroid  (E3→POI translation)
-      * ``lig_offset``   = PROTAC heavy centroid − E3 Cα centroid  (PROTAC in E3 frame)
+      * ``lig_offset``   = retained ligand centroid − E3 Cα centroid
     """
     e3_center = _protein_ca_centroid(protein1)
     poi_center = _protein_ca_centroid(protein2)
-    lig_center = _ligand_heavy_centroid(ligand_path)
+    lig_center = _ligand_centroid(ligand_path, remove_hs)
     return poi_center - e3_center, lig_center - e3_center
 
 
@@ -135,7 +120,7 @@ def generate_esm_embeddings(protein_paths, device):
 
     Returns: dict {protein_path: [per-chain torch.Tensor (n_res, 1280)]}.
     """
-    from tricoopdiff.esm_embedder import ESMEmbedder
+    from tricoopdiff.inputs.esm_embedder import ESMEmbedder
 
     print(f"Loading ESM2-650M on {device} via HF mirror...", flush=True)
     local_model = os.environ.get("TRICOOPDIFF_ESM_MODEL")
@@ -267,7 +252,8 @@ def _to_device_and_batch(data, device):
 
 
 def featurize_complex(case_label, protein1, protein2, ligand_path,
-                      score_model_args, device, cache_dir=None):
+                      score_model_args, device, cache_dir=None,
+                      cache_read_only=False, cache_wait_seconds=3600.):
     """Featurize one ternary complex into the three B=1 data dicts.
 
     Args:
@@ -301,24 +287,33 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
     cache_signature = _featurize_signature(
         protein1, protein2, ligand_path, score_model_args
     )
+    if cache_wait_seconds < 0:
+        raise ValueError('cache_wait_seconds must be nonnegative')
     if cache_dir is not None:
         cache_path = Path(cache_dir) / f"{case_label.replace('/', '_')}.pt"
-        if cache_path.exists():
-            # weights_only=False: the cache holds numpy arrays (mask_rotate),
-            # which PyTorch 2.6's default weights_only=True refuses to unpickle.
-            # The file is written by us (trusted), so full unpickling is safe.
-            cached = torch.load(cache_path, map_location="cpu", weights_only=False)
-            if (
-                cached.get('cache_version') == _FEATURIZE_CACHE_VERSION
-                and cached.get('source_signature') == cache_signature
-            ):
-                e3 = _to_device_and_batch(cached['e3_data'], device)
-                poi = _to_device_and_batch(cached['poi_data'], device)
-                lig = _to_device_and_batch(cached['ligand_data'], device)
-                return e3, poi, lig, cached['receptor_feat_dim']
-            # else: stale cache written before the shared-reference-frame fix
-            # (BUG-18) — fall through and re-featurize so the corrected geometry
-            # is never silently replaced by the old per-molecule-centered one.
+        deadline = time.monotonic() + cache_wait_seconds
+        while True:
+            if cache_path.exists():
+                # weights_only=False: the cache holds numpy arrays (mask_rotate),
+                # which PyTorch 2.6's default weights_only=True refuses to unpickle.
+                # The file is written by us (trusted), so full unpickling is safe.
+                cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+                if (
+                    cached.get('cache_version') == _FEATURIZE_CACHE_VERSION
+                    and cached.get('source_signature') == cache_signature
+                ):
+                    e3 = _to_device_and_batch(cached['e3_data'], device)
+                    poi = _to_device_and_batch(cached['poi_data'], device)
+                    lig = _to_device_and_batch(cached['ligand_data'], device)
+                    return e3, poi, lig, cached['receptor_feat_dim']
+            if not cache_read_only:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f'{case_label}: read-only featurization follower timed out waiting for writer')
+            time.sleep(min(.1, max(0., deadline - time.monotonic())))
+            # A stale cache can be atomically replaced by the writer while the
+            # follower waits.  It must never featurize or publish independently.
 
     embeddings_map = generate_esm_embeddings([protein1, protein2], device)
 
@@ -347,7 +342,8 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
     # reference frame (E3 itself stays at its featurized, centroid-at-origin
     # coords). After this, model.forward's ``t_e3_to_poi = poi_center - e3_center``
     # recovers the true E3→POI translation instead of 0.
-    t_e3_to_poi, lig_offset = _true_relative_offsets(protein1, protein2, ligand_path)
+    t_e3_to_poi, lig_offset = _true_relative_offsets(
+        protein1, protein2, ligand_path, remove_hs=score_model_args.remove_hs)
     poi_data['coords'] = poi_data['coords'] + torch.tensor(
         t_e3_to_poi, dtype=poi_data['coords'].dtype, device=poi_data['coords'].device
     ).view(1, 1, 3)
@@ -358,7 +354,6 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
           f"(|.|={float(np.linalg.norm(t_e3_to_poi)):.2f} Å)", flush=True)
 
     if cache_path is not None:
-        os.makedirs(cache_dir, exist_ok=True)
         payload = {
             'e3_data': _strip_batch_and_cpu(e3_data),
             'poi_data': _strip_batch_and_cpu(poi_data),
@@ -368,14 +363,6 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
             'cache_version': _FEATURIZE_CACHE_VERSION,
             'source_signature': cache_signature,
         }
-        # B/C training processes intentionally share this cache.  A fixed
-        # ``.tmp`` name lets one process move the other process's in-progress
-        # file, causing the loser to fail at os.replace.  Per-process names
-        # preserve atomic publication without cross-process collisions.
-        temporary_path = cache_path.with_suffix(
-            cache_path.suffix + f'.tmp.{os.getpid()}'
-        )
-        torch.save(payload, temporary_path)
-        os.replace(temporary_path, cache_path)
+        atomic_torch_save(payload, cache_path)
 
     return e3_data, poi_data, ligand_data, receptor_feat_dim

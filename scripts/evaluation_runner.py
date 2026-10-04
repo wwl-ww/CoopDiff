@@ -1,7 +1,5 @@
 """Reusable model runtime for in-process evaluation of many ternary cases."""
 
-import json
-import os
 from argparse import Namespace
 from pathlib import Path
 
@@ -15,10 +13,10 @@ from featurize_common import featurize_complex
 from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
-from tricoopdiff.expert_factory import build_diffdock_expert
-from tricoopdiff.consensus import ConsensusCoopDiff, ConsensusFuse
-from tricoopdiff.reproducibility import configure_inference_reproducibility
-from tricoopdiff.checkpoint_contract import validate_expert_base_identity
+from tricoopdiff.models.expert import build_diffdock_expert
+from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse
+from tricoopdiff.runtime import configure_inference_reproducibility, atomic_json as write_report_atomic
+from tricoopdiff.models.expert import validate_expert_base_identity
 from tricoopdiff.diffdock.utils.torus import (
     SCORE_NORM_VERSION, validate_score_norm_version,
 )
@@ -32,7 +30,8 @@ class EvaluationRunner:
                  expert_checkpoint="best_ema_inference_epoch_model.pt",
                  deepternary_root=None, deterministic=True,
                  conformer_policy="etkdgv3_random",
-                 allow_experimental_checkpoint=False):
+                 allow_experimental_checkpoint=False,
+                 allow_conditioned_checkpoint=False):
         self.reproducibility = configure_inference_reproducibility(deterministic)
         self.reproducibility['torus_score_norm_version'] = SCORE_NORM_VERSION
         self.root = Path(project_root).resolve()
@@ -47,11 +46,19 @@ class EvaluationRunner:
         if not self.checkpoint_path.is_absolute():
             self.checkpoint_path = self.root / self.checkpoint_path
         self.checkpoint_sha256 = sha256_file(self.checkpoint_path)
-        self.checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+        self.checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
         self.experimental_checkpoint = (
             self.checkpoint.get('architecture') == 'residual_consensus_factorial_v1'
         )
-        if self.experimental_checkpoint:
+        self.conditioned_checkpoint = (
+            self.checkpoint.get('format') == 'conditioned_consensus_training_v1'
+        )
+        if self.conditioned_checkpoint:
+            if not allow_conditioned_checkpoint:
+                raise ValueError('conditioned checkpoint requires explicit opt-in')
+            from tricoopdiff.conditioning.conditioned_consensus_train import validate_conditioned_checkpoint
+            validate_conditioned_checkpoint(self.checkpoint)
+        elif self.experimental_checkpoint:
             if not allow_experimental_checkpoint:
                 raise ValueError(
                     'experimental factorial checkpoint requires explicit '
@@ -76,10 +83,8 @@ class EvaluationRunner:
         self.activation_clamp = float(
             self.checkpoint["runtime_config"]["activation_clamp"]
         )
-        os.environ["NAN_CLAMP"] = str(self.activation_clamp)
         self.activation_clamp_mode = self.checkpoint['runtime_config'].get(
             'activation_clamp_mode', 'componentwise')
-        os.environ['NAN_CLAMP_MODE'] = self.activation_clamp_mode
 
         self.model_dir = Path(model_dir)
         if not self.model_dir.is_absolute():
@@ -92,12 +97,18 @@ class EvaluationRunner:
             ckpt=expert_checkpoint,
             num_conv_layers=self.score_model_args.num_conv_layers,
         )
+        from tricoopdiff.models.expert import configure_expert_policy
+        configure_expert_policy(self.expert, self.activation_clamp, self.activation_clamp_mode)
+        if self.checkpoint.get('checkpoint_version', 0) >= 24:
+            from tricoopdiff.models.expert import expert_runtime_identity
+            if self.checkpoint['runtime_config'].get('expert_runtime_identity') != expert_runtime_identity(self.expert):
+                raise ValueError('evaluation expert runtime differs from the training checkpoint')
         self.reproducibility['checkpoint_expert_base_identity'] = (
             validate_expert_base_identity(self.checkpoint, self.expert)
         )
         self.model = None
         self.input_dim = None
-        self.diffusion = SDPIFlow()
+        self.diffusion = SDPIFlow(inference_steps=self.checkpoint['runtime_config'].get('inference_steps', 20))
         self.initializer = TernaryInitializer(
             no_torsion=getattr(self.score_model_args, "no_torsion", False),
             conformer_policy=conformer_policy,
@@ -113,20 +124,30 @@ class EvaluationRunner:
             return
         if self.checkpoint['model_config']['input_dim'] != input_dim:
             raise ValueError('checkpoint input feature dimension mismatch')
-        trifuse = ConsensusFuse(**self.checkpoint['model_config'])
-        if self.experimental_checkpoint:
-            from tricoopdiff.consensus_experiment import ExperimentalConsensus
-
-            self.model = ExperimentalConsensus(self.expert, trifuse).to(self.device)
+        if self.conditioned_checkpoint:
+            from tricoopdiff.conditioning.conditioned_consensus_train import (ConditionedConsensusCoopDiff,
+                                                          ConditionedConsensusFuse)
+            trifuse = ConditionedConsensusFuse(**self.checkpoint['model_config'])
+            model = ConditionedConsensusCoopDiff(self.expert, trifuse).to(self.device)
         else:
-            self.model = ConsensusCoopDiff(
+            trifuse = ConsensusFuse(**self.checkpoint['model_config'])
+        if self.experimental_checkpoint:
+            from tricoopdiff.experiments.consensus_experiment import ExperimentalConsensus
+
+            model = ExperimentalConsensus(self.expert, trifuse).to(self.device)
+        elif not self.conditioned_checkpoint:
+            model = ConsensusCoopDiff(
                 frozen_expert=self.expert,
                 trifuse=trifuse,
-                num_conv_layers=self.expert.num_conv_layers,
-                use_film=False,
             ).to(self.device)
-        self.model.trifuse.load_state_dict(self.checkpoint["ema_trifuse_state_dict"])
-        self.model.eval()
+        weights = getattr(model.trifuse, 'active_state_dict', dict)(self.checkpoint['ema_trifuse_state_dict'])
+        current = model.trifuse.state_dict()
+        if set(weights) != set(current) or any(
+                not torch.is_tensor(weights[name]) or weights[name].shape != current[name].shape
+                or not torch.isfinite(weights[name].to(current[name])).all() for name in current):
+            raise ValueError('evaluation EMA weights must match the finite active model dtype')
+        model.trifuse.load_state_dict(weights, strict=True)
+        self.model = model.eval()
         self.input_dim = input_dim
 
     def evaluate_case(self, case, paths, cache_dir, native_complex_pdb=None,
@@ -137,7 +158,8 @@ class EvaluationRunner:
                       debug_trace=False, debug_seed=0,
                       translation_velocity_scale=1.0,
                       rotation_velocity_scale=1.0,
-                      return_rank_features=False):
+                      return_rank_features=False,
+                      condition_manifest=None):
         """Featurize and evaluate one case with the resident model."""
         torch.manual_seed(seed)
         if self.device.type == "cuda":
@@ -148,10 +170,24 @@ class EvaluationRunner:
             cache_dir=str(cache_dir),
         )
         self._ensure_model(input_dim)
+        conditions, condition_audit, condition_path = None, None, None
+        if self.conditioned_checkpoint:
+            if condition_manifest is None:
+                raise ValueError('conditioned evaluation requires a deploy-time condition manifest')
+            from rdkit import Chem
+            from tricoopdiff.conditioning.condition_features import load_condition_manifest
+            condition_path = Path(condition_manifest)
+            if not condition_path.is_absolute():
+                condition_path = self.root / condition_path
+            conditions, condition_audit = load_condition_manifest(
+                condition_path, case=case, molecule=Chem.Mol(ligand_data['mol']),
+                protein_sizes=(e3_data['coords'].shape[1], poi_data['coords'].shape[1]))
+        elif condition_manifest is not None:
+            raise ValueError('legacy checkpoints cannot silently consume condition manifests')
         case_initializer = self.initializer
         initialization_version = "sdpi_v1"
         if init_mode == "expert_anchor":
-            from tricoopdiff.expert_anchors import (
+            from tricoopdiff.initialization.candidates import (
                 DualExpertAnchorInitializer, EXPERT_ANCHOR_CONSENSUS_VERSION,
                 EXPERT_ANCHOR_VERSION,
             )
@@ -178,6 +214,7 @@ class EvaluationRunner:
             translation_velocity_scale=translation_velocity_scale,
             rotation_velocity_scale=rotation_velocity_scale,
             return_rank_features=return_rank_features,
+            conditions=conditions,
             deepternary_dockq_paths={
                 "protein1_pdb": str(paths["protein1"]),
                 "protein2_pdb": str(paths["protein2"]),
@@ -211,14 +248,28 @@ class EvaluationRunner:
                          1.0),
             "trifuse_checkpoint": str(self.checkpoint_path.resolve()),
             "checkpoint_schema": (
-                "experimental_factorial_v1_ema" if self.experimental_checkpoint
-                else "production_v18_ema"
-            ),
+                "conditioned_consensus_training_v1_ema" if self.conditioned_checkpoint else
+                "experimental_factorial_v1_ema" if self.experimental_checkpoint else
+                f"production_v{self.checkpoint['checkpoint_version']}_ema"),
+            "architecture": self.checkpoint['architecture'],
+            "rigid_output_mode": ("independent_centroids_v1"
+                                  if self.checkpoint['model_config'].get('direct_ternary_motion', False)
+                                  else "dual_interfaces_v1"),
+            "weight_origin": ("raw_no_ema"
+                              if self.checkpoint.get('checkpoint_kind') == 'inference_only'
+                              and self.checkpoint['runtime_config'].get('ema_decay') == 0
+                              else "ema"),
+            "condition_manifest": (str(condition_path.resolve()) if condition_path else None),
+            "condition_manifest_sha256": (sha256_file(condition_path) if condition_path else None),
+            "condition_audit": condition_audit,
             "rank_features_saved": bool(return_rank_features),
+            "rank_feature_state": ('final_pose_t0_dt0_v1' if return_rank_features else None),
             "checkpoint_sha256": self.checkpoint_sha256,
             "expert_checkpoint_sha256": self.expert.provenance["score_checkpoint_sha256"],
             "expert_config_sha256": self.expert_config_sha256,
-            "input_signature": evaluation_input_signature(paths, native_complex_pdb),
+            "input_signature": evaluation_input_signature(
+                {**paths, **({'condition_manifest': condition_path} if condition_path else {})},
+                native_complex_pdb),
             "activation_clamp": self.activation_clamp,
             "activation_clamp_mode": self.activation_clamp_mode,
             "dockq_reconstruction": (
@@ -235,12 +286,3 @@ class EvaluationRunner:
             ),
         }
         return report
-
-
-def write_report_atomic(report, destination):
-    """Atomically publish one completed case report."""
-    path = Path(destination)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    temporary.replace(path)

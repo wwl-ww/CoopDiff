@@ -14,7 +14,7 @@ import numpy as np
 
 def test_trifuse_build():
     """TriFuse builds with correct output shapes."""
-    from tricoopdiff.trifuse import TriFuse
+    from tricoopdiff.legacy.trifuse import TriFuse
 
     trifuse = TriFuse(
         node_dim=128, ns=32, nv=4,
@@ -62,8 +62,8 @@ def test_trifuse_build():
 
 def test_trifuse_reads_geometry_and_preserves_rigid_invariance():
     """Context changes with interfaces, not with a common rigid transform."""
-    from tricoopdiff.diffusion import so3_exp
-    from tricoopdiff.trifuse import TriFuse
+    from tricoopdiff.geometry.rigid import rotation_exp as so3_exp
+    from tricoopdiff.legacy.trifuse import TriFuse
 
     torch.manual_seed(3)
     trifuse = TriFuse(
@@ -107,7 +107,7 @@ def test_trifuse_reads_geometry_and_preserves_rigid_invariance():
 
 def test_trifuse_links_chemical_features_to_local_contacts():
     """Moving chemical identities between near/far atoms changes context."""
-    from tricoopdiff.trifuse import TriFuse
+    from tricoopdiff.legacy.trifuse import TriFuse
 
     torch.manual_seed(7)
     trifuse = TriFuse(
@@ -142,7 +142,7 @@ def test_trifuse_links_chemical_features_to_local_contacts():
 
 def test_trifuse_reads_sigma_and_solver_state():
     """Equal geometry at different sigma/dt must produce different context."""
-    from tricoopdiff.trifuse import TriFuse
+    from tricoopdiff.legacy.trifuse import TriFuse
 
     torch.manual_seed(13)
     trifuse = TriFuse(
@@ -174,7 +174,7 @@ def test_trifuse_reads_sigma_and_solver_state():
 
 def test_trifuse_distinguishes_mirrored_interface_handedness():
     """Signed local geometry distinguishes mirror images with equal distances."""
-    from tricoopdiff.trifuse import TriFuse
+    from tricoopdiff.legacy.trifuse import TriFuse
 
     torch.manual_seed(23)
     trifuse = TriFuse(
@@ -203,7 +203,7 @@ def test_trifuse_distinguishes_mirrored_interface_handedness():
 
 def test_film_zero_init():
     """FiLM is transparent at initialization (adaLN-Zero)."""
-    from tricoopdiff.trifuse import FiLMHead
+    from tricoopdiff.legacy.trifuse import FiLMHead
 
     head = FiLMHead(hidden_dim=64)
     h = torch.randn(2, 64)
@@ -220,7 +220,7 @@ def test_film_zero_init():
 
 def test_trifuse_atom_film_can_select_ligand_regions():
     """A trained FiLM head can assign different scalar gates per atom."""
-    from tricoopdiff.trifuse import TriFuse
+    from tricoopdiff.legacy.trifuse import TriFuse
 
     torch.manual_seed(19)
     trifuse = TriFuse(
@@ -239,7 +239,7 @@ def test_trifuse_atom_film_can_select_ligand_regions():
 
 def test_score_control_is_identity_bounded_and_trainable():
     """Score calibration starts exact identity and cannot reverse direction."""
-    from tricoopdiff.trifuse import ScoreControlHead
+    from tricoopdiff.legacy.trifuse import ScoreControlHead
 
     head = ScoreControlHead(hidden_dim=16, max_delta=0.25)
     context = torch.randn(3, 16)
@@ -252,7 +252,7 @@ def test_score_control_is_identity_bounded_and_trainable():
 
 def test_layerwise_bridge_starts_exactly_transparent():
     """The dual-stream bridge must not perturb native zero-init experts."""
-    from tricoopdiff.trifuse import LayerwiseExpertBridge
+    from tricoopdiff.legacy.trifuse import LayerwiseExpertBridge
 
     bridge = LayerwiseExpertBridge(
         scalar_dim=8, hidden_dim=16, num_layers=3,
@@ -271,7 +271,7 @@ def test_layerwise_bridge_starts_exactly_transparent():
 
 def test_torsion_coordinator_zero_init_and_per_bond_control():
     """Shared torsion starts neutral but can make independent bond decisions."""
-    from tricoopdiff.trifuse import TorsionCoordinator
+    from tricoopdiff.legacy.trifuse import TorsionCoordinator
 
     coordinator = TorsionCoordinator(context_dim=8, hidden_dim=4)
     context = torch.randn(2, 8)
@@ -288,7 +288,7 @@ def test_torsion_coordinator_zero_init_and_per_bond_control():
 
 def test_torsion_coordinator_rejects_flat_native_shape():
     """The coordinator boundary requires an explicit batch dimension."""
-    from tricoopdiff.trifuse import TorsionCoordinator
+    from tricoopdiff.legacy.trifuse import TorsionCoordinator
 
     coordinator = TorsionCoordinator(context_dim=8, hidden_dim=4)
     try:
@@ -301,7 +301,7 @@ def test_torsion_coordinator_rejects_flat_native_shape():
 
 def test_torsion_coordinator_does_not_overflow_finite_evidence():
     """Finite expert scores must not overflow inside feature construction."""
-    from tricoopdiff.trifuse import TorsionCoordinator
+    from tricoopdiff.legacy.trifuse import TorsionCoordinator
 
     coordinator = TorsionCoordinator(context_dim=8, hidden_dim=4).eval()
     context = torch.zeros(1, 8)
@@ -314,7 +314,7 @@ def test_torsion_coordinator_does_not_overflow_finite_evidence():
 
 def test_bond_context_is_local_to_each_rotatable_bond():
     """Distinct endpoints/fragments must produce distinct bond contexts."""
-    from tricoopdiff.trifuse import BondContextEncoder
+    from tricoopdiff.legacy.trifuse import BondContextEncoder
 
     torch.manual_seed(11)
     encoder = BondContextEncoder(hidden_dim=16)
@@ -340,7 +340,7 @@ def test_bond_context_is_local_to_each_rotatable_bond():
 
 def test_expert_telemetry_conditions_bond_context():
     """Branch activation evidence must reach the shared torsion decision."""
-    from tricoopdiff.trifuse import (
+    from tricoopdiff.legacy.trifuse import (
         TELEMETRY_PER_LAYER, TELEMETRY_TAIL, TriFuse,
     )
 
@@ -362,7 +362,8 @@ def test_expert_telemetry_conditions_bond_context():
 
 def test_diffusion_schedules():
     """Diffusion schedules produce valid noise levels."""
-    from tricoopdiff.diffusion import InterfaceDiffusion, so3_score_norm
+    from tricoopdiff.legacy.diffusion import InterfaceDiffusion
+    from tricoopdiff.models.expert import so3_score_norm
 
     diffusion = InterfaceDiffusion(inference_steps=20)
 
@@ -383,7 +384,7 @@ def test_diffusion_schedules():
 
 def test_graph_construction():
     """Subgraph construction produces valid HeteroData."""
-    from tricoopdiff.graphs import (
+    from tricoopdiff.inputs.graphs import (
         build_subgraph_e3l, build_subgraph_pol,
         build_trifuse_graph, transform_ligand_to_poi_frame,
     )
@@ -437,8 +438,8 @@ def test_graph_construction():
 def test_initializer_body_frame():
     """The rotation returned by POI initialization is the inverse frame map."""
     from scipy.spatial.transform import Rotation
-    from tricoopdiff.rigid import assemble_interface_pair
-    from tricoopdiff.graphs import transform_ligand_to_poi_frame
+    from tricoopdiff.geometry.rigid import assemble_interface_pair
+    from tricoopdiff.inputs.graphs import transform_ligand_to_poi_frame
 
     np.random.seed(7)
     torch.manual_seed(7)
@@ -467,17 +468,28 @@ def test_initializer_body_frame():
 def test_frozen_expert_stays_eval():
     """Parent train mode must not reactivate a frozen pretrained expert."""
     import torch.nn as nn
-    from tricoopdiff.expert import FrozenDiffDock
+    from tricoopdiff.models.expert import FrozenDiffDock
 
     class DummyExpert(nn.Module):
         def __init__(self):
             super().__init__()
             self.dropout = nn.Dropout(0.5)
+            self.batchnorm = nn.BatchNorm1d(4)
             self.ns, self.nv = 4, 1
             self.sh_irreps = None
             self.device = "cpu"
 
+        def forward(self, features):
+            return self.dropout(self.batchnorm(features))
+
     frozen = FrozenDiffDock(DummyExpert(), num_conv_layers=1)
+    assert not frozen.training and not frozen.model.training, 'freezing must disable dropout/BN immediately'
+    features = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    running_mean = frozen.model.batchnorm.running_mean.clone()
+    first, second = frozen(features), frozen(features)
+    assert torch.equal(first, second), 'a frozen expert cannot produce training-mode dropout samples'
+    assert torch.equal(frozen.model.batchnorm.running_mean, running_mean)
+    assert frozen.model.batchnorm.num_batches_tracked == 0
     parent = nn.Module()
     parent.add_module("expert", frozen)
     parent.train()
@@ -488,21 +500,155 @@ def test_frozen_expert_stays_eval():
     print("  [OK] Frozen expert remains in eval mode")
 
 
-def test_score_sanitizer_handles_infinity():
+def test_frozen_expert_features_preserve_scores_gradients_and_hook_cleanup():
+    import torch.nn as nn
+    from tricoopdiff.models.expert import FrozenDiffDock, configure_expert_policy
+    from tricoopdiff.geometry.equivariant_clamp import clamp_irrep_features
+
+    class FeatureLayer(nn.Module):
+        out_irreps = '2x0e + 1x1o + 1x0o'
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(2.))
+
+        def forward(self, coords):
+            return torch.cat((coords[:, :2] * self.weight, coords,
+                              coords.sum(-1, keepdim=True)), dim=-1)
+
+    class NativeExpert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv_layers = nn.ModuleList([FeatureLayer()])
+            self.ns, self.nv, self.sh_irreps, self.device = 2, 1, None, 'cpu'
+            self.fail = False
+
+        def forward(self, coords):
+            nodes = self.conv_layers[0](coords)
+            if self.fail:
+                raise RuntimeError('score head failure')
+            if self.activation_clamp_mode == 'irrep_norm':
+                nodes = clamp_irrep_features(nodes, self.conv_layers[0].out_irreps,
+                                            self.activation_clamp)
+            else:
+                nodes = nodes.clamp(-self.activation_clamp, self.activation_clamp)
+            # Native production CGModel also returns an auxiliary confidence.
+            return nodes[:, :3], nodes[:, 3:], nodes[:, -1], nodes.new_zeros(1)
+
+    expert = FrozenDiffDock(NativeExpert(), num_conv_layers=1)
+    assert expert.node_scalar_dim == 3
+    original_keys = set(expert.state_dict())
+    for mode in ('componentwise', 'irrep_norm'):
+        configure_expert_policy(expert, .75, mode)
+        coords = torch.tensor([[.1, .2, .3], [2., 3., 4.]], requires_grad=True)
+        ordinary = expert(coords)
+        tr, rot, tor, scalars = expert.forward_features(coords)
+        assert all(torch.equal(actual, expected)
+                   for actual, expected in zip((tr, rot, tor), ordinary[:3]))
+        expected = torch.cat((ordinary[0][:, :2], ordinary[2][:, None]), dim=-1)
+        assert torch.equal(scalars, expected), '0e/0o extraction must follow irrep sections'
+        assert scalars.shape == (2, expert.node_scalar_dim)
+        native_gradient = torch.autograd.grad(expected.sum(), coords)[0]
+        scalars.sum().backward()
+        assert torch.equal(coords.grad, native_gradient), 'features must preserve native post-clamp Jacobians'
+        assert torch.isfinite(coords.grad).all() and coords.grad.abs().sum() > 0
+        assert all(parameter.grad is None and not parameter.requires_grad
+                   for parameter in expert.parameters())
+        assert not expert.model.conv_layers[0]._forward_hooks
+        assert set(expert.state_dict()) == original_keys
+    # At the production threshold, replacing scalar norm clipping with clamp
+    # differs by an ULP. Features must be the actual native post-clamp scalars.
+    configure_expert_policy(expert, 10000., 'irrep_norm')
+    coords = torch.linspace(10000. * 1.01, 10000. * 20., 1000).reshape(-1, 1).expand(-1, 3).clone()
+    ordinary = expert(coords)
+    expected = torch.cat((ordinary[0][:, :2], ordinary[2][:, None]), dim=-1)
+    assert torch.equal(expert.forward_features(coords)[3], expected)
+    assert not torch.equal(expected, expected.clamp(-10000., 10000.)), \
+        'fixture must expose native scalar norm-clamp rounding, not only approximate equality'
+    bad_coords = torch.tensor([[float('inf'), float('nan'), 1.]])
+    ordinary = expert(bad_coords)
+    expected = torch.cat((ordinary[0][:, :2], ordinary[2][:, None]), dim=-1)
+    assert torch.equal(torch.isnan(expert.forward_features(bad_coords)[3]), torch.isnan(expected)), \
+        'feature clipping must not conceal native invalid scalar activations'
+
+    # Non-reentrant checkpoint calls the native read again during backward.
+    # Hooks must remain local to each read and preserve the coordinate Jacobian.
+    from torch.utils.checkpoint import checkpoint
+    configure_expert_policy(expert, .75, 'irrep_norm')
+    coords = torch.tensor([[.1, .2, .3], [.2, .1, .2]], requires_grad=True)
+    direct = expert.forward_features(coords)[3]
+    direct_grad = torch.autograd.grad(direct.square().sum(), coords)[0]
+    recomputed = checkpoint(lambda value: expert.forward_features(value)[3], coords, use_reentrant=False)
+    recomputed_grad = torch.autograd.grad(recomputed.square().sum(), coords)[0]
+    assert torch.equal(recomputed, direct) and torch.equal(recomputed_grad, direct_grad)
+    assert not expert.model.conv_layers[0]._forward_hooks
+    expert.model.fail = True
+    try:
+        expert.forward_features(coords)
+    except RuntimeError as error:
+        assert 'score head failure' in str(error)
+    else:
+        raise AssertionError('feature read must not swallow native score failures')
+    assert not expert.model.conv_layers[0]._forward_hooks, 'failed reads must remove their hook'
+    expert.model.fail = False
+    assert expert.forward_features(coords)[3].shape == (2, 3)
+    print('  [OK] Frozen feature scores, coordinate gradients and hook cleanup')
+
+
+def test_failed_expert_policy_configuration_preserves_the_live_policy():
+    from types import SimpleNamespace
+    from tricoopdiff.models.expert import configure_expert_policy
+
+    expert = SimpleNamespace(model=SimpleNamespace(activation_clamp=10000.,
+                                                   activation_clamp_mode='irrep_norm'))
+    for limit, mode in ((1., 'invalid'), (float('nan'), 'componentwise'), (-1., 'componentwise')):
+        try:
+            configure_expert_policy(expert, limit, mode)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('invalid numerical policies must fail')
+        assert expert.model.activation_clamp == 10000.
+        assert expert.model.activation_clamp_mode == 'irrep_norm'
+
+
+def test_expert_loader_cannot_mislabel_the_frozen_layer_count():
+    import tempfile
+    from unittest.mock import patch
+    from tricoopdiff.models.expert import build_diffdock_expert
+
+    source = Path(__file__).resolve().parents[1] / 'checkpoints/score_model/model_parameters.yml'
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / 'model_parameters.yml').write_text(source.read_text())
+        with patch('tricoopdiff.diffdock.factory.build_cg_model') as build:
+            for invalid in (6, 0, True, 11.0):
+                try:
+                    build_diffdock_expert(root, device='cpu', num_conv_layers=invalid)
+                except ValueError as error:
+                    assert 'frozen checkpoint architecture' in str(error)
+                else:
+                    raise AssertionError('wrapper layers must not disagree with the checkpoint')
+            assert not build.called, 'invalid overrides must fail before constructing/loading a model'
+
+
+def test_score_guard_handles_infinity():
     """Inference must detect non-finite scores without hiding their values."""
-    from tricoopdiff.sampler import _sanitize_score
+    from tricoopdiff.sampler import _nonfinite_components
 
     score = torch.tensor([[1.0, float("nan"), float("inf"), -float("inf")]])
-    sanitized, changed = _sanitize_score(score)
-    assert changed
-    assert torch.equal(torch.isfinite(sanitized), torch.isfinite(score))
+    velocities = {'e3_ligand': {'tr': score, 'rot': torch.zeros(1, 3)},
+                  'poi_ligand': {'tr': torch.zeros(1, 3), 'rot': torch.zeros(1, 3)},
+                  'torsion': torch.empty(1, 0)}
+    assert _nonfinite_components(velocities) == ['e3_ligand.tr']
+    assert torch.equal(torch.isfinite(velocities['e3_ligand']['tr']), torch.isfinite(score))
 
     print("  [OK] Score guard rejects rather than sanitizes infinities")
 
 
 def test_reflect_pipeline():
     """TriReflect detects clashes and runs minimization."""
-    from tricoopdiff.reflect import detect_clashes, tricoop_reflect
+    from tricoopdiff.geometry.reflect import detect_clashes, tricoop_reflect
 
     # Create two non-bonded atoms well inside VDW contact → should clash.
     # (0.5Å is skipped by the covalent-radius 1-2 heuristic, which treats very
@@ -571,7 +717,10 @@ if __name__ == "__main__":
     test_graph_construction()
     test_initializer_body_frame()
     test_frozen_expert_stays_eval()
-    test_score_sanitizer_handles_infinity()
+    test_frozen_expert_features_preserve_scores_gradients_and_hook_cleanup()
+    test_failed_expert_policy_configuration_preserves_the_live_policy()
+    test_expert_loader_cannot_mislabel_the_frozen_layer_count()
+    test_score_guard_handles_infinity()
     test_reflect_pipeline()
     test_deepternary_dockq_alignment()
 

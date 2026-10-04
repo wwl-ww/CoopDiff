@@ -13,7 +13,7 @@ from .layers import GaussianSmearing, AtomEncoder
 from .tensor_layers import TensorProductConvLayer, get_irrep_seq
 from ..utils import so3, torus
 from ..constants import lig_feature_dims, rec_residue_feature_dims, rec_atom_feature_dims
-from ...equivariant_clamp import clamp_irrep_features, validate_clamp_mode
+from ...geometry.equivariant_clamp import clamp_irrep_features, validate_clamp_mode
 
 
 class CGModel(torch.nn.Module):
@@ -328,7 +328,10 @@ class CGModel(torch.nn.Module):
         lr_edge_attr = self.cross_edge_embedding(lr_edge_attr)
 
         node_attr = torch.cat([lig_node_attr, rec_node_attr], dim=0)
-        lr_edge_index[1] = lr_edge_index[1] + len(lig_node_attr)
+        # Cross-geometry autograd saves the original indices for coordinate
+        # gathers. Do not mutate them when switching to combined-node indices.
+        lr_edge_index = torch.stack((lr_edge_index[0],
+                                     lr_edge_index[1] + len(lig_node_attr)))
         edge_index = torch.cat([lig_edge_index, lr_edge_index, rec_edge_index + len(lig_node_attr),
                                 torch.flip(lr_edge_index, dims=[0])], dim=1)
         edge_attr = torch.cat([lig_edge_attr, lr_edge_attr, rec_edge_attr, lr_edge_attr], dim=0)
@@ -366,9 +369,10 @@ class CGModel(torch.nn.Module):
             # |node_attr| < ~3e2, so a 1e4 clamp is transparent to normal inference
             # while preventing the exponential (10^2-10^4 per layer) runaway that
             # overflows float32 and produces NaN scores. Opt-in via NAN_CLAMP env.
-            _nan_clamp = os.environ.get("NAN_CLAMP")
+            _nan_clamp = getattr(self, 'activation_clamp', os.environ.get("NAN_CLAMP"))
             if _nan_clamp:
-                mode = validate_clamp_mode(os.environ.get('NAN_CLAMP_MODE', 'componentwise'))
+                mode = validate_clamp_mode(getattr(self, 'activation_clamp_mode',
+                                                  os.environ.get('NAN_CLAMP_MODE', 'componentwise')))
                 if mode == 'irrep_norm':
                     node_attr = clamp_irrep_features(
                         node_attr, self.conv_layers[l].out_irreps, float(_nan_clamp))

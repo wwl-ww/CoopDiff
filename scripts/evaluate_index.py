@@ -16,7 +16,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 def select_entries(index_path, start=0, limit=None):
     """Load a deterministic slice from an evaluation index."""
     payload = json.loads(Path(index_path).read_text(encoding="utf-8"))
-    entries = payload.get("entries", payload)
+    entries = payload["entries"] if isinstance(payload, dict) else payload
+    cases = [entry['case'] for entry in entries]
+    if len(set(cases)) != len(cases):
+        raise ValueError('evaluation index contains duplicate case names')
     if start < 0 or (limit is not None and limit < 1):
         raise ValueError("start must be non-negative and limit must be positive")
     return entries[start:] if limit is None else entries[start:start + limit]
@@ -158,6 +161,7 @@ def main():
                 "dockq_source_sha256": sha256_file(runner.deepternary_root / 'DockQ/dockq_util.py'),
                 "dockq_binary_sha256": sha256_file(runner.deepternary_root / 'DockQ/fnat'),
                 "rank_features_saved": args.save_rank_features,
+                "rank_feature_state": ('final_pose_t0_dt0_v1' if args.save_rank_features else None),
             }
             if not args.no_resume and completed_report(
                     report_path, case, checkpoint, expected_config,

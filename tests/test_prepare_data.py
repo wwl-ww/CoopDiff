@@ -180,3 +180,28 @@ def test_repository_joint_pool_contract():
     )
     assert len(merged) == 653
     assert sum(len(cluster['items']) for cluster in merged) == 7198
+
+
+def test_ligand_centroid_matches_retained_graph_atoms(tmp_path):
+    import sys
+    import numpy as np
+    from rdkit import Chem
+    from rdkit.Geometry import Point3D
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+    from featurize_common import _ligand_centroid
+
+    # RemoveHs retains isotope hydrogens; a heavy-only centroid is incorrect.
+    mol = Chem.AddHs(Chem.MolFromSmiles('[2H]C'))
+    conformer = Chem.Conformer(mol.GetNumAtoms())
+    for index in range(mol.GetNumAtoms()):
+        conformer.SetAtomPosition(index, Point3D(float(index * 2), 0., 0.))
+    mol.AddConformer(conformer)
+    path = tmp_path / 'isotope.sdf'
+    with Chem.SDWriter(str(path)) as writer:
+        writer.write(mol)
+    for remove_hs in (True, False):
+        retained = Chem.RemoveHs(mol) if remove_hs else mol
+        expected = retained.GetConformer().GetPositions().mean(axis=0)
+        assert np.allclose(_ligand_centroid(str(path), remove_hs), expected), \
+            'native ligand frame must use the same atoms as the input graph'

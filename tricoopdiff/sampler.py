@@ -15,12 +15,15 @@ This module is self-contained: it takes already-featurized B=1 data dicts
 does NOT import ``../DiffDock``.
 """
 
+from functools import wraps
+
 import numpy as np
 import torch
 
-from .initialization import TernaryInitializer
-from .sdpi_flow import SDPIFlow, FLOW_VERSION
-from .consensus import SOURCE_NAMES
+from tricoopdiff.initialization import TernaryInitializer
+from tricoopdiff.sdpi_flow import SDPIFlow, FLOW_VERSION
+from tricoopdiff.models.consensus import SOURCE_NAMES
+from tricoopdiff.runtime import evaluation_context
 
 
 def actual_candidate_source(init_mode, initialization):
@@ -50,24 +53,24 @@ def _tensor_summary(tensor: torch.Tensor) -> dict:
     }
 
 
-def _sanitize_score(score):
-    """Detect a non-finite score without inventing a replacement value.
-
-    The historical name is retained for local callers, but sanitization is no
-    longer performed. A non-finite expert prediction invalidates the walker
-    before coordinates are updated; ``nan_to_num`` would hide an OOD state and
-    create a pose that is not sampled from the learned reverse process.
-
-    Returns:
-        (original_score, had_nonfinite)
-    """
-    if score is None or score.numel() == 0:
-        return score, False
-    had_nonfinite = bool(torch.isnan(score).any() or torch.isinf(score).any())
-    return score, had_nonfinite
+def _nonfinite_components(velocities):
+    """Reject invalid motion without replacing values or rebuilding predictions."""
+    components = [(f'{branch}.{name}', velocities[branch][name])
+                  for branch in ('e3_ligand', 'poi_ligand') for name in ('tr', 'rot')]
+    components.append(('e3_ligand.tor', velocities['torsion']))
+    return [name for name, value in components if not torch.isfinite(value).all()]
 
 
-@torch.no_grad()
+def _sampling_context(function):
+    """Inference must leave the caller's training mode and RNG unchanged."""
+    @wraps(function)
+    def wrapped(model, *args, **kwargs):
+        with evaluation_context(model):
+            return function(model, *args, **kwargs)
+    return wrapped
+
+
+@_sampling_context
 def sample_single(
     model,
     diffusion: SDPIFlow,
@@ -87,6 +90,8 @@ def sample_single(
     rotation_velocity_scale: float = 1.0,
     velocity_transform=None,
     return_rank_features: bool = False,
+    return_body_frame: bool = False,
+    conditions=None,
 ) -> dict:
     """
     Run one reverse-flow trajectory (single walker) from t=1 to t=0.
@@ -113,17 +118,13 @@ def sample_single(
             leave this as ``None``.
         return_rank_features: retain the final pre-update invariant consensus
             context for separately supervised pose ranking.
+        conditions: optional immutable, node-aligned PROTAC condition features.
 
     Returns:
         dict with 'ligand_coords' [N_lig, 3], 'poi_coords' [N_poi, 3] (CPU numpy),
         plus 'trajectory' (list of (lig, poi) per step) when requested and
         'trace' (per-step diagnostic dicts) when requested.
     """
-    model.eval()
-    if seed is not None:
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-
     if steps is None:
         steps = diffusion.inference_steps
     if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
@@ -158,6 +159,8 @@ def sample_single(
     )
     if not torch.isfinite(ligand_pos).all() or not torch.isfinite(poi_pos).all():
         raise FloatingPointError("non-finite sdpi initialization")
+    if ligand_pos.shape != ligand_data['coords'].shape or poi_pos.shape != poi_data['coords'].shape:
+        raise ValueError('initialization atom counts must match the indexed inputs')
     if freeze_poi:
         poi_pos = poi_data["coords"].clone().detach()
         r_e3_to_poi = torch.eye(3, device=device, dtype=poi_pos.dtype).unsqueeze(0)
@@ -175,15 +178,9 @@ def sample_single(
         "minimum_poi_ca_ligand_distance": float(torch.cdist(poi_pos[0], ligand_pos[0]).min()),
     }
 
-    schedule = (
-        diffusion.get_refinement_schedule(steps, t_start=t_anchor)
-        if init_mode == "fixed_candidate"
-        else diffusion.get_inference_schedule(steps, t_start=t_anchor)
-    )
     trajectory = [] if return_trajectory else None
     trace = [] if return_trace else None
     nonfinite_score_steps = []
-    final_rank_features = None
 
     init_ligand_com = ligand_pos.mean(dim=1)[0]
     init_poi_com = poi_pos.mean(dim=1)[0]
@@ -206,65 +203,28 @@ def sample_single(
     if return_trace:
         trace.append(init_record)
 
-    for i in range(steps):
-        t_tr = torch.tensor([schedule["tr_schedule"][i]], device=device, dtype=torch.float32)
-        t_rot = torch.tensor([schedule["rot_schedule"][i]], device=device, dtype=torch.float32)
-        t_tor = torch.tensor([schedule["tor_schedule"][i]], device=device, dtype=torch.float32)
-        if i < steps - 1:
-            dt_tr = torch.tensor(
-                [schedule["tr_schedule"][i] - schedule["tr_schedule"][i + 1]],
-                device=device, dtype=torch.float32,
-            )
-            dt_rot = torch.tensor(
-                [schedule["rot_schedule"][i] - schedule["rot_schedule"][i + 1]],
-                device=device, dtype=torch.float32,
-            )
-            dt_tor = torch.tensor(
-                [schedule["tor_schedule"][i] - schedule["tor_schedule"][i + 1]],
-                device=device, dtype=torch.float32,
-            )
-        else:
-            # Match vendored DiffDock's sampling driver: the final deterministic
-            # step uses dt = t_i (actual_steps=19 with a length-20 schedule), not
-            # t_i - t_{i+1} against an explicit zero endpoint.
-            dt_tr = t_tr.clone()
-            dt_rot = t_rot.clone()
-            dt_tor = t_tor.clone()
-
+    for i, (t_tr, dt_tr) in enumerate(diffusion.reverse_times(ligand_pos, steps, t_anchor)):
+        t_rot = t_tor = t_tr
+        dt_rot = dt_tor = dt_tr
         tr_sigma, rot_sigma, tor_sigma = diffusion.t_to_sigma(t_tr, t_rot, t_tor)
-        pol_tr_sigma, pol_rot_sigma, _ = diffusion.t_to_sigma(
-            t_tr, t_rot, t_tor,
-        )
-        diffusion_state = diffusion.conditioning(t_tr, dt_tr, e3_data['coords'], poi_data['coords'])
-
         if bool(getattr(model.expert.model, "dynamic_max_cross", False)):
             receptor_crop_cutoff = tr_sigma * 3 + 20
         else:
             receptor_crop_cutoff = None
 
-        # Rebuild the data dicts with the current (noisy) coordinates. Edges and
-        # features are constant; only coords change between steps.
-        lig_d = {**ligand_data, "coords": ligand_pos}
-        poi_d = {**poi_data, "coords": poi_pos}
-
+        probe_enabled = getattr(model, '_debug_step0_probe', False)
         if return_trace:
             setattr(model, '_debug_step0_probe', True)
             setattr(model, '_last_step0_probe', None)
-        out = model(
-            e3_data, poi_d, lig_d, t_e3l=t_tr, t_pol=t_tr,
-            r_e3_to_poi=r_e3_to_poi,
-            receptor_crop_cutoff=receptor_crop_cutoff,
-            diffusion_state=diffusion_state,
-            source=source_index,
-        )
-        if return_rank_features:
-            features = out.get('rank_features')
-            if features is None or features.ndim != 2 or features.shape[0] != 1:
-                raise ValueError('model did not return rank_features [1,D]')
-            final_rank_features = features[0].detach().cpu().numpy().copy()
+        try:
+            out = diffusion.forward_state(
+                model, e3_data, poi_data, ligand_data, ligand_pos, poi_pos,
+                r_e3_to_poi, t_tr, dt_tr, source_index, conditions)
+        finally:
+            if return_trace:
+                setattr(model, '_debug_step0_probe', probe_enabled)
         if return_trace:
             step0_probe = getattr(model, '_last_step0_probe', None)
-            setattr(model, '_debug_step0_probe', False)
         else:
             step0_probe = None
         predicted = diffusion.normalized_predictions(out, t_tr)
@@ -275,31 +235,20 @@ def sample_single(
             velocities[branch]['rot'] = (
                 velocities[branch]['rot'] * rotation_velocity_scale)
         if velocity_transform is not None:
+            original_mode = velocities.get('rigid_output_mode', 'dual_interfaces_v1')
+            original_torsion_mode = velocities.get('torsion_update_mode')
             velocities = velocity_transform(
                 velocities, ligand_pos, poi_pos, r_e3_to_poi,
                 t_tr, dt_tr, ligand_data)
             if not isinstance(velocities, dict):
                 raise TypeError("velocity_transform must return a velocity dictionary")
-        interface_scores = velocities
-        s_q = {}
-        sanitized_components = []
-        for name, value in (
-            ("tr", interface_scores["e3_ligand"]["tr"]),
-            ("rot", interface_scores["e3_ligand"]["rot"]),
-            ("tor", velocities['torsion']),
-        ):
-            s_q[name], had_nonfinite = _sanitize_score(value)
-            if had_nonfinite:
-                sanitized_components.append(f"e3_ligand.{name}")
-        s_pol = {}
-        for name in ("tr", "rot"):
-            s_pol[name], had_nonfinite = _sanitize_score(
-                interface_scores["poi_ligand"][name]
-            )
-            if had_nonfinite:
-                sanitized_components.append(f"poi_ligand.{name}")
-        if freeze_poi:
-            s_pol = {name: torch.zeros_like(value) for name, value in s_pol.items()}
+            if velocities.get('rigid_output_mode', 'dual_interfaces_v1') != original_mode:
+                raise ValueError('velocity_transform must preserve the rigid output mode')
+            if velocities.get('torsion_update_mode') != original_torsion_mode:
+                raise ValueError('velocity_transform must preserve the torsion update mode')
+        s_q = {**velocities['e3_ligand'], 'tor': velocities['torsion']}
+        s_pol = velocities['poi_ligand']
+        sanitized_components = _nonfinite_components(velocities)
         if sanitized_components:
             nonfinite_score_steps.append({
                 "step": i,
@@ -317,7 +266,7 @@ def sample_single(
         add_noise = False  # deterministic reverse flow, not temperature SDE
         ligand_pos, poi_pos, r_e3_to_poi = diffusion.step(
             ligand_pos, poi_pos, r_e3_to_poi,
-            {'e3_ligand': s_q, 'poi_ligand': s_pol, 'torsion': s_q['tor']},
+            velocities,
             dt_tr, ligand_data, freeze_poi=freeze_poi,
         )
 
@@ -330,6 +279,8 @@ def sample_single(
                 "add_noise": add_noise,
                 "sanitized_components": sanitized_components,
                 "freeze_poi": bool(freeze_poi),
+                "rigid_output_mode": velocities.get('rigid_output_mode', 'dual_interfaces_v1'),
+                "torsion_update_mode": velocities.get('torsion_update_mode', 'legacy_kabsch_v1'),
                 "t": {
                     "tr": float(t_tr.item()),
                     "rot": float(t_rot.item()),
@@ -368,7 +319,7 @@ def sample_single(
                 },
                 "step0_probe": step0_probe,
                 "consensus": {
-                    key: value.detach().cpu().tolist()
+                    key: (value.detach().cpu().tolist() if torch.is_tensor(value) else value)
                     for key, value in out.get('consensus_diagnostics', {}).items()
                 },
             }
@@ -391,12 +342,22 @@ def sample_single(
     }
     if return_trajectory:
         result["trajectory"] = trajectory
+    if return_body_frame:
+        result["body_frame"] = r_e3_to_poi[0].detach().cpu().numpy().copy()
     if return_trace:
         result["trace"] = trace
-    if return_rank_features:
-        if final_rank_features is None:
-            raise RuntimeError('no rank features were produced')
+    if return_rank_features and not nonfinite_score_steps:
+        final = diffusion.forward_state(
+            model, e3_data, poi_data, ligand_data, ligand_pos, poi_pos,
+            r_e3_to_poi, ligand_pos.new_zeros(1), ligand_pos.new_zeros(1),
+            source_index, conditions)
+        features = final.get('rank_features')
+        if (features is None or features.ndim != 2 or features.shape[0] != 1
+                or not torch.isfinite(features).all()):
+            raise ValueError('model did not return finite final rank_features [1,D]')
+        final_rank_features = features[0].detach().cpu().numpy().copy()
         result['rank_features'] = final_rank_features
+        result['rank_feature_state'] = 'final_pose_t0_dt0_v1'
     return result
 
 
@@ -417,6 +378,7 @@ def sample_ensemble(
     translation_velocity_scale: float = 1.0,
     rotation_velocity_scale: float = 1.0,
     return_rank_features: bool = False,
+    conditions=None,
 ) -> list:
     """
     Run ``n_walkers`` independent reverse-flow trajectories.
@@ -448,6 +410,7 @@ def sample_ensemble(
                 translation_velocity_scale=translation_velocity_scale,
                 rotation_velocity_scale=rotation_velocity_scale,
                 return_rank_features=return_rank_features,
+                conditions=conditions,
             )
         )
     return results
