@@ -23,6 +23,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 
 import tricoopdiff.diffdock_compat  # noqa: F401
+from featurize_common import _FEATURIZE_CACHE_VERSION
 from tricoopdiff.legacy.diffusion import InterfaceDiffusion
 from tricoopdiff.models.expert import build_diffdock_expert
 from tricoopdiff.inputs.graphs import build_subgraph_e3l, crop_receptor_to_ligand
@@ -156,8 +157,8 @@ def main():
     results = []
     for cache in args.cache:
         payload = torch.load(cache, map_location='cuda', weights_only=False)
-        if payload.get('cache_version') != 7 or not payload.get('source_signature'):
-            raise ValueError(f'{cache}: expected signed feature cache v7 (corrected k-NN edges)')
+        if payload.get('cache_version') != _FEATURIZE_CACHE_VERSION or not payload.get('source_signature'):
+            raise ValueError(f'{cache}: expected signed feature cache v{_FEATURIZE_CACHE_VERSION}')
         for component in ('e3_data', 'poi_data', 'ligand_data'):
             for name in ('coords', 'features'):
                 value = payload[component][name]

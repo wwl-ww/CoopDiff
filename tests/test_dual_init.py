@@ -14,7 +14,7 @@ from tricoopdiff.initialization.endpoints import (  # noqa: E402
     CachedEndpointStore, DUAL_INIT_CACHE_VERSION, validate_endpoint_cache,
 )
 from tricoopdiff.initialization.endpoints import (  # noqa: E402
-    LazyTrainingEndpointStore, ONLINE_TRAINING_ENDPOINT_PROTOCOL,
+    LazyTrainingEndpointStore, RESAMPLED_TRAINING_ENDPOINT_PROTOCOL,
     endpoint_input_signature,
 )
 
@@ -61,6 +61,11 @@ def test_cache_roundtrip_preserves_deterministic_coupling():
         second, _ = store.coupling('demo', occurrence=4)
         assert second['angles'][0] == 0
         assert record['actual_source'] == 'bitseed'
+        record['coupling']['angles'][0] = 88
+        record['actual_source'] = 'sdpi'
+        third, fresh_record = store.coupling('demo', occurrence=4)
+        assert third['angles'][0] == 0 and fresh_record['actual_source'] == 'bitseed', (
+            'returned metadata must not expose mutable cached training state')
 
 
 def test_fallback_cannot_be_relabelled_as_bitseed():
@@ -86,13 +91,13 @@ def test_lazy_training_protocol_is_exactly_one_pose_per_expert():
     with tempfile.TemporaryDirectory() as directory:
         store = LazyTrainingEndpointStore(directory, expert)
         assert store.protocol == {
-            'version': ONLINE_TRAINING_ENDPOINT_PROTOCOL,
+            'version': RESAMPLED_TRAINING_ENDPOINT_PROTOCOL,
             'conformers': 1, 'poses_per_side': 1, 'binary_steps': 20,
             'binary_retry_limit': 1, 'selection': 'single_pair_no_ranking',
             'fallback': 'sdpi_v1_on_any_invalid_expert_side',
             'base_seed': 41000,
             'expert_runtime': store.protocol['expert_runtime'],
-            'generation_version': 'raw_target_projection_v2',
+            'generation_version': 'raw_target_projection_v3',
             'frozen_expert': {
                 'diffdock_commit': 'test', 'score_checkpoint_sha256': 'abc',
                 'no_torsion': False,
@@ -125,7 +130,7 @@ def test_resampled_endpoints_use_occurrence_and_keep_validation_fixed():
 
     with tempfile.TemporaryDirectory() as directory:
         expert = _lazy_store(directory).expert
-        store = LazyTrainingEndpointStore(directory, expert, resample=True)
+        store = LazyTrainingEndpointStore(directory, expert)
         assert store.protocol['version'] == RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
 
         def generate(case, batch, signature, occurrence):
@@ -191,14 +196,21 @@ def test_lazy_cache_checks_disk_and_memory_inputs_without_overwriting():
         store = _lazy_store(directory)
         batch = _input_batch()
         path = store._path('demo')
-        torch.save({'case': 'demo', 'protocol': store.protocol,
-                    'record': payload()['entries'][0],
-                    'input_signature': endpoint_input_signature(batch)}, path)
+        record = deepcopy(payload()['entries'][0])
+        record['occurrence'] = 0
+        record['target_ligand'] = np.zeros((4, 3))
+        torch.save({'case': 'demo', 'occurrence': 0, 'protocol': store.protocol,
+                    'record': record, 'input_signature': endpoint_input_signature(batch)}, path)
         original = path.read_bytes()
-        first, _ = store.coupling('demo', batch=batch)
-        first['angles'][0] = 99
-        again, _ = store.coupling('demo', batch=deepcopy(batch))
-        assert again['angles'][0] == 0
+        first, record = store.coupling('demo', batch=batch)
+        first['initial_state']['ligand'][0, 0] = 99
+        record['endpoint']['ligand'][0, 0] = 88
+        record['target_ligand'][0, 0] = 77
+        record['actual_source'] = 'sdpi'
+        again, fresh_record = store.coupling('demo', batch=deepcopy(batch))
+        assert again['initial_state']['ligand'][0, 0] == 0
+        assert again['target_ligand'][0, 0] == 0 and fresh_record['actual_source'] == 'bitseed', (
+            'returned metadata changed deterministic cached inputs, labels or source')
         changed = deepcopy(batch)
         changed['ligand_data']['coords'] = torch.ones(1, 6, 3)
         for reader in (store, _lazy_store(directory)):

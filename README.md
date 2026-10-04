@@ -36,9 +36,15 @@ TriCoopDiff 研究蛋白–配体–蛋白三元装配：两个冻结 DiffDock �
 
 BiTSeed 生产训练按样本 occurrence 重采，验证固定 occurrence 0；缓存按 occurrence 分文件保存，RAM 每个 case 仅保留最新记录。缓存包含专家配置和实例数值策略，新协议不可复用旧缓存。重采会增加二元专家计算与磁盘占用，不再享有每 case 只生成一次的旧成本。
 
-专家 clamp 属于实例，不受其他 trainer/runner 覆盖；专家 sigma 配置必须匹配生产 DiffDock-L 预条件器。v24 checkpoint 保存 Python、NumPy、Torch CPU/CUDA RNG 和专家运行身份；恢复要求相同 CUDA 拓扑。旧 checkpoint 可显式恢复旧训练目标，但没有 RNG 时不能声称连续轨迹精确恢复。切换到新监督必须作为新训练加载权重，不能伪装成原训练 resume。
+目标投影统一使用保留原子对应关系的 NumPy Kabsch 拟合，包括共线和单原子退化情形；目标缓存生成身份为 `raw_target_projection_v3`，拒绝复用旧拟合标签。checkpoint 恢复先验证权重、优化器动量、调度器、进度和 RNG，再加载实时状态；非法恢复不会留下半加载模型。
+
+候选与流更新器要求 body frame 是合法 SO(3) 旋转，拒绝缩放、剪切和反射矩阵。可微刚体拟合 RMSD 在精确拟合零点保持有限梯度；验证和采样共用上下文恢复各子模块模式及 RNG。EMA 临时权重下禁止优化和保存/恢复训练状态，EMA 加载失败也会回滚原始权重。
+
+专家 clamp 属于实例，不受其他 trainer/runner 覆盖；专家 sigma 配置必须匹配生产 DiffDock-L 预条件器。v24 checkpoint 保存 Python、NumPy、Torch CPU/CUDA RNG 和专家运行身份；恢复要求相同 CUDA 拓扑。生产训练只保留此终点协议；旧 checkpoint 仅用于推理或作为新训练的权重来源，不再支持恢复旧生产训练。历史速度实验显式使用基础速度训练器；历史条件训练仅读取已有投影归档，不再在线生成旧协议缓存。
 
 采样保留调用者 RNG。请求 rank features 时会额外读取最终构象，使用 `t=0, dt=0`，标记为 `final_pose_t0_dt0_v1`；不能与旧的最后一步更新前特征混用。
+
+训练验证采用 `case_fixed_real_initialization_protein_fullatom_v4`：SDPI 起点按 case 固定，不随遍历顺序或子集变化；验证与特征处理保留所有已初始化 GPU 的 RNG。恢复不同验证协议时，保留权重和优化器/LR，但重置最佳 loss、DockQ 和调度器的旧验证历史。完整 DockQ 续跑必须有匹配的逐 walker 完整评分计数。
 
 ## 环境与检查
 

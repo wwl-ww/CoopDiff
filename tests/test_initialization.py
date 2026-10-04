@@ -171,11 +171,28 @@ def test_torsion_is_applied_once_and_no_torsion_is_explicit():
             assert not any(metadata['torsion_updates'])
 
 
+def test_float64_initial_torsions_preserve_bond_geometry_precision():
+    data = ligand_input()
+    data['coords'] = data['coords'].double()
+    receptor = torch.tensor([[0., 0., 0.], [2., 0., 0.], [0., 3., 0.]],
+                            dtype=torch.float64)
+    rigid = TernaryInitializer(no_torsion=True).initialize(
+        receptor, receptor * 2, data, seed=73)[0][0]
+    flexible = TernaryInitializer().initialize(
+        receptor, receptor * 2, data, seed=73)[0][0]
+    u, v = data['edge_index']
+    expected = torch.linalg.vector_norm(rigid[u] - rigid[v], dim=-1)
+    actual = torch.linalg.vector_norm(flexible[u] - flexible[v], dim=-1)
+    assert flexible.dtype == torch.float64
+    assert torch.allclose(actual, expected, atol=1e-10, rtol=0.), (
+        'float64 torsion initialization silently rounded the conformer to float32')
+
+
 def test_sampler_rejects_removed_modes_and_mismatched_clock():
     from tricoopdiff.legacy.diffusion import InterfaceDiffusion
     from tricoopdiff.sampler import sample_single
 
-    model = SimpleNamespace(eval=lambda: None)
+    model = torch.nn.Linear(1, 1)
     data = {'coords': torch.ones(1, 4, 3)}
     for kwargs in ({'init_mode': 'dual_native'}, {'init_mode': 'native'}, {'init_mode': 'coupled5a'},
                    {'init_mode': 'anchor_local'}, {'t_anchor': 0.7},

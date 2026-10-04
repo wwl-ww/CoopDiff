@@ -343,6 +343,81 @@ def test_rigid_fit_gradient_is_regular_at_repeated_singular_values():
     assert torch.isfinite(source.grad).all() and torch.isfinite(target.grad).all()
 
 
+def test_exact_rigid_fit_rmsd_has_finite_zero_gradient():
+    from tricoopdiff.geometry.rigid import proper_rigid_fit
+
+    source = torch.cat((torch.eye(3), -torch.eye(3))).double().requires_grad_()
+    _, _, rmsd = proper_rigid_fit(source, source.detach())
+    assert rmsd == 0
+    rmsd.backward()
+    assert torch.isfinite(source.grad).all() and torch.equal(source.grad, torch.zeros_like(source))
+
+
+def test_candidates_and_decoder_reject_nonrotation_frames():
+    from tricoopdiff.initialization.candidates import FixedCandidateInitializer, _valid_candidate
+
+    flow, data, _, native_poi, coupling = fixture()
+    ligand, poi, body, velocities = flow.path(data, native_poi, coupling, torch.tensor([.5]))
+    candidate = {'ligand': ligand, 'poi': poi, 'rotation': body}
+    assert _valid_candidate(candidate)
+    invalid = (torch.eye(3) * 2, torch.diag(torch.tensor([-1., 1., 1.])),
+               torch.tensor([[1., .2, 0.], [0., 1., 0.], [0., 0., 1.]]))
+    for matrix in invalid:
+        frame = matrix.double().unsqueeze(0)
+        assert not _valid_candidate({**candidate, 'rotation': frame})
+        for execute in (
+                lambda: FixedCandidateInitializer({**candidate, 'rotation': frame}, no_torsion=False),
+                lambda: flow.step(ligand, poi, frame, velocities, torch.tensor([.05]), data)):
+            try:
+                execute()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('a scale, shear or reflection was accepted as a rotation')
+
+
+def test_sampler_restores_training_mode_and_rng_on_success_and_failure():
+    from tricoopdiff.sampler import sample_single
+    from tricoopdiff.initialization import TernaryInitializer
+
+    flow, data, e3, poi, _ = fixture()
+
+    class Predictor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.expert = SimpleNamespace(model=SimpleNamespace(no_torsion=False, dynamic_max_cross=False))
+            self.fail = False
+            self.fixed_eval_child = torch.nn.Dropout()
+
+        def forward(self, *args, **kwargs):
+            assert not self.training and not torch.is_grad_enabled()
+            if self.fail:
+                raise RuntimeError('intentional model failure')
+            zero = data['coords'].new_zeros
+            return {'normalized_velocity': {
+                'e3_ligand': {'tr': zero(1, 3), 'rot': zero(1, 3)},
+                'poi_ligand': {'tr': zero(1, 3), 'rot': zero(1, 3)},
+                'torsion': zero(1, int(data['edge_mask'].sum()))}}
+
+    model = Predictor()
+    for training in (True, False):
+        model.train(training)
+        model.fixed_eval_child.eval()
+        for fail in (False, True):
+            model.fail = fail
+            rng = torch.get_rng_state().clone()
+            try:
+                sample_single(model, flow, TernaryInitializer(), {'coords': e3}, {'coords': poi},
+                              data, steps=1, seed=3, device='cpu')
+            except RuntimeError as error:
+                assert fail and 'intentional' in str(error)
+            else:
+                assert not fail
+            assert model.training == training, 'sampling leaked eval mode into its caller'
+            assert not model.fixed_eval_child.training, 'sampling changed a fixed-eval child module'
+            assert torch.equal(torch.get_rng_state(), rng), 'sampling changed training RNG'
+
+
 if __name__ == '__main__':
     for name, function in list(globals().items()):
         if name.startswith('test_'):

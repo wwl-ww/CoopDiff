@@ -264,8 +264,9 @@ def compute_poi_dockq(
         cutoff: contact distance cutoff (Å) between PROTAC atom and POI Cα.
 
     Returns:
-        dict with 'dockq' (Fnat in [0,1]) and contact counts, or None when the
-        native PDB is unavailable/unparseable.
+        Contact recovery ('dockq') only with matching atom counts. Otherwise
+        return 'contact_density_ratio' as a separate, non-correspondence
+        diagnostic; it is not Fnat. Return None for an unavailable native.
     """
     from scipy.spatial.distance import cdist
 
@@ -282,14 +283,14 @@ def compute_poi_dockq(
     n_pred = int((pred_d < cutoff).sum())
 
     if not (n_lig_ok and n_poi_ok):
-        # Correspondence broken → density ratio only (still non-NaN).
+        # A count ratio cannot measure recovery of specific native contacts.
         n_native = int((cdist(ref_lig, ref_poi) < cutoff).sum())
         if n_native == 0:
             return None
         return {
-            'dockq': float(min(n_pred, n_native) / n_native),
+            'contact_density_ratio': float(n_pred / n_native),
             'n_native_contacts': n_native,
-            'n_recovered_contacts': min(n_pred, n_native),
+            'n_recovered_contacts': None,
             'n_pred_contacts': n_pred,
             'atom_correspondence': False,
         }
@@ -514,7 +515,7 @@ def evaluate_model(
     from tricoopdiff.sampler import sample_ensemble, sample_single
 
     if initializer is None:
-        initializer = TernaryInitializer()
+        initializer = TernaryInitializer(no_torsion=bool(getattr(model.expert.model, 'no_torsion', False)))
 
     ensemble = sample_ensemble(
         model, diffusion, initializer, e3_data, poi_data, ligand_data,
@@ -601,7 +602,11 @@ def evaluate_model(
         if native_complex_pdb is not None:
             poi_m = compute_poi_dockq(pred_poi, pred, native_complex_pdb)
             if poi_m is not None:
-                rec['poi_dockq'] = poi_m['dockq']
+                rec['poi_atom_correspondence'] = poi_m['atom_correspondence']
+                if poi_m['atom_correspondence']:
+                    rec['poi_dockq'] = poi_m['dockq']
+                else:
+                    rec['poi_contact_density_ratio'] = poi_m['contact_density_ratio']
                 if poi_native_contacts is None:
                     poi_native_contacts = poi_m['n_native_contacts']
             poi_c = compute_poi_com_dist(pred_poi, native_complex_pdb)
@@ -746,6 +751,8 @@ def evaluate_model(
             freeze_poi=freeze_poi,
             init_mode=init_mode,
             t_anchor=t_anchor,
+            translation_velocity_scale=translation_velocity_scale,
+            rotation_velocity_scale=rotation_velocity_scale,
             conditions=conditions,
         )
 

@@ -4,7 +4,7 @@ import torch
 
 from tricoopdiff.models.expert import validate_expert_base_identity
 from tricoopdiff.models.consensus import ConsensusCoopDiff
-from tricoopdiff.train import ConsensusTrainer
+from tricoopdiff.train import ConsensusTrainer, TriCoopDiffTrainer
 from tricoopdiff.runtime import atomic_torch_save
 
 EXPERIMENT_ARCHITECTURE = 'residual_consensus_factorial_v1'
@@ -16,6 +16,10 @@ class ExperimentalConsensus(ConsensusCoopDiff):
 
 class ExperimentalConsensusTrainer(ConsensusTrainer):
     """Train and serialize a factorial frozen-expert consensus model."""
+    training_objective = 'sdpi_velocity_mse_v1'
+    mixed_endpoint_protocol = 'online_bitseed_training_c1_m1_v1'
+    compute_loss = TriCoopDiffTrainer.compute_loss
+
     def __init__(self, *args, experiment_contract, **kwargs):
         self.experiment_contract = dict(experiment_contract)
         super().__init__(*args, **kwargs)

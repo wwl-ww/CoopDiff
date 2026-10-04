@@ -128,20 +128,26 @@ class EvaluationRunner:
             from tricoopdiff.conditioning.conditioned_consensus_train import (ConditionedConsensusCoopDiff,
                                                           ConditionedConsensusFuse)
             trifuse = ConditionedConsensusFuse(**self.checkpoint['model_config'])
-            self.model = ConditionedConsensusCoopDiff(self.expert, trifuse).to(self.device)
+            model = ConditionedConsensusCoopDiff(self.expert, trifuse).to(self.device)
         else:
             trifuse = ConsensusFuse(**self.checkpoint['model_config'])
         if self.experimental_checkpoint:
             from tricoopdiff.experiments.consensus_experiment import ExperimentalConsensus
 
-            self.model = ExperimentalConsensus(self.expert, trifuse).to(self.device)
+            model = ExperimentalConsensus(self.expert, trifuse).to(self.device)
         elif not self.conditioned_checkpoint:
-            self.model = ConsensusCoopDiff(
+            model = ConsensusCoopDiff(
                 frozen_expert=self.expert,
                 trifuse=trifuse,
             ).to(self.device)
-        self.model.trifuse.load_state_dict(self.checkpoint["ema_trifuse_state_dict"])
-        self.model.eval()
+        weights = getattr(model.trifuse, 'active_state_dict', dict)(self.checkpoint['ema_trifuse_state_dict'])
+        current = model.trifuse.state_dict()
+        if set(weights) != set(current) or any(
+                not torch.is_tensor(weights[name]) or weights[name].shape != current[name].shape
+                or not torch.isfinite(weights[name].to(current[name])).all() for name in current):
+            raise ValueError('evaluation EMA weights must match the finite active model dtype')
+        model.trifuse.load_state_dict(weights, strict=True)
+        self.model = model.eval()
         self.input_dim = input_dim
 
     def evaluate_case(self, case, paths, cache_dir, native_complex_pdb=None,

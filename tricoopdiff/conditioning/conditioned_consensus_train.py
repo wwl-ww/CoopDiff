@@ -15,7 +15,7 @@ from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse
 from tricoopdiff.models.expert import validate_expert_base_identity
 from tricoopdiff.sdpi_flow import FLOW_VERSION
 from tricoopdiff.runtime import atomic_torch_save, sha256_file as checkpoint_sha256
-from tricoopdiff.train import ConsensusTrainer, validate_consensus_checkpoint
+from tricoopdiff.train import ConsensusTrainer, TriCoopDiffTrainer, validate_consensus_checkpoint
 
 
 ARCHITECTURE = 'conditioned_residual_consensus_v3_prototype'
@@ -196,6 +196,10 @@ def validate_conditioned_checkpoint(payload):
 
 class ConditionedConsensusTrainer(ConsensusTrainer):
     """EMA trainer whose checkpoint cannot be loaded as an old C40/v20 model."""
+
+    training_objective = 'sdpi_velocity_mse_v1'
+    mixed_endpoint_protocol = 'online_bitseed_training_c1_m1_v1'
+    compute_loss = TriCoopDiffTrainer.compute_loss
 
     def __init__(self, *args, parent_checkpoint_sha256, condition_dropout=ConditionFeatureDropout(),
                  pocket_cutoff_angstrom=6., condition_lr=1e-3, **kwargs):

@@ -102,6 +102,16 @@ def test_source_conditioning_distinguishes_paths_and_receives_gradient():
     assert gradient[0].abs().sum() == 0
 
 
+    from tricoopdiff.models.consensus import candidate_source_tensor
+    for invalid in (.9, -.2, 1.9, True, float('nan'), complex(1, 0)):
+        try:
+            candidate_source_tensor(invalid, state)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'invalid source silently became a class: {invalid}')
+
+
 def test_unconditioned_arm_accepts_both_source_labels_without_changing_output():
     fuse, graph, proposals, state = fixture()
     sdpi = fuse(graph, proposals, state, source=0)
@@ -664,6 +674,40 @@ def test_consensus_rejects_unknown_architecture_arguments():
         pass
     else:
         raise AssertionError('unknown architecture options must not be silently ignored')
+
+
+def test_ligand_category_encoding_never_mutates_integer_inputs():
+    from tricoopdiff.models.consensus import LigandFeatureEncoder
+
+    encoder = LigandFeatureEncoder(16)
+    features = torch.zeros(3, len(encoder.embeddings), dtype=torch.long)
+    features[0, 0], features[1, 0] = 999, -1
+    original = features.clone()
+    encoded = encoder(features)
+    assert torch.isfinite(encoded).all()
+    assert torch.equal(features, original), 'category encoding modified the caller graph'
+    assert torch.allclose(encoded, encoder(original.float()))
+
+
+def test_ternary_contacts_and_gradients_survive_large_common_translation():
+    from tricoopdiff.models.consensus import TernaryGeometryEncoder
+
+    encoder = TernaryGeometryEncoder(16, 32, joint_geometry=True, spatial_geometry=True).eval()
+    line = torch.stack((torch.arange(32).float() / 8, torch.zeros(32), torch.zeros(32)), -1)
+    coords = torch.cat((line, line + torch.tensor([0., 2., 0.]),
+                        line + torch.tensor([0., 0., 2.]))).requires_grad_()
+    translated = (coords.detach() + 1024).requires_grad_()
+    types, features = torch.arange(3).repeat_interleave(32), torch.randn(96, 16)
+    outputs = [encoder(features, value, types) for value in (coords, translated)]
+    for key in ('global', 'e3l', 'pol'):
+        assert torch.allclose(outputs[0][key], outputs[1][key], atol=1e-6), key
+    first, second = (output['joint_geometry'] for output in outputs)
+    assert torch.equal(first['receiver'], second['receiver'])
+    assert torch.equal(first['sender'], second['sender']), 'translation changed nearest neighbours'
+    for output in outputs:
+        (output['global'].square().mean() + output['ligand_tokens'][0].square().mean()).backward()
+    assert torch.isfinite(coords.grad).all() and torch.isfinite(translated.grad).all()
+    assert torch.allclose(coords.grad, translated.grad, atol=1e-6), 'translation changed geometric gradients'
 
 
 if __name__ == '__main__':

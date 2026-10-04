@@ -489,14 +489,16 @@ def test_frozen_expert_stays_eval():
     print("  [OK] Frozen expert remains in eval mode")
 
 
-def test_score_sanitizer_handles_infinity():
+def test_score_guard_handles_infinity():
     """Inference must detect non-finite scores without hiding their values."""
-    from tricoopdiff.sampler import _sanitize_score
+    from tricoopdiff.sampler import _nonfinite_components
 
     score = torch.tensor([[1.0, float("nan"), float("inf"), -float("inf")]])
-    sanitized, changed = _sanitize_score(score)
-    assert changed
-    assert torch.equal(torch.isfinite(sanitized), torch.isfinite(score))
+    velocities = {'e3_ligand': {'tr': score, 'rot': torch.zeros(1, 3)},
+                  'poi_ligand': {'tr': torch.zeros(1, 3), 'rot': torch.zeros(1, 3)},
+                  'torsion': torch.empty(1, 0)}
+    assert _nonfinite_components(velocities) == ['e3_ligand.tr']
+    assert torch.equal(torch.isfinite(velocities['e3_ligand']['tr']), torch.isfinite(score))
 
     print("  [OK] Score guard rejects rather than sanitizes infinities")
 
@@ -572,7 +574,7 @@ if __name__ == "__main__":
     test_graph_construction()
     test_initializer_body_frame()
     test_frozen_expert_stays_eval()
-    test_score_sanitizer_handles_infinity()
+    test_score_guard_handles_infinity()
     test_reflect_pipeline()
     test_deepternary_dockq_alignment()
 

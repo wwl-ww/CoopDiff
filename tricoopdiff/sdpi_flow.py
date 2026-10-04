@@ -14,7 +14,8 @@ from scipy.spatial.transform import Rotation
 
 from tricoopdiff.models.expert import expert_t_to_sigma, so3_score_norm
 from tricoopdiff.initialization import receptor_prior, sample_binary_pose, validate_ligand_graph
-from tricoopdiff.geometry.rigid import assemble_interface_pair, rotation_exp
+from tricoopdiff.geometry.rigid import (apply_rigid, assemble_interface_pair,
+                                      is_proper_rotation, proper_rigid_fit, rotation_exp)
 
 
 FLOW_VERSION = 'sdpi_flow_v1'
@@ -129,10 +130,15 @@ class SDPIFlow:
             tr_sigma, _, _ = self.t_to_sigma(t, t, t)
             crop = tr_sigma * 3 + 20
         condition_kwargs = {'conditions': conditions} if conditions is not None else {}
-        return model(e3_data, {**poi_data, 'coords': poi},
-                     {**ligand_data, 'coords': ligand}, t_e3l=t, t_pol=t,
-                     r_e3_to_poi=body, diffusion_state=conditioning,
-                     receptor_crop_cutoff=crop, source=source, **condition_kwargs)
+        output = model(e3_data, {**poi_data, 'coords': poi},
+                       {**ligand_data, 'coords': ligand}, t_e3l=t, t_pol=t,
+                       r_e3_to_poi=body, diffusion_state=conditioning,
+                       receptor_crop_cutoff=crop, source=source, **condition_kwargs)
+        if (getattr(getattr(model, 'trifuse', None), 'direct_ternary_motion', False)
+                and output.get('normalized_velocity', {}).get('rigid_output_mode')
+                != INDEPENDENT_RIGID_MODE):
+            raise ValueError('direct model must execute independent centroid motion')
+        return output
 
     @staticmethod
     def scales(e3_coords, poi_coords):
@@ -225,15 +231,12 @@ class SDPIFlow:
     def differentiable_step(ligand, poi, body, velocities, dt, ligand_data,
                             freeze_poi=False):
         """Execute the production rigid/torsion contract without detaching inputs."""
-        from tricoopdiff.geometry.rigid import proper_rigid_fit
-        from tricoopdiff.geometry.rigid import apply_rigid
-
         _check_coords(ligand)
         _check_coords(poi)
-        if (body.shape != (1, 3, 3) or not torch.isfinite(body).all()
+        if (body.shape != (1, 3, 3) or not is_proper_rotation(body)
                 or dt.shape != (1,) or not torch.isfinite(dt).all()
                 or not bool((dt > 0).all())):
-            raise ValueError('finite body/dt must be [1,3,3]/[1] with positive dt')
+            raise ValueError('body must be a proper [1,3,3] rotation and dt finite positive [1]')
         rigid, poi, body = SDPIFlow.rigid_step(ligand, poi, body, velocities, dt, freeze_poi)
         _check_coords(rigid)
         _check_coords(poi)

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import random
+from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
 import tempfile
@@ -41,6 +42,21 @@ def preserve_rng(function):
         finally:
             restore_rng_state(state)
     return wrapped
+
+
+@contextmanager
+def evaluation_context(model):
+    """Read-only inference restores every module mode and active RNG stream."""
+    state = capture_rng_state()
+    modes = [(module, module.training) for module in model.modules()]
+    try:
+        model.eval()
+        with torch.no_grad():
+            yield
+    finally:
+        for module, training in modes:
+            module.training = training
+        restore_rng_state(state)
 
 
 def sha256_file(path, chunk_size=1024 * 1024):

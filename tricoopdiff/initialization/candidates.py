@@ -9,8 +9,7 @@ from tricoopdiff.legacy.diffusion import InterfaceDiffusion
 from tricoopdiff.models.expert import _set_time_embeddings
 from tricoopdiff.inputs.graphs import build_subgraph_e3l, crop_receptor_to_ligand
 from tricoopdiff.initialization import TernaryInitializer, sample_binary_pose
-from tricoopdiff.geometry.rigid import proper_rigid_fit
-from tricoopdiff.geometry.rigid import apply_rigid
+from tricoopdiff.geometry.rigid import apply_rigid, is_proper_rotation, proper_rigid_fit
 
 
 EXPERT_ANCHOR_VERSION = "dual_diffdock_rigid_anchor_v1"
@@ -151,7 +150,8 @@ def _valid_candidate(candidate):
             return False
         if not bool(torch.isfinite(tensor).all()):
             return False
-    return tensors[0].shape[1] > 0 and tensors[1].shape[1] > 0
+    return (tensors[0].shape[1] > 0 and tensors[1].shape[1] > 0
+            and is_proper_rotation(tensors[2]))
 
 
 def _fixed_frame_rmsd(left, right):

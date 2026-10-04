@@ -17,6 +17,18 @@ def rotation_exp(vector):
     return torch.linalg.matrix_exp(matrix)
 
 
+def is_proper_rotation(rotation, atol=1e-4):
+    """Check SO(3), not merely finite entries, without modifying the frame."""
+    if (rotation.shape[-2:] != (3, 3) or not rotation.is_floating_point()
+            or not torch.isfinite(rotation).all()):
+        return False
+    identity = torch.eye(3, device=rotation.device, dtype=rotation.dtype)
+    return (torch.allclose(rotation.transpose(-1, -2) @ rotation,
+                           identity.expand_as(rotation), atol=atol, rtol=0.)
+            and torch.allclose(torch.linalg.det(rotation), rotation.new_ones(rotation.shape[:-2]),
+                               atol=atol, rtol=0.))
+
+
 def apply_rigid(points, rotation, translation):
     return points @ rotation.transpose(-1, -2) + translation.unsqueeze(-2)
 
@@ -87,7 +99,10 @@ class _ProperPolarRotation(torch.autograd.Function):
         denominator = signed.unsqueeze(-1) + signed.unsqueeze(-2)
         # Reflection/near-collinear fits can genuinely be ill-conditioned;
         # bound only that singular chart, not the ordinary polar derivative.
-        floor = signed.abs().amax(-1, keepdim=True).unsqueeze(-1).clamp_min(1.) * 1e-8
+        # The rotation is invariant to positive covariance rescaling; its
+        # derivative must scale inversely. An absolute floor breaks that law
+        # even for a perfectly conditioned small covariance.
+        floor = signed.abs().amax(-1, keepdim=True).unsqueeze(-1) * 1e-8
         denominator = torch.where(denominator.abs() < floor,
                                   torch.where(denominator < 0, -floor, floor), denominator)
         k = vh.transpose(-1, -2) @ (skew / denominator) @ vh
@@ -111,7 +126,9 @@ def proper_rigid_fit(source, target):
         rotation @ source_center.unsqueeze(-1)
     ).squeeze(-1)
     fitted = apply_rigid(source, rotation, translation)
-    rmsd = (fitted - target).square().sum(-1).mean(-1).sqrt()
+    # vector_norm has the finite zero subgradient; sqrt(MSE) yields 0 * inf
+    # during backward when an exact fit is reached.
+    rmsd = torch.linalg.vector_norm(fitted - target, dim=(-2, -1)) / source.shape[-2] ** 0.5
     return rotation, translation, rmsd
 
 

@@ -1,7 +1,8 @@
 """Training, executed endpoint supervision, EMA and checkpoint contracts.
 
 Variable-size complexes accumulate gradients before one optimizer update.
-Legacy velocity supervision remains explicit, not a second training entry point.
+Production executes real-initialization endpoint supervision. Historical
+velocity experiments explicitly use the base trainer.
 """
 
 from contextlib import contextmanager
@@ -27,7 +28,8 @@ from tricoopdiff.models.consensus import (
 )
 from tricoopdiff.models.expert import (expert_base_identity, validate_expert_base_identity,
                                     configure_expert_policy, expert_runtime_identity)
-from tricoopdiff.runtime import atomic_torch_save, capture_rng_state, restore_rng_state
+from tricoopdiff.runtime import (atomic_torch_save, capture_rng_state, evaluation_context,
+                                preserve_rng, restore_rng_state)
 from tricoopdiff.sdpi_flow import FLOW_VERSION, INDEPENDENT_RIGID_MODE, LEGACY_RIGID_MODE, SDPIFlow
 
 
@@ -215,6 +217,8 @@ class TriCoopDiffTrainer:
 
     def train_batch(self, batches) -> list:
         """Mean microbatch gradient, one optimizer step, bounded graph memory."""
+        if getattr(self, '_ema_active', False):
+            raise RuntimeError('cannot train while temporary EMA weights are active')
         if not batches:
             raise ValueError('training batch must contain at least one complex')
         self.model.train()  # dropout / attention dropout active during training
@@ -253,12 +257,11 @@ class TriCoopDiffTrainer:
             result['optimizer_batch_size'] = len(batches)
         return results
 
-    @torch.no_grad()
     def validate_step(self, **batch) -> dict:
         """Forward + loss only, no backward."""
-        self.model.eval()  # dropout / attention dropout off during validation
-        loss_dict = self.compute_loss(**batch)
-        return {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
+        with evaluation_context(self.model):
+            loss_dict = self.compute_loss(**batch)
+            return {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
 
 
     def scheduler_step(self, validation_loss: float):
@@ -293,14 +296,13 @@ REAL_ENDPOINT_OBJECTIVE = 'real_initialization_reachable_endpoint_v2'
 ENDPOINT_OBJECTIVES = (ENDPOINT_OBJECTIVE, REAL_ENDPOINT_OBJECTIVE)
 
 
-VALIDATION_DOCKQ_PROTOCOL = 'training_coupling_protein_fullatom_v2'
-REAL_VALIDATION_DOCKQ_PROTOCOL = 'real_initialization_protein_fullatom_v3'
+REAL_VALIDATION_DOCKQ_PROTOCOL = 'case_fixed_real_initialization_protein_fullatom_v4'
 
 
 def terminal_interface_losses(e3, native_poi, predicted_poi, cutoff):
     """Native C-alpha interface coordinate/distance surrogates, not DockQ."""
     with torch.no_grad():
-        target_distances = torch.cdist(e3[0], native_poi[0])
+        target_distances = torch.cdist(e3[0], native_poi[0], compute_mode='donot_use_mm_for_euclid_dist')
         contacts = target_distances <= cutoff
         poi_interface = contacts.any(dim=0)
     count = int(contacts.sum())
@@ -331,8 +333,8 @@ def coarse_intercomponent_repulsion(e3, native_poi, native_ligand, poi, ligand, 
                                        (e3, native_ligand, e3, ligand),
                                        (native_poi, native_ligand, poi, ligand)):
         with torch.no_grad():
-            threshold = torch.cdist(fixed[0], target[0]).clamp_max(cutoff)
-        distances = torch.cdist(left[0], right[0])
+            threshold = torch.cdist(fixed[0], target[0], compute_mode='donot_use_mm_for_euclid_dist').clamp_max(cutoff)
+        distances = torch.cdist(left[0], right[0], compute_mode='donot_use_mm_for_euclid_dist')
         penetration = ((threshold - distances).clamp_min(0) / cutoff).square()
         penalties.append((penetration.amax(0).mean() + penetration.amax(1).mean()) / 2)
     return torch.stack(penalties).mean()
@@ -430,10 +432,15 @@ def validate_consensus_checkpoint(payload):
 
 
 class ConsensusTrainer(TriCoopDiffTrainer):
+    """Endpoint trainer without historical objective switches."""
+
+    training_objective = REAL_ENDPOINT_OBJECTIVE
+    mixed_endpoint_protocol = 'online_bitseed_raw_resampled_v2'
+
     def __init__(self, *args, residual_weight=1e-3, ema_decay=0.999,
                  activation_clamp_mode='irrep_norm',
                  training_source_mix='sdpi_only',
-                 training_endpoint_protocol='none', training_objective=None,
+                 training_endpoint_protocol='none',
                  endpoint_loss_weight=0.1, interface_loss_weight=1.0,
                  interface_cutoff=10.0, effective_batch_size=1,
                  steric_loss_weight=0.0, steric_cutoff=2.0, **kwargs):
@@ -441,12 +448,6 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             raise ValueError('invalid residual regularization or EMA decay')
         kwargs['torsion_expert_aux_weight'] = 0.0
         super().__init__(*args, **kwargs)
-        self.training_objective = training_objective or (
-            REAL_ENDPOINT_OBJECTIVE if self.model.trifuse.config.get('model_profile') == PRODUCTION_MODEL_PROFILE
-            else (ENDPOINT_OBJECTIVE if getattr(self.model.trifuse, 'direct_ternary_motion', False)
-                  else VELOCITY_OBJECTIVE))
-        if self.training_objective not in (VELOCITY_OBJECTIVE, *ENDPOINT_OBJECTIVES):
-            raise ValueError('unsupported training objective')
         if not math.isfinite(endpoint_loss_weight) or endpoint_loss_weight <= 0:
             raise ValueError('endpoint loss weight must be finite and positive')
         self.endpoint_loss_weight = float(endpoint_loss_weight)
@@ -472,8 +473,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             raise ValueError('training_source_mix must be sdpi_only or sdpi_bitseed_1_1')
         self.training_source_mix = training_source_mix
         expected_protocol = ('none' if training_source_mix == 'sdpi_only'
-                             else ('online_bitseed_raw_resampled_v2' if self.training_objective == REAL_ENDPOINT_OBJECTIVE
-                                   else 'online_bitseed_training_c1_m1_v1'))
+                             else self.mixed_endpoint_protocol)
         if training_endpoint_protocol != expected_protocol:
             raise ValueError(
                 f'{training_source_mix} requires training endpoint protocol '
@@ -486,11 +486,6 @@ class ConsensusTrainer(TriCoopDiffTrainer):
     def compute_loss(self, e3_data, poi_data, ligand_data, case='unknown',
                      t_override=None, t_pol_override=None, coupling_override=None,
                      diagnostics=False, source=0, conditions=None):
-        if self.training_objective == VELOCITY_OBJECTIVE:
-            return super().compute_loss(
-                e3_data, poi_data, ligand_data, case=case, t_override=t_override,
-                t_pol_override=t_pol_override, coupling_override=coupling_override,
-                diagnostics=diagnostics, source=source, conditions=conditions)
         for override in (t_override, t_pol_override):
             if override is not None:
                 value = torch.as_tensor(override).reshape(-1)
@@ -499,50 +494,39 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         ed = {**e3_data, 'coords': e3_data['coords'].to(self.device)}
         pd = {**poi_data, 'coords': poi_data['coords'].to(self.device)}
         ld = {**ligand_data, 'coords': ligand_data['coords'].to(self.device)}
-        real_initialization = self.training_objective == REAL_ENDPOINT_OBJECTIVE
         no_torsion = bool(getattr(self.model.expert.model, 'no_torsion', False))
-        steps = self.diffusion.inference_steps
-        dt = ld['coords'].new_full((1,), 1 / steps)
-        target_ligand = ld['coords']
+        dt = ld['coords'].new_full((1,), 1 / self.diffusion.inference_steps)
         projection = None
-        if real_initialization:
-            source = int(candidate_source_tensor(source, dt).item())
-            from tricoopdiff.initialization import TernaryInitializer
-            from tricoopdiff.initialization.endpoints import reachable_ligand_target
-            if coupling_override is None:
-                if int(source) != 0:
-                    raise ValueError('BiTSeed training requires its actual sampled state')
-                seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
-                ligand, poi, body, _ = TernaryInitializer(no_torsion=no_torsion).initialize(
-                    ed['coords'][0], pd['coords'][0], ld, seed=seed)
+        source = int(candidate_source_tensor(source, dt).item())
+        from tricoopdiff.initialization import TernaryInitializer
+        from tricoopdiff.initialization.endpoints import reachable_ligand_target
+        if coupling_override is None:
+            if int(source) != 0:
+                raise ValueError('BiTSeed training requires its actual sampled state')
+            seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
+            ligand, poi, body, _ = TernaryInitializer(no_torsion=no_torsion).initialize(
+                ed['coords'][0], pd['coords'][0], ld, seed=seed)
+            target, projection = reachable_ligand_target(
+                ld, ligand, poi, pd['coords'], no_torsion=no_torsion)
+        else:
+            if 'initial_state' not in coupling_override:
+                raise ValueError('real initialization training rejects crystal-projected couplings')
+            state = coupling_override['initial_state']
+            ligand, poi, body = [torch.as_tensor(state[key], device=self.device,
+                                                dtype=ld['coords'].dtype).reshape(1, -1, 3)
+                                 for key in ('ligand', 'poi', 'body_frame')]
+            if 'target_ligand' in coupling_override:
+                target = coupling_override['target_ligand']
+            else:
                 target, projection = reachable_ligand_target(
                     ld, ligand, poi, pd['coords'], no_torsion=no_torsion)
-            else:
-                if 'initial_state' not in coupling_override:
-                    raise ValueError('real initialization training rejects crystal-projected couplings')
-                state = coupling_override['initial_state']
-                ligand, poi, body = [torch.as_tensor(state[key], device=self.device,
-                                                    dtype=ld['coords'].dtype).reshape(1, -1, 3)
-                                     for key in ('ligand', 'poi', 'body_frame')]
-                if 'target_ligand' in coupling_override:
-                    target = coupling_override['target_ligand']
-                else:
-                    target, projection = reachable_ligand_target(
-                        ld, ligand, poi, pd['coords'], no_torsion=no_torsion)
-            target_ligand = torch.as_tensor(target, device=self.device,
-                                            dtype=ld['coords'].dtype).reshape_as(ld['coords'])
-            if ligand.shape != ld['coords'].shape or poi.shape != pd['coords'].shape:
-                raise ValueError('actual initialization atom counts must match the indexed inputs')
-        else:
-            coupling = coupling_override if coupling_override is not None else self.diffusion.sample_coupling(
-                ed['coords'], pd['coords'], ld, no_torsion=no_torsion)
-            ligand, poi, body, _ = self._training_state(ed, pd, ld, coupling, torch.ones_like(dt), dt)
+        target_ligand = torch.as_tensor(target, device=self.device,
+                                        dtype=ld['coords'].dtype).reshape_as(ld['coords'])
+        if ligand.shape != ld['coords'].shape or poi.shape != pd['coords'].shape:
+            raise ValueError('actual initialization atom counts must match the indexed inputs')
         for t, dt in self.diffusion.reverse_times(ld['coords']):
             output = self._forward_state(ed, pd, ld, ligand, poi, body, t, dt, source, conditions)
             normalized = self.diffusion.normalized_predictions(output, t)
-            if (getattr(self.model.trifuse, 'direct_ternary_motion', False)
-                    and normalized.get('rigid_output_mode') != INDEPENDENT_RIGID_MODE):
-                raise ValueError('direct model must execute independent centroid motion')
             velocities = self.diffusion.velocities(normalized, ed['coords'], pd['coords'])
             ligand, poi, body = self.diffusion.differentiable_step(
                 ligand, poi, body, velocities, dt, ld)
@@ -591,24 +575,20 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             yield
             return
         raw = {name: value.detach().clone() for name, value in self.model.trifuse.state_dict().items()}
-        self.model.trifuse.load_state_dict(self.ema)
         self._ema_active = True
         try:
+            self.model.trifuse.load_state_dict(self.ema)
             yield
         finally:
             self._ema_active = False
             self.model.trifuse.load_state_dict(raw)
 
-    @torch.no_grad()
     def validate_step(self, dockq_context=None, **batch):
-        with self.ema_parameters():
+        with self.ema_parameters(), evaluation_context(self.model):
+            output = self.compute_loss(**batch, diagnostics=dockq_context is not None)
             if dockq_context is not None:
-                if self.training_objective not in ENDPOINT_OBJECTIVES:
-                    raise ValueError('terminal DockQ validation requires the endpoint objective')
                 from tricoopdiff.metrics.dockq import compute_fullatom_dockq
 
-                self.model.eval()
-                output = self.compute_loss(**batch, diagnostics=True)
                 metric = compute_fullatom_dockq(
                     output['predicted_ligand'][0].cpu().numpy(),
                     output['predicted_poi'][0].cpu().numpy(),
@@ -616,13 +596,13 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                     **dockq_context)
                 if not math.isfinite(metric['dockq']) or not 0 <= metric['dockq'] <= 1:
                     raise NonFiniteTrainingError('invalid full-atom validation DockQ')
-                return {'loss_total': float(output['loss_total']),
-                        **{key: float(value) for key, value in output['components'].items()},
-                        **metric}
-            return super().validate_step(**batch)
+                output = {'loss_total': output['loss_total'], **output['components'], **metric}
+            return {key: value.item() if torch.is_tensor(value) else value for key, value in output.items()}
 
     def _optimization_payload(self, training_state):
         """Shared trainable state; subclasses own their supervision contracts."""
+        if getattr(self, '_ema_active', False):
+            raise RuntimeError('cannot save training state while temporary EMA weights are active')
         return {
             'expert_base_identity': expert_base_identity(self.model.expert),
             'model_config': dict(self.model.trifuse.config),
@@ -636,26 +616,84 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         }
 
     def _restore_optimization(self, payload):
-        """Restore common state after the caller validates its own protocol."""
-        ema = getattr(self.model.trifuse, 'active_state_dict', dict)(payload['ema_trifuse_state_dict'])
+        """Validate a staged optimizer/RNG before committing any live state."""
+        if getattr(self, '_ema_active', False):
+            raise RuntimeError('cannot restore training state while temporary EMA weights are active')
+        active = getattr(self.model.trifuse, 'active_state_dict', dict)
+        raw, ema = [active(payload[key]) for key in ('trifuse_state_dict', 'ema_trifuse_state_dict')]
         current = self.model.trifuse.state_dict()
-        if set(ema) != set(current) or any(ema[name].shape != current[name].shape for name in current):
-            raise ValueError('checkpoint EMA state does not match the active model')
-        self.model.trifuse.load_state_dict(payload['trifuse_state_dict'], strict=True)
-        self.ema = {name: value.detach().clone() for name, value in ema.items()}
-        self.optimizer.load_state_dict(payload['optimizer_state_dict'])
-        self.scheduler.load_state_dict(payload['scheduler_state_dict'])
-        self.global_step = int(payload['global_step'])
+        for label, state in (('raw', raw), ('EMA', ema)):
+            if set(state) != set(current) or any(
+                    not torch.is_tensor(state[name]) or state[name].shape != current[name].shape
+                    or not torch.isfinite(state[name]).all() for name in current):
+                raise ValueError(f'checkpoint {label} state does not match the finite active model')
+            for name in current:
+                state[name] = state[name].to(current[name])
+                if not torch.isfinite(state[name]).all():
+                    raise ValueError(f'checkpoint {label} state overflows the active model dtype')
+        optimizer = AdamW([{**group, 'params': list(group['params'])}
+                           for group in self.optimizer.param_groups])
+        optimizer.load_state_dict(payload['optimizer_state_dict'])
+        for expected, group in zip(self.optimizer.param_groups, optimizer.param_groups):
+            if any(group[key] != expected[key] for key in expected if key not in ('params', 'lr')):
+                raise ValueError('checkpoint optimizer hyperparameters do not match the trainer')
+            if not math.isfinite(group['lr']) or group['lr'] < 0:
+                raise ValueError('checkpoint optimizer learning rate is invalid')
+            for parameter in group['params']:
+                moment = optimizer.state.get(parameter, {})
+                if not moment:
+                    continue
+                keys = ('exp_avg', 'exp_avg_sq') + (('max_exp_avg_sq',) if group['amsgrad'] else ())
+                for key in keys:
+                    value = moment.get(key)
+                    if (not torch.is_tensor(value) or value.shape != parameter.shape
+                            or not torch.isfinite(value).all()
+                            or (key != 'exp_avg' and (value < 0).any())):
+                        raise ValueError(f'checkpoint optimizer {key} is invalid')
+                step = moment.get('step')
+                if (not torch.is_tensor(step) or step.numel() != 1
+                        or not torch.isfinite(step).all() or step.item() < 0):
+                    raise ValueError('checkpoint optimizer step is invalid')
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5,
+                                     patience=10, min_lr=1e-7)
+        saved_scheduler = payload['scheduler_state_dict']
+        fresh_scheduler = scheduler.state_dict()
+        history = {'best', 'num_bad_epochs', 'cooldown_counter', 'last_epoch', '_last_lr'}
+        if (set(saved_scheduler) != set(fresh_scheduler)
+                or any(saved_scheduler[key] != value for key, value in fresh_scheduler.items()
+                       if key not in history)
+                or math.isnan(float(saved_scheduler['best']))
+                or any(isinstance(saved_scheduler[key], bool)
+                       or not isinstance(saved_scheduler[key], int) or saved_scheduler[key] < 0
+                       for key in ('num_bad_epochs', 'cooldown_counter', 'last_epoch'))
+                or saved_scheduler['_last_lr'] != [group['lr'] for group in optimizer.param_groups]):
+            raise ValueError('checkpoint scheduler state is invalid or inconsistent with optimizer')
+        scheduler.load_state_dict(saved_scheduler)
         state = payload['training_state']
-        self.resume_epoch = int(state['epoch'])
-        self.resume_best_val_loss = float(state['best_val_loss'])
-        self.samples_seen = state.get('samples_seen', self.global_step)
+        counters = (payload['global_step'], state['epoch'],
+                    state.get('samples_seen', payload['global_step']))
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+               for value in counters):
+            raise ValueError('checkpoint training counters must be nonnegative integers')
+        best_loss = float(state['best_val_loss'])
+        if math.isnan(best_loss) or best_loss < 0:
+            raise ValueError('checkpoint best validation loss is invalid')
+        best_dockq = float(state.get('best_val_dockq', float('-inf')))
+        if best_dockq != float('-inf') and not 0 <= best_dockq <= 1:
+            raise ValueError('checkpoint best validation DockQ is invalid')
         if 'rng_state' in payload:
-            restore_rng_state(payload['rng_state'])
+            preserve_rng(restore_rng_state)(payload['rng_state'])
         else:
             import warnings
             warnings.warn('legacy checkpoint has no RNG state; resume is not trajectory-exact',
                           RuntimeWarning, stacklevel=2)
+        self.model.trifuse.load_state_dict(raw, strict=True)
+        self.ema = {name: value.detach().clone() for name, value in ema.items()}
+        self.optimizer, self.scheduler = optimizer, scheduler
+        self.global_step, self.resume_epoch, self.samples_seen = counters
+        self.resume_best_val_loss = best_loss
+        if 'rng_state' in payload:
+            restore_rng_state(payload['rng_state'])
 
     def checkpoint_payload(self, epoch=0, best_val_loss=float('inf'), best_val_dockq=None):
         """Build the shared training/inference payload without writing files."""
@@ -682,9 +720,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 'steric_loss_weight': self.steric_loss_weight,
                 'steric_cutoff': self.steric_cutoff,
                 'effective_batch_size': self.effective_batch_size,
-                'validation_dockq_protocol': (REAL_VALIDATION_DOCKQ_PROTOCOL
-                                              if self.training_objective == REAL_ENDPOINT_OBJECTIVE
-                                              else VALIDATION_DOCKQ_PROTOCOL),
+                'validation_dockq_protocol': REAL_VALIDATION_DOCKQ_PROTOCOL,
                 'expert_runtime_identity': expert_runtime_identity(self.model.expert),
             },
             **self._optimization_payload({'epoch': epoch, 'best_val_loss': best_val_loss,
@@ -703,32 +739,23 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         validate_consensus_checkpoint(payload)
         if payload.get('checkpoint_kind') == 'inference_only':
             raise ValueError('inference-only weights cannot resume the production training objective')
-        saved_objective = payload['runtime_config'].get('training_objective', VELOCITY_OBJECTIVE)
-        if saved_objective != self.training_objective:
-            raise ValueError('training objective differs; load weights only rather than silently changing supervision')
-        if payload['runtime_config'].get('inference_steps', 20) != self.diffusion.inference_steps:
-            raise ValueError('checkpoint rollout length differs from the trainer')
-        if (self.training_objective in ENDPOINT_OBJECTIVES
-                and payload['runtime_config']['endpoint_loss_weight'] != self.endpoint_loss_weight):
-            raise ValueError('checkpoint endpoint loss weight differs from the trainer')
-        if self.training_objective in ENDPOINT_OBJECTIVES:
-            for key, old_default in (('interface_loss_weight', 0.0), ('interface_cutoff', 10.0),
-                                     ('steric_loss_weight', 0.0), ('steric_cutoff', 2.0)):
-                if payload['runtime_config'].get(key, old_default) != getattr(self, key):
-                    raise ValueError(f'checkpoint {key} differs from the trainer')
-        if payload['runtime_config'].get('effective_batch_size', 1) != self.effective_batch_size:
-            raise ValueError('checkpoint effective batch size differs from the trainer')
+        if (payload['checkpoint_version'] != CONSENSUS_CHECKPOINT_VERSION
+                or payload['runtime_config'].get('training_objective') != REAL_ENDPOINT_OBJECTIVE):
+            raise ValueError('training objective differs or checkpoint is historical; load weights only')
+        for key in ('inference_steps', 'endpoint_loss_weight', 'interface_loss_weight',
+                    'interface_cutoff', 'steric_loss_weight', 'steric_cutoff',
+                    'effective_batch_size'):
+            expected = self.diffusion.inference_steps if key == 'inference_steps' else getattr(self, key)
+            if payload['runtime_config'].get(key) != expected:
+                raise ValueError(f'checkpoint {key} differs from the trainer')
         validate_expert_base_identity(payload, self.model.expert)
-        if payload['checkpoint_version'] >= 24:
-            if payload['runtime_config']['expert_runtime_identity'] != expert_runtime_identity(self.model.expert):
-                raise ValueError('checkpoint expert runtime configuration differs')
+        if payload['runtime_config']['expert_runtime_identity'] != expert_runtime_identity(self.model.expert):
+            raise ValueError('checkpoint expert runtime configuration differs')
         saved_grad = payload['runtime_config'].get('expert_input_grad', False)
         if saved_grad != getattr(self.model, 'expert_input_grad', True):
             raise ValueError('expert input-gradient contract differs; use matching '
                              'expert_input_grad for resume or load weights only for a new run')
         saved_model_config = dict(payload['model_config'])
-        if payload['checkpoint_version'] == LEGACY_CONSENSUS_CHECKPOINT_VERSION:
-            saved_model_config.setdefault('source_conditioning', False)
         if saved_model_config != self.model.trifuse.config:
             raise ValueError('consensus model configuration differs from checkpoint')
         saved_mode = payload['runtime_config'].get('activation_clamp_mode', 'componentwise')
@@ -738,22 +765,21 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         expected = {'activation_clamp': self.activation_clamp,
                     'residual_weight': self.residual_weight, 'ema_decay': self.ema_decay,
                     'optimizer_groups': self.optimizer_config}
-        if payload['checkpoint_version'] >= PREVIOUS_CONSENSUS_CHECKPOINT_VERSION:
-            expected.update({
-                'flow_time_contract': 'shared_flow_expert_clock_v1',
-                'candidate_source_contract': SOURCE_CONTRACT_VERSION,
-                'training_source_mix': self.training_source_mix,
-            })
-        if payload['checkpoint_version'] >= ENDPOINT_PROTOCOL_CHECKPOINT_VERSION:
-            expected['training_endpoint_protocol'] = self.training_endpoint_protocol
+        expected.update({
+            'flow_time_contract': 'shared_flow_expert_clock_v1',
+            'candidate_source_contract': SOURCE_CONTRACT_VERSION,
+            'training_source_mix': self.training_source_mix,
+            'training_endpoint_protocol': self.training_endpoint_protocol,
+        })
         for key, value in expected.items():
             if payload['runtime_config'].get(key) != value:
                 raise ValueError(f'consensus checkpoint runtime mismatch: {key}')
+        fresh_scheduler = self.scheduler.state_dict()
         self._restore_optimization(payload)
         self.resume_best_val_dockq = payload['training_state'].get('best_val_dockq', float('-inf'))
-        protocol = (REAL_VALIDATION_DOCKQ_PROTOCOL if self.training_objective == REAL_ENDPOINT_OBJECTIVE
-                    else VALIDATION_DOCKQ_PROTOCOL)
-        if payload['runtime_config'].get('validation_dockq_protocol') != protocol:
-            # Old scores may include insertion-code duplicate contacts. Resume
-            # weights/optimizer, but never compare corrected scores to them.
+        if payload['runtime_config'].get('validation_dockq_protocol') != REAL_VALIDATION_DOCKQ_PROTOCOL:
+            # Keep optimizer/LR, but do not compare different validation protocols.
             self.resume_best_val_dockq = float('-inf')
+            self.resume_best_val_loss = float('inf')
+            fresh_scheduler['_last_lr'] = [group['lr'] for group in self.optimizer.param_groups]
+            self.scheduler.load_state_dict(fresh_scheduler)

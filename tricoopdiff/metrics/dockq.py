@@ -80,10 +80,16 @@ def _fit_rigid(source, target):
 def _replace_coords(lines, indices, coords, chain=None):
     if len(indices) != len(coords):
         raise ValueError(f"PDB atom-count mismatch: {len(indices)} vs {len(coords)}")
+    coords = np.asarray(coords)
+    if coords.shape != (len(indices), 3) or not np.isfinite(coords).all():
+        raise ValueError('PDB coordinates must be a finite [N, 3] array')
     output = list(lines)
     for index, xyz in zip(indices, coords):
         line = output[index]
-        line = f"{line[:30]}{xyz[0]:8.3f}{xyz[1]:8.3f}{xyz[2]:8.3f}{line[54:]}"
+        fields = [f'{value:8.3f}' for value in xyz]
+        if any(len(field) != 8 for field in fields):
+            raise ValueError('PDB coordinates exceed eight-column capacity')
+        line = f"{line[:30]}{''.join(fields)}{line[54:]}"
         if chain is not None:
             line = f"{line[:21]}{chain}{line[22:]}"
         output[index] = line

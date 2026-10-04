@@ -42,7 +42,7 @@ class LigandFeatureEncoder(nn.Module):
         for column, (embedding, size) in enumerate(zip(
             self.embeddings, self.categorical_dims,
         )):
-            indices = features[:, column].long().clamp_(0, size - 1)
+            indices = features[:, column].long().clamp(0, size - 1)
             encoded = encoded + embedding(indices)
         return self.norm(encoded / math.sqrt(len(self.embeddings)))
 
@@ -266,7 +266,7 @@ class TernaryGeometryEncoder(nn.Module):
             candidates = all_indices[types == component]
             if not len(candidates):
                 raise ValueError('joint geometry requires all three components')
-            distances = torch.cdist(coords, coords[candidates])
+            distances = torch.cdist(coords, coords[candidates], compute_mode='donot_use_mm_for_euclid_dist')
             distances = distances.masked_fill(all_indices[:, None] == candidates[None], float('inf'))
             values, local = distances.topk(min(4, len(candidates)), largest=False, dim=1)
             receiver = all_indices[:, None].expand_as(local)
@@ -515,7 +515,7 @@ class TernaryGeometryEncoder(nn.Module):
                 ))
 
             pair_distances = [
-                torch.cdist(component_coords[a], component_coords[b])
+                torch.cdist(component_coords[a], component_coords[b], compute_mode='donot_use_mm_for_euclid_dist')
                 for a, b in self.PAIRS
             ]
             pair_descriptors = [self._pair_descriptor(distances) for distances in pair_distances]
@@ -854,10 +854,11 @@ def candidate_source_tensor(source, reference):
         if source not in SOURCE_NAMES:
             raise ValueError(f'unknown candidate source: {source!r}')
         source = SOURCE_NAMES.index(source)
-    value = torch.as_tensor(source, device=reference.device, dtype=torch.long).reshape(-1)
-    if value.shape != (1,) or not bool(((value >= 0) & (value < len(SOURCE_NAMES))).all()):
+    value = torch.as_tensor(source, device=reference.device).reshape(-1)
+    if (value.shape != (1,) or value.dtype == torch.bool or value.is_complex()
+            or not bool(((value == 0) | (value == 1)).all())):
         raise ValueError('candidate source must be one SDPI/BiTSeed class')
-    return value
+    return value.long()
 
 
 def attentive_interface_motion(weights, direction, torque, sender_types):

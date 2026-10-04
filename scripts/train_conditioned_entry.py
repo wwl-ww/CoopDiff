@@ -30,7 +30,7 @@ from tricoopdiff.conditioning.conditioned_consensus_train import (
 )
 from tricoopdiff.train import validate_consensus_checkpoint
 from tricoopdiff.models.expert import build_diffdock_expert
-from tricoopdiff.initialization.endpoints import LazyTrainingEndpointStore, ONLINE_TRAINING_ENDPOINT_PROTOCOL
+from tricoopdiff.initialization.endpoints import CachedEndpointStore, ONLINE_TRAINING_ENDPOINT_PROTOCOL
 from tricoopdiff.sdpi_flow import SDPIFlow
 
 
@@ -49,7 +49,8 @@ def parse_args(argv=None):
     parser.add_argument('--output-dir', required=True)
     parser.add_argument('--expert-model-dir', default='checkpoints/score_model')
     parser.add_argument('--cache-dir', default='results/featurize_cache')
-    parser.add_argument('--bitseed-lazy-cache-dir', default=None)
+    parser.add_argument('--endpoint-cache', required=True,
+                        help='Historical projected endpoint archive; no online legacy generation')
     parser.add_argument('--paired-cache-follower', action='store_true',
                         help='Never generate shared features/endpoints; wait for the writer arm')
     parser.add_argument('--paired-cache-wait-seconds', type=float, default=3600.)
@@ -190,8 +191,7 @@ def main(argv=None):
     os.chdir(ROOT)
     output = Path(args.output_dir).resolve()
     output.mkdir(parents=True, exist_ok=False)
-    endpoint_cache = (Path(args.bitseed_lazy_cache_dir).resolve() if args.bitseed_lazy_cache_dir
-                      else output / 'bitseed_c1m1_cache')
+    endpoint_cache = Path(args.endpoint_cache).resolve()
     config = {**vars(args), 'parent': str(Path(args.parent).resolve()),
               'parent_checkpoint_sha256': checkpoint_sha256(args.parent),
               'training_source_mix': 'sdpi_bitseed_1_1',
@@ -213,9 +213,7 @@ def main(argv=None):
                       cache_wait_seconds=args.paired_cache_wait_seconds)
     seed_training(args.seed, device)
     model, trainer, _ = build_trainer(args, device)
-    endpoint_store = LazyTrainingEndpointStore(
-        endpoint_cache, model.expert, read_only=args.paired_cache_follower,
-        wait_seconds=args.paired_cache_wait_seconds)
+    endpoint_store = CachedEndpointStore(endpoint_cache)
     train_loader = TernaryDataLoader(
         args.train_data, score_args, shuffle=True, device=str(device), cache_dir=args.cache_dir,
         max_clusters=args.max_train_clusters, random_flip_proteins=False,

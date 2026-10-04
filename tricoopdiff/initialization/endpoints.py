@@ -1,5 +1,6 @@
 """SDPI/BiTSeed training endpoints: projection, cache contracts and online generation."""
 
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -16,9 +17,8 @@ from tricoopdiff.initialization.candidates import (
     generate_sdpi_candidates,
 )
 from tricoopdiff.models.expert import expert_base_identity, expert_runtime_identity
-from tricoopdiff.geometry.rigid import proper_rigid_fit
 from tricoopdiff.sdpi_flow import SDPIFlow, _raw_torsions
-from tricoopdiff.runtime import atomic_torch_save
+from tricoopdiff.runtime import atomic_torch_save, preserve_rng
 
 
 def _coordinates(value, name):
@@ -122,33 +122,24 @@ def _mask_array(mask_rotate, bond_count, atom_count):
 def _fit_numpy_rigid(source, target):
     source = np.asarray(source, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
-    if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
+    if (source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3
+            or len(source) == 0 or not np.isfinite(source).all()
+            or not np.isfinite(target).all()):
         raise ValueError("rigid-fit coordinates must have matching [N,3] shapes")
     centered_source = source - source.mean(0)
     centered_target = target - target.mean(0)
     underdetermined = (len(source) < 3
                        or np.linalg.matrix_rank(centered_source, tol=1e-10) < 2)
-    if underdetermined:
-        source_norms = np.linalg.norm(centered_source, axis=1)
-        target_norms = np.linalg.norm(centered_target, axis=1)
-        if source_norms.max() < 1e-10 or target_norms.max() < 1e-10:
-            rotation = np.eye(3)
-        else:
-            source_vector = centered_source[int(np.argmax(source_norms))]
-            target_vector = centered_target[int(np.argmax(target_norms))]
-            rotation, _ = Rotation.align_vectors(
-                target_vector[None], source_vector[None],
-            )
-            rotation = rotation.as_matrix()
-        translation = target.mean(0) - rotation @ source.mean(0)
-        fitted = source @ rotation.T + translation
-        rmsd = float(np.sqrt(np.mean(np.sum((fitted - target) ** 2, axis=1))))
-        return rotation, translation, rmsd, True
-    dtype = torch.float64
-    rotation, translation, rmsd = proper_rigid_fit(
-        torch.as_tensor(source, dtype=dtype), torch.as_tensor(target, dtype=dtype),
-    )
-    return (rotation.numpy(), translation.numpy(), float(rmsd), False)
+    # Kabsch preserves atom correspondence even when the rotation is non-unique.
+    # Independently selecting each cloud's farthest atom can reverse a linear
+    # molecule merely because floating-point noise changes an argmax tie.
+    left, _, right = np.linalg.svd(centered_source.T @ centered_target)
+    correction = np.array([1., 1., np.linalg.det(left @ right)])
+    rotation = ((left * correction) @ right).T
+    translation = target.mean(0) - rotation @ source.mean(0)
+    fitted = source @ rotation.T + translation
+    rmsd = float(np.sqrt(np.mean(np.sum((fitted - target) ** 2, axis=1))))
+    return rotation, translation, rmsd, underdetermined
 
 
 def project_endpoint_coupling(ligand_data, native_poi, endpoint_ligand,
@@ -338,7 +329,7 @@ class CachedEndpointStore:
             name: np.asarray(value).copy()
             for name, value in record["coupling"].items()
         }
-        return coupling, record
+        return coupling, deepcopy(record)
 
 
 def mixed_source_for_step(global_step):
@@ -436,15 +427,15 @@ def _cpu_array(value):
     return value
 
 
-def _case_seed(case, base_seed):
+def case_seed(case, base_seed):
     digest = hashlib.sha256(case.encode("utf-8")).digest()
     return (int(base_seed) + int.from_bytes(digest[:4], "big")) % (2**31 - 1)
 
 
 class LazyTrainingEndpointStore:
-    """Cache per-occurrence real inputs, or explicitly replay legacy couplings.
+    """Cache actual inputs and reachable labels per occurrence.
 
-    New production training uses resample=True. Validation requests occurrence
+    Validation requests occurrence
     zero. Only the latest occurrence per case stays resident in host memory.
     """
 
@@ -452,11 +443,10 @@ class LazyTrainingEndpointStore:
 
     def __init__(self, cache_dir, expert, *, binary_steps=20,
                  base_seed=ONLINE_TRAINING_BASE_SEED, read_only=False,
-                 wait_seconds=3600., resample=False):
+                 wait_seconds=3600.):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.expert = expert
-        self.resample = bool(resample)
         self.binary_steps = int(binary_steps)
         self.base_seed = int(base_seed)
         self.read_only = bool(read_only)
@@ -464,8 +454,7 @@ class LazyTrainingEndpointStore:
         if self.wait_seconds < 0:
             raise ValueError('endpoint cache wait_seconds must be nonnegative')
         self.protocol = {
-            "version": (RESAMPLED_TRAINING_ENDPOINT_PROTOCOL if self.resample
-                        else ONLINE_TRAINING_ENDPOINT_PROTOCOL),
+            "version": RESAMPLED_TRAINING_ENDPOINT_PROTOCOL,
             "conformers": 1,
             "poses_per_side": 1,
             "binary_steps": self.binary_steps,
@@ -475,7 +464,7 @@ class LazyTrainingEndpointStore:
             "base_seed": self.base_seed,
             "frozen_expert": expert_base_identity(expert),
             "expert_runtime": expert_runtime_identity(expert),
-            "generation_version": 'raw_target_projection_v2',
+            "generation_version": 'raw_target_projection_v3',
         }
         self._records = {}
         self._input_signatures = {}
@@ -485,8 +474,7 @@ class LazyTrainingEndpointStore:
         safe = "".join(char if char.isalnum() or char in "-_." else "_"
                        for char in case)
         suffix = hashlib.sha256(case.encode("utf-8")).hexdigest()[:12]
-        occurrence_tag = f'.occ{occurrence}' if self.resample else ''
-        return self.cache_dir / f"{safe}.{suffix}{occurrence_tag}.pt"
+        return self.cache_dir / f"{safe}.{suffix}.occ{occurrence}.pt"
 
     def _load(self, case, input_signature, occurrence=0):
         path = self._path(case, occurrence)
@@ -501,165 +489,86 @@ class LazyTrainingEndpointStore:
                 "use a new endpoint cache directory (old cache left unchanged)"
             )
         record = payload.get("record")
-        if self.resample:
-            if (payload.get('occurrence') != occurrence or record.get('occurrence') != occurrence
-                    or record.get('case') != case):
-                raise ValueError('resampled endpoint occurrence mismatch')
-            validate_raw_endpoint_record(record)
-        else:
-            validate_endpoint_record(record)
+        if (payload.get('occurrence') != occurrence or record.get('occurrence') != occurrence
+                or record.get('case') != case):
+            raise ValueError('resampled endpoint occurrence mismatch')
+        validate_raw_endpoint_record(record)
         return record
 
+    @preserve_rng
     def _generate(self, case, batch, input_signature, occurrence=0):
         e3, poi, ligand = batch["e3_data"], batch["poi_data"], batch["ligand_data"]
         initializer = DualExpertAnchorInitializer(
             self.expert, e3, poi, binary_steps=self.binary_steps,
             proposal_attempts=1, conformer_policy="etkdgv3_random",
         )
-        seed = _case_seed(f'{case}:{occurrence}' if self.resample else case, self.base_seed)
-        device = ligand["coords"].device
-        devices = ([device.index if device.index is not None
-                    else torch.cuda.current_device()] if device.type == "cuda" else [])
-        python_state, numpy_state = random.getstate(), np.random.get_state()
+        seed = case_seed(f'{case}:{occurrence}', self.base_seed)
+        random.seed(seed)
+        np.random.seed(seed % (2**32))
+        torch.random.default_generator.manual_seed(seed)
+        if torch.cuda.is_initialized():
+            torch.cuda.manual_seed_all(seed)
         try:
-            with torch.random.fork_rng(devices=devices):
-                random.seed(seed)
-                np.random.seed(seed % (2**32))
-                torch.manual_seed(seed)
-                if devices:
-                    torch.cuda.manual_seed_all(seed)
-                try:
-                    candidates, generation = generate_hybrid_candidates(
-                        initializer, e3["coords"][0], poi["coords"][0], ligand,
-                        seed=seed, conformer_count=1, bitseed_candidate_budget=1,
-                        sdpi_candidate_budget=0, binary_retry_limit=1,
-                        binary_consecutive_failure_limit=1,
-                    )
-                except Exception as error:
-                    # Frozen experts are allowed to be undefined on OOD inputs.
-                    # Training must retain the case and use an SDPI endpoint no
-                    # matter which ordinary exception the expert path raises.
-                    candidates, sdpi_records = generate_sdpi_candidates(
-                        initializer.base, e3["coords"][0], poi["coords"][0],
-                        ligand, count=1, seed=seed + 1_000_000,
-                        seed_stride=1,
-                    )
-                    event = {
-                        "conformer_index": 0,
-                        "seed": initializer._conformer_seed(seed, 0),
-                        "error": f"{type(error).__name__}: {error}",
-                        "replacement": "sdpi_v1",
-                        "replacement_count": 1,
-                    }
-                    generation = {
-                        "requested_bitseed": 1,
-                        "actual_bitseed": 0,
-                        "requested_sdpi": 0,
-                        "actual_sdpi": 1,
-                        "successful_conformers": [],
-                        "failed_conformers": [event],
-                        "partial_conformers": [],
-                        "fallback_events": [event],
-                        "sdpi_candidates": sdpi_records,
-                    }
-        finally:
-            random.setstate(python_state)
-            np.random.set_state(numpy_state)
+            candidates, generation = generate_hybrid_candidates(
+                initializer, e3["coords"][0], poi["coords"][0], ligand,
+                seed=seed, conformer_count=1, bitseed_candidate_budget=1,
+                sdpi_candidate_budget=0, binary_retry_limit=1,
+                binary_consecutive_failure_limit=1,
+            )
+        except Exception as error:
+            # Frozen experts are allowed to be undefined on OOD inputs.
+            # Training must retain the case and use an SDPI endpoint no
+            # matter which ordinary exception the expert path raises.
+            candidates, sdpi_records = generate_sdpi_candidates(
+                initializer.base, e3["coords"][0], poi["coords"][0],
+                ligand, count=1, seed=seed + 1_000_000,
+                seed_stride=1,
+            )
+            event = {
+                "conformer_index": 0,
+                "seed": initializer._conformer_seed(seed, 0),
+                "error": f"{type(error).__name__}: {error}",
+                "replacement": "sdpi_v1",
+                "replacement_count": 1,
+            }
+            generation = {
+                "requested_bitseed": 1,
+                "actual_bitseed": 0,
+                "requested_sdpi": 0,
+                "actual_sdpi": 1,
+                "successful_conformers": [],
+                "failed_conformers": [event],
+                "partial_conformers": [],
+                "fallback_events": [event],
+                "sdpi_candidates": sdpi_records,
+            }
         if len(candidates) != 1:
             raise AssertionError(f"{case}: C=1/M=1 must produce exactly one endpoint")
         candidate = candidates[0]
         actual_source = candidate["candidate_id"][0]
-        if self.resample:
-            target, projection = reachable_ligand_target(
-                ligand, candidate['ligand'], candidate['poi'], poi['coords'],
-                no_torsion=initializer.no_torsion)
-            record = {
-                'case': case, 'actual_source': actual_source,
-                'candidate_id': candidate['candidate_id'], 'occurrence': occurrence,
-                'native_used_in_candidate_generation': False,
-                'native_used_in_candidate_selection': False,
-                'endpoint': {'ligand': _cpu_array(candidate['ligand'][0]),
-                             'poi': _cpu_array(candidate['poi'][0]),
-                             'body_frame': _cpu_array(candidate['rotation'][0])},
-                'target_ligand': target, 'projection': projection,
-                'generation': generation,
-            }
-            validate_raw_endpoint_record(record)
-            atomic_torch_save({'case': case, 'occurrence': occurrence,
-                              'protocol': self.protocol, 'record': record,
-                              'input_signature': input_signature}, self._path(case, occurrence))
-            return record
-        coupling, projected, projection = project_endpoint_coupling(
-            ligand, poi["coords"], candidate["ligand"], candidate["poi"],
-            no_torsion=initializer.no_torsion,
-        )
-        ligand_one, poi_one, body_one, targets = SDPIFlow().path(
-            ligand, poi["coords"], coupling,
-            torch.ones(1, device=device),
-        )
-        if not all(torch.isfinite(value).all() for branch in targets.values()
-                   for value in (branch.values() if isinstance(branch, dict) else (branch,))):
-            raise FloatingPointError(f"{case}: non-finite projected velocity target")
-        conformer_index = candidate.get("conformer_index")
+        target, projection = reachable_ligand_target(
+            ligand, candidate['ligand'], candidate['poi'], poi['coords'],
+            no_torsion=initializer.no_torsion)
         record = {
-            "case": case,
-            "actual_source": actual_source,
-            "candidate_id": candidate["candidate_id"],
-            "conformer_seed": (initializer._conformer_seed(seed, int(conformer_index))
-                               if conformer_index is not None else None),
-            "binary_pose_ids": list(candidate["attempt"]),
-            "fallback": candidate.get("fallback"),
-            "native_used_in_candidate_generation": False,
-            "native_used_in_candidate_selection": False,
-            "native_used_for_training_projection": True,
-            "endpoint": {
-                "ligand": _cpu_array(candidate["ligand"][0]),
-                "poi": _cpu_array(candidate["poi"][0]),
-                "body_frame": _cpu_array(candidate["rotation"][0]),
-            },
-            "training_endpoint": {
-                "ligand": _cpu_array(ligand_one[0]),
-                "poi": _cpu_array(poi_one[0]),
-                "body_frame": _cpu_array(body_one[0]),
-            },
-            "coupling": {name: _cpu_array(value) for name, value in coupling.items()},
-            "projection": projection,
-            "generation": {
-                "case_seed": seed,
-                "fallback_events": generation["fallback_events"],
-                "geometry": candidate["geometry"],
-                "fit_rmsd": candidate["fit_rmsd"],
-            },
+            'case': case, 'actual_source': actual_source,
+            'candidate_id': candidate['candidate_id'], 'occurrence': occurrence,
+            'native_used_in_candidate_generation': False,
+            'native_used_in_candidate_selection': False,
+            'endpoint': {'ligand': _cpu_array(candidate['ligand'][0]),
+                         'poi': _cpu_array(candidate['poi'][0]),
+                         'body_frame': _cpu_array(candidate['rotation'][0])},
+            'target_ligand': target, 'projection': projection,
+            'generation': generation,
         }
-        ligand_roundtrip_error = float(np.max(np.abs(
-            _cpu_array(ligand_one[0]) - projected["ligand"]
-        )))
-        poi_roundtrip_error = float(np.max(np.abs(
-            _cpu_array(poi_one[0]) - projected["poi"]
-        )))
-        roundtrip_error = max(ligand_roundtrip_error, poi_roundtrip_error)
-        projection["flow_t1_max_abs_error_angstrom"] = roundtrip_error
-        # ``projected`` is assembled in float64 while the production flow uses
-        # the model coordinate dtype (normally float32).  Large complexes can
-        # therefore exceed a fixed 1e-5 comparison solely from dtype rounding.
-        # Keep the check tied to the projection contract's 1e-3 Angstrom
-        # representability tolerance so genuine chart mismatches still abort.
-        if roundtrip_error > projection["exact_atol_angstrom"]:
-            raise AssertionError(
-                f"{case}: projected endpoint failed t=1 round-trip "
-                f"(max_abs_error={roundtrip_error:.6g} Angstrom)"
-            )
-        validate_endpoint_record(record)
-        atomic_torch_save({"case": case, "protocol": self.protocol, "record": record,
-                      "input_signature": input_signature},
-                     self._path(case))
+        validate_raw_endpoint_record(record)
+        atomic_torch_save({'case': case, 'occurrence': occurrence,
+                          'protocol': self.protocol, 'record': record,
+                          'input_signature': input_signature}, self._path(case, occurrence))
         return record
 
     def coupling(self, case, occurrence=0, *, batch=None):
         if not isinstance(occurrence, int) or isinstance(occurrence, bool) or occurrence < 0:
             raise ValueError('endpoint occurrence must be a nonnegative integer')
-        if not self.resample:
-            occurrence = 0  # Explicit legacy protocol only.
         if batch is None:
             raise ValueError(f"{case}: batch is required to validate endpoint inputs")
         if expert_runtime_identity(self.expert) != self.protocol['expert_runtime']:
@@ -686,10 +595,6 @@ class LazyTrainingEndpointStore:
         self._records[case] = record
         self._input_signatures[case] = input_signature
         self._occurrences[case] = occurrence
-        if self.resample:
-            return {'initial_state': {name: np.asarray(value).copy()
-                                      for name, value in record['endpoint'].items()},
-                    'target_ligand': np.asarray(record['target_ligand']).copy()}, record
-        coupling = {name: np.asarray(value).copy()
-                    for name, value in record["coupling"].items()}
-        return coupling, record
+        return {'initial_state': {name: np.asarray(value).copy()
+                                  for name, value in record['endpoint'].items()},
+                'target_ligand': np.asarray(record['target_ligand']).copy()}, deepcopy(record)

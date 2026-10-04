@@ -3,7 +3,6 @@ TriCoopDiff training entry point.
 
 Supervised training:
   Direct ternary: executed endpoint and protein-interface supervision.
-  Explicit legacy mode: SDPI conditional velocity matching with frozen experts.
   Auxiliary confidence/state training is intentionally unavailable until the
   dataset and loss expose explicit labels.
 
@@ -44,6 +43,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 from featurize_common import featurize_complex  # noqa: E402
+from tricoopdiff.runtime import evaluation_context, preserve_rng
+from tricoopdiff.initialization.endpoints import case_seed
 
 
 def parse_args(argv=None):
@@ -83,44 +84,17 @@ def parse_args(argv=None):
     p.add_argument(
         '--activation-clamp-mode', choices=('irrep_norm', 'componentwise'),
         default='irrep_norm',
-        help='Use componentwise explicitly when resuming legacy v2 checkpoints',
+        help='Instance expert numerical policy',
     )
-    p.add_argument(
-        "--torsion-expert-aux-weight", type=float, default=0.25,
-        help="Weight for per-expert torsion losses in addition to joint torsion",
-    )
-    p.add_argument('--residual-weight', type=float, default=1e-3)
     p.add_argument('--interface-loss-weight', type=float, default=1.0)
     p.add_argument('--interface-cutoff', type=float, default=10.0,
                    help='Native C-alpha interface cutoff in Angstrom, not full-atom DockQ contact membership')
     p.add_argument('--steric-loss-weight', type=float, default=None,
-                   help='Coarse short-range repulsion: production default .05, custom default 0')
-    p.add_argument('--model-profile', choices=('production', 'custom'), default=None,
-                   help='Default is the fixed production recipe; explicit legacy overrides select custom')
-    p.add_argument('--dropout', type=float, default=None,
-                   help='Production uses 0; custom models retain .1 unless explicitly set')
-    p.add_argument('--protein-pair-motion', action=argparse.BooleanOptionalAction,
-                   default=False,
-                   help='Add local protein-contact motion; disable for legacy checkpoint resume')
-    p.add_argument('--direct-ternary-motion', action=argparse.BooleanOptionalAction,
-                   default=True,
-                   help='Joint geometry owns independent ligand/POI motion; disable for old checkpoints')
-    p.add_argument('--global-node-context', action=argparse.BooleanOptionalAction,
-                   default=True,
-                   help='Broadcast component summaries during joint message passing; disable for older direct checkpoints')
-    p.add_argument('--spatial-geometry', action=argparse.BooleanOptionalAction,
-                   default=True,
-                   help='Use current-state center distances, angles and handedness in joint geometry')
-    p.add_argument('--motion-attention', action=argparse.BooleanOptionalAction, default=True,
-                   help='Learn separate translation/rotation interface attention instead of uniform edge averaging')
-    p.add_argument('--global-node-attention', action=argparse.BooleanOptionalAction, default=True,
-                   help='Add unpooled node-to-all-node attention after local geometric messages')
+                   help='Coarse short-range repulsion; default .05')
     p.add_argument('--checkpoint-ternary', action=argparse.BooleanOptionalAction, default=True,
                    help='Recompute ternary activations during backward to reduce rollout memory')
     p.add_argument('--native-root', default='DeepTernary/data/TernaryDB/pdbs',
                    help='Native complexes for exact terminal training-validation DockQ; not the MGD benchmark protocol')
-    p.add_argument('--expert-input-grad', action=argparse.BooleanOptionalAction,
-                   default=True, help='Keep frozen expert input derivatives during rollouts')
     p.add_argument('--ema-decay', type=float, default=0.999)
     # Phase
     p.add_argument("--phase", type=int, default=1, choices=[1],
@@ -128,9 +102,6 @@ def parse_args(argv=None):
     p.add_argument("--resume", default=None, help="Resume from checkpoint")
 
     # Model config
-    # TriFuse params
-    p.add_argument("--ns", type=int, default=32, help="TriFuse scalar channels")
-    p.add_argument("--nv", type=int, default=4, help="TriFuse vector channels")
     p.add_argument("--num_transformer_layers", type=int, default=3)
     p.add_argument("--node_dim", type=int, default=128)
     # Frozen DiffDock-L expert (ns=48, nv=10, num_conv_layers=11). These are read
@@ -157,10 +128,6 @@ def parse_args(argv=None):
         help="A1=SDPI only, B=mixed without source embedding, C=mixed with it",
     )
     p.add_argument(
-        "--bitseed-endpoint-cache", default=None,
-        help="Retired full-pool cache option; mixed training now generates lazily",
-    )
-    p.add_argument(
         "--bitseed-lazy-cache-dir", default=None,
         help="Per-case C=1/M=1 endpoint cache (defaults inside output_dir)",
     )
@@ -172,16 +139,6 @@ def parse_args(argv=None):
                                      '--interface-cutoff', '--steric-loss-weight')]
     if args.batch_size < 1:
         p.error('--batch_size must be positive')
-    if args.dropout is not None and not 0 <= args.dropout < 1:
-        p.error('--dropout must be in [0, 1)')
-    custom = (args.protein_pair_motion or not all((args.direct_ternary_motion,
-              args.global_node_context, args.spatial_geometry, args.motion_attention,
-              args.global_node_attention, args.expert_input_grad))
-              or args.dropout not in (None, 0.))
-    if args.model_profile is None:
-        args.model_profile = 'custom' if custom or args.resume else 'production'
-    if args.model_profile == 'production' and custom:
-        p.error('production architecture is fixed; use --model-profile custom for legacy overrides')
     return args
 
 
@@ -218,6 +175,8 @@ def _load_index(data_json):
             entry[key] = str(path.resolve())
         resolved.append(entry)
     entries_by_case = {entry['case']: entry for entry in resolved}
+    if len(entries_by_case) != len(resolved):
+        raise ValueError(f'{data_json}: duplicate case names would overwrite training inputs')
     clusters = index.get('clusters') if isinstance(index, dict) else None
     return resolved, clusters, entries_by_case
 
@@ -266,19 +225,14 @@ def main():
             raise SystemExit(
                 "FATAL: mixed endpoint caches require --no-random-flip-proteins"
             )
-        if args.bitseed_endpoint_cache:
-            raise SystemExit(
-                "FATAL: full-pool endpoint caches are retired for arms B/C; "
-                "use --bitseed-lazy-cache-dir"
-            )
         if args.bitseed_lazy_cache_dir is None:
             args.bitseed_lazy_cache_dir = str(
                 Path(args.output_dir).resolve() / "bitseed_c1m1_cache"
             )
-        from tricoopdiff.initialization.endpoints import ONLINE_TRAINING_ENDPOINT_PROTOCOL
-        args.training_endpoint_protocol = ONLINE_TRAINING_ENDPOINT_PROTOCOL
+        from tricoopdiff.initialization.endpoints import RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
+        args.training_endpoint_protocol = RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
     else:
-        if args.bitseed_endpoint_cache or args.bitseed_lazy_cache_dir:
+        if args.bitseed_lazy_cache_dir:
             raise SystemExit("FATAL: arm A1 must not consume a BiTSeed endpoint cache")
         args.training_endpoint_protocol = "none"
 
@@ -322,17 +276,14 @@ def main():
     # ----------------------------------------------------------------
     print("[1/6] Building model...")
     model, diffusion, trainer = build_trainer(args, device, input_dim=input_dim)
-    print(f"  Model profile: {args.model_profile} | "
+    print(f"  Model profile: production | "
           f"dropout={args.resolved_model_config['dropout'] if 'dropout' in args.resolved_model_config else .1:g}")
     # Include resolved resume/profile settings, not defaults that were ignored.
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as handle:
         json.dump(vars(args), handle, indent=2)
     if args.training_arm in ("B", "C"):
         from tricoopdiff.initialization.endpoints import LazyTrainingEndpointStore
-        endpoint_store = LazyTrainingEndpointStore(
-            args.bitseed_lazy_cache_dir, model.expert,
-            resample=trainer.training_objective == 'real_initialization_reachable_endpoint_v2',
-        )
+        endpoint_store = LazyTrainingEndpointStore(args.bitseed_lazy_cache_dir, model.expert)
 
     # ----------------------------------------------------------------
     # 2. Load data
@@ -349,10 +300,9 @@ def main():
         shuffle=False, device=str(device), cache_dir=args.cache_dir,
         skip_on_error=False, max_clusters=args.max_val_clusters,
     )
-    if trainer.training_objective == 'executed_endpoint_geometry_v1':
-        # Check scoring dependencies before spending an epoch on training.
-        for entry in val_loader._epoch_entries():
-            validation_metric_context(entry, args.native_root)
+    # Check scoring dependencies before spending an epoch on training.
+    for entry in val_loader._epoch_entries():
+        validation_metric_context(entry, args.native_root)
 
     # ----------------------------------------------------------------
     # 3. Resume if specified
@@ -401,21 +351,10 @@ def main():
                          for key in group_losses[0]}
 
             if batch_idx % args.log_interval == 0:
-                if 'loss_ligand_geometry' in loss_dict:
-                    print(f"  Epoch {epoch} | Batch {batch_idx} | "
-                          f"loss={loss_dict['loss_total']:.4f} | "
-                          f"ligand_geometry={loss_dict['loss_ligand_geometry']:.4f} | "
-                          f"protein_geometry={loss_dict['loss_protein_geometry']:.4f}")
-                else:
-                    print(f"  Epoch {epoch} | Batch {batch_idx} | "
+                print(f"  Epoch {epoch} | Batch {batch_idx} | "
                       f"loss={loss_dict['loss_total']:.4f} | "
-                      f"e3l=(tr={loss_dict['loss_e3l_tr']:.4f}, "
-                      f"rot={loss_dict['loss_e3l_rot']:.4f}) | "
-                      f"pol=(tr={loss_dict['loss_pol_tr']:.4f}, "
-                      f"rot={loss_dict['loss_pol_rot']:.4f}) | "
-                      f"tor=(joint={loss_dict['loss_score_tor']:.4f}, "
-                      f"e3l={loss_dict['loss_e3l_tor']:.4f}, "
-                      f"pol={loss_dict['loss_pol_tor']:.4f})")
+                      f"ligand_geometry={loss_dict['loss_ligand_geometry']:.4f} | "
+                      f"protein_geometry={loss_dict['loss_protein_geometry']:.4f}")
 
         if n_skipped:
             raise RuntimeError(
@@ -445,18 +384,13 @@ def main():
 
         # Log
         train_loss_avg = np.mean([d['loss_total'] for d in train_losses]) if train_losses else float('nan')
-        endpoint_training = 'loss_ligand_geometry' in train_losses[0]
-        train_e3l_avg = np.mean([
-            d['loss_ligand_geometry'] if endpoint_training else d['loss_e3l_tr'] + d['loss_e3l_rot']
-            for d in train_losses])
-        train_pol_avg = np.mean([
-            d['loss_protein_geometry'] if endpoint_training else d['loss_pol_tr'] + d['loss_pol_rot']
-            for d in train_losses])
+        train_ligand_avg = np.mean([d['loss_ligand_geometry'] for d in train_losses])
+        train_protein_avg = np.mean([d['loss_protein_geometry'] for d in train_losses])
         dt = time.time() - t0
         print(f"  Epoch {epoch}/{args.epochs} | "
               f"train_loss={train_loss_avg:.4f} | "
-              f"{'ligand_geometry' if endpoint_training else 'e3l'}={train_e3l_avg:.4f} | "
-              f"{'protein_geometry' if endpoint_training else 'pol'}={train_pol_avg:.4f} | "
+              f"ligand_geometry={train_ligand_avg:.4f} | "
+              f"protein_geometry={train_protein_avg:.4f} | "
               f"val_loss={val_loss:.4f} | "
               f"skipped={n_skipped} | "
               f"lr={trainer.optimizer.param_groups[0]['lr']:.2e} | "
@@ -522,31 +456,9 @@ def build_trainer(args, device, input_dim=None):
         input_dim = args.node_dim
         print(f"[warn] input_dim not provided; defaulting to node_dim={input_dim}")
 
-    # Consensus learns after expert inference; no FiLM dimensions are needed.
-    model_config = {
-        'node_dim': args.node_dim, 'input_dim': input_dim,
-        'num_transformer_layers': args.num_transformer_layers,
-    }
-    if getattr(args, 'training_arm', 'A1') == 'C':
-        model_config['source_conditioning'] = True
-    if getattr(args, 'protein_pair_motion', False):
-        model_config['protein_pair_motion'] = True
-    if getattr(args, 'direct_ternary_motion', False):
-        model_config['direct_ternary_motion'] = True
-        if getattr(args, 'global_node_context', True):
-            model_config['global_node_context'] = True
-        if getattr(args, 'spatial_geometry', True):
-            model_config['spatial_geometry'] = True
-        if getattr(args, 'motion_attention', True):
-            model_config['motion_attention'] = True
-        if getattr(args, 'global_node_attention', True):
-            model_config['global_node_attention'] = True
-    if args.model_profile == 'production':
-        model_config = production_model_config(args.node_dim, input_dim,
-                                               args.num_transformer_layers,
-                                               args.training_arm == 'C')
-    elif args.dropout is not None:
-        model_config['dropout'] = args.dropout
+    model_config = production_model_config(args.node_dim, input_dim,
+                                           args.num_transformer_layers,
+                                           args.training_arm == 'C')
     if args.resume:
         # Resume means reconstruct the saved architecture, not reinterpret it
         # using today's defaults. The trainer subsequently checks every runtime
@@ -554,14 +466,13 @@ def build_trainer(args, device, input_dim=None):
         from tricoopdiff.train import validate_consensus_checkpoint
         saved = torch.load(args.resume, map_location='cpu', weights_only=False)
         validate_consensus_checkpoint(saved)
+        if saved['runtime_config'].get('training_objective') != 'real_initialization_reachable_endpoint_v2':
+            raise ValueError('historical checkpoints are inference/weight sources, not production resumes')
         model_config = dict(saved['model_config'])
-        if args.model_profile == 'production' and not model_config.get('model_profile'):
+        if not model_config.get('model_profile'):
             raise ValueError('an older custom checkpoint cannot resume as the production profile')
-        if args.dropout is not None and args.dropout != model_config.get('dropout', .1):
-            raise ValueError('resume cannot override the saved dropout')
         if model_config['input_dim'] != input_dim:
             raise ValueError('resume checkpoint input features do not match the data')
-        args.model_profile = 'production' if model_config.get('model_profile') else 'custom'
         for key, option, old_default in (('interface_loss_weight', '--interface-loss-weight', 0.),
                                          ('interface_cutoff', '--interface-cutoff', 10.),
                                          ('steric_loss_weight', '--steric-loss-weight', 0.)):
@@ -569,18 +480,14 @@ def build_trainer(args, device, input_dim=None):
                 setattr(args, key, saved['runtime_config'].get(key, old_default))
     args.resolved_model_config = dict(model_config)
     if args.steric_loss_weight is None:
-        args.steric_loss_weight = .05 if args.model_profile == 'production' else 0.
-    from tricoopdiff.train import REAL_ENDPOINT_OBJECTIVE
-    objective = (saved['runtime_config'].get('training_objective', 'sdpi_velocity_mse_v1')
-                 if args.resume else
-                 (REAL_ENDPOINT_OBJECTIVE if model_config.get('model_profile') else None))
-    if objective == REAL_ENDPOINT_OBJECTIVE and getattr(args, 'training_arm', 'A1') in ('B', 'C'):
+        args.steric_loss_weight = .05
+    if getattr(args, 'training_arm', 'A1') in ('B', 'C'):
         from tricoopdiff.initialization.endpoints import RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
         args.training_endpoint_protocol = RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
     trifuse = ConsensusFuse(**model_config)
 
     model = ConsensusCoopDiff(frozen_expert, trifuse,
-                             expert_input_grad=getattr(args, 'expert_input_grad', True),
+                             expert_input_grad=True,
                              checkpoint_ternary=getattr(args, 'checkpoint_ternary', True))
 
     # Build diffusion
@@ -594,14 +501,12 @@ def build_trainer(args, device, input_dim=None):
         weight_decay=args.weight_decay,
         activation_clamp=args.nan_clamp,
         activation_clamp_mode=args.activation_clamp_mode,
-        torsion_expert_aux_weight=args.torsion_expert_aux_weight,
-        residual_weight=args.residual_weight,
+        residual_weight=0.,
         ema_decay=args.ema_decay,
         interface_loss_weight=args.interface_loss_weight,
         interface_cutoff=args.interface_cutoff,
         effective_batch_size=args.batch_size,
         steric_loss_weight=args.steric_loss_weight,
-        training_objective=objective,
         training_source_mix=(
             'sdpi_only' if getattr(args, 'training_arm', 'A1') == 'A1'
             else 'sdpi_bitseed_1_1'
@@ -680,81 +585,65 @@ def prepare_source_batch(batch, global_step, training_arm, endpoint_store):
 def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None,
              native_root='DeepTernary/data/TernaryDB/pdbs'):
     """Run a deterministic validation pass without perturbing training RNG."""
-    from tricoopdiff.train import VALIDATION_DOCKQ_PROTOCOL
-    cuda_devices = []
-    if device.type == 'cuda':
-        cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()]
-    numpy_state = np.random.get_state()
-    python_state = random.getstate()
-    from tricoopdiff.train import ENDPOINT_OBJECTIVES, REAL_ENDPOINT_OBJECTIVE, REAL_VALIDATION_DOCKQ_PROTOCOL
-    exact_dockq = getattr(trainer, 'training_objective', None) in ENDPOINT_OBJECTIVES
+    from tricoopdiff.train import REAL_ENDPOINT_OBJECTIVE, REAL_VALIDATION_DOCKQ_PROTOCOL
+    exact_dockq = getattr(trainer, 'training_objective', None) == REAL_ENDPOINT_OBJECTIVE
     scores = {'sdpi': [], 'bitseed': []}
     per_case = []
     ema_context = trainer.ema_parameters() if hasattr(trainer, 'ema_parameters') else nullcontext()
-    try:
-        with torch.random.fork_rng(devices=cuda_devices), ema_context:
-            torch.manual_seed(0)
-            if cuda_devices:
-                torch.cuda.manual_seed_all(0)
-            np.random.seed(0)
-            random.seed(0)
-            trainer.model.eval()
-            losses = {'sdpi': [], 'bitseed': []}
-            fallback_count = 0
+    with ema_context, evaluation_context(trainer.model):
+        losses = {'sdpi': [], 'bitseed': []}
+        fallback_count = 0
 
-            for batch in val_loader:
-                metric_kwargs = ({'dockq_context': validation_metric_context(
-                    val_loader.entries_by_case[batch['case']], native_root)} if exact_dockq else {})
+        for batch in val_loader:
+            seed_training(case_seed(batch['case'], 0), device)
+            metric_kwargs = ({'dockq_context': validation_metric_context(
+                val_loader.entries_by_case[batch['case']], native_root)} if exact_dockq else {})
+            try:
+                loss_dict = trainer.validate_step(**{**batch, 'source': 0}, **metric_kwargs)
+            except FloatingPointError as error:
+                raise RuntimeError(f"validation failed: {error}") from error
+            if not np.isfinite(loss_dict['loss_total']):
+                raise RuntimeError(
+                    f"validation failed: case={batch.get('case', 'unknown')} "
+                    "produced a non-finite loss"
+                )
+            losses['sdpi'].append(loss_dict['loss_total'])
+            if exact_dockq:
+                scores['sdpi'].append(loss_dict['dockq'])
+                per_case.append({'case': batch['case'], 'source': 'sdpi',
+                                 'loss': loss_dict['loss_total'],
+                                 **{key: loss_dict[key] for key in ('dockq', 'fnat', 'irms', 'lrms')}})
+            if training_arm in ('B', 'C'):
+                if endpoint_store is None:
+                    raise ValueError('mixed validation requires an endpoint store')
+                coupling, record = endpoint_store.coupling(
+                    batch['case'],
+                    **({'batch': batch} if getattr(endpoint_store, 'lazy', False)
+                       else {}),
+                )
+                actual_source = record['actual_source']
                 try:
-                    loss_dict = trainer.validate_step(**{**batch, 'source': 0}, **metric_kwargs)
+                    endpoint_loss = trainer.validate_step(**{
+                        **batch,
+                        'source': 1 if actual_source == 'bitseed' else 0,
+                        'coupling_override': coupling,
+                    }, **metric_kwargs)
                 except FloatingPointError as error:
-                    raise RuntimeError(f"validation failed: {error}") from error
-                if not np.isfinite(loss_dict['loss_total']):
+                    raise RuntimeError(
+                        f"BiTSeed validation failed: {error}"
+                    ) from error
+                if not np.isfinite(endpoint_loss['loss_total']):
                     raise RuntimeError(
                         f"validation failed: case={batch.get('case', 'unknown')} "
-                        "produced a non-finite loss"
+                        "produced a non-finite BiTSeed loss"
                     )
-                losses['sdpi'].append(loss_dict['loss_total'])
+                losses[actual_source].append(endpoint_loss['loss_total'])
                 if exact_dockq:
-                    scores['sdpi'].append(loss_dict['dockq'])
-                    per_case.append({'case': batch['case'], 'source': 'sdpi',
-                                     'loss': loss_dict['loss_total'],
-                                     **{key: loss_dict[key] for key in ('dockq', 'fnat', 'irms', 'lrms')}})
-                if training_arm in ('B', 'C'):
-                    if endpoint_store is None:
-                        raise ValueError('mixed validation requires an endpoint store')
-                    coupling, record = endpoint_store.coupling(
-                        batch['case'],
-                        **({'batch': batch} if getattr(endpoint_store, 'lazy', False)
-                           else {}),
-                    )
-                    actual_source = record['actual_source']
-                    try:
-                        endpoint_loss = trainer.validate_step(**{
-                            **batch,
-                            'source': 1 if actual_source == 'bitseed' else 0,
-                            'coupling_override': coupling,
-                        }, **metric_kwargs)
-                    except FloatingPointError as error:
-                        raise RuntimeError(
-                            f"BiTSeed validation failed: {error}"
-                        ) from error
-                    if not np.isfinite(endpoint_loss['loss_total']):
-                        raise RuntimeError(
-                            f"validation failed: case={batch.get('case', 'unknown')} "
-                            "produced a non-finite BiTSeed loss"
-                        )
-                    losses[actual_source].append(endpoint_loss['loss_total'])
-                    if exact_dockq:
-                        scores[actual_source].append(endpoint_loss['dockq'])
-                        per_case.append({'case': batch['case'], 'source': actual_source,
-                                         'loss': endpoint_loss['loss_total'],
-                                         **{key: endpoint_loss[key] for key in ('dockq', 'fnat', 'irms', 'lrms')}})
-                    fallback_count += int(actual_source == 'sdpi')
-    finally:
-        np.random.set_state(numpy_state)
-        random.setstate(python_state)
-        trainer.model.train()
+                    scores[actual_source].append(endpoint_loss['dockq'])
+                    per_case.append({'case': batch['case'], 'source': actual_source,
+                                     'loss': endpoint_loss['loss_total'],
+                                     **{key: endpoint_loss[key] for key in ('dockq', 'fnat', 'irms', 'lrms')}})
+                fallback_count += int(actual_source == 'sdpi')
     by_source = {
         source: float(np.mean(values))
         for source, values in losses.items() if values
@@ -771,9 +660,7 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
             raise RuntimeError('full-atom validation produced no DockQ measurements')
         result.update(selection_dockq=float(np.mean(list(dockq_by_source.values()))),
                       dockq_by_source=dockq_by_source, per_case=per_case,
-                      dockq_protocol=(REAL_VALIDATION_DOCKQ_PROTOCOL
-                                      if trainer.training_objective == REAL_ENDPOINT_OBJECTIVE
-                                      else VALIDATION_DOCKQ_PROTOCOL))
+                      dockq_protocol=REAL_VALIDATION_DOCKQ_PROTOCOL)
     return result
 
 
@@ -869,21 +756,12 @@ class TernaryDataLoader:
         # ESM/model construction on a cold cache can consume framework RNG
         # while a warm-cache read does not. Feature cache state must never
         # alter diffusion couplings, dropout or later epoch order.
-        numpy_state, python_state = np.random.get_state(), random.getstate()
-        device = torch.device(self.device)
-        cuda_devices = ([device.index if device.index is not None else torch.cuda.current_device()]
-                        if device.type == 'cuda' else [])
-        try:
-            with torch.random.fork_rng(devices=cuda_devices):
-                e3_data, poi_data, ligand_data, _ = featurize_complex(
-                    entry["case"], entry["protein1"], entry["protein2"], entry["ligand"],
-                    self.score_model_args, self.device, cache_dir=self.cache_dir,
-                    cache_read_only=self.cache_read_only,
-                    cache_wait_seconds=self.cache_wait_seconds,
-                )
-        finally:
-            np.random.set_state(numpy_state)
-            random.setstate(python_state)
+        e3_data, poi_data, ligand_data, _ = preserve_rng(featurize_complex)(
+            entry["case"], entry["protein1"], entry["protein2"], entry["ligand"],
+            self.score_model_args, self.device, cache_dir=self.cache_dir,
+            cache_read_only=self.cache_read_only,
+            cache_wait_seconds=self.cache_wait_seconds,
+        )
         if self.random_flip_proteins and np.random.random() < 0.5:
             # Re-express the entire ternary state in the old POI-centered frame,
             # then exchange branch identities. This matches DeepTernary's

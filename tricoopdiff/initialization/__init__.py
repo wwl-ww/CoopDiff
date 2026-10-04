@@ -164,9 +164,12 @@ class TernaryInitializer:
         torsions = np.zeros(len(bonds))
         if not self.no_torsion and len(bonds):
             torsions = rng.uniform(-np.pi, np.pi, len(bonds))
-            shared = modify_conformer_torsion_angles(
-                shared.cpu(), bonds, masks, torsions, as_numpy=False,
-            ).to(device=e3_coords.device, dtype=e3_coords.dtype)
+            # The vendored tensor return forcibly casts to float32. Preserve
+            # the conformer's actual precision instead of widening it back
+            # after bond geometry has already been rounded.
+            shared = torch.as_tensor(modify_conformer_torsion_angles(
+                shared.cpu(), bonds, masks, torsions, as_numpy=True,
+            ), device=e3_coords.device, dtype=e3_coords.dtype)
         transforms, sides = [], {}
         for name, receptor in (("e3", e3_coords), ("poi", poi_coords)):
             rotation, translation, sides[name] = sample_binary_pose(
