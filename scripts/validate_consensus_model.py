@@ -18,13 +18,13 @@ import tricoopdiff.diffdock_compat  # noqa: E402,F401
 import numpy as np
 import torch
 
-from tricoopdiff.consensus import ConsensusCoopDiff, ConsensusFuse
-from tricoopdiff.consensus_train import ConsensusTrainer
-from tricoopdiff.expert_factory import build_diffdock_expert
+from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse
+from tricoopdiff.train import ConsensusTrainer
+from tricoopdiff.models.expert import build_diffdock_expert
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.sampler import sample_single
 from tricoopdiff.sdpi_flow import SDPIFlow
-from tricoopdiff.reproducibility import configure_inference_reproducibility
+from tricoopdiff.runtime import configure_inference_reproducibility
 
 
 def main():

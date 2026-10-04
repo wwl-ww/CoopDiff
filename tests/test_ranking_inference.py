@@ -11,10 +11,10 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 from evaluation_common import sha256_file
-from tricoopdiff.pose_ranking import StateQualityRanker
-from tricoopdiff.ranking_inference import (export_quality_checkpoint, feature_vector,
+from tricoopdiff.ranking.ranking_inference import StateQualityRanker
+from tricoopdiff.ranking.ranking_inference import (export_quality_checkpoint, feature_vector,
                                          load_quality_checkpoint, predict_archive)
-from tricoopdiff.ranking_audit import case_metrics, join_labels, label_support, random_hit_probability, summarize_cases
+from tricoopdiff.ranking.ranking_audit import case_metrics, join_labels, label_support, random_hit_probability, summarize_cases
 
 
 def example_archive():

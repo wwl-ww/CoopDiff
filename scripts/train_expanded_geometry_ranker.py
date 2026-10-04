@@ -14,7 +14,7 @@ import torch
 from evaluation_common import sha256_file
 from extract_expanded_ranking_features import PROTOCOL
 from train_state_ranker import combine_training_parts, evaluate, quality_class_support
-from tricoopdiff.pose_ranking import StateQualityRanker, state_quality_loss
+from tricoopdiff.ranking.ranking_inference import StateQualityRanker, state_quality_loss
 
 
 def load_split(archives, feature_dir, labels, split):

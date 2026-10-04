@@ -12,9 +12,9 @@ import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 
-from .diffusion import InterfaceDiffusion, so3_score_norm
-from .initialization import receptor_prior, sample_binary_pose, validate_ligand_graph
-from .rigid import assemble_interface_pair
+from tricoopdiff.models.expert import expert_t_to_sigma, so3_score_norm
+from tricoopdiff.initialization import receptor_prior, sample_binary_pose, validate_ligand_graph
+from tricoopdiff.pose_anchors import assemble_interface_pair, rotation_exp
 
 
 FLOW_VERSION = 'sdpi_flow_v1'
@@ -29,18 +29,8 @@ def _check_coords(coords):
         raise ValueError('SDPI flow coordinates must be finite [1, N, 3] with N > 0')
 
 
-def _rotation_exp(vector):
-    """SO(3) exponential without small-angle division or dtype conversion."""
-    matrix = vector.new_zeros((*vector.shape[:-1], 3, 3))
-    x, y, z = vector.unbind(-1)
-    matrix[..., 0, 1], matrix[..., 0, 2] = -z, y
-    matrix[..., 1, 0], matrix[..., 1, 2] = z, -x
-    matrix[..., 2, 0], matrix[..., 2, 1] = -y, x
-    return torch.linalg.matrix_exp(matrix)
-
-
 def _raw_torsions(coords, bonds, masks, angles):
-    from .diffdock.utils.torsion import modify_conformer_torsion_angles
+    from tricoopdiff.diffdock.utils.torsion import modify_conformer_torsion_angles
 
     if not len(bonds):
         return coords.copy()
@@ -90,16 +80,15 @@ class SDPIFlow:
         if not isinstance(inference_steps, int) or isinstance(inference_steps, bool) or inference_steps < 1:
             raise ValueError('inference_steps must be a positive integer')
         self.inference_steps = inference_steps
-        self._expert_conditioning = InterfaceDiffusion(inference_steps=inference_steps)
 
     def t_to_sigma(self, t_tr, t_rot, t_tor):
         """Native expert preconditioning; these are NOT flow noise variances."""
-        return self._expert_conditioning.t_to_sigma(t_tr, t_rot, t_tor)
+        return expert_t_to_sigma(t_tr, t_rot, t_tor)
 
     def get_inference_schedule(self, steps, t_start=1.0):
         if t_start != 1:
             raise ValueError('SDPI flow must start at its prior endpoint t=1')
-        return self._expert_conditioning.get_inference_schedule(steps, t_start)
+        return self.get_refinement_schedule(steps, t_start)
 
     def get_refinement_schedule(self, steps, t_start):
         """Return a truncated clock for an externally generated fixed proposal.
@@ -110,9 +99,40 @@ class SDPIFlow:
         """
         if not isinstance(t_start, (int, float)) or not 0.0 < float(t_start) <= 1.0:
             raise ValueError('refinement t_start must be in (0, 1]')
-        return self._expert_conditioning.get_inference_schedule(
-            steps, float(t_start),
-        )
+        if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
+            raise ValueError('refinement steps must be a positive integer')
+        clock = np.linspace(float(t_start), 0., steps + 1)
+        return {name + '_schedule': clock.copy() for name in ('tr', 'rot', 'tor')}
+
+    def reverse_times(self, reference, steps=None, t_start=1.0):
+        """One shared deterministic clock for endpoint training and sampling."""
+        steps = self.inference_steps if steps is None else steps
+        if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
+            raise ValueError('reverse steps must be a positive integer')
+        if not math.isfinite(float(t_start)) or not 0 < float(t_start) <= 1:
+            raise ValueError('reverse start time must be in (0, 1]')
+        clock = torch.linspace(float(t_start), 0., steps + 1,
+                               device=reference.device, dtype=reference.dtype)
+        for index in range(steps):
+            yield clock[index:index + 1], (clock[index] - clock[index + 1]).reshape(1)
+
+    def forward_state(self, model, e3_data, poi_data, ligand_data,
+                      ligand, poi, body, t, dt, source=0, conditions=None):
+        """Read the same current geometry and expert clock in both execution paths.
+
+        Template coordinates supply fixed conditioning scales; moving coordinates
+        supply graph geometry. Input dictionaries are never mutated.
+        """
+        conditioning = self.conditioning(t, dt, e3_data['coords'], poi_data['coords'])
+        crop = None
+        if bool(getattr(model.expert.model, 'dynamic_max_cross', False)):
+            tr_sigma, _, _ = self.t_to_sigma(t, t, t)
+            crop = tr_sigma * 3 + 20
+        condition_kwargs = {'conditions': conditions} if conditions is not None else {}
+        return model(e3_data, {**poi_data, 'coords': poi},
+                     {**ligand_data, 'coords': ligand}, t_e3l=t, t_pol=t,
+                     r_e3_to_poi=body, diffusion_state=conditioning,
+                     receptor_crop_cutoff=crop, source=source, **condition_kwargs)
 
     @staticmethod
     def scales(e3_coords, poi_coords):
@@ -136,7 +156,7 @@ class SDPIFlow:
         """
         if 'normalized_velocity' in output:
             return output['normalized_velocity']
-        from .diffdock.utils import torus
+        from tricoopdiff.diffdock.utils import torus
 
         tr, rot, tor = self.t_to_sigma(t, t, t)
         rot_norm = so3_score_norm(rot).reshape(-1, 1)
@@ -187,7 +207,7 @@ class SDPIFlow:
                 if velocity[component].shape != (1, 3) or not torch.isfinite(velocity[component]).all():
                     raise ValueError('rigid velocities must be finite [1, 3]')
             pivot = (poi if mode == INDEPENDENT_RIGID_MODE and index == 1 else ligand).mean(1)
-            rotation = _rotation_exp(-dt[:, None] * velocity['rot'])
+            rotation = rotation_exp(-dt[:, None] * velocity['rot'])
             offset = pivot - dt[:, None] * velocity['tr'] - (rotation @ pivot[..., None]).squeeze(-1)
             transforms.append((rotation, offset))
         (ra, ta), (rb, tb) = transforms
@@ -205,8 +225,8 @@ class SDPIFlow:
     def differentiable_step(ligand, poi, body, velocities, dt, ligand_data,
                             freeze_poi=False):
         """Execute the production rigid/torsion contract without detaching inputs."""
-        from .pose_anchors import proper_rigid_fit
-        from .rigid import apply_rigid
+        from tricoopdiff.pose_anchors import proper_rigid_fit
+        from tricoopdiff.pose_anchors import apply_rigid
 
         _check_coords(ligand)
         _check_coords(poi)
@@ -242,7 +262,7 @@ class SDPIFlow:
             norm = torch.linalg.vector_norm(axis, dim=-1, keepdim=True)
             if bool((norm <= 1e-10).any()):
                 raise ValueError('degenerate torsion axis')
-            rotation = _rotation_exp(axis / norm * (-dt * torsion[:, index])[:, None])
+            rotation = rotation_exp(axis / norm * (-dt * torsion[:, index])[:, None])
             pivot = raw[:, v:v + 1]
             moved = (raw - pivot) @ rotation.transpose(-1, -2) + pivot
             raw = torch.where(masks[index][None, :, None], moved, raw)

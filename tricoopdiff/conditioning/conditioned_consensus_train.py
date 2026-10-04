@@ -1,42 +1,130 @@
 """Experimental condition-aware training contract, isolated from v20 production weights."""
 
 import math
-import os
-from pathlib import Path
-import hashlib
 
-import torch
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from rdkit import Chem
+import torch
+from torch import nn
 
-from .checkpoint_contract import expert_base_identity, validate_expert_base_identity
-from .condition_augmentation import ConditionFeatureDropout, dropout_condition_features
-from .condition_features import build_supervised_contact_features
-from .conditional_consensus import ARCHITECTURE, CONDITION_CONTRACT, ConditionedConsensusFuse
-from .conditional_consensus import ConditionedConsensusCoopDiff
-from .consensus import ConsensusFuse
-from .consensus_train import ConsensusTrainer
-from .consensus_train import validate_consensus_checkpoint
-from .diffdock.utils.torus import SCORE_NORM_VERSION, validate_score_norm_version
-from .sdpi_flow import FLOW_VERSION
+from tricoopdiff.conditioning.condition_augmentation import ConditionFeatureDropout, dropout_condition_features
+from tricoopdiff.conditioning.condition_features import (
+    ProtacConditionEncoder, condition_feature_shapes, build_supervised_contact_features,
+)
+from tricoopdiff.diffdock.utils.torus import SCORE_NORM_VERSION, validate_score_norm_version
+from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse
+from tricoopdiff.models.expert import validate_expert_base_identity
+from tricoopdiff.sdpi_flow import FLOW_VERSION
+from tricoopdiff.runtime import atomic_torch_save, sha256_file as checkpoint_sha256
+from tricoopdiff.train import ConsensusTrainer, validate_consensus_checkpoint
+
+
+ARCHITECTURE = 'conditioned_residual_consensus_v3_prototype'
+
+
+CONDITION_CONTRACT = 'protac_condition_features_v2_no_learned_provenance'
+
+
+class ConditionedConsensusFuse(ConsensusFuse):
+    """Condition residuals affect consensus only, never frozen expert proposals."""
+
+    supports_conditions = True
+
+    def __init__(self, **base_config):
+        super().__init__(**base_config)
+        # Keep common initialization and the caller RNG stream identical to v2.
+        with torch.random.fork_rng(devices=[]):
+            # Only CPU parameters are initialized here. manual_seed() would also
+            # reset CUDA streams that this CPU-only fork does not restore.
+            torch.random.default_generator.manual_seed(1701)
+            self.condition_encoder = ProtacConditionEncoder(self.config['node_dim'])
+            self.condition_node_projection = nn.Linear(self.config['node_dim'], self.config['node_dim'], bias=False)
+            self.condition_gate_head = nn.Linear(self.config['node_dim'], 4, bias=False)
+            # Exact function-preserving migration matters more than avoiding a
+            # one-update delay in the new encoders. Each injection path first
+            # learns whether to open, then propagates gradients into its body.
+            self.condition_scale = nn.Parameter(torch.zeros(()))
+            nn.init.normal_(self.condition_node_projection.weight, std=.01)
+            nn.init.normal_(self.condition_gate_head.weight, std=.01)
+
+    @classmethod
+    def from_base(cls, base):
+        if type(base) is not ConsensusFuse:
+            raise ValueError('migration requires an unmodified base ConsensusFuse')
+        with torch.random.fork_rng(devices=[]):
+            model = cls(**base.config).to(next(base.parameters()).device)
+        state = model.state_dict()
+        state.update(base.state_dict())
+        model.load_state_dict(state, strict=True)
+        model.train(base.training)
+        return model
+
+    def prepare_conditions(self, graph, conditions):
+        reference, types = graph['node_features'], graph['node_types']
+        shapes = condition_feature_shapes(
+            [int((types == 0).sum()), int((types == 1).sum())], int((types == 2).sum()))
+        if set(conditions) != set(shapes):
+            raise ValueError('condition feature fields do not match the versioned contract')
+        values = {}
+        for name, shape in shapes.items():
+            value = torch.as_tensor(conditions[name], device=reference.device, dtype=reference.dtype).detach()
+            if value.shape != shape or not torch.isfinite(value).all():
+                raise ValueError(f'condition/node alignment mismatch: {name}')
+            values[name] = value
+        encoded = self.condition_encoder(values)
+        delta = reference.new_zeros(reference.shape[0], self.config['node_dim'])
+        summaries = [encoded['sides'].mean(0, keepdim=True)]
+        for index, name in enumerate(('protein1', 'protein2', 'ligand')):
+            if encoded[name].shape[0] == 0:
+                raise ValueError('conditioned consensus requires nonempty node groups')
+            delta[types == index] = self.condition_node_projection(encoded[name]) * self.condition_scale
+            summaries.append(encoded[name].mean(0, keepdim=True))
+        raw_context = torch.stack(summaries).mean(0)
+        context = raw_context * self.condition_scale
+        gate_bias = self.condition_gate_head(raw_context) * self.condition_scale
+        return {**graph, 'condition_node_residual': delta}, context, gate_bias
+
+    def prototype_checkpoint(self, parent_sha256):
+        if len(parent_sha256) != 64 or any(c not in '0123456789abcdef' for c in parent_sha256):
+            raise ValueError('record the parent checkpoint SHA256')
+        return {'format': 'conditioned_fuse_prototype_v1', 'architecture': ARCHITECTURE,
+                'condition_contract': CONDITION_CONTRACT, 'base_model_config': dict(self.config),
+                'parent_checkpoint_sha256': parent_sha256,
+                'fuse_state_dict': {k: v.detach().cpu().clone() for k, v in self.state_dict().items()},
+                'scope': 'experimental fusion module only; not a trained production refinement checkpoint'}
+
+
+def load_prototype_checkpoint(payload):
+    if (payload.get('format') != 'conditioned_fuse_prototype_v1'
+            or payload.get('architecture') != ARCHITECTURE
+            or payload.get('condition_contract') != CONDITION_CONTRACT):
+        raise ValueError('unsupported condition prototype checkpoint')
+    parent = payload.get('parent_checkpoint_sha256', '')
+    if len(parent) != 64 or any(c not in '0123456789abcdef' for c in parent):
+        raise ValueError('missing parent checkpoint identity')
+    model = ConditionedConsensusFuse(**payload['base_model_config'])
+    model.load_state_dict(payload['fuse_state_dict'], strict=True)
+    return model
+
+
+class ConditionedConsensusCoopDiff(ConsensusCoopDiff):
+    """Explicit experimental wrapper; legacy evaluators cannot silently enable it."""
+
+    architecture = ARCHITECTURE
+
+    def __init__(self, frozen_expert, trifuse, **kwargs):
+        if not isinstance(trifuse, ConditionedConsensusFuse):
+            raise ValueError('conditional model requires ConditionedConsensusFuse')
+        super().__init__(frozen_expert, trifuse, **kwargs)
 
 
 CHECKPOINT_FORMAT = 'conditioned_consensus_training_v1'
+
+
 TRAINING_CONDITION_CONTRACT = 'native_contact_masks_local_distances_6A_dropout_v3_no_provenance'
 
 
 def _sha256(value):
     return isinstance(value, str) and len(value) == 64 and all(c in '0123456789abcdef' for c in value)
-
-
-def checkpoint_sha256(path):
-    """Hash a parent checkpoint without loading a second in-memory copy."""
-    digest = hashlib.sha256()
-    with Path(path).open('rb') as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def build_conditioned_model(parent_payload, frozen_expert):
@@ -49,8 +137,7 @@ def build_conditioned_model(parent_payload, frozen_expert):
     base = ConsensusFuse(**config)
     base.load_state_dict(parent_payload['ema_trifuse_state_dict'], strict=True)
     conditioned = ConditionedConsensusFuse.from_base(base)
-    return ConditionedConsensusCoopDiff(
-        frozen_expert, conditioned, num_conv_layers=frozen_expert.num_conv_layers)
+    return ConditionedConsensusCoopDiff(frozen_expert, conditioned)
 
 
 def supervised_condition_batch(batch, *, seed, dropout=ConditionFeatureDropout(), cutoff=6.):
@@ -132,15 +219,10 @@ class ConditionedConsensusTrainer(ConsensusTrainer):
         if not base or not condition or set(map(id, base)) & set(map(id, condition)):
             raise AssertionError('condition optimizer partition is incomplete')
         previous = self.optimizer.param_groups[0]
-        self.optimizer = AdamW([
+        self._configure_optimizer([
             {'params': base, 'lr': float(previous['lr']), 'name': 'base_trifuse'},
             {'params': condition, 'lr': self.condition_lr, 'name': 'condition'},
-        ], weight_decay=float(previous['weight_decay']))
-        self.optimizer_config = {
-            group['name']: {'lr': float(group['lr']), 'weight_decay': float(group['weight_decay'])}
-            for group in self.optimizer.param_groups}
-        self.scheduler = ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=.5, patience=10, min_lr=1e-7)
+        ], float(previous['weight_decay']))
 
     def condition_batch(self, batch, *, seed):
         return supervised_condition_batch(
@@ -153,8 +235,6 @@ class ConditionedConsensusTrainer(ConsensusTrainer):
             'training_condition_contract': TRAINING_CONDITION_CONTRACT,
             'generative_process': FLOW_VERSION,
             'parent_checkpoint_sha256': self.parent_checkpoint_sha256,
-            'expert_base_identity': expert_base_identity(self.model.expert),
-            'model_config': dict(self.model.trifuse.config),
             'runtime_config': {
                 'torus_score_norm_version': SCORE_NORM_VERSION,
                 'activation_clamp': self.activation_clamp,
@@ -169,17 +249,10 @@ class ConditionedConsensusTrainer(ConsensusTrainer):
                 'condition_lr': self.condition_lr,
                 'native_coordinates_stored_in_conditions': False,
             },
-            'trifuse_state_dict': self.model.trifuse.state_dict(),
-            'ema_trifuse_state_dict': self.ema,
-            'global_step': self.global_step,
-            'training_state': {'epoch': epoch, 'best_val_loss': best_val_loss},
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
+            **self._optimization_payload({'epoch': epoch, 'best_val_loss': best_val_loss}),
         }
         validate_conditioned_checkpoint(payload)
-        temporary = f'{path}.tmp'
-        torch.save(payload, temporary)
-        os.replace(temporary, path)
+        atomic_torch_save(payload, path)
 
     def load_checkpoint(self, path, *, allow_dropout_change=False):
         payload = torch.load(path, map_location=self.device, weights_only=False)
@@ -204,11 +277,5 @@ class ConditionedConsensusTrainer(ConsensusTrainer):
                 continue
             if payload['runtime_config'].get(key) != value:
                 raise ValueError(f'conditioned checkpoint runtime mismatch: {key}')
-        self.model.trifuse.load_state_dict(payload['trifuse_state_dict'], strict=True)
-        self.ema = {name: value.clone() for name, value in payload['ema_trifuse_state_dict'].items()}
-        self.optimizer.load_state_dict(payload['optimizer_state_dict'])
-        self.scheduler.load_state_dict(payload['scheduler_state_dict'])
-        self.global_step = int(payload['global_step'])
-        self.resume_epoch = int(payload['training_state']['epoch'])
-        self.resume_best_val_loss = float(payload['training_state']['best_val_loss'])
+        self._restore_optimization(payload)
         return payload

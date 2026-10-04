@@ -8,7 +8,7 @@ import scipy
 import torch
 from scipy.spatial.transform import Rotation
 
-from .rigid import apply_rigid, assemble_interface_pair
+from tricoopdiff.pose_anchors import apply_rigid, assemble_interface_pair
 
 
 INITIAL_NOISE_STD_PROPORTION = 1.4601642460337794
@@ -115,7 +115,7 @@ class TernaryInitializer:
         """
         from rdkit import Chem
         from rdkit.Chem import AllChem
-        from .diffdock.utils.torsion import modify_conformer_torsion_angles
+        from tricoopdiff.diffdock.utils.torsion import modify_conformer_torsion_angles
 
         if seed is None:
             seed = random.SystemRandom().randrange(2**32)

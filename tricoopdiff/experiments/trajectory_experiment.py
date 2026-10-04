@@ -7,9 +7,9 @@ import math
 
 import torch
 
-from .consensus_experiment import ExperimentalConsensusTrainer
-from .joint_endpoint_experiment import joint_rigid_endpoint_targets
-from .sdpi_flow import INDEPENDENT_RIGID_MODE, SDPIFlow
+from tricoopdiff.experiments.consensus_experiment import ExperimentalConsensusTrainer
+from tricoopdiff.experiments.joint_endpoint_experiment import joint_rigid_endpoint_targets
+from tricoopdiff.sdpi_flow import INDEPENDENT_RIGID_MODE, SDPIFlow
 
 
 TRAJECTORY_CONTRACT_MODE = 'differentiable_sdpi_trajectory_v1'

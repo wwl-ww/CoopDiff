@@ -14,11 +14,11 @@ import torch
 from rdkit import Chem
 
 from evaluation_common import sha256_file
-from tricoopdiff.condition_augmentation import ConditionAugmentation, augment_conditions
-from tricoopdiff.condition_features import SideCondition, build_condition_features
-from tricoopdiff.conditional_consensus import ConditionedConsensusFuse
-from tricoopdiff.consensus import ConsensusFuse
-from tricoopdiff.consensus_train import validate_consensus_checkpoint
+from tricoopdiff.conditioning.condition_augmentation import ConditionAugmentation, augment_conditions
+from tricoopdiff.conditioning.condition_features import SideCondition, build_condition_features
+from tricoopdiff.conditioning.conditioned_consensus_train import ConditionedConsensusFuse
+from tricoopdiff.models.consensus import ConsensusFuse
+from tricoopdiff.train import validate_consensus_checkpoint
 
 
 def main():
@@ -93,9 +93,9 @@ def main():
               'device': 'cpu', 'modes': list(modes), 'checks': rows,
               'code_sha256': {str(p.relative_to(ROOT)): sha256_file(p) for p in (
                   Path(__file__), ROOT / 'scripts/smoke_conditioned_fuse.py',
-                  ROOT / 'tricoopdiff/condition_augmentation.py', ROOT / 'tricoopdiff/condition_features.py',
-                  ROOT / 'tricoopdiff/conditional_consensus.py', ROOT / 'tricoopdiff/consensus.py',
-                  ROOT / 'tricoopdiff/geometry_encoders.py')}}
+                  ROOT / 'tricoopdiff/conditioning/condition_augmentation.py', ROOT / 'tricoopdiff/conditioning/condition_features.py',
+                  ROOT / 'tricoopdiff/conditioning/conditioned_consensus_train.py', ROOT / 'tricoopdiff/models/consensus.py',
+                  ROOT / 'tricoopdiff/models/consensus.py')}}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open('x') as handle:
         json.dump(report, handle, indent=2, allow_nan=False)

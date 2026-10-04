@@ -16,7 +16,7 @@ from train_entry import (
     build_trainer,
     seed_training,
 )
-from tricoopdiff.trajectory_experiment import TrajectoryConsistencyTrainer
+from tricoopdiff.experiments.trajectory_experiment import TrajectoryConsistencyTrainer
 
 
 def args_parser():

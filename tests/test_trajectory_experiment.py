@@ -9,7 +9,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tricoopdiff.sdpi_flow import SDPIFlow
-from tricoopdiff.trajectory_experiment import (
+from tricoopdiff.experiments.trajectory_experiment import (
     DISTANCE_STAGED_POI_CONTRACT_MODE,
     PRIOR_REPLAY_CONTRACT_MODE,
     PRIOR_REPLAY_EVAL_CONTRACT_MODE,

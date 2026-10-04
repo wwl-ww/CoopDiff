@@ -1,8 +1,48 @@
-"""Explicit numerical policy for reproducible inference and diagnostic controls."""
+"""Shared numerical policy, artifact identity and atomic checkpoint publishing."""
 
+import hashlib
+import json
 import os
+from pathlib import Path
+import tempfile
 
 import torch
+
+
+def sha256_file(path, chunk_size=1024 * 1024):
+    """Hash cached assets without loading a complete checkpoint into RAM."""
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_publish(destination, write):
+    """Publish a complete artifact; failures preserve the previous destination."""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=destination.name + '.tmp.', dir=destination.parent)
+    os.close(descriptor)
+    try:
+        write(temporary)
+        os.replace(temporary, destination)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def atomic_torch_save(payload, destination):
+    """Publish training state without shared temporary names or partial files."""
+    _atomic_publish(destination, lambda path: torch.save(payload, path))
+
+
+def atomic_json(payload, destination):
+    """Publish strict UTF-8 JSON; non-finite numbers cannot become valid reports."""
+    def write(path):
+        Path(path).write_text(json.dumps(payload, indent=2, allow_nan=False) + '\n',
+                              encoding='utf-8')
+    _atomic_publish(destination, write)
 
 
 def configure_inference_reproducibility(deterministic=True):

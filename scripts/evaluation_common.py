@@ -5,6 +5,8 @@ import json
 import math
 from pathlib import Path
 
+from tricoopdiff.runtime import sha256_file
+
 
 def load_index_entry(index_path, case):
     """Return one uniquely named entry from a ternary JSON index."""
@@ -35,7 +37,7 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=None):
     """The model-v2 production evaluator accepts only consensus checkpoints."""
     if not isinstance(payload, dict):
         raise ValueError('checkpoint must contain a mapping')
-    from tricoopdiff.consensus_train import validate_consensus_checkpoint
+    from tricoopdiff.train import validate_consensus_checkpoint
     validate_consensus_checkpoint(payload)
 
 
@@ -117,15 +119,6 @@ def completed_report(path, case, checkpoint, expected_config=None,
     return core_matches and exact_dockq_matches and walker_count_matches and all(
         config.get(key) == value for key, value in (expected_config or {}).items()
     )
-
-
-def sha256_file(path, chunk_size=1024 * 1024):
-    """Return a reproducibility hash without loading a large file into RAM."""
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(chunk_size), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def evaluation_input_signature(paths, native_complex_pdb=None):

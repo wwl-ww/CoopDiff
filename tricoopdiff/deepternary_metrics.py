@@ -57,7 +57,7 @@ def _ligand_records(path):
 def _featurized_ca_coords(path):
     """Use DiffDock's residue/alternate-location selection and atom order."""
     import prody as pr
-    from .diffdock.datasets.parse_chi import get_coords
+    from tricoopdiff.diffdock.datasets.parse_chi import get_coords
 
     return get_coords(pr.parsePDB(str(path)))[:, 1, :]
 

@@ -38,9 +38,14 @@ def pairwise_pose_rmsd(poses: Sequence[np.ndarray]) -> np.ndarray:
 
 def cluster_poses(poses: Sequence[np.ndarray], rmsd_cutoff: float = 2.0) -> np.ndarray:
     """Average-linkage cluster poses using fixed-receptor-frame RMSD."""
-    if rmsd_cutoff <= 0:
+    return _cluster_distances(pairwise_pose_rmsd(poses), rmsd_cutoff)
+
+
+def _cluster_distances(matrix: np.ndarray, rmsd_cutoff: float) -> np.ndarray:
+    """Cluster a precomputed matrix so reports calculate pair distances once."""
+    if not np.isfinite(rmsd_cutoff) or rmsd_cutoff <= 0:
         raise ValueError("rmsd_cutoff must be positive")
-    count = len(poses)
+    count = len(matrix)
     if count == 0:
         return np.asarray([], dtype=int)
     if count == 1:
@@ -48,7 +53,7 @@ def cluster_poses(poses: Sequence[np.ndarray], rmsd_cutoff: float = 2.0) -> np.n
     from scipy.cluster.hierarchy import fcluster, linkage
     from scipy.spatial.distance import squareform
 
-    condensed = squareform(pairwise_pose_rmsd(poses), checks=False)
+    condensed = squareform(matrix, checks=False)
     return fcluster(
         linkage(condensed, method="average"),
         t=rmsd_cutoff, criterion="distance",
@@ -174,8 +179,8 @@ def analyze_ensemble(
     energies_kcal_mol: Optional[Sequence[float]] = None,
 ) -> Dict[str, object]:
     """Return clustering, diversity, populations, and optional energy agreement."""
-    labels = cluster_poses(poses, rmsd_cutoff)
     matrix = pairwise_pose_rmsd(poses)
+    labels = _cluster_distances(matrix, rmsd_cutoff)
     upper = (matrix[np.triu_indices(len(poses), k=1)]
              if len(poses) else np.asarray([]))
     populations = population_free_energies(labels, temperature_k) if len(labels) else []

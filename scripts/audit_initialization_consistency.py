@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from validate_initialization import read_case
-from tricoopdiff.diffusion import InterfaceDiffusion
+from tricoopdiff.legacy.diffusion import InterfaceDiffusion
 from tricoopdiff.initialization import INITIALIZATION_VERSION, TernaryInitializer, receptor_prior
 from tricoopdiff.initialization_audit import (
     conditional_translation_kl, invariant_atom_pairs, invariant_geometry_gap,

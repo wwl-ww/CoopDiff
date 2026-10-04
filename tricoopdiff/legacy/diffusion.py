@@ -17,9 +17,9 @@ import torch
 import torch.nn as nn
 from scipy.spatial.transform import Rotation as R
 
-from .diffdock.utils.geometry import rigid_transform_Kabsch_3D_torch_batch
-from .initialization import TernaryInitializer
-from .rigid import assemble_interface_pair
+from tricoopdiff.diffdock.utils.geometry import rigid_transform_Kabsch_3D_torch_batch
+from tricoopdiff.pose_anchors import assemble_interface_pair, rotation_exp as so3_exp
+from tricoopdiff.diffdock.utils import so3
 
 
 class InterfaceDiffusion(nn.Module):
@@ -119,7 +119,7 @@ class InterfaceDiffusion(nn.Module):
         σ schedule, never applying λ) and with the DSM training target. The previous
         λ_q cutoff made the forward schedule asymmetric with the reverse step.
 
-        Torsion angles are perturbed separately by ``add_torsion_noise`` (applied
+        Torsion updates are handled by the native binary sampler (applied
         after this rigid transform), mirroring DiffDock's ``modify_conformer``.
 
         Args:
@@ -141,7 +141,7 @@ class InterfaceDiffusion(nn.Module):
         tr_update = torch.randn(B, 3, device=device) * tr_sigma.unsqueeze(-1)
 
         # Rotation noise (SO(3)) — wrapped sampling, matching the frozen expert's
-        # and so3_score_vec's IGSO(3) convention (see sample_so3_noise_wrapped).
+        # and the native expert's IGSO(3) convention (see sample_so3_noise_wrapped).
         rot_update, rot_omega = sample_so3_noise_wrapped(B, rot_sigma, device)
 
         # Rotate about the ligand centre, then translate in the world frame —
@@ -202,76 +202,6 @@ class InterfaceDiffusion(nn.Module):
         }
         return noisy_ligand, noisy_poi, noise, poi_to_global
 
-    def add_torsion_noise(
-        self,
-        ligand_pos: torch.Tensor,
-        t_tor: torch.Tensor,
-        lig_edge_index: torch.Tensor,
-        lig_edge_mask: torch.Tensor,
-        lig_mask_rotate,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Add Gaussian noise to PROTAC rotatable-bond torsion angles.
-
-        Full-range (no λ_q cutoff), matching ``reverse_step_torsion`` and the
-        torsion DSM target over all t ∈ [0, 1] — the previous λ_q gate made the
-        forward schedule asymmetric with the reverse step.
-
-        Translation/rotation perturb the whole conformer; torsion rotates each
-        rotatable bond's downstream atoms around the bond axis. This mirrors
-        DiffDock's ``modify_conformer``: the torsion-perturbed conformer is
-        Kabsch-aligned back to its pre-torsion pose so the internal-coordinate
-        (torsion) perturbation does not leak a global drift into the tr/rot
-        score-matching targets. Applied AFTER ``add_noise_protac``.
-
-        Args:
-            ligand_pos: [B, N_lig, 3] conformer (already tr+rot noised)
-            t_tor: [B] torsion diffusion times
-            lig_edge_index: [2, E] ligand internal bond edges
-            lig_edge_mask: [E] bool — rotatable bond mask
-            lig_mask_rotate: [n_rot, N_lig] bool, or list of per-complex masks
-
-        Returns:
-            noisy_pos: [B, N_lig, 3] conformer with torsion angles perturbed
-            tor_update: [B, n_rot] torsion angle noise (used as the score target)
-        """
-        from .diffdock.utils.torsion import modify_conformer_torsion_angles
-
-        B = ligand_pos.shape[0]
-        device = ligand_pos.device
-
-        _, _, tor_sigma = self.t_to_sigma(t_tor, t_tor, t_tor)
-
-        # Rotatable bond edges (one direction each), same row order as mask_rotate.
-        rot_edges = lig_edge_index.T[lig_edge_mask]  # [n_rot, 2]
-        n_rot = rot_edges.shape[0]
-
-        tor_update = torch.randn(B, n_rot, device=device) * tor_sigma.unsqueeze(-1)
-
-        # A batch of 1 may carry mask_rotate as a bare ndarray; a batch of N as a
-        # list of per-complex masks. Normalize to a per-element list.
-        if not isinstance(lig_mask_rotate, (list, tuple)):
-            lig_mask_rotate = [lig_mask_rotate] * B
-
-        noisy_pos = ligand_pos.clone()
-        for b in range(B):
-            rigid_pos = noisy_pos[b].unsqueeze(0)  # [1, N_lig, 3] pre-torsion pose
-            mr = lig_mask_rotate[b]
-            if isinstance(mr, torch.Tensor):
-                mr = mr.detach().cpu().numpy()
-            tu = tor_update[b].detach().cpu().numpy()
-            flexible_pos = modify_conformer_torsion_angles(
-                rigid_pos[0].detach().cpu(), rot_edges, mr, tu, as_numpy=False
-            ).to(device).unsqueeze(0)  # [1, N_lig, 3] torsion-perturbed pose
-
-            # Kabsch-align the torsion-perturbed conformer back to its pre-torsion
-            # pose (DiffDock's `modify_conformer` does exactly this): rotating
-            # downstream side-groups moves the global pose, which would otherwise
-            # contaminate the tr/rot score-matching targets.
-            R_align, t_align = rigid_transform_Kabsch_3D_torch_batch(flexible_pos, rigid_pos)
-            noisy_pos[b] = flexible_pos[0] @ R_align[0].T + t_align[0].T
-
-        return noisy_pos, tor_update
 
     # ------------------------------------------------------------------
     # Reverse diffusion step (score-based update)
@@ -377,7 +307,7 @@ class InterfaceDiffusion(nn.Module):
         Complements ``reverse_step_protac`` (which handles tr/rot but ignores
         ``tor_score``): updates rotatable-bond angles via the torsion score, then
         Kabsch-aligns the result back to the pre-torsion pose — mirroring
-        ``add_torsion_noise`` — so the internal-coordinate update does not leak a
+        the native DiffDock conformer update — so torsions do not leak a
         global drift into the already-denoised tr/rot DOFs.
 
         Args:
@@ -395,7 +325,7 @@ class InterfaceDiffusion(nn.Module):
         Returns:
             [B, N_lig, 3] conformer with torsion angles updated
         """
-        from .diffdock.utils.torsion import modify_conformer_torsion_angles
+        from tricoopdiff.diffdock.utils.torsion import modify_conformer_torsion_angles
 
         B = ligand_pos.shape[0]
         device = ligand_pos.device
@@ -545,7 +475,7 @@ def sample_so3_noise_wrapped(
 
     Draws a uniform unit direction × a wrapped angle sampled from the IGSO(3)
     CDF in [0, π], returning the wrapped so(3) vector ω and its rotation matrix.
-    This is the convention the frozen expert and `so3_score_vec` assume.
+    This is the convention the frozen expert assumes.
 
     The wrapped IGSO(3) distribution is required by both interface experts;
     an unwrapped R³ Gaussian emits ‖ω‖ > π for σ > 1.0, outside the score table.
@@ -557,19 +487,18 @@ def sample_so3_noise_wrapped(
     Returns:
         (rotation_matrices [B, 3, 3], omega [B, 3]) with ‖omega‖ ∈ [0, π]
     """
-    _init_so3_cache()
     B = batch_size
     sigma_np = sigma.detach().cpu().numpy() if hasattr(sigma, 'cpu') else np.asarray(sigma)
-    sigma_np = np.clip(np.atleast_1d(sigma_np).astype(float), _MIN_EPS, _MAX_EPS)
-    eps_idx = (np.log10(sigma_np) - np.log10(_MIN_EPS)) / (
-        np.log10(_MAX_EPS) - np.log10(_MIN_EPS)) * _N_EPS
-    eps_idx = np.clip(np.around(eps_idx).astype(int), 0, _N_EPS - 1)
+    sigma_np = np.clip(np.atleast_1d(sigma_np).astype(float), so3.MIN_EPS, so3.MAX_EPS)
+    eps_idx = (np.log10(sigma_np) - np.log10(so3.MIN_EPS)) / (
+        np.log10(so3.MAX_EPS) - np.log10(so3.MIN_EPS)) * so3.N_EPS
+    eps_idx = np.clip(np.around(eps_idx).astype(int), 0, so3.N_EPS - 1)
 
     # Inverse-CDF sampling of the wrapped angle, mirroring so3.sample(): draw
     # u ~ U[0,1) and linearly interpolate u against the CDF row → angle ∈ [0, π].
     u = torch.rand(B, device=device).cpu().numpy()
     angles_np = np.array([
-        np.interp(u[i], _cdf_vals[eps_idx[i]], _omegas_array) for i in range(B)
+        np.interp(u[i], so3._cdf_vals[eps_idx[i]], so3._omegas_array) for i in range(B)
     ])
     angles = torch.from_numpy(angles_np).float().to(device)
 
@@ -577,196 +506,3 @@ def sample_so3_noise_wrapped(
     direction = direction / torch.linalg.norm(direction, dim=-1, keepdim=True).clamp(min=1e-8)
     omega = direction * angles.unsqueeze(-1)  # [B, 3], ‖ω‖ ∈ [0, π]
     return so3_exp(omega), omega
-
-
-def so3_exp(omega: torch.Tensor) -> torch.Tensor:
-    """
-    Exponential map from so(3) to SO(3) using Rodrigues' formula.
-
-    Args:
-        omega: [B, 3] rotation vectors in so(3)
-    Returns:
-        [B, 3, 3] rotation matrices
-    """
-    B = omega.shape[0]
-    device = omega.device
-
-    theta = torch.linalg.vector_norm(omega, dim=-1, keepdim=True)  # [B, 1]
-    # Avoid division by zero
-    mask = theta.squeeze(-1) > 1e-8
-
-    # Rodrigues' formula: R = I + sin(θ)/θ * ω̂ + (1-cos(θ))/θ² * ω̂²
-    omega_hat = vector_to_skew(omega)  # [B, 3, 3]
-
-    R = torch.eye(3, device=device).unsqueeze(0).repeat(B, 1, 1)
-
-    if mask.any():
-        theta_m = theta[mask]
-        omega_hat_m = omega_hat[mask]
-        sin_theta = torch.sin(theta_m).unsqueeze(-1)
-        cos_theta = torch.cos(theta_m).unsqueeze(-1)
-
-        R[mask] = (
-            torch.eye(3, device=device)
-            + sin_theta / theta_m.unsqueeze(-1) * omega_hat_m
-            + (1 - cos_theta) / (theta_m.unsqueeze(-1) ** 2)
-            * torch.bmm(omega_hat_m, omega_hat_m)
-        )
-
-    return R
-
-
-def vector_to_skew(v: torch.Tensor) -> torch.Tensor:
-    """
-    Convert 3D vectors to skew-symmetric matrices.
-
-    Args:
-        v: [..., 3]
-    Returns:
-        [..., 3, 3] skew-symmetric matrices
-    """
-    *batch_dims, _ = v.shape
-    device = v.device
-
-    z = torch.zeros(*batch_dims, device=device)
-
-    row0 = torch.stack([z, -v[..., 2], v[..., 1]], dim=-1)
-    row1 = torch.stack([v[..., 2], z, -v[..., 0]], dim=-1)
-    row2 = torch.stack([-v[..., 1], v[..., 0], z], dim=-1)
-
-    return torch.stack([row0, row1, row2], dim=-2)
-
-
-# ------------------------------------------------------------------
-# SO(3) score normalization — precomputed table lookup
-# Matches DiffDock utils/so3.py exactly
-# ------------------------------------------------------------------
-
-_MIN_EPS, _MAX_EPS, _N_EPS = 0.0005, 4, 2000
-_X_N = 2000
-_omegas_array = None
-_cdf_vals = None
-_score_norms = None
-_exp_score_norms = None
-
-
-def _init_so3_cache(cache_dir=None):
-    """Precompute SO(3) score norms and cache to disk. Run once."""
-    global _omegas_array, _cdf_vals, _score_norms, _exp_score_norms
-    if _exp_score_norms is not None:
-        return
-
-    import os as _os
-    from pathlib import Path as _Path
-    cache_dir = cache_dir or _os.environ.get(
-        "TRICOOPDIFF_CACHE_DIR",
-        str(_Path(__file__).resolve().parents[1]
-            / "results/runtime_cache/diffdock"),
-    )
-    _os.makedirs(cache_dir, exist_ok=True)
-    omega_file = _os.path.join(cache_dir, '.so3_omegas_array4.npy')
-    score_file = _os.path.join(cache_dir, '.so3_exp_score_norms4.npy')
-    score_norm_file = _os.path.join(cache_dir, '.so3_score_norms4.npy')
-
-    if _os.path.exists(omega_file) and _os.path.exists(score_file):
-        _omegas_array = np.load(omega_file)
-        _exp_score_norms = np.load(score_file)
-        if _os.path.exists(score_norm_file):
-            _score_norms = np.load(score_norm_file)
-        cdf_file = _os.path.join(cache_dir, '.so3_cdf_vals4.npy')
-        if _os.path.exists(cdf_file):
-            _cdf_vals = np.load(cdf_file)
-        return
-
-    _eps_array = 10 ** np.linspace(np.log10(_MIN_EPS), np.log10(_MAX_EPS), _N_EPS)
-    _omegas_array = np.linspace(0, np.pi, _X_N + 1)[1:]
-
-    def _expansion(omega, eps, L=2000):
-        l = np.arange(L).reshape(-1, 1)
-        return ((2 * l + 1) * np.exp(-l * (l + 1) * eps**2 / 2)
-                * np.sin(omega * (l + 0.5)) / np.sin(omega / 2)).sum(0)
-
-    def _density(exp, omega):
-        return exp * (1 - np.cos(omega)) / np.pi
-
-    def _score(exp, omega, eps, L=2000):
-        l = np.arange(L).reshape(-1, 1)
-        hi = np.sin((l + 0.5) * omega)
-        dhi = (l + 0.5) * np.cos((l + 0.5) * omega)
-        lo = np.sin(omega / 2)
-        dlo = 0.5 * np.cos(omega / 2)
-        dSigma = ((2 * l + 1) * np.exp(-l * (l + 1) * eps**2 / 2)
-                  * (lo * dhi - hi * dlo) / lo**2).sum(0)
-        return dSigma / exp
-
-    exp_vals = np.asarray([_expansion(_omegas_array, eps) for eps in _eps_array])
-    pdf_vals = np.asarray([_density(exp, _omegas_array) for exp in exp_vals])
-    _cdf_vals = np.asarray([pdf.cumsum() / _X_N * np.pi for pdf in pdf_vals])
-    _score_norms = np.asarray([
-        _score(exp_vals[i], _omegas_array, _eps_array[i]) for i in range(len(_eps_array))
-    ])
-    _exp_score_norms = np.sqrt(
-        np.sum(_score_norms**2 * pdf_vals, axis=1)
-        / np.sum(pdf_vals, axis=1) / np.pi
-    )
-    np.save(omega_file, _omegas_array)
-    np.save(score_file, _exp_score_norms)
-    np.save(score_norm_file, _score_norms)
-    np.save(_os.path.join(cache_dir, '.so3_cdf_vals4.npy'), _cdf_vals)
-
-
-def so3_score_norm(sigma, cache_dir=None):
-    """
-    SO(3) score normalization factor — table lookup matching DiffDock.
-    For sigma values outside the precomputed range, falls back to analytic approx.
-    """
-    _init_so3_cache(cache_dir)
-    sigma_np = sigma.detach().cpu().numpy() if hasattr(sigma, 'cpu') else np.asarray(sigma)
-    eps_idx = (np.log10(sigma_np) - np.log10(_MIN_EPS)) / (
-        np.log10(_MAX_EPS) - np.log10(_MIN_EPS)) * _N_EPS
-    eps_idx = np.clip(np.around(eps_idx).astype(int), 0, _N_EPS - 1)
-    result = torch.from_numpy(_exp_score_norms[eps_idx]).float()
-    if hasattr(sigma, 'device'):
-        result = result.to(sigma.device)
-    return result
-
-
-def so3_score_vec(sigma, vec, cache_dir=None):
-    """
-    SO(3) score vector — matches DiffDock utils/so3.py `score_vec(eps, vec)`.
-
-    Given a sampled rotation vector `omega` and the noise level `sigma` that
-    produced it, returns the score of the isotropic-Gaussian-on-SO(3) density,
-    used as the rotation score-matching target.
-
-    Args:
-        sigma: [B] noise level (or scalar)
-        vec: [B, 3] rotation vector omega
-    Returns:
-        [B, 3] score vector
-    """
-    _init_so3_cache(cache_dir)
-    sigma_np = sigma.detach().cpu().numpy() if hasattr(sigma, 'cpu') else np.asarray(sigma)
-    vec_np = vec.detach().cpu().numpy() if hasattr(vec, 'cpu') else np.asarray(vec)
-    sigma_np = np.atleast_1d(sigma_np).astype(float)
-    vec_np = np.atleast_2d(vec_np).astype(float)
-
-    eps_idx = (np.log10(sigma_np) - np.log10(_MIN_EPS)) / (
-        np.log10(_MAX_EPS) - np.log10(_MIN_EPS)) * _N_EPS
-    eps_idx = np.clip(np.around(eps_idx).astype(int), 0, _N_EPS - 1)
-
-    om = np.linalg.norm(vec_np, axis=-1)  # [B]
-    om_safe = np.clip(om, 1e-8, None)
-    score_norm = np.array([
-        np.interp(om[i], _omegas_array, _score_norms[eps_idx[i]])
-        for i in range(len(om))
-    ])
-    out = score_norm[:, None] * vec_np / om_safe[:, None]
-
-    result = torch.from_numpy(out).float()
-    if hasattr(vec, 'device'):
-        result = result.to(vec.device)
-    # Match input rank: scalar sigma + [3] vec -> [3]
-    if not hasattr(sigma, 'shape') or len(sigma.shape) == 0:
-        result = result[0]
-    return result

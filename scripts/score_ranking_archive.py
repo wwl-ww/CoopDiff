@@ -13,7 +13,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 import tricoopdiff.diffdock_compat  # noqa: E402,F401
 import torch
 
-from collect_ranking_archive import atomic_json
+from tricoopdiff.runtime import atomic_json
 from evaluation_common import evaluation_input_signature, sha256_file
 from tricoopdiff.deepternary_metrics import compute_fullatom_dockq
 

@@ -8,7 +8,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 from evaluation_common import sha256_file
-from tricoopdiff.ranking_audit import join_labels, summarize_cases
+from tricoopdiff.ranking.ranking_audit import join_labels, summarize_cases
 
 
 def main():

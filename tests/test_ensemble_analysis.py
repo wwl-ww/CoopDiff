@@ -2,6 +2,7 @@
 
 import numpy as np
 
+
 from tricoopdiff.ensemble_analysis import (
     analyze_ensemble,
     cooperativity_from_ddg,
@@ -9,6 +10,26 @@ from tricoopdiff.ensemble_analysis import (
     cooperativity_ranking,
     energy_population_association,
 )
+
+
+def test_report_diversity_keeps_rigid_pose_displacement():
+    from tricoopdiff.evaluate import compute_ensemble_diversity
+
+    pose = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]])
+    result = compute_ensemble_diversity([pose, pose + [10., 0., 0.]])
+    assert result['mean_pairwise_rmsd'] == 10.
+    assert result['n_clusters'] == 2
+    assert result['coordinate_frame'] == 'fixed_e3_v1'
+
+
+def test_ensemble_report_computes_pair_distances_once():
+    from unittest.mock import patch
+    from tricoopdiff import ensemble_analysis
+
+    with patch.object(ensemble_analysis, 'pairwise_pose_rmsd',
+                      wraps=ensemble_analysis.pairwise_pose_rmsd) as distances:
+        report = analyze_ensemble([_pose(0.), _pose(5.)])
+    assert distances.call_count == 1 and report['n_clusters'] == 2
 
 
 def _pose(offset):

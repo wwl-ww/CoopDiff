@@ -19,17 +19,17 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 
-from train_entry import (TernaryDataLoader, _guarded_train_step, _load_entries,
+from train_entry import (TernaryDataLoader, _guarded_train_batch, _load_entries,
                          _load_score_model_args, append_metric, prepare_source_batch,
                          seed_training)
 from featurize_common import featurize_complex
-from tricoopdiff.condition_augmentation import ConditionFeatureDropout, dropout_condition_features
-from tricoopdiff.conditioned_consensus_train import (
+from tricoopdiff.conditioning.condition_augmentation import ConditionFeatureDropout, dropout_condition_features
+from tricoopdiff.conditioning.conditioned_consensus_train import (
     ConditionedConsensusTrainer, build_conditioned_model, checkpoint_sha256,
     supervised_condition_batch,
 )
-from tricoopdiff.consensus_train import validate_consensus_checkpoint
-from tricoopdiff.expert_factory import build_diffdock_expert
+from tricoopdiff.train import validate_consensus_checkpoint
+from tricoopdiff.models.expert import build_diffdock_expert
 from tricoopdiff.online_endpoints import LazyTrainingEndpointStore, ONLINE_TRAINING_ENDPOINT_PROTOCOL
 from tricoopdiff.sdpi_flow import SDPIFlow
 
@@ -244,7 +244,7 @@ def main(argv=None):
             conditions, audit = trainer.condition_batch(raw_batch, seed=condition_seed(
                 raw_batch['case'], args.seed + trainer.global_step))
             batch = prepare_source_batch(raw_batch, trainer.global_step, 'C', endpoint_store)
-            result = _guarded_train_step(trainer, {**batch, 'conditions': conditions})
+            result = _guarded_train_batch(trainer, [{**batch, 'conditions': conditions}])[0]
             losses.append(result['loss_total'])
             append_metric(output, {'event': 'train_step', 'epoch': epoch,
                                    'global_step': trainer.global_step, 'case': batch['case'],

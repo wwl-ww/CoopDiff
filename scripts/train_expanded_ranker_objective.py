@@ -13,7 +13,7 @@ import torch
 from evaluation_common import sha256_file
 from train_expanded_geometry_ranker import load_split
 from train_state_ranker import combine_training_parts, evaluate, quality_class_support
-from tricoopdiff.pose_ranking import StateQualityRanker, state_ranking_only_loss
+from tricoopdiff.ranking.ranking_inference import StateQualityRanker, state_ranking_only_loss
 
 
 @torch.no_grad()

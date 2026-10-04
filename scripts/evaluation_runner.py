@@ -1,6 +1,5 @@
 """Reusable model runtime for in-process evaluation of many ternary cases."""
 
-import json
 import os
 from argparse import Namespace
 from pathlib import Path
@@ -15,10 +14,10 @@ from featurize_common import featurize_complex
 from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
-from tricoopdiff.expert_factory import build_diffdock_expert
-from tricoopdiff.consensus import ConsensusCoopDiff, ConsensusFuse
-from tricoopdiff.reproducibility import configure_inference_reproducibility
-from tricoopdiff.checkpoint_contract import validate_expert_base_identity
+from tricoopdiff.models.expert import build_diffdock_expert
+from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse
+from tricoopdiff.runtime import configure_inference_reproducibility, atomic_json as write_report_atomic
+from tricoopdiff.models.expert import validate_expert_base_identity
 from tricoopdiff.diffdock.utils.torus import (
     SCORE_NORM_VERSION, validate_score_norm_version,
 )
@@ -58,7 +57,7 @@ class EvaluationRunner:
         if self.conditioned_checkpoint:
             if not allow_conditioned_checkpoint:
                 raise ValueError('conditioned checkpoint requires explicit opt-in')
-            from tricoopdiff.conditioned_consensus_train import validate_conditioned_checkpoint
+            from tricoopdiff.conditioning.conditioned_consensus_train import validate_conditioned_checkpoint
             validate_conditioned_checkpoint(self.checkpoint)
         elif self.experimental_checkpoint:
             if not allow_experimental_checkpoint:
@@ -123,23 +122,20 @@ class EvaluationRunner:
         if self.checkpoint['model_config']['input_dim'] != input_dim:
             raise ValueError('checkpoint input feature dimension mismatch')
         if self.conditioned_checkpoint:
-            from tricoopdiff.conditional_consensus import (ConditionedConsensusCoopDiff,
+            from tricoopdiff.conditioning.conditioned_consensus_train import (ConditionedConsensusCoopDiff,
                                                           ConditionedConsensusFuse)
             trifuse = ConditionedConsensusFuse(**self.checkpoint['model_config'])
-            self.model = ConditionedConsensusCoopDiff(
-                self.expert, trifuse, num_conv_layers=self.expert.num_conv_layers).to(self.device)
+            self.model = ConditionedConsensusCoopDiff(self.expert, trifuse).to(self.device)
         else:
             trifuse = ConsensusFuse(**self.checkpoint['model_config'])
         if self.experimental_checkpoint:
-            from tricoopdiff.consensus_experiment import ExperimentalConsensus
+            from tricoopdiff.experiments.consensus_experiment import ExperimentalConsensus
 
             self.model = ExperimentalConsensus(self.expert, trifuse).to(self.device)
         elif not self.conditioned_checkpoint:
             self.model = ConsensusCoopDiff(
                 frozen_expert=self.expert,
                 trifuse=trifuse,
-                num_conv_layers=self.expert.num_conv_layers,
-                use_film=False,
             ).to(self.device)
         self.model.trifuse.load_state_dict(self.checkpoint["ema_trifuse_state_dict"])
         self.model.eval()
@@ -170,7 +166,7 @@ class EvaluationRunner:
             if condition_manifest is None:
                 raise ValueError('conditioned evaluation requires a deploy-time condition manifest')
             from rdkit import Chem
-            from tricoopdiff.condition_manifest import load_condition_manifest
+            from tricoopdiff.conditioning.condition_features import load_condition_manifest
             condition_path = Path(condition_manifest)
             if not condition_path.is_absolute():
                 condition_path = self.root / condition_path
@@ -280,12 +276,3 @@ class EvaluationRunner:
             ),
         }
         return report
-
-
-def write_report_atomic(report, destination):
-    """Atomically publish one completed case report."""
-    path = Path(destination)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    temporary.replace(path)

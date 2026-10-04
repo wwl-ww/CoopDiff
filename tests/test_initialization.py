@@ -16,7 +16,7 @@ from tricoopdiff.initialization import (
     INITIAL_NOISE_STD_PROPORTION, TernaryInitializer, receptor_prior,
     validate_ligand_graph,
 )
-from tricoopdiff.rigid import apply_rigid, assemble_interface_pair, invert_rigid
+from tricoopdiff.pose_anchors import apply_rigid, assemble_interface_pair, invert_rigid
 
 
 def ligand_input(smiles="CCCOCC"):
@@ -156,7 +156,7 @@ def test_torsion_is_applied_once_and_no_torsion_is_explicit():
 
 
 def test_sampler_rejects_removed_modes_and_mismatched_clock():
-    from tricoopdiff.diffusion import InterfaceDiffusion
+    from tricoopdiff.legacy.diffusion import InterfaceDiffusion
     from tricoopdiff.sampler import sample_single
 
     model = SimpleNamespace(eval=lambda: None)

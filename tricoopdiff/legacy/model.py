@@ -13,17 +13,17 @@ The forward pass at each diffusion step:
 import torch
 import torch.nn as nn
 
-from .graphs import (
+from tricoopdiff.graphs import (
     build_subgraph_e3l,
     build_subgraph_pol,
     build_trifuse_graph,
     crop_receptor_to_ligand,
     transform_ligand_to_poi_frame,
 )
-from .expert import FrozenDiffDock
-from .expert_time import _set_time_embeddings
-from .trifuse import TriFuse
-from .film import apply_film
+from tricoopdiff.models.expert import FrozenDiffDock
+from tricoopdiff.models.expert import _set_time_embeddings
+from tricoopdiff.legacy.trifuse import TriFuse
+from tricoopdiff.legacy.trifuse import apply_film
 
 
 class TriCoopDiff(nn.Module):

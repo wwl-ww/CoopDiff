@@ -11,8 +11,8 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 import torch
 
 from evaluation_common import sha256_file
-from tricoopdiff.initial_selector import POOL_LABEL_VERSION, selector_retention
-from tricoopdiff.pose_ranking import StateQualityRanker, state_quality_loss
+from tricoopdiff.ranking.initial_selector import POOL_LABEL_VERSION, selector_retention
+from tricoopdiff.ranking.ranking_inference import StateQualityRanker, state_quality_loss
 
 
 def load_cases(archive_dirs, label_dirs, split):

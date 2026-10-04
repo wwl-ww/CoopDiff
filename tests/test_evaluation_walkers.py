@@ -30,7 +30,8 @@ def test_walker_metrics_preserve_seeds_and_exact_failures():
         for name in ('compute_deepternary_dockq', 'compute_e3_interface_dockq',
                      'compute_poi_dockq', 'compute_poi_com_dist'):
             stack.enter_context(patch(f'tricoopdiff.evaluate.{name}', return_value=None))
-        stack.enter_context(patch('tricoopdiff.ensemble_analysis.analyze_ensemble', return_value={}))
+        stack.enter_context(patch('tricoopdiff.ensemble_analysis.analyze_ensemble', return_value={
+            'mean_pairwise_rmsd': 0., 'std_pairwise_rmsd': 0., 'n_clusters': 1}))
         report = evaluate_model(
             None, data, data, data, None, initializer=object(), device='cpu',
             n_walkers=3, seed=7, native_complex_pdb='dummy', deepternary_dockq_paths={})
@@ -55,7 +56,8 @@ def test_rank_features_are_saved_only_when_requested():
         for name in ('compute_deepternary_dockq', 'compute_e3_interface_dockq',
                      'compute_poi_dockq', 'compute_poi_com_dist'):
             stack.enter_context(patch(f'tricoopdiff.evaluate.{name}', return_value=None))
-        stack.enter_context(patch('tricoopdiff.ensemble_analysis.analyze_ensemble', return_value={}))
+        stack.enter_context(patch('tricoopdiff.ensemble_analysis.analyze_ensemble', return_value={
+            'mean_pairwise_rmsd': 0., 'std_pairwise_rmsd': 0., 'n_clusters': 1}))
         report = evaluate_model(
             None, data, data, data, None, initializer=object(), device='cpu',
             n_walkers=1, return_rank_features=True, conditions=conditions,

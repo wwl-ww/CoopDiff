@@ -10,13 +10,13 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tricoopdiff.initial_selector import (future_selector_retention,
+from tricoopdiff.ranking.initial_selector import (future_selector_retention,
                                           future_selector_retention_at_indices,
                                           initial_pool_features,
                                           diversity_aware_indices, exact_random_selection,
                                           selector_retention,
                                           selector_retention_at_indices)
-from tricoopdiff.ranking_archive import state_hash
+from tricoopdiff.ranking.ranking_archive import state_hash
 
 SPEC = importlib.util.spec_from_file_location(
     'train_initial_selector', ROOT / 'scripts/train_initial_selector.py')

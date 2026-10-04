@@ -10,11 +10,23 @@ TriCoopDiff 研究蛋白–配体–蛋白三元装配：两个冻结 DiffDock �
 
 ## 目录
 
-- `tricoopdiff/`：模型、坐标、初始化、训练与采样；`diffdock/` 为 vendored 专家。
+- `tricoopdiff/models/`：生产模型，仅包含模型本体（编码、交互、运动输出）和冻结专家两个实现文件。
+- `tricoopdiff/legacy/`：历史 FiLM 模型；不由生产模型导入。
+- `tricoopdiff/experiments/`：诊断实验模型与训练目标；不由生产模型导入。
+- `tricoopdiff/conditioning/`、`tricoopdiff/ranking/`：可选条件建模与候选排序。
+- `tricoopdiff/` 根目录：坐标、初始化、训练、采样与评估；`diffdock/` 为 vendored 专家。
 - `scripts/`：当前特征化、训练、评估与通用审计入口；model-v3 已移除退役运行 wrapper。
 - `tests/`：断言式回归检查。
 - `doc/`：主题文档；从[文档索引](doc/README.md)进入。
 - `data/`、`checkpoints/`、`results/`、`logs/`：本地资产/产物。
+
+训练实现统一在 `tricoopdiff/train.py`；双初始化的投影、缓存契约与在线生成统一在 `tricoopdiff/online_endpoints.py`；刚体变换与拟合统一在 `tricoopdiff/pose_anchors.py`。已删除被合并的旧模块，仓库入口使用新路径，不保留转发空壳。
+
+生产运输使用 `SDPIFlow`，不实例化旧扩散过程。BiTSeed 的二元专家扩散采样保留在 `tricoopdiff/legacy/diffusion.py`；SO(3) 数值表直接复用 vendored 专家实现，不再维护第二份缓存与预计算代码。
+
+生产路径为 `models/consensus.py` → `sdpi_flow.py` → `train.py` / `sampler.py` → `evaluate.py`。共享文件发布和资产哈希集中在 `runtime.py`。三类训练器复用优化状态保存/恢复，但保持各自的 checkpoint 协议校验；不支持通过恢复权重静默更换监督目标。
+
+历史 FiLM 和诊断实验保留用于复核已有结果，不由生产模型导入。评估的主指标仍是蛋白–蛋白完整原子 DockQ。集合多样性已统一为固定 E3 坐标系下的 RMSD，报告以 `fixed_e3_v1` 标记，不能与旧的对齐后多样性直接比较。
 
 ## 环境与检查
 

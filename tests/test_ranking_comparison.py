@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tricoopdiff.ranking_comparison import paired_case_comparison
+from tricoopdiff.ranking.ranking_audit import paired_case_comparison
 
 
 def report(values, label='label'):

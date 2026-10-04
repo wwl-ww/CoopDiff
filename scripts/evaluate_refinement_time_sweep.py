@@ -14,7 +14,7 @@ from tricoopdiff.expert_anchors import (
     DualExpertAnchorInitializer, FixedCandidateInitializer,
     generate_hybrid_candidates,
 )
-from tricoopdiff.endpoint_kinematics import endpoint_internal_geometry
+from tricoopdiff.online_endpoints import endpoint_internal_geometry
 from tricoopdiff.sampler import sample_single
 
 

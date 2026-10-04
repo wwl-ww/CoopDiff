@@ -11,10 +11,10 @@ from rdkit import Chem
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tricoopdiff.condition_augmentation import (ConditionAugmentation, ConditionFeatureDropout,
+from tricoopdiff.conditioning.condition_augmentation import (ConditionAugmentation, ConditionFeatureDropout,
                                                 augment_conditions, dropout_condition_features,
                                                 protein_local_basis)
-from tricoopdiff.condition_features import (SideCondition, build_condition_features,
+from tricoopdiff.conditioning.condition_features import (SideCondition, build_condition_features,
                                             build_supervised_contact_features, ProtacConditionEncoder)
 
 

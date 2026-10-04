@@ -10,7 +10,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 import torch
 
 from evaluation_common import sha256_file
-from tricoopdiff.ranking_inference import INFERENCE_FIELDS, load_quality_checkpoint, predict_archive
+from tricoopdiff.ranking.ranking_inference import INFERENCE_FIELDS, load_quality_checkpoint, predict_archive
 
 
 def main():
@@ -33,7 +33,7 @@ def main():
         'archive_manifest_sha256': sha256_file(args.archives / 'manifest.json'),
         'checkpoint_sha256': sha256_file(args.ranker) if args.ranker else None,
         'code_sha256': {str(p.relative_to(ROOT)): sha256_file(p) for p in
-                       (Path(__file__), ROOT / 'tricoopdiff/ranking_inference.py', ROOT / 'tricoopdiff/pose_ranking.py')},
+                       (Path(__file__), ROOT / 'tricoopdiff/ranking/ranking_inference.py', ROOT / 'tricoopdiff/ranking/ranking_inference.py')},
         'cases': manifest['cases'], 'native_or_labels_read': False,
         'output_set': 'archived paired states only; unsampled pool initial states excluded',
         'tie_break': 'pool_index ascending, then initial before final',

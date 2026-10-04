@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from .ranking_archive import geometry_features, state_hash
+from tricoopdiff.ranking.ranking_archive import geometry_features, state_hash
 
 
 POOL_LABEL_VERSION = 'exact_initial_pool_labels_v1'

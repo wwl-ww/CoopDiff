@@ -7,9 +7,9 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tricoopdiff.consensus import ConsensusFuse, BRANCHES
-from tricoopdiff.consensus_train import validate_consensus_checkpoint
-from tricoopdiff.diffusion import so3_exp
+from tricoopdiff.models.consensus import ConsensusFuse, BRANCHES
+from tricoopdiff.train import validate_consensus_checkpoint
+from tricoopdiff.pose_anchors import rotation_exp as so3_exp
 from tricoopdiff.diffdock.utils.torus import SCORE_NORM_VERSION
 
 
@@ -232,7 +232,7 @@ def test_protein_pair_motion_is_equivariant_and_independent_of_expert_vectors():
 
 
 def test_frozen_expert_context_preserves_input_derivatives_and_outer_no_grad():
-    from tricoopdiff.consensus import ConsensusCoopDiff
+    from tricoopdiff.models.consensus import ConsensusCoopDiff
 
     fuse, _, _, _ = fixture()
     expert = torch.nn.Linear(3, 3)
@@ -253,7 +253,7 @@ def test_frozen_expert_context_preserves_input_derivatives_and_outer_no_grad():
 
 def test_checkpointed_expert_matches_direct_coordinate_gradient():
     from torch_geometric.data import HeteroData
-    from tricoopdiff.consensus import ConsensusCoopDiff
+    from tricoopdiff.models.consensus import ConsensusCoopDiff
 
     class Expert(torch.nn.Module):
         num_conv_layers = 1
@@ -346,7 +346,7 @@ def test_direct_motion_uses_joint_geometry_and_is_equivariant():
 
 
 def test_global_node_context_reaches_nodes_outside_local_receptive_field():
-    from tricoopdiff.geometry_encoders import TernaryGeometryEncoder
+    from tricoopdiff.models.consensus import TernaryGeometryEncoder
 
     torch.manual_seed(31)
     local = TernaryGeometryEncoder(16, hidden_dim=16, joint_geometry=True)
@@ -374,7 +374,7 @@ def test_global_node_context_reaches_nodes_outside_local_receptive_field():
 
 
 def test_spatial_edge_features_are_global_invariant_and_handed():
-    from tricoopdiff.geometry_encoders import TernaryGeometryEncoder
+    from tricoopdiff.models.consensus import TernaryGeometryEncoder
 
     encoder = TernaryGeometryEncoder(16, hidden_dim=16, joint_geometry=True,
                                      spatial_geometry=True)
@@ -412,7 +412,7 @@ def test_spatial_edge_features_are_global_invariant_and_handed():
 
 
 def test_unpooled_global_attention_reaches_distant_nodes_without_summary_broadcast():
-    from tricoopdiff.geometry_encoders import TernaryGeometryEncoder
+    from tricoopdiff.models.consensus import TernaryGeometryEncoder
 
     encoder = TernaryGeometryEncoder(16, hidden_dim=16, joint_geometry=True,
                                      global_node_attention=True)
@@ -429,7 +429,7 @@ def test_unpooled_global_attention_reaches_distant_nodes_without_summary_broadca
 
 
 def test_chunked_global_histogram_preserves_values_and_coordinate_gradients():
-    from tricoopdiff.geometry_encoders import TernaryGeometryEncoder
+    from tricoopdiff.models.consensus import TernaryGeometryEncoder
 
     encoder = TernaryGeometryEncoder(16, hidden_dim=16).double()
     encoder.RBF_CHUNK_SIZE = 3  # Exercise several independently recomputed chunks.
@@ -474,7 +474,7 @@ def test_independent_decoder_does_not_move_protein_when_only_ligand_moves():
 
 
 def test_direct_checkpoint_cannot_be_decoded_as_legacy_motion():
-    from tricoopdiff.consensus import DIRECT_ARCHITECTURE
+    from tricoopdiff.models.consensus import DIRECT_ARCHITECTURE
 
     payload = _checkpoint_payload(20)
     payload['architecture'] = DIRECT_ARCHITECTURE
@@ -490,7 +490,7 @@ def test_direct_checkpoint_cannot_be_decoded_as_legacy_motion():
 
 
 def test_interface_attention_is_not_biased_by_partner_node_count():
-    from tricoopdiff.consensus import attentive_interface_motion
+    from tricoopdiff.models.consensus import attentive_interface_motion
 
     weights = torch.tensor([[2., 3., 0., 0.], [4., 5., 0., 0.]], requires_grad=True)
     direction = torch.eye(3)[:2]
@@ -535,7 +535,7 @@ def test_checkpointed_ternary_preserves_dropout_outputs_and_gradients():
 
 
 def test_production_profile_has_same_train_and_eval_motion():
-    from tricoopdiff.consensus import production_model_config
+    from tricoopdiff.models.consensus import production_model_config
 
     _, graph, proposals, state = fixture()
     fuse = ConsensusFuse(**production_model_config(32, 16, 1))
@@ -560,7 +560,7 @@ def test_production_profile_has_same_train_and_eval_motion():
 
 
 def test_rotation_levers_are_scale_normalized_and_have_finite_degenerate_gradients():
-    from tricoopdiff.consensus import rotation_levers
+    from tricoopdiff.models.consensus import rotation_levers
 
     coords = torch.tensor([[2., 0., 0.], [-2., 0., 0.], [0., 2., 1.]])
     normalized = rotation_levers(coords, True)
@@ -597,7 +597,7 @@ def test_chunked_expert_tensor_products_preserve_outputs_and_gradients():
 
 
 def test_direct_model_contains_only_active_heads_and_migrates_old_weights():
-    from tricoopdiff.consensus import production_model_config
+    from tricoopdiff.models.consensus import production_model_config
     model = ConsensusFuse(**production_model_config(32, 16, 1, True))
     obsolete = ('gate_head', 'residual_head', 'source_gate_head',
                 'torsion_coordinator', 'judge_head', 'state_head')
@@ -623,7 +623,7 @@ def test_direct_model_contains_only_active_heads_and_migrates_old_weights():
 
 
 def test_joint_direction_has_bounded_gradient_at_overlapping_nodes():
-    from tricoopdiff.geometry_encoders import TernaryGeometryEncoder
+    from tricoopdiff.models.consensus import TernaryGeometryEncoder
     encoder = TernaryGeometryEncoder(16, 32, joint_geometry=True, spatial_geometry=True)
     coords = torch.zeros(6, 3, requires_grad=True)
     features = torch.randn(6, 32)
@@ -634,7 +634,7 @@ def test_joint_direction_has_bounded_gradient_at_overlapping_nodes():
 
 def test_geometry_reuses_pair_distances_and_handles_single_node_components():
     from unittest.mock import patch
-    from tricoopdiff.geometry_encoders import TernaryGeometryEncoder
+    from tricoopdiff.models.consensus import TernaryGeometryEncoder
     encoder = TernaryGeometryEncoder(16, 32, joint_geometry=True, spatial_geometry=True)
     coords = torch.zeros(5, 3, requires_grad=True)
     features = torch.randn(5, 16)

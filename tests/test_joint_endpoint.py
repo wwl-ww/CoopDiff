@@ -16,7 +16,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tricoopdiff.diffdock_compat  # noqa: F401
-from tricoopdiff.rigid import assemble_interface_pair
+from tricoopdiff.pose_anchors import assemble_interface_pair
 from tricoopdiff.sdpi_flow import SDPIFlow
 
 

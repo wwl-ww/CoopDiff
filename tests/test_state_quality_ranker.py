@@ -8,13 +8,13 @@ from unittest.mock import patch
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tricoopdiff.pose_ranking import (StateQualityRanker, state_quality_loss,
+from tricoopdiff.ranking.ranking_inference import (StateQualityRanker, state_quality_loss,
                                       state_ranking_only_loss)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from evaluation_common import sha256_file
 from train_state_ranker import combine_training_parts, evaluate, load_split, quality_class_support
 from train_state_ranker import main as train_main
-from tricoopdiff.ranking_inference import GENERATOR_KEYS
+from tricoopdiff.ranking.ranking_inference import GENERATOR_KEYS
 
 
 def test_quality_outputs_are_bounded_and_thresholds_ordered():

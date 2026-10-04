@@ -110,10 +110,10 @@ def test_consensus_builder_passes_only_active_model_dimensions():
         '--output_dir', 'unused',
     ])
     expert = SimpleNamespace(num_conv_layers=11)
-    with patch('tricoopdiff.expert_factory.build_diffdock_expert', return_value=expert), \
-            patch('tricoopdiff.consensus.ConsensusFuse') as fuse, \
-            patch('tricoopdiff.consensus.ConsensusCoopDiff') as model, \
-            patch('tricoopdiff.consensus_train.ConsensusTrainer') as trainer:
+    with patch('tricoopdiff.models.expert.build_diffdock_expert', return_value=expert), \
+            patch('tricoopdiff.models.consensus.ConsensusFuse') as fuse, \
+            patch('tricoopdiff.models.consensus.ConsensusCoopDiff') as model, \
+            patch('tricoopdiff.train.ConsensusTrainer') as trainer:
         result, _, trained = build_trainer(args, 'cpu', input_dim=1281)
         fuse.assert_called_once_with(
             node_dim=args.node_dim, input_dim=1281,
@@ -137,8 +137,8 @@ def test_consensus_builder_passes_only_active_model_dimensions():
 
 
 def _endpoint_trainer_fixture():
-    from tricoopdiff.consensus import DIRECT_ARCHITECTURE
-    from tricoopdiff.consensus_train import ConsensusTrainer
+    from tricoopdiff.models.consensus import DIRECT_ARCHITECTURE
+    from tricoopdiff.train import ConsensusTrainer
     from test_sdpi_flow import fixture
 
     flow, ligand, e3, poi, coupling = fixture()
@@ -177,7 +177,7 @@ def _endpoint_trainer_fixture():
 
 
 def test_direct_trainer_supervises_executed_endpoint_not_teacher_velocities():
-    from tricoopdiff.consensus_train import ENDPOINT_OBJECTIVE
+    from tricoopdiff.train import ENDPOINT_OBJECTIVE
 
     trainer, batch, coupling = _endpoint_trainer_fixture()
     assert trainer.training_objective == ENDPOINT_OBJECTIVE
@@ -199,6 +199,37 @@ def test_direct_trainer_supervises_executed_endpoint_not_teacher_velocities():
     assert all(p.requires_grad for group in trainer.optimizer.param_groups for p in group['params'])
 
 
+def test_endpoint_training_and_sampling_execute_identical_full_trajectory():
+    from tricoopdiff.sampler import sample_single
+
+    trainer, batch, coupling = _endpoint_trainer_fixture()
+    flow = trainer.diffusion
+    flow.inference_steps = 20
+    state = flow.path(batch['ligand_data'], batch['poi_data']['coords'], coupling,
+                      batch['ligand_data']['coords'].new_ones(1))[:3]
+    original_forward = trainer.model.forward
+
+    def geometry_dependent_forward(ed, pd, ld, **kwargs):
+        output = original_forward(ed, pd, ld, **kwargs)
+        velocity = output['normalized_velocity']
+        velocity['e3_ligand']['tr'] = velocity['e3_ligand']['tr'] + ld['coords'].mean(1) * .001
+        velocity['poi_ligand']['tr'] = velocity['poi_ligand']['tr'] + pd['coords'].mean(1) * .001
+        return output
+
+    trainer.model.forward = geometry_dependent_forward
+    trained = trainer.compute_loss(**batch, coupling_override=coupling, diagnostics=True)
+    training_calls = list(trainer.model.calls)
+    trainer.model.calls.clear()
+    initializer = SimpleNamespace(no_torsion=False,
+        initialize=lambda *args, **kwargs: (*[value.detach().clone() for value in state], {}))
+    sampled = sample_single(trainer.model, flow, initializer, **batch,
+                            device='cpu', return_trace=True, return_trajectory=True)
+    assert sampled['valid'] and len(sampled['trajectory']) == flow.inference_steps
+    assert trainer.model.calls == training_calls
+    assert np.allclose(sampled['ligand_coords'], trained['predicted_ligand'][0].detach().numpy(), atol=1e-10)
+    assert np.allclose(sampled['poi_coords'], trained['predicted_poi'][0].detach().numpy(), atol=1e-10)
+
+
 def test_endpoint_objective_cannot_silently_use_a_random_teacher_clock():
     trainer, batch, coupling = _endpoint_trainer_fixture()
     try:
@@ -210,7 +241,7 @@ def test_endpoint_objective_cannot_silently_use_a_random_teacher_clock():
 
 
 def test_endpoint_checkpoint_records_objective_weight_and_execution_length():
-    from tricoopdiff.consensus_train import ENDPOINT_OBJECTIVE, validate_consensus_checkpoint
+    from tricoopdiff.train import ENDPOINT_OBJECTIVE, validate_consensus_checkpoint
 
     trainer, _, _ = _endpoint_trainer_fixture()
     payload = trainer.checkpoint_payload()
@@ -228,18 +259,18 @@ def test_endpoint_checkpoint_records_objective_weight_and_execution_length():
 
 
 def test_endpoint_checkpoint_roundtrip_and_objective_mismatch_guard():
-    from tricoopdiff.consensus_train import VELOCITY_OBJECTIVE
+    from tricoopdiff.train import VELOCITY_OBJECTIVE
 
     trainer, _, _ = _endpoint_trainer_fixture()
     payload = trainer.checkpoint_payload()
     restored, _, _ = _endpoint_trainer_fixture()
-    with patch('tricoopdiff.consensus_train.torch.load', return_value=payload):
+    with patch('tricoopdiff.train.torch.load', return_value=payload):
         restored.load_checkpoint('unused.pt')
     assert restored.training_objective == trainer.training_objective
     assert all(torch.equal(a, b) for a, b in zip(
         restored.model.trifuse.parameters(), trainer.model.trifuse.parameters()))
     payload['runtime_config']['training_objective'] = VELOCITY_OBJECTIVE
-    with patch('tricoopdiff.consensus_train.torch.load', return_value=payload):
+    with patch('tricoopdiff.train.torch.load', return_value=payload):
         try:
             restored.load_checkpoint('unused.pt')
         except ValueError as error:
@@ -248,8 +279,24 @@ def test_endpoint_checkpoint_roundtrip_and_objective_mismatch_guard():
             raise AssertionError('resume must not silently exchange endpoint and velocity supervision')
 
 
+def test_resume_rejects_incomplete_ema_before_mutating_parameters():
+    trainer, _, _ = _endpoint_trainer_fixture()
+    payload = trainer.checkpoint_payload()
+    payload['ema_trifuse_state_dict'] = dict(payload['ema_trifuse_state_dict'])
+    payload['ema_trifuse_state_dict'].pop(next(iter(payload['ema_trifuse_state_dict'])))
+    before = {name: value.clone() for name, value in trainer.model.trifuse.state_dict().items()}
+    with patch('tricoopdiff.train.torch.load', return_value=payload):
+        try:
+            trainer.load_checkpoint('unused.pt')
+        except ValueError as error:
+            assert 'EMA state' in str(error)
+        else:
+            raise AssertionError('incomplete EMA weights were accepted')
+    assert all(torch.equal(value, before[name]) for name, value in trainer.model.trifuse.state_dict().items())
+
+
 def test_interface_checkpoint_preserves_batch_progress_and_rejects_loss_changes():
-    from tricoopdiff.consensus_train import validate_consensus_checkpoint
+    from tricoopdiff.train import validate_consensus_checkpoint
 
     trainer, _, _ = _endpoint_trainer_fixture()
     trainer.samples_seen = 7
@@ -257,11 +304,11 @@ def test_interface_checkpoint_preserves_batch_progress_and_rejects_loss_changes(
     payload = trainer.checkpoint_payload(best_val_dockq=.67)
     restored, _, _ = _endpoint_trainer_fixture()
     restored.effective_batch_size = 2
-    with patch('tricoopdiff.consensus_train.torch.load', return_value=payload):
+    with patch('tricoopdiff.train.torch.load', return_value=payload):
         restored.load_checkpoint('unused.pt')
     assert restored.samples_seen == 7 and restored.resume_best_val_dockq == .67
     payload['runtime_config']['interface_loss_weight'] = .5
-    with patch('tricoopdiff.consensus_train.torch.load', return_value=payload):
+    with patch('tricoopdiff.train.torch.load', return_value=payload):
         try:
             restored.load_checkpoint('unused.pt')
         except ValueError as error:
@@ -276,7 +323,7 @@ def test_interface_checkpoint_preserves_batch_progress_and_rejects_loss_changes(
 
 
 def test_resume_builder_uses_saved_model_and_loss_recipe_not_current_defaults():
-    from tricoopdiff.consensus import production_model_config
+    from tricoopdiff.models.consensus import production_model_config
 
     trainer, _, _ = _endpoint_trainer_fixture()
     payload = trainer.checkpoint_payload()
@@ -286,10 +333,10 @@ def test_resume_builder_uses_saved_model_and_loss_recipe_not_current_defaults():
     args = parse_args(['--train_data', 'unused', '--val_data', 'unused',
                        '--output_dir', 'unused', '--resume', 'saved.pt'])
     with patch('train_entry.torch.load', return_value=payload), \
-            patch('tricoopdiff.expert_factory.build_diffdock_expert', return_value=SimpleNamespace(num_conv_layers=11)), \
-            patch('tricoopdiff.consensus.ConsensusFuse') as fuse, \
-            patch('tricoopdiff.consensus.ConsensusCoopDiff'), \
-            patch('tricoopdiff.consensus_train.ConsensusTrainer') as builder:
+            patch('tricoopdiff.models.expert.build_diffdock_expert', return_value=SimpleNamespace(num_conv_layers=11)), \
+            patch('tricoopdiff.models.consensus.ConsensusFuse') as fuse, \
+            patch('tricoopdiff.models.consensus.ConsensusCoopDiff'), \
+            patch('tricoopdiff.train.ConsensusTrainer') as builder:
         build_trainer(args, 'cpu', input_dim=16)
     assert fuse.call_args.kwargs == payload['model_config']
     assert builder.call_args.kwargs['steric_loss_weight'] == .05
@@ -298,7 +345,7 @@ def test_resume_builder_uses_saved_model_and_loss_recipe_not_current_defaults():
 
 
 def test_terminal_interface_supervision_is_zero_at_native_and_penalizes_errors():
-    from tricoopdiff.consensus_train import terminal_interface_losses
+    from tricoopdiff.train import terminal_interface_losses
 
     e3 = torch.tensor([[[0., 0., 0.], [0., 2., 0.]]])
     native = torch.tensor([[[3., 0., 0.], [50., 0., 0.]]])
@@ -315,7 +362,7 @@ def test_terminal_interface_supervision_is_zero_at_native_and_penalizes_errors()
 
 
 def test_coarse_repulsion_is_target_preserving_short_range_and_differentiable():
-    from tricoopdiff.consensus_train import coarse_intercomponent_repulsion
+    from tricoopdiff.train import coarse_intercomponent_repulsion
 
     e3 = torch.tensor([[[0., 0., 0.], [0., 0., 3.]]])
     native_poi = torch.tensor([[[5., 0., 0.]]])
@@ -394,7 +441,7 @@ def test_fullatom_validation_reuses_terminal_rollout_and_restores_raw_weights():
 
 
 def test_validation_reports_actual_dockq_and_preserves_rng():
-    from tricoopdiff.consensus_train import ENDPOINT_OBJECTIVE
+    from tricoopdiff.train import ENDPOINT_OBJECTIVE
 
     class Loader:
         entries_by_case = {'sample': {'case': 'sample'}}
@@ -418,7 +465,7 @@ def test_validation_reports_actual_dockq_and_preserves_rng():
 
 def test_training_entry_keeps_dockq_best_separate_from_loss_best():
     import train_entry
-    from tricoopdiff.consensus_train import ENDPOINT_OBJECTIVE
+    from tricoopdiff.train import ENDPOINT_OBJECTIVE
 
     class Trainer:
         training_objective = ENDPOINT_OBJECTIVE
@@ -485,10 +532,10 @@ def test_c_builder_records_online_single_pair_endpoint_protocol():
     ])
     args.training_endpoint_protocol = 'online_bitseed_training_c1_m1_v1'
     expert = SimpleNamespace(num_conv_layers=11)
-    with patch('tricoopdiff.expert_factory.build_diffdock_expert', return_value=expert), \
-            patch('tricoopdiff.consensus.ConsensusFuse'), \
-            patch('tricoopdiff.consensus.ConsensusCoopDiff'), \
-            patch('tricoopdiff.consensus_train.ConsensusTrainer') as trainer:
+    with patch('tricoopdiff.models.expert.build_diffdock_expert', return_value=expert), \
+            patch('tricoopdiff.models.consensus.ConsensusFuse'), \
+            patch('tricoopdiff.models.consensus.ConsensusCoopDiff'), \
+            patch('tricoopdiff.train.ConsensusTrainer') as trainer:
         build_trainer(args, 'cpu', input_dim=1281)
         assert trainer.call_args.kwargs['training_endpoint_protocol'] == (
             'online_bitseed_training_c1_m1_v1'

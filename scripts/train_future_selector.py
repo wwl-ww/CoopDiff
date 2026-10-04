@@ -12,8 +12,8 @@ import numpy as np
 import torch
 
 from evaluation_common import sha256_file
-from tricoopdiff.initial_selector import future_selector_retention, initial_pool_features
-from tricoopdiff.pose_ranking import StateQualityRanker, state_quality_loss
+from tricoopdiff.ranking.initial_selector import future_selector_retention, initial_pool_features
+from tricoopdiff.ranking.ranking_inference import StateQualityRanker, state_quality_loss
 
 
 def load_cases(archive_dirs, label_dirs, split, require_full_pool=False):

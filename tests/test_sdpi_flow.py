@@ -55,6 +55,93 @@ def test_truncated_clock_is_refinement_only():
     assert np.allclose(schedule["tor_schedule"], schedule["tr_schedule"])
 
 
+def test_flow_preconditioning_uses_native_expert_units_and_table():
+    from tricoopdiff.diffdock.utils.diffusion_utils import t_to_sigma
+    from tricoopdiff.diffdock.utils import so3
+    from tricoopdiff.models.expert import so3_score_norm
+
+    args = SimpleNamespace(tr_sigma_min=.1, tr_sigma_max=19.,
+                           rot_sigma_min=.03, rot_sigma_max=1.55,
+                           tor_sigma_min=.0314, tor_sigma_max=3.14)
+    flow = SDPIFlow()
+    for dtype in (torch.float32, torch.float64):
+        time = torch.linspace(0., 1., 21, dtype=dtype, requires_grad=True)
+        actual = flow.t_to_sigma(time, time, time)
+        expected = t_to_sigma(time, time, time, args)
+        for value, reference in zip(actual, expected):
+            assert torch.allclose(value, reference, rtol=2e-6, atol=1e-8)
+        sum(value.sum() for value in actual).backward()
+        assert torch.isfinite(time.grad).all() and bool((time.grad > 0).all())
+        rotation_sigma = actual[1].detach()
+        assert torch.equal(so3_score_norm(rotation_sigma), so3.score_norm(rotation_sigma.cpu()))
+        assert so3_score_norm(rotation_sigma[0]).shape == torch.Size([])
+
+
+def test_shared_rotation_exponential_preserves_precision_and_zero_gradient():
+    from scipy.spatial.transform import Rotation
+    from tricoopdiff.pose_anchors import rotation_exp
+
+    vectors = torch.tensor([[0., 0., 0.], [1e-9, -1e-9, 2e-9],
+                            [.7, -1.2, .3]], dtype=torch.float64, requires_grad=True)
+    matrices = rotation_exp(vectors)
+    assert matrices.dtype == vectors.dtype
+    assert np.allclose(matrices.detach().numpy(), Rotation.from_rotvec(vectors.detach().numpy()).as_matrix(),
+                       atol=1e-12, rtol=0)
+    (matrices * torch.arange(9, dtype=vectors.dtype).reshape(3, 3)).sum().backward()
+    assert torch.isfinite(vectors.grad).all() and vectors.grad[0].abs().sum() > 0
+
+
+def test_reverse_clock_integrates_to_zero_with_identical_branch_times():
+    flow = SDPIFlow()
+    for dtype in (torch.float32, torch.float64):
+        reference = torch.empty(1, 3, 3, dtype=dtype)
+        for steps in (1, 3, 20):
+            for start in (1., .25):
+                clock = list(flow.reverse_times(reference, steps, start))
+                assert len(clock) == steps
+                assert all(t.dtype == dtype and dt.dtype == dtype for t, dt in clock)
+                assert all(bool((dt > 0).all()) for _, dt in clock)
+                assert torch.allclose(sum(dt for _, dt in clock), reference.new_tensor([start]))
+                assert torch.equal(clock[-1][0] - clock[-1][1], reference.new_zeros(1))
+                for (t, dt), (following, _) in zip(clock, clock[1:]):
+                    assert torch.allclose(t - dt, following)
+    for invalid in (0, -1, True, 2.5):
+        try:
+            list(flow.reverse_times(reference, invalid))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('invalid reverse step count accepted')
+
+
+def test_shared_model_read_preserves_geometry_gradient_and_conditioning():
+    flow, ligand_data, e3, poi, _ = fixture()
+    ligand = ligand_data['coords'].detach().clone().requires_grad_()
+    moved_poi = (poi + 3).detach().requires_grad_()
+    body = torch.eye(3, dtype=e3.dtype).unsqueeze(0)
+    t, dt = next(flow.reverse_times(ligand))
+    conditions = {'fixture': True}
+
+    class Reader:
+        expert = SimpleNamespace(model=SimpleNamespace(dynamic_max_cross=True))
+
+        def __call__(self, ed, pd, ld, **kwargs):
+            assert pd['coords'] is moved_poi and ld['coords'] is ligand
+            assert kwargs['t_e3l'] is kwargs['t_pol'] is t
+            assert kwargs['r_e3_to_poi'] is body
+            assert kwargs['conditions'] is conditions and kwargs['source'] == 1
+            assert torch.equal(kwargs['diffusion_state'], flow.conditioning(t, dt, e3, poi))
+            assert torch.equal(kwargs['receptor_crop_cutoff'], flow.t_to_sigma(t, t, t)[0] * 3 + 20)
+            return ld['coords'].sum() + pd['coords'].sum()
+
+    output = flow.forward_state(Reader(), {'coords': e3}, {'coords': poi}, ligand_data,
+                                ligand, moved_poi, body, t, dt, source=1, conditions=conditions)
+    output.backward()
+    assert torch.equal(ligand.grad, torch.ones_like(ligand))
+    assert torch.equal(moved_poi.grad, torch.ones_like(moved_poi))
+    assert not ligand_data['coords'].requires_grad
+
+
 def test_flow_complete_cartesian_tangent_and_step_convergence():
     # Both interfaces, mixed torsions, and nontrivial body frames must agree.
     for smiles in ('CCCOCC', 'CC1CCCCC1', 'c1ccccc1'):
@@ -89,7 +176,7 @@ def test_flow_oracle_roundtrip_refines_with_steps():
 
 
 def test_independent_targets_match_actual_path_and_both_decoders():
-    from tricoopdiff.trajectory_experiment import differentiable_sdpi_step
+    from tricoopdiff.experiments.trajectory_experiment import differentiable_sdpi_step
 
     for smiles in ('CCCOCC', 'c1ccccc1'):
         flow, data, _, b, coupling = fixture(smiles)

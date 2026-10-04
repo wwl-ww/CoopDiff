@@ -18,9 +18,9 @@ import math
 import numpy as np
 import torch
 
-from .consensus_experiment import ExperimentalConsensusTrainer
-from .joint_endpoint_experiment import joint_rigid_endpoint_targets
-from .sdpi_flow import _horizontal_torsion_velocity
+from tricoopdiff.experiments.consensus_experiment import ExperimentalConsensusTrainer
+from tricoopdiff.experiments.joint_endpoint_experiment import joint_rigid_endpoint_targets
+from tricoopdiff.sdpi_flow import _horizontal_torsion_velocity
 
 
 OFFPATH_CONTRACT_MODE = 'poi_body_frame_transported_coupling_v1'

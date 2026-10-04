@@ -34,8 +34,8 @@ from evaluation_common import (
     resolve_entry_paths,
 )
 
-from tricoopdiff.expert_factory import build_diffdock_expert
-from tricoopdiff.consensus import ConsensusCoopDiff, ConsensusFuse
+from tricoopdiff.models.expert import build_diffdock_expert
+from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse
 from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
@@ -231,8 +231,6 @@ def main():
     model = ConsensusCoopDiff(
         frozen_expert=expert,
         trifuse=trifuse,
-        num_conv_layers=num_conv_layers,
-        use_film=False,
     ).to(device)
     diffusion = SDPIFlow()
     initializer = TernaryInitializer(

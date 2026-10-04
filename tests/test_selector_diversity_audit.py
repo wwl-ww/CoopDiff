@@ -13,7 +13,7 @@ SPEC = importlib.util.spec_from_file_location(
     ROOT / 'scripts/audit_initial_selector_diversity.py')
 audit = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(audit)
-from tricoopdiff.pose_ranking import StateQualityRanker
+from tricoopdiff.ranking.ranking_inference import StateQualityRanker
 
 
 def test_diversity_audit_keeps_zero_penalty_as_exact_control(tmp_path=None):

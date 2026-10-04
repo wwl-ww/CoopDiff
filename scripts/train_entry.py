@@ -501,10 +501,10 @@ def main():
 
 def build_trainer(args, device, input_dim=None):
     """Build model, diffusion, and trainer."""
-    from tricoopdiff.consensus import ConsensusCoopDiff, ConsensusFuse, production_model_config
-    from tricoopdiff.expert_factory import build_diffdock_expert
+    from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse, production_model_config
+    from tricoopdiff.models.expert import build_diffdock_expert
     from tricoopdiff.sdpi_flow import SDPIFlow
-    from tricoopdiff.consensus_train import ConsensusTrainer
+    from tricoopdiff.train import ConsensusTrainer
 
     # Build frozen DiffDock-L expert from pretrained weights (self-contained
     # vendored core — no ../DiffDock dependency). num_conv_layers (11) and the
@@ -513,7 +513,6 @@ def build_trainer(args, device, input_dim=None):
         model_dir=args.expert_model_dir,
         device=str(device),
     )
-    num_conv_layers = frozen_expert.num_conv_layers
 
     # input_dim must match the ternary node feature dim, which is the receptor
     # feature dim (1281 = 1 amino-acid index + 1280 ESM2 for DiffDock-L). It is
@@ -551,7 +550,7 @@ def build_trainer(args, device, input_dim=None):
         # Resume means reconstruct the saved architecture, not reinterpret it
         # using today's defaults. The trainer subsequently checks every runtime
         # loss/source/optimizer contract before loading trainable state.
-        from tricoopdiff.consensus_train import validate_consensus_checkpoint
+        from tricoopdiff.train import validate_consensus_checkpoint
         saved = torch.load(args.resume, map_location='cpu', weights_only=False)
         validate_consensus_checkpoint(saved)
         model_config = dict(saved['model_config'])
@@ -572,7 +571,7 @@ def build_trainer(args, device, input_dim=None):
         args.steric_loss_weight = .05 if args.model_profile == 'production' else 0.
     trifuse = ConsensusFuse(**model_config)
 
-    model = ConsensusCoopDiff(frozen_expert, trifuse, num_conv_layers=num_conv_layers,
+    model = ConsensusCoopDiff(frozen_expert, trifuse,
                              expert_input_grad=getattr(args, 'expert_input_grad', True),
                              checkpoint_ternary=getattr(args, 'checkpoint_ternary', True))
 
@@ -654,7 +653,7 @@ def prepare_source_batch(batch, global_step, training_arm, endpoint_store):
     """Attach the actual source and matching coupling for one training step."""
     if training_arm == 'A1':
         return {**batch, 'source': 0}
-    from tricoopdiff.dual_init import mixed_source_for_step
+    from tricoopdiff.online_endpoints import mixed_source_for_step
     source = mixed_source_for_step(global_step)
     if source == 0:
         return {**batch, 'source': 0}
@@ -671,7 +670,7 @@ def prepare_source_batch(batch, global_step, training_arm, endpoint_store):
 def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None,
              native_root='DeepTernary/data/TernaryDB/pdbs'):
     """Run a deterministic validation pass without perturbing training RNG."""
-    from tricoopdiff.consensus_train import VALIDATION_DOCKQ_PROTOCOL
+    from tricoopdiff.train import VALIDATION_DOCKQ_PROTOCOL
     cuda_devices = []
     if device.type == 'cuda':
         cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()]

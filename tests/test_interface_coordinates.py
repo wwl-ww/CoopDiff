@@ -7,7 +7,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from tricoopdiff.diffusion import InterfaceDiffusion
+from tricoopdiff.legacy.diffusion import InterfaceDiffusion
 from tricoopdiff.graphs import transform_ligand_to_poi_frame
 
 

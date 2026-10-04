@@ -12,7 +12,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 from collect_ranking_archive import inference_entries
-from tricoopdiff.ranking_archive import (geometry_features, probe_state,
+from tricoopdiff.ranking.ranking_archive import (geometry_features, probe_state,
                                        select_archive_candidates, state_hash)
 
 

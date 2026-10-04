@@ -14,7 +14,7 @@ import numpy as np
 
 def test_trifuse_build():
     """TriFuse builds with correct output shapes."""
-    from tricoopdiff.trifuse import TriFuse
+    from tricoopdiff.legacy.trifuse import TriFuse
 
     trifuse = TriFuse(
         node_dim=128, ns=32, nv=4,
@@ -62,8 +62,8 @@ def test_trifuse_build():
 
 def test_trifuse_reads_geometry_and_preserves_rigid_invariance():
     """Context changes with interfaces, not with a common rigid transform."""
-    from tricoopdiff.diffusion import so3_exp
-    from tricoopdiff.trifuse import TriFuse
+    from tricoopdiff.pose_anchors import rotation_exp as so3_exp
+    from tricoopdiff.legacy.trifuse import TriFuse
 
     torch.manual_seed(3)
     trifuse = TriFuse(
@@ -107,7 +107,7 @@ def test_trifuse_reads_geometry_and_preserves_rigid_invariance():
 
 def test_trifuse_links_chemical_features_to_local_contacts():
     """Moving chemical identities between near/far atoms changes context."""
-    from tricoopdiff.trifuse import TriFuse
+    from tricoopdiff.legacy.trifuse import TriFuse
 
     torch.manual_seed(7)
     trifuse = TriFuse(
@@ -142,7 +142,7 @@ def test_trifuse_links_chemical_features_to_local_contacts():
 
 def test_trifuse_reads_sigma_and_solver_state():
     """Equal geometry at different sigma/dt must produce different context."""
-    from tricoopdiff.trifuse import TriFuse
+    from tricoopdiff.legacy.trifuse import TriFuse
 
     torch.manual_seed(13)
     trifuse = TriFuse(
@@ -174,7 +174,7 @@ def test_trifuse_reads_sigma_and_solver_state():
 
 def test_trifuse_distinguishes_mirrored_interface_handedness():
     """Signed local geometry distinguishes mirror images with equal distances."""
-    from tricoopdiff.trifuse import TriFuse
+    from tricoopdiff.legacy.trifuse import TriFuse
 
     torch.manual_seed(23)
     trifuse = TriFuse(
@@ -203,7 +203,7 @@ def test_trifuse_distinguishes_mirrored_interface_handedness():
 
 def test_film_zero_init():
     """FiLM is transparent at initialization (adaLN-Zero)."""
-    from tricoopdiff.trifuse import FiLMHead
+    from tricoopdiff.legacy.trifuse import FiLMHead
 
     head = FiLMHead(hidden_dim=64)
     h = torch.randn(2, 64)
@@ -220,7 +220,7 @@ def test_film_zero_init():
 
 def test_trifuse_atom_film_can_select_ligand_regions():
     """A trained FiLM head can assign different scalar gates per atom."""
-    from tricoopdiff.trifuse import TriFuse
+    from tricoopdiff.legacy.trifuse import TriFuse
 
     torch.manual_seed(19)
     trifuse = TriFuse(
@@ -239,7 +239,7 @@ def test_trifuse_atom_film_can_select_ligand_regions():
 
 def test_score_control_is_identity_bounded_and_trainable():
     """Score calibration starts exact identity and cannot reverse direction."""
-    from tricoopdiff.trifuse import ScoreControlHead
+    from tricoopdiff.legacy.trifuse import ScoreControlHead
 
     head = ScoreControlHead(hidden_dim=16, max_delta=0.25)
     context = torch.randn(3, 16)
@@ -252,7 +252,7 @@ def test_score_control_is_identity_bounded_and_trainable():
 
 def test_layerwise_bridge_starts_exactly_transparent():
     """The dual-stream bridge must not perturb native zero-init experts."""
-    from tricoopdiff.trifuse import LayerwiseExpertBridge
+    from tricoopdiff.legacy.trifuse import LayerwiseExpertBridge
 
     bridge = LayerwiseExpertBridge(
         scalar_dim=8, hidden_dim=16, num_layers=3,
@@ -271,7 +271,7 @@ def test_layerwise_bridge_starts_exactly_transparent():
 
 def test_torsion_coordinator_zero_init_and_per_bond_control():
     """Shared torsion starts neutral but can make independent bond decisions."""
-    from tricoopdiff.trifuse import TorsionCoordinator
+    from tricoopdiff.legacy.trifuse import TorsionCoordinator
 
     coordinator = TorsionCoordinator(context_dim=8, hidden_dim=4)
     context = torch.randn(2, 8)
@@ -288,7 +288,7 @@ def test_torsion_coordinator_zero_init_and_per_bond_control():
 
 def test_torsion_coordinator_rejects_flat_native_shape():
     """The coordinator boundary requires an explicit batch dimension."""
-    from tricoopdiff.trifuse import TorsionCoordinator
+    from tricoopdiff.legacy.trifuse import TorsionCoordinator
 
     coordinator = TorsionCoordinator(context_dim=8, hidden_dim=4)
     try:
@@ -301,7 +301,7 @@ def test_torsion_coordinator_rejects_flat_native_shape():
 
 def test_torsion_coordinator_does_not_overflow_finite_evidence():
     """Finite expert scores must not overflow inside feature construction."""
-    from tricoopdiff.trifuse import TorsionCoordinator
+    from tricoopdiff.legacy.trifuse import TorsionCoordinator
 
     coordinator = TorsionCoordinator(context_dim=8, hidden_dim=4).eval()
     context = torch.zeros(1, 8)
@@ -314,7 +314,7 @@ def test_torsion_coordinator_does_not_overflow_finite_evidence():
 
 def test_bond_context_is_local_to_each_rotatable_bond():
     """Distinct endpoints/fragments must produce distinct bond contexts."""
-    from tricoopdiff.trifuse import BondContextEncoder
+    from tricoopdiff.legacy.trifuse import BondContextEncoder
 
     torch.manual_seed(11)
     encoder = BondContextEncoder(hidden_dim=16)
@@ -340,7 +340,7 @@ def test_bond_context_is_local_to_each_rotatable_bond():
 
 def test_expert_telemetry_conditions_bond_context():
     """Branch activation evidence must reach the shared torsion decision."""
-    from tricoopdiff.trifuse import (
+    from tricoopdiff.legacy.trifuse import (
         TELEMETRY_PER_LAYER, TELEMETRY_TAIL, TriFuse,
     )
 
@@ -362,7 +362,8 @@ def test_expert_telemetry_conditions_bond_context():
 
 def test_diffusion_schedules():
     """Diffusion schedules produce valid noise levels."""
-    from tricoopdiff.diffusion import InterfaceDiffusion, so3_score_norm
+    from tricoopdiff.legacy.diffusion import InterfaceDiffusion
+    from tricoopdiff.models.expert import so3_score_norm
 
     diffusion = InterfaceDiffusion(inference_steps=20)
 
@@ -437,7 +438,7 @@ def test_graph_construction():
 def test_initializer_body_frame():
     """The rotation returned by POI initialization is the inverse frame map."""
     from scipy.spatial.transform import Rotation
-    from tricoopdiff.rigid import assemble_interface_pair
+    from tricoopdiff.pose_anchors import assemble_interface_pair
     from tricoopdiff.graphs import transform_ligand_to_poi_frame
 
     np.random.seed(7)
@@ -467,7 +468,7 @@ def test_initializer_body_frame():
 def test_frozen_expert_stays_eval():
     """Parent train mode must not reactivate a frozen pretrained expert."""
     import torch.nn as nn
-    from tricoopdiff.expert import FrozenDiffDock
+    from tricoopdiff.models.expert import FrozenDiffDock
 
     class DummyExpert(nn.Module):
         def __init__(self):

@@ -18,9 +18,9 @@ does NOT import ``../DiffDock``.
 import numpy as np
 import torch
 
-from .initialization import TernaryInitializer
-from .sdpi_flow import SDPIFlow, FLOW_VERSION
-from .consensus import SOURCE_NAMES
+from tricoopdiff.initialization import TernaryInitializer
+from tricoopdiff.sdpi_flow import SDPIFlow, FLOW_VERSION
+from tricoopdiff.models.consensus import SOURCE_NAMES
 
 
 def actual_candidate_source(init_mode, initialization):
@@ -178,11 +178,6 @@ def sample_single(
         "minimum_poi_ca_ligand_distance": float(torch.cdist(poi_pos[0], ligand_pos[0]).min()),
     }
 
-    schedule = (
-        diffusion.get_refinement_schedule(steps, t_start=t_anchor)
-        if init_mode == "fixed_candidate"
-        else diffusion.get_inference_schedule(steps, t_start=t_anchor)
-    )
     trajectory = [] if return_trajectory else None
     trace = [] if return_trace else None
     nonfinite_score_steps = []
@@ -209,58 +204,21 @@ def sample_single(
     if return_trace:
         trace.append(init_record)
 
-    for i in range(steps):
-        t_tr = torch.tensor([schedule["tr_schedule"][i]], device=device, dtype=torch.float32)
-        t_rot = torch.tensor([schedule["rot_schedule"][i]], device=device, dtype=torch.float32)
-        t_tor = torch.tensor([schedule["tor_schedule"][i]], device=device, dtype=torch.float32)
-        if i < steps - 1:
-            dt_tr = torch.tensor(
-                [schedule["tr_schedule"][i] - schedule["tr_schedule"][i + 1]],
-                device=device, dtype=torch.float32,
-            )
-            dt_rot = torch.tensor(
-                [schedule["rot_schedule"][i] - schedule["rot_schedule"][i + 1]],
-                device=device, dtype=torch.float32,
-            )
-            dt_tor = torch.tensor(
-                [schedule["tor_schedule"][i] - schedule["tor_schedule"][i + 1]],
-                device=device, dtype=torch.float32,
-            )
-        else:
-            # Match vendored DiffDock's sampling driver: the final deterministic
-            # step uses dt = t_i (actual_steps=19 with a length-20 schedule), not
-            # t_i - t_{i+1} against an explicit zero endpoint.
-            dt_tr = t_tr.clone()
-            dt_rot = t_rot.clone()
-            dt_tor = t_tor.clone()
-
+    for i, (t_tr, dt_tr) in enumerate(diffusion.reverse_times(ligand_pos, steps, t_anchor)):
+        t_rot = t_tor = t_tr
+        dt_rot = dt_tor = dt_tr
         tr_sigma, rot_sigma, tor_sigma = diffusion.t_to_sigma(t_tr, t_rot, t_tor)
-        pol_tr_sigma, pol_rot_sigma, _ = diffusion.t_to_sigma(
-            t_tr, t_rot, t_tor,
-        )
-        diffusion_state = diffusion.conditioning(t_tr, dt_tr, e3_data['coords'], poi_data['coords'])
-
         if bool(getattr(model.expert.model, "dynamic_max_cross", False)):
             receptor_crop_cutoff = tr_sigma * 3 + 20
         else:
             receptor_crop_cutoff = None
 
-        # Rebuild the data dicts with the current (noisy) coordinates. Edges and
-        # features are constant; only coords change between steps.
-        lig_d = {**ligand_data, "coords": ligand_pos}
-        poi_d = {**poi_data, "coords": poi_pos}
-
         if return_trace:
             setattr(model, '_debug_step0_probe', True)
             setattr(model, '_last_step0_probe', None)
-        out = model(
-            e3_data, poi_d, lig_d, t_e3l=t_tr, t_pol=t_tr,
-            r_e3_to_poi=r_e3_to_poi,
-            receptor_crop_cutoff=receptor_crop_cutoff,
-            diffusion_state=diffusion_state,
-            source=source_index,
-            conditions=conditions,
-        )
+        out = diffusion.forward_state(
+            model, e3_data, poi_data, ligand_data, ligand_pos, poi_pos,
+            r_e3_to_poi, t_tr, dt_tr, source_index, conditions)
         if return_rank_features:
             features = out.get('rank_features')
             if features is None or features.ndim != 2 or features.shape[0] != 1:

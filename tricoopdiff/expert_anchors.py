@@ -5,12 +5,12 @@ import random
 import numpy as np
 import torch
 
-from .diffusion import InterfaceDiffusion
-from .expert_time import _set_time_embeddings
-from .graphs import build_subgraph_e3l, crop_receptor_to_ligand
-from .initialization import TernaryInitializer, sample_binary_pose
-from .pose_anchors import proper_rigid_fit
-from .rigid import apply_rigid
+from tricoopdiff.legacy.diffusion import InterfaceDiffusion
+from tricoopdiff.models.expert import _set_time_embeddings
+from tricoopdiff.graphs import build_subgraph_e3l, crop_receptor_to_ligand
+from tricoopdiff.initialization import TernaryInitializer, sample_binary_pose
+from tricoopdiff.pose_anchors import proper_rigid_fit
+from tricoopdiff.pose_anchors import apply_rigid
 
 
 EXPERT_ANCHOR_VERSION = "dual_diffdock_rigid_anchor_v1"

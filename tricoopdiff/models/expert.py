@@ -5,9 +5,11 @@ Wraps DiffDock's CGModel with all parameters frozen. Exposes per-layer outputs
 for FiLM modulation injection. The expert processes two physically disconnected
 subgraphs (E3-L and POI-L) in separate forward passes.
 
-Key constraint: each subgraph contains exactly one protein + PROTAC, matching
-DiffDock's pretraining input distribution exactly (zero OOD).
+Each subgraph contains one protein and ligand, preserving DiffDock's input
+schema. This does not guarantee that generated poses are in-distribution.
 """
+
+import warnings
 
 import torch
 import torch.nn as nn
@@ -17,7 +19,21 @@ from e3nn import o3
 # Vendored DiffDock so3/torus score norms — single source of truth so the
 # FiLM-path score computation matches native CGModel.forward() exactly
 # (required for zero_film_verification to pass).
-from .diffdock.utils import so3, torus
+from tricoopdiff.diffdock.utils import so3, torus
+from tricoopdiff.runtime import sha256_file
+
+
+def expert_t_to_sigma(t_tr, t_rot, t_tor):
+    """DiffDock-L input preconditioning, not a ternary diffusion process."""
+    bounds = ((0.1, 19.0), (0.03, 1.55), (0.0314, 3.14))
+    return tuple(low * (high / low) ** time
+                 for time, (low, high) in zip((t_tr, t_rot, t_tor), bounds))
+
+
+def so3_score_norm(sigma):
+    """Reuse the expert's SO(3) table; keep native float32 output units."""
+    value = torch.as_tensor(sigma)
+    return so3.score_norm(value.detach().cpu().reshape(-1)).reshape(value.shape).to(value.device)
 
 
 def torus_score_norm(sigma):
@@ -241,3 +257,140 @@ class FrozenDiffDock(nn.Module):
         FiLM is transparent when zero-initialized and for L0 ablation.
         """
         return self.model(data)
+
+
+def _set_time_embeddings(data, t, model):
+    """
+    Set diffusion time information on the HeteroData object, matching DiffDock's
+    `set_time` semantics: `complex_t` holds per-graph [batchsize] tensors and
+    `ligand.node_t` holds per-node [num_nodes] tensors. CGModel's
+    `timestep_emb_func` (GaussianFourierProjection) requires 1-D tensor inputs,
+    so these must be tensors, not Python floats.
+    """
+    device = data['ligand'].pos.device
+    if not torch.is_tensor(t):
+        t = torch.tensor(t, device=device, dtype=torch.float32)
+    t = t.to(device).reshape(-1)  # [1] (single-complex mode)
+
+    batchsize = int(data.num_graphs)
+    num_nodes = data['ligand'].pos.shape[0]
+
+    data.complex_t = {
+        'tr': t.expand(batchsize),
+        'rot': t.expand(batchsize),
+        'tor': t.expand(batchsize),
+    }
+    data['ligand'].node_t = {
+        'tr': t.expand(num_nodes),
+        'rot': t.expand(num_nodes),
+        'tor': t.expand(num_nodes),
+    }
+    if 'receptor' in data.node_types:
+        num_rec_nodes = data['receptor'].pos.shape[0]
+        data['receptor'].node_t = {
+            'tr': t.expand(num_rec_nodes),
+            'rot': t.expand(num_rec_nodes),
+            'tor': t.expand(num_rec_nodes),
+        }
+
+
+def build_diffdock_expert(
+    model_dir: str = "checkpoints/score_model",
+    device: str = "cuda",
+    ckpt: str = "best_ema_inference_epoch_model.pt",
+    num_conv_layers: int = None,
+    crop_beyond="native",
+) -> FrozenDiffDock:
+    """
+    Build and freeze a DiffDock score model from pretrained weights.
+
+    Args:
+        model_dir: directory containing `model_parameters.yml` and the checkpoint.
+        device: 'cuda' or 'cpu'.
+        ckpt: checkpoint filename inside model_dir.
+        num_conv_layers: override (defaults to the value in model_parameters.yml;
+            11 for DiffDock-L).
+        crop_beyond: receptor-crop policy for the frozen expert. ``"native"``
+            (default) preserves the checkpoint's `model_parameters.yml` setting so
+            the expert stays on vendored DiffDock's native inference path.
+            Pass ``None`` to force the old full-receptor fallback, or a numeric
+            value to override the crop radius explicitly.
+
+    Returns:
+        FrozenDiffDock wrapping the loaded CGModel (all params frozen).
+    """
+    from argparse import Namespace
+    from functools import partial
+    from pathlib import Path
+
+    import yaml
+    from tricoopdiff.diffdock.factory import build_cg_model
+    from tricoopdiff.diffdock.utils.diffusion_utils import t_to_sigma as t_to_sigma_compl
+
+    model_dir = Path(model_dir)
+    with open(model_dir / "model_parameters.yml") as f:
+        args = Namespace(**yaml.full_load(f))
+
+    if num_conv_layers is None:
+        num_conv_layers = getattr(args, "num_conv_layers", 11)
+
+    # Keep the frozen expert on the same crop/dynamic-cross regime as the
+    # vendored DiffDock checkpoint unless the caller explicitly overrides it.
+    # Previous versions forced ``args.crop_beyond = None`` here, which silently
+    # downgraded native inference from
+    #   crop_beyond(...) + dynamic_max_cross=True
+    # to
+    #   full receptor + dynamic_max_cross=False,
+    # creating a persistent parity gap for the zero-FiLM baseline.
+    if crop_beyond == "native":
+        pass
+    elif crop_beyond is None:
+        args.crop_beyond = None
+    else:
+        args.crop_beyond = crop_beyond
+
+    t_to_sigma = partial(t_to_sigma_compl, args=args)
+    cg_model = build_cg_model(args, device, t_to_sigma)
+
+    ckpt_path = model_dir / ckpt
+    state_dict = torch.load(ckpt_path, map_location=torch.device("cpu"))
+    cg_model.load_state_dict(state_dict, strict=True)
+    cg_model = cg_model.to(device)
+    cg_model.eval()
+
+    expert = FrozenDiffDock(cg_model, num_conv_layers=num_conv_layers)
+    expert.provenance = {
+        "diffdock_commit": "47eb91a",
+        "diffdock_source": "vendored with repository stability patches",
+        "score_checkpoint": str(ckpt_path.resolve()),
+        "score_checkpoint_sha256": sha256_file(ckpt_path),
+        "no_torsion": bool(getattr(args, "no_torsion", False)),
+    }
+    return expert
+
+
+_EXPERT_IDENTITY_KEYS = ('diffdock_commit', 'score_checkpoint_sha256', 'no_torsion')
+
+
+def expert_base_identity(expert):
+    """Return the stable identity fields for the external frozen expert."""
+    provenance = getattr(expert, 'provenance', {})
+    missing = [key for key in _EXPERT_IDENTITY_KEYS if key not in provenance]
+    if missing:
+        raise ValueError(f'frozen expert has incomplete provenance: {missing}')
+    return {key: provenance[key] for key in _EXPERT_IDENTITY_KEYS}
+
+
+def validate_expert_base_identity(checkpoint, expert):
+    """Reject known base/adapter mismatches and label legacy uncertainty."""
+    actual = expert_base_identity(expert)
+    saved = checkpoint.get('expert_base_identity')
+    if saved is None:
+        warnings.warn(
+            'Checkpoint has no frozen-expert identity; compatibility with the '
+            'runtime DiffDock base cannot be proven.', RuntimeWarning, stacklevel=2)
+        return 'legacy_unrecorded'
+    if saved != actual:
+        raise ValueError(f'checkpoint frozen expert identity {saved!r} does not '
+                         f'match runtime {actual!r}')
+    return saved

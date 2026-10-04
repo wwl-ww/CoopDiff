@@ -23,7 +23,7 @@ from tricoopdiff.diffdock.datasets.process_mols import get_lig_graph_with_matchi
 from tricoopdiff.initialization import (
     INITIAL_NOISE_STD_PROPORTION, TernaryInitializer, sample_binary_pose,
 )
-from tricoopdiff.rigid import apply_rigid, invert_rigid
+from tricoopdiff.pose_anchors import apply_rigid, invert_rigid
 
 
 def read_case(directory):

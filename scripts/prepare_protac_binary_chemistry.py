@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 from evaluation_common import sha256_file
 from restore_ligand_chemistry import restore_ligand
-from tricoopdiff.protac_conditions import fragment_matches, mapping_diagnostics
+from tricoopdiff.conditioning.condition_features import fragment_matches, mapping_diagnostics
 
 
 def restore_side(pdb, ccd_dir, destination, full_molecule):
@@ -95,7 +95,7 @@ def main():
               'scope': 'chemical restoration and mapping only; binary provenance remains unverified',
               'code_sha256': {str(p.relative_to(ROOT)): sha256_file(p) for p in
                              (Path(__file__), ROOT / 'scripts/restore_ligand_chemistry.py',
-                              ROOT / 'tricoopdiff/protac_conditions.py')}}
+                              ROOT / 'tricoopdiff/conditioning/condition_features.py')}}
     (args.out / 'report.json').write_text(json.dumps(result, indent=2, allow_nan=False) + '\n')
     print(json.dumps(summary, indent=2))
 
