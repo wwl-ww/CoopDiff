@@ -8,7 +8,7 @@ import scipy
 import torch
 from scipy.spatial.transform import Rotation
 
-from tricoopdiff.pose_anchors import apply_rigid, assemble_interface_pair
+from tricoopdiff.geometry.rigid import apply_rigid, assemble_interface_pair
 
 
 INITIAL_NOISE_STD_PROPORTION = 1.4601642460337794

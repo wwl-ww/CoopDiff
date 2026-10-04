@@ -432,7 +432,7 @@ def test_fullatom_validation_reuses_terminal_rollout_and_restores_raw_weights():
     trainer, batch, coupling = _endpoint_trainer_fixture()
     weights = {key: value.clone() for key, value in trainer.model.trifuse.state_dict().items()}
     metric = {'dockq': .6, 'fnat': .7, 'irms': 1.2, 'lrms': 3., 'method': 'test_exact_bridge'}
-    with patch('tricoopdiff.deepternary_metrics.compute_fullatom_dockq', return_value=metric) as scorer:
+    with patch('tricoopdiff.metrics.dockq.compute_fullatom_dockq', return_value=metric) as scorer:
         result = trainer.validate_step(**batch, coupling_override=coupling,
                                        dockq_context={'native_complex_pdb': 'native.pdb'})
     assert result['dockq'] == .6 and len(trainer.model.calls) == 3

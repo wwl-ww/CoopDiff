@@ -22,7 +22,7 @@ def _load(name, path):
 
 
 metrics = _load("tricoopdiff_evaluate", ROOT / "tricoopdiff" / "evaluate.py")
-exact = _load("deepternary_metrics", ROOT / "tricoopdiff" / "deepternary_metrics.py")
+exact = _load("deepternary_metrics", ROOT / "tricoopdiff" / "metrics" / "dockq.py")
 reference = _load("deepternary_simple_dockq", ROOT / "DeepTernary" / "DockQ" / "simple_dockq.py")
 
 

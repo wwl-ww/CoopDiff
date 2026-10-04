@@ -15,7 +15,7 @@ import torch
 
 from tricoopdiff.runtime import atomic_json
 from evaluation_common import evaluation_input_signature, sha256_file
-from tricoopdiff.deepternary_metrics import compute_fullatom_dockq
+from tricoopdiff.metrics.dockq import compute_fullatom_dockq
 
 
 def main():
@@ -42,7 +42,7 @@ def main():
     manifest = {'protocol': 'exact_archive_labels_v1', 'references_sha256': sha256_file(args.label_refs),
                 'archive_manifest_sha256': sha256_file(args.archives / 'manifest.json'),
                 'entrypoint_sha256': sha256_file(Path(__file__)),
-                'metric_sources': {str(p): sha256_file(p) for p in [ROOT / 'tricoopdiff/deepternary_metrics.py']
+                'metric_sources': {str(p): sha256_file(p) for p in [ROOT / 'tricoopdiff/metrics/dockq.py']
                                    + sorted((args.deepternary_root / 'DockQ').rglob('*.py'))},
                 'references': {e['case']: evaluation_input_signature(
                     {k: e[k] for k in ('protein1', 'protein2', 'ligand')}, e['native_complex_pdb']) for e in entries}}

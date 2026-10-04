@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from tricoopdiff.evaluate import evaluate_model
-from tricoopdiff.deepternary_metrics import compute_fullatom_dockq, _ligand_records
+from tricoopdiff.metrics.dockq import compute_fullatom_dockq, _ligand_records
 
 
 def test_walker_metrics_preserve_seeds_and_exact_failures():
@@ -25,12 +25,12 @@ def test_walker_metrics_preserve_seeds_and_exact_failures():
     exact = {'dockq': .5, 'fnat': .4, 'lrms': 2., 'irms': 1.}
     with ExitStack() as stack:
         stack.enter_context(patch('tricoopdiff.sampler.sample_ensemble', return_value=samples))
-        stack.enter_context(patch('tricoopdiff.deepternary_metrics.compute_fullatom_dockq',
+        stack.enter_context(patch('tricoopdiff.metrics.dockq.compute_fullatom_dockq',
                                   side_effect=[exact, RuntimeError('metric failed')]))
         for name in ('compute_deepternary_dockq', 'compute_e3_interface_dockq',
                      'compute_poi_dockq', 'compute_poi_com_dist'):
             stack.enter_context(patch(f'tricoopdiff.evaluate.{name}', return_value=None))
-        stack.enter_context(patch('tricoopdiff.ensemble_analysis.analyze_ensemble', return_value={
+        stack.enter_context(patch('tricoopdiff.metrics.ensemble.analyze_ensemble', return_value={
             'mean_pairwise_rmsd': 0., 'std_pairwise_rmsd': 0., 'n_clusters': 1}))
         report = evaluate_model(
             None, data, data, data, None, initializer=object(), device='cpu',
@@ -56,7 +56,7 @@ def test_rank_features_are_saved_only_when_requested():
         for name in ('compute_deepternary_dockq', 'compute_e3_interface_dockq',
                      'compute_poi_dockq', 'compute_poi_com_dist'):
             stack.enter_context(patch(f'tricoopdiff.evaluate.{name}', return_value=None))
-        stack.enter_context(patch('tricoopdiff.ensemble_analysis.analyze_ensemble', return_value={
+        stack.enter_context(patch('tricoopdiff.metrics.ensemble.analyze_ensemble', return_value={
             'mean_pairwise_rmsd': 0., 'std_pairwise_rmsd': 0., 'n_clusters': 1}))
         report = evaluate_model(
             None, data, data, data, None, initializer=object(), device='cpu',

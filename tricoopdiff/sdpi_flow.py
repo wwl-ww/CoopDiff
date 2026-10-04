@@ -14,7 +14,7 @@ from scipy.spatial.transform import Rotation
 
 from tricoopdiff.models.expert import expert_t_to_sigma, so3_score_norm
 from tricoopdiff.initialization import receptor_prior, sample_binary_pose, validate_ligand_graph
-from tricoopdiff.pose_anchors import assemble_interface_pair, rotation_exp
+from tricoopdiff.geometry.rigid import assemble_interface_pair, rotation_exp
 
 
 FLOW_VERSION = 'sdpi_flow_v1'
@@ -225,8 +225,8 @@ class SDPIFlow:
     def differentiable_step(ligand, poi, body, velocities, dt, ligand_data,
                             freeze_poi=False):
         """Execute the production rigid/torsion contract without detaching inputs."""
-        from tricoopdiff.pose_anchors import proper_rigid_fit
-        from tricoopdiff.pose_anchors import apply_rigid
+        from tricoopdiff.geometry.rigid import proper_rigid_fit
+        from tricoopdiff.geometry.rigid import apply_rigid
 
         _check_coords(ligand)
         _check_coords(poi)

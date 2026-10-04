@@ -15,7 +15,7 @@ import torch
 
 from tricoopdiff.runtime import atomic_json
 from evaluation_common import evaluation_input_signature, sha256_file
-from tricoopdiff.deepternary_metrics import compute_fullatom_dockq
+from tricoopdiff.metrics.dockq import compute_fullatom_dockq
 from tricoopdiff.ranking.initial_selector import POOL_LABEL_VERSION, initial_pool_features
 
 
@@ -49,7 +49,7 @@ def main(argv=None):
         'entrypoint_sha256': sha256_file(Path(__file__)),
         'feature_source_sha256': sha256_file(ROOT / 'tricoopdiff/ranking/initial_selector.py'),
         'metric_sources': {str(path): sha256_file(path) for path in
-                           [ROOT / 'tricoopdiff/deepternary_metrics.py']
+                           [ROOT / 'tricoopdiff/metrics/dockq.py']
                            + sorted((deep / 'DockQ').rglob('*.py'))},
         'references': {row['case']: evaluation_input_signature(
             {key: row[key] for key in ('protein1', 'protein2', 'ligand')},

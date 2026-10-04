@@ -14,13 +14,17 @@ TriCoopDiff 研究蛋白–配体–蛋白三元装配：两个冻结 DiffDock �
 - `tricoopdiff/legacy/`：历史 FiLM 模型；不由生产模型导入。
 - `tricoopdiff/experiments/`：诊断实验模型与训练目标；不由生产模型导入。
 - `tricoopdiff/conditioning/`、`tricoopdiff/ranking/`：可选条件建模与候选排序。
-- `tricoopdiff/` 根目录：坐标、初始化、训练、采样与评估；`diffdock/` 为 vendored 专家。
+- `tricoopdiff/inputs/`：蛋白嵌入和图构造。
+- `tricoopdiff/geometry/`：刚体变换、等变数值保护和物理几何检查。
+- `tricoopdiff/initialization/`：初始化分布、双专家候选、终点投影与缓存、分布审计。
+- `tricoopdiff/metrics/`：完整原子 DockQ 和固定坐标系集合分析。
+- `tricoopdiff/` 根目录：仅保留包入口、训练、采样、流、评估、运行支持和 DiffDock 兼容补丁，共 7 个 Python 文件；`diffdock/` 为 vendored 专家。
 - `scripts/`：当前特征化、训练、评估与通用审计入口；model-v3 已移除退役运行 wrapper。
 - `tests/`：断言式回归检查。
 - `doc/`：主题文档；从[文档索引](doc/README.md)进入。
 - `data/`、`checkpoints/`、`results/`、`logs/`：本地资产/产物。
 
-训练实现统一在 `tricoopdiff/train.py`；双初始化的投影、缓存契约与在线生成统一在 `tricoopdiff/online_endpoints.py`；刚体变换与拟合统一在 `tricoopdiff/pose_anchors.py`。已删除被合并的旧模块，仓库入口使用新路径，不保留转发空壳。
+训练实现统一在 `tricoopdiff/train.py`；双初始化的投影、缓存契约与在线生成统一在 `tricoopdiff/initialization/endpoints.py`；刚体变换与拟合统一在 `tricoopdiff/geometry/rigid.py`。已删除被合并的旧模块，仓库入口使用新路径，不保留转发空壳。
 
 生产运输使用 `SDPIFlow`，不实例化旧扩散过程。BiTSeed 的二元专家扩散采样保留在 `tricoopdiff/legacy/diffusion.py`；SO(3) 数值表直接复用 vendored 专家实现，不再维护第二份缓存与预计算代码。
 

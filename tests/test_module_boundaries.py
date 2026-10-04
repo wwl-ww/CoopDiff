@@ -8,6 +8,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
+def test_package_root_contains_only_production_orchestration():
+    expected = {
+        '__init__.py', 'train.py', 'sampler.py', 'sdpi_flow.py',
+        'evaluate.py', 'runtime.py', 'diffdock_compat.py',
+    }
+    actual = {path.name for path in (ROOT / 'tricoopdiff').glob('*.py')}
+    assert actual == expected, f'Unexpected root modules: {actual ^ expected}'
+    for directory in ('inputs', 'geometry', 'initialization', 'metrics'):
+        assert (ROOT / 'tricoopdiff' / directory / '__init__.py').is_file()
+
+
 def test_shared_layer_imports_remain_compatible():
     from tricoopdiff.models import consensus
     from tricoopdiff.legacy import trifuse
@@ -52,6 +63,7 @@ def test_flow_import_is_independent_of_model_and_legacy_diffusion():
 
 
 if __name__ == '__main__':
+    test_package_root_contains_only_production_orchestration()
     test_shared_layer_imports_remain_compatible()
     test_consensus_import_does_not_load_legacy_model()
     test_flow_import_is_independent_of_model_and_legacy_diffusion()

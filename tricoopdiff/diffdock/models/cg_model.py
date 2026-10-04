@@ -13,7 +13,7 @@ from .layers import GaussianSmearing, AtomEncoder
 from .tensor_layers import TensorProductConvLayer, get_irrep_seq
 from ..utils import so3, torus
 from ..constants import lig_feature_dims, rec_residue_feature_dims, rec_atom_feature_dims
-from ...equivariant_clamp import clamp_irrep_features, validate_clamp_mode
+from ...geometry.equivariant_clamp import clamp_irrep_features, validate_clamp_mode
 
 
 class CGModel(torch.nn.Module):

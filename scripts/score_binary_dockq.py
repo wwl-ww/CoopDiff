@@ -17,7 +17,7 @@ import torch
 from rdkit import Chem
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tricoopdiff.deepternary_metrics import _featurized_ca_coords, _fit_rigid, _records
+from tricoopdiff.metrics.dockq import _featurized_ca_coords, _fit_rigid, _records
 
 
 def write_complex(path, protein_path, rotation, translation, mol, ligand_coords):

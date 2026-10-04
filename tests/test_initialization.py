@@ -16,7 +16,7 @@ from tricoopdiff.initialization import (
     INITIAL_NOISE_STD_PROPORTION, TernaryInitializer, receptor_prior,
     validate_ligand_graph,
 )
-from tricoopdiff.pose_anchors import apply_rigid, assemble_interface_pair, invert_rigid
+from tricoopdiff.geometry.rigid import apply_rigid, assemble_interface_pair, invert_rigid
 
 
 def ligand_input(smiles="CCCOCC"):

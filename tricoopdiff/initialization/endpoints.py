@@ -11,12 +11,12 @@ import torch
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
-from tricoopdiff.expert_anchors import (
+from tricoopdiff.initialization.candidates import (
     DualExpertAnchorInitializer, generate_hybrid_candidates,
     generate_sdpi_candidates,
 )
 from tricoopdiff.models.expert import expert_base_identity
-from tricoopdiff.pose_anchors import proper_rigid_fit
+from tricoopdiff.geometry.rigid import proper_rigid_fit
 from tricoopdiff.sdpi_flow import SDPIFlow, _raw_torsions
 from tricoopdiff.runtime import atomic_torch_save
 

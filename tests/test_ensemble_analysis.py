@@ -3,7 +3,7 @@
 import numpy as np
 
 
-from tricoopdiff.ensemble_analysis import (
+from tricoopdiff.metrics.ensemble import (
     analyze_ensemble,
     cooperativity_from_ddg,
     cooperativity_from_kd,
@@ -24,7 +24,7 @@ def test_report_diversity_keeps_rigid_pose_displacement():
 
 def test_ensemble_report_computes_pair_distances_once():
     from unittest.mock import patch
-    from tricoopdiff import ensemble_analysis
+    from tricoopdiff.metrics import ensemble as ensemble_analysis
 
     with patch.object(ensemble_analysis, 'pairwise_pose_rmsd',
                       wraps=ensemble_analysis.pairwise_pose_rmsd) as distances:

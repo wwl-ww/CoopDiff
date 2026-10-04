@@ -62,7 +62,7 @@ def compute_clash_rate(
     Returns:
         dict with 'mean_clash_rate', 'max_clash_rate', 'std_clash_rate'
     """
-    from tricoopdiff.reflect import detect_clashes
+    from tricoopdiff.geometry.reflect import detect_clashes
 
     clash_rates = []
     for coords in ensemble_coords:
@@ -446,7 +446,7 @@ def compute_e3_interface_dockq(
 
 def compute_ensemble_diversity(ensemble_coords: List[np.ndarray]) -> Dict[str, float]:
     """Pose diversity in the fixed E3 frame, not conformer-aligned diversity."""
-    from tricoopdiff.ensemble_analysis import analyze_ensemble
+    from tricoopdiff.metrics.ensemble import analyze_ensemble
 
     report = analyze_ensemble(ensemble_coords, rmsd_cutoff=2.)
     return {
@@ -574,7 +574,7 @@ def evaluate_model(
             rec['approx_dockq'] = deepternary_m['dockq']
         if deepternary_dockq_paths is not None and native_complex_pdb is not None:
             try:
-                from tricoopdiff.deepternary_metrics import compute_fullatom_dockq
+                from tricoopdiff.metrics.dockq import compute_fullatom_dockq
                 exact_m = compute_fullatom_dockq(
                     pred_ligand=pred,
                     pred_poi_ca=pred_poi,
@@ -729,7 +729,7 @@ def evaluate_model(
     if len(pred_ligs) > 1:
         ensemble_metrics['diversity'] = compute_ensemble_diversity(pred_ligs)
     if walkers:
-        from tricoopdiff.ensemble_analysis import analyze_ensemble
+        from tricoopdiff.metrics.ensemble import analyze_ensemble
         ternary_poses = [
             np.concatenate([walker['pred'], walker['pred_poi']], axis=0)
             for walker in walkers

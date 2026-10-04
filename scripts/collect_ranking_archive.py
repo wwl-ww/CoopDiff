@@ -20,7 +20,7 @@ import torch
 from evaluation_common import evaluation_input_signature, resolve_entry_paths, sha256_file
 from evaluation_runner import EvaluationRunner
 from featurize_common import featurize_complex
-from tricoopdiff.expert_anchors import DualExpertAnchorInitializer, FixedCandidateInitializer, generate_hybrid_candidates
+from tricoopdiff.initialization.candidates import DualExpertAnchorInitializer, FixedCandidateInitializer, generate_hybrid_candidates
 from tricoopdiff.ranking.ranking_archive import (ARCHIVE_VERSION, GEOMETRY_NAMES, PROBE_TIME, cpu_tree,
                                        probe_state, select_archive_candidates, state_hash)
 from tricoopdiff.sampler import sample_single

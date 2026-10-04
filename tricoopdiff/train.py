@@ -15,7 +15,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from tricoopdiff.diffdock.utils.torus import SCORE_NORM_VERSION, validate_score_norm_version
-from tricoopdiff.equivariant_clamp import validate_clamp_mode
+from tricoopdiff.geometry.equivariant_clamp import validate_clamp_mode
 from tricoopdiff.models.consensus import (
     ARCHITECTURE, DIRECT_ARCHITECTURE, CONSENSUS_CHECKPOINT_VERSION,
     ENDPOINT_PROTOCOL_CHECKPOINT_VERSION,
@@ -562,7 +562,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             if dockq_context is not None:
                 if self.training_objective != ENDPOINT_OBJECTIVE:
                     raise ValueError('terminal DockQ validation requires the endpoint objective')
-                from tricoopdiff.deepternary_metrics import compute_fullatom_dockq
+                from tricoopdiff.metrics.dockq import compute_fullatom_dockq
 
                 self.model.eval()
                 output = self.compute_loss(**batch, diagnostics=True)

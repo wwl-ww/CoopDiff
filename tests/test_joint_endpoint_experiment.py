@@ -8,9 +8,9 @@ from tricoopdiff.experiments.joint_endpoint_experiment import (
     joint_rigid_endpoint_targets,
     stable_so3_log,
 )
-from tricoopdiff.pose_anchors import apply_rigid, assemble_interface_pair
+from tricoopdiff.geometry.rigid import apply_rigid, assemble_interface_pair
 from tricoopdiff.sdpi_flow import SDPIFlow
-from tricoopdiff.pose_anchors import rotation_exp as _rotation_exp
+from tricoopdiff.geometry.rigid import rotation_exp as _rotation_exp
 
 
 DTYPE = torch.float64

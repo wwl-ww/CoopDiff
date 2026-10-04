@@ -18,7 +18,7 @@ from tricoopdiff.conditioning.conditioned_consensus_train import (ConditionedCon
                                               load_prototype_checkpoint)
 from tricoopdiff.models.consensus import BRANCHES, ConsensusCoopDiff, ConsensusFuse
 from tricoopdiff.train import validate_consensus_checkpoint
-from tricoopdiff.pose_anchors import rotation_exp as so3_exp
+from tricoopdiff.geometry.rigid import rotation_exp as so3_exp
 
 
 def conditions():

@@ -136,7 +136,7 @@ def generate_esm_embeddings(protein_paths, device):
 
     Returns: dict {protein_path: [per-chain torch.Tensor (n_res, 1280)]}.
     """
-    from tricoopdiff.esm_embedder import ESMEmbedder
+    from tricoopdiff.inputs.esm_embedder import ESMEmbedder
 
     print(f"Loading ESM2-650M on {device} via HF mirror...", flush=True)
     local_model = os.environ.get("TRICOOPDIFF_ESM_MODEL")

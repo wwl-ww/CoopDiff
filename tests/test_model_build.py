@@ -62,7 +62,7 @@ def test_trifuse_build():
 
 def test_trifuse_reads_geometry_and_preserves_rigid_invariance():
     """Context changes with interfaces, not with a common rigid transform."""
-    from tricoopdiff.pose_anchors import rotation_exp as so3_exp
+    from tricoopdiff.geometry.rigid import rotation_exp as so3_exp
     from tricoopdiff.legacy.trifuse import TriFuse
 
     torch.manual_seed(3)
@@ -384,7 +384,7 @@ def test_diffusion_schedules():
 
 def test_graph_construction():
     """Subgraph construction produces valid HeteroData."""
-    from tricoopdiff.graphs import (
+    from tricoopdiff.inputs.graphs import (
         build_subgraph_e3l, build_subgraph_pol,
         build_trifuse_graph, transform_ligand_to_poi_frame,
     )
@@ -438,8 +438,8 @@ def test_graph_construction():
 def test_initializer_body_frame():
     """The rotation returned by POI initialization is the inverse frame map."""
     from scipy.spatial.transform import Rotation
-    from tricoopdiff.pose_anchors import assemble_interface_pair
-    from tricoopdiff.graphs import transform_ligand_to_poi_frame
+    from tricoopdiff.geometry.rigid import assemble_interface_pair
+    from tricoopdiff.inputs.graphs import transform_ligand_to_poi_frame
 
     np.random.seed(7)
     torch.manual_seed(7)
@@ -503,7 +503,7 @@ def test_score_sanitizer_handles_infinity():
 
 def test_reflect_pipeline():
     """TriReflect detects clashes and runs minimization."""
-    from tricoopdiff.reflect import detect_clashes, tricoop_reflect
+    from tricoopdiff.geometry.reflect import detect_clashes, tricoop_reflect
 
     # Create two non-bonded atoms well inside VDW contact → should clash.
     # (0.5Å is skipped by the covalent-radius 1-2 heuristic, which treats very

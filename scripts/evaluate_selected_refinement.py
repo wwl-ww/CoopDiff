@@ -39,8 +39,8 @@ import torch
 from evaluation_common import evaluation_input_signature, resolve_entry_paths, sha256_file
 from evaluation_runner import EvaluationRunner
 from featurize_common import featurize_complex
-from tricoopdiff.deepternary_metrics import compute_fullatom_dockq
-from tricoopdiff.expert_anchors import (
+from tricoopdiff.metrics.dockq import compute_fullatom_dockq
+from tricoopdiff.initialization.candidates import (
     DualExpertAnchorInitializer, FixedCandidateInitializer,
     generate_hybrid_candidates, select_hybrid_walkers,
 )
@@ -347,9 +347,9 @@ def main():
         "runtime_source_sha256": {
             name: sha256_file(RUNTIME_ROOT / name) for name in (
                 "tricoopdiff/models/consensus.py", "tricoopdiff/sampler.py",
-                "tricoopdiff/sdpi_flow.py", "tricoopdiff/expert_anchors.py",
+                "tricoopdiff/sdpi_flow.py", "tricoopdiff/initialization/candidates.py",
                 "scripts/evaluation_runner.py", "scripts/featurize_common.py",
-                "scripts/evaluation_common.py", "tricoopdiff/deepternary_metrics.py",
+                "scripts/evaluation_common.py", "tricoopdiff/metrics/dockq.py",
             ) + (("tricoopdiff/conditioning/conditioned_consensus_train.py",
                   "tricoopdiff/conditioning/condition_features.py")
                  if args.allow_conditioned_checkpoint else ())

@@ -178,7 +178,7 @@ class EvaluationRunner:
         case_initializer = self.initializer
         initialization_version = "sdpi_v1"
         if init_mode == "expert_anchor":
-            from tricoopdiff.expert_anchors import (
+            from tricoopdiff.initialization.candidates import (
                 DualExpertAnchorInitializer, EXPERT_ANCHOR_CONSENSUS_VERSION,
                 EXPERT_ANCHOR_VERSION,
             )

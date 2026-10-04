@@ -6,7 +6,7 @@
 # keep the (broken-on-GPU) native kernels.
 from . import diffdock_compat  # noqa: F401
 
-from tricoopdiff.graphs import build_subgraph_e3l, build_subgraph_pol, build_trifuse_graph
+from tricoopdiff.inputs.graphs import build_subgraph_e3l, build_subgraph_pol, build_trifuse_graph
 
 __all__ = [
     'TriCoopDiff', 'build_subgraph_e3l', 'build_subgraph_pol',

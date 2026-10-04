@@ -8,10 +8,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tricoopdiff.online_endpoints import (
+from tricoopdiff.initialization.endpoints import (
     endpoint_internal_geometry, project_endpoint_coupling,
 )
-from tricoopdiff.pose_anchors import apply_rigid
+from tricoopdiff.geometry.rigid import apply_rigid
 from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.sdpi_flow import _raw_torsions
 

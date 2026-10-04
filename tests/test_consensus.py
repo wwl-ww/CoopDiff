@@ -9,7 +9,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tricoopdiff.models.consensus import ConsensusFuse, BRANCHES
 from tricoopdiff.train import validate_consensus_checkpoint
-from tricoopdiff.pose_anchors import rotation_exp as so3_exp
+from tricoopdiff.geometry.rigid import rotation_exp as so3_exp
 from tricoopdiff.diffdock.utils.torus import SCORE_NORM_VERSION
 
 

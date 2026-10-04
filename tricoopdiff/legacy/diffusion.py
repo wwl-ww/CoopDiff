@@ -18,7 +18,7 @@ import torch.nn as nn
 from scipy.spatial.transform import Rotation as R
 
 from tricoopdiff.diffdock.utils.geometry import rigid_transform_Kabsch_3D_torch_batch
-from tricoopdiff.pose_anchors import assemble_interface_pair, rotation_exp as so3_exp
+from tricoopdiff.geometry.rigid import assemble_interface_pair, rotation_exp as so3_exp
 from tricoopdiff.diffdock.utils import so3
 
 

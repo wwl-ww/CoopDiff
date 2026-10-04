@@ -21,8 +21,8 @@ from typing import Dict, Mapping, Optional, Tuple, Union
 
 import torch
 
-from tricoopdiff.pose_anchors import proper_rigid_fit
-from tricoopdiff.pose_anchors import compose_rigid, invert_rigid
+from tricoopdiff.geometry.rigid import proper_rigid_fit
+from tricoopdiff.geometry.rigid import compose_rigid, invert_rigid
 
 
 Tensor = torch.Tensor

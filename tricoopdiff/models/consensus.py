@@ -13,7 +13,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
-from tricoopdiff.graphs import build_binary_graph, build_trifuse_graph, crop_receptor_to_ligand
+from tricoopdiff.inputs.graphs import build_binary_graph, build_trifuse_graph, crop_receptor_to_ligand
 from tricoopdiff.models.expert import _set_time_embeddings
 from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.diffdock.constants import lig_feature_dims

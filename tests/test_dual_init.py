@@ -10,10 +10,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tricoopdiff.online_endpoints import (  # noqa: E402
+from tricoopdiff.initialization.endpoints import (  # noqa: E402
     CachedEndpointStore, DUAL_INIT_CACHE_VERSION, validate_endpoint_cache,
 )
-from tricoopdiff.online_endpoints import (  # noqa: E402
+from tricoopdiff.initialization.endpoints import (  # noqa: E402
     LazyTrainingEndpointStore, ONLINE_TRAINING_ENDPOINT_PROTOCOL,
     endpoint_input_signature,
 )

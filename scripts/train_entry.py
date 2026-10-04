@@ -275,7 +275,7 @@ def main():
             args.bitseed_lazy_cache_dir = str(
                 Path(args.output_dir).resolve() / "bitseed_c1m1_cache"
             )
-        from tricoopdiff.online_endpoints import ONLINE_TRAINING_ENDPOINT_PROTOCOL
+        from tricoopdiff.initialization.endpoints import ONLINE_TRAINING_ENDPOINT_PROTOCOL
         args.training_endpoint_protocol = ONLINE_TRAINING_ENDPOINT_PROTOCOL
     else:
         if args.bitseed_endpoint_cache or args.bitseed_lazy_cache_dir:
@@ -328,7 +328,7 @@ def main():
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as handle:
         json.dump(vars(args), handle, indent=2)
     if args.training_arm in ("B", "C"):
-        from tricoopdiff.online_endpoints import LazyTrainingEndpointStore
+        from tricoopdiff.initialization.endpoints import LazyTrainingEndpointStore
         endpoint_store = LazyTrainingEndpointStore(
             args.bitseed_lazy_cache_dir, model.expert,
         )
@@ -653,7 +653,7 @@ def prepare_source_batch(batch, global_step, training_arm, endpoint_store):
     """Attach the actual source and matching coupling for one training step."""
     if training_arm == 'A1':
         return {**batch, 'source': 0}
-    from tricoopdiff.online_endpoints import mixed_source_for_step
+    from tricoopdiff.initialization.endpoints import mixed_source_for_step
     source = mixed_source_for_step(global_step)
     if source == 0:
         return {**batch, 'source': 0}

@@ -79,7 +79,7 @@ def test_flow_preconditioning_uses_native_expert_units_and_table():
 
 def test_shared_rotation_exponential_preserves_precision_and_zero_gradient():
     from scipy.spatial.transform import Rotation
-    from tricoopdiff.pose_anchors import rotation_exp
+    from tricoopdiff.geometry.rigid import rotation_exp
 
     vectors = torch.tensor([[0., 0., 0.], [1e-9, -1e-9, 2e-9],
                             [.7, -1.2, .3]], dtype=torch.float64, requires_grad=True)
@@ -332,7 +332,7 @@ def test_flow_checkpoint_rejects_old_or_wrong_process():
 
 
 def test_rigid_fit_gradient_is_regular_at_repeated_singular_values():
-    from tricoopdiff.pose_anchors import proper_rigid_fit, _ProperPolarRotation
+    from tricoopdiff.geometry.rigid import proper_rigid_fit, _ProperPolarRotation
     covariance = torch.randn(2, 3, 3, dtype=torch.float64, requires_grad=True)
     assert torch.autograd.gradcheck(_ProperPolarRotation.apply, (covariance,), atol=2e-5)
     source = torch.tensor([[1., 0., 0.], [-1., 0., 0.], [0., 1., 0.],

@@ -21,7 +21,7 @@ from tricoopdiff.experiments.offpath_experiments import (
     transport_poi_body_frame_targets,
     transport_targets_with_recomputed_gauge,
 )
-from tricoopdiff.pose_anchors import rotation_exp as _rotation_exp
+from tricoopdiff.geometry.rigid import rotation_exp as _rotation_exp
 
 
 def rotation(vector):

@@ -10,11 +10,11 @@ from evaluation_common import resolve_entry_paths, sha256_file
 from evaluation_runner import EvaluationRunner
 from evaluate_selected_refinement import atomic_json, exact_dockq
 from featurize_common import featurize_complex
-from tricoopdiff.expert_anchors import (
+from tricoopdiff.initialization.candidates import (
     DualExpertAnchorInitializer, FixedCandidateInitializer,
     generate_hybrid_candidates,
 )
-from tricoopdiff.online_endpoints import endpoint_internal_geometry
+from tricoopdiff.initialization.endpoints import endpoint_internal_geometry
 from tricoopdiff.sampler import sample_single
 
 

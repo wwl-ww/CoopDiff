@@ -30,7 +30,7 @@ from tricoopdiff.conditioning.conditioned_consensus_train import (
 )
 from tricoopdiff.train import validate_consensus_checkpoint
 from tricoopdiff.models.expert import build_diffdock_expert
-from tricoopdiff.online_endpoints import LazyTrainingEndpointStore, ONLINE_TRAINING_ENDPOINT_PROTOCOL
+from tricoopdiff.initialization.endpoints import LazyTrainingEndpointStore, ONLINE_TRAINING_ENDPOINT_PROTOCOL
 from tricoopdiff.sdpi_flow import SDPIFlow
 
 
