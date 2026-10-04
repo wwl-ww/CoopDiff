@@ -25,7 +25,7 @@ from e3nn import o3
 # (required for zero_film_verification to pass).
 from tricoopdiff.diffdock.utils import so3, torus
 from tricoopdiff.runtime import sha256_file
-from tricoopdiff.geometry.equivariant_clamp import validate_clamp_mode
+from tricoopdiff.geometry.equivariant_clamp import clamp_irrep_features, validate_clamp_mode
 
 
 EXPERT_SIGMA_BOUNDS = ((0.1, 19.0), (0.03, 1.55), (0.0314, 3.14))
@@ -117,6 +117,7 @@ class FrozenDiffDock(nn.Module):
         self.nv = self.model.nv
         self.sh_irreps = self.model.sh_irreps
         self.device = self.model.device
+        self.eval()
 
     def embedding(self, data):
         """
@@ -322,11 +323,15 @@ class FrozenDiffDock(nn.Module):
         if len(captured) != 1 or captured[0].ndim != 2 or captured[0].shape[1] != irreps.dim:
             raise ValueError('expert final-layer node output does not match its irreps')
         scalars = torch.cat([captured[0][:, section] for section in sections], dim=-1)
-        # Native CGModel applies its clamp after the hook. Both supported clamp
-        # policies are identical on individual scalar irreps.
+        # Native CGModel applies its clamp after the hook. Scalar norm clipping
+        # is mathematically equivalent to component clipping, but its floating
+        # point arithmetic and non-finite propagation must also match native.
         limit = self.model.activation_clamp
         if limit:
-            scalars = scalars.clamp(min=-float(limit), max=float(limit))
+            if self.model.activation_clamp_mode == 'irrep_norm':
+                scalars = clamp_irrep_features(scalars, f'{scalars.shape[-1]}x0e', float(limit))
+            else:
+                scalars = scalars.clamp(min=-float(limit), max=float(limit))
         return tr, rot, tor, scalars
 
 
@@ -379,8 +384,8 @@ def build_diffdock_expert(
         model_dir: directory containing `model_parameters.yml` and the checkpoint.
         device: 'cuda' or 'cpu'.
         ckpt: checkpoint filename inside model_dir.
-        num_conv_layers: override (defaults to the value in model_parameters.yml;
-            11 for DiffDock-L).
+        num_conv_layers: optional assertion of the checkpoint architecture;
+            must match model_parameters.yml (11 for DiffDock-L).
         crop_beyond: receptor-crop policy for the frozen expert. ``"native"``
             (default) preserves the checkpoint's `model_parameters.yml` setting so
             the expert stays on vendored DiffDock's native inference path.
@@ -403,8 +408,12 @@ def build_diffdock_expert(
         args = Namespace(**yaml.full_load(f))
     validate_expert_sigma_args(args)
 
+    checkpoint_layers = getattr(args, "num_conv_layers", 11)
     if num_conv_layers is None:
-        num_conv_layers = getattr(args, "num_conv_layers", 11)
+        num_conv_layers = checkpoint_layers
+    if (not isinstance(num_conv_layers, int) or isinstance(num_conv_layers, bool)
+            or num_conv_layers < 1 or num_conv_layers != checkpoint_layers):
+        raise ValueError('num_conv_layers must match the frozen checkpoint architecture')
 
     # Keep the frozen expert on the same crop/dynamic-cross regime as the
     # vendored DiffDock checkpoint unless the caller explicitly overrides it.

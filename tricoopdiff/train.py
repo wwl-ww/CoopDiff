@@ -472,6 +472,10 @@ def validate_consensus_checkpoint(payload):
             raise ValueError('version 24+ training checkpoint requires complete RNG state')
         if not config.get('expert_runtime_identity'):
             raise ValueError('version 24+ requires the expert runtime identity')
+    if version >= 28 and payload.get('checkpoint_kind') != 'inference_only':
+        if (payload.get('optimizer_mapping_contract') != 'named_parameters_v1'
+                or not isinstance(payload.get('optimizer_parameter_manifest'), dict)):
+            raise ValueError('version 28+ requires an optimizer named parameter manifest')
 
 
 class ConsensusTrainer(TriCoopDiffTrainer):
@@ -726,6 +730,8 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         """Shared trainable state; subclasses own their supervision contracts."""
         if getattr(self, '_ema_active', False):
             raise RuntimeError('cannot save training state while temporary EMA weights are active')
+        names = {id(parameter): name for name, parameter in self.model.named_parameters()}
+        parameters = [parameter for group in self.optimizer.param_groups for parameter in group['params']]
         return {
             'expert_base_identity': expert_base_identity(self.model.expert),
             'model_config': dict(self.model.trifuse.config),
@@ -734,6 +740,9 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             'global_step': self.global_step,
             'training_state': training_state,
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'optimizer_mapping_contract': 'named_parameters_v1',
+            'optimizer_parameter_manifest': {index: names[id(parameter)]
+                                             for index, parameter in enumerate(parameters)},
             'scheduler_state_dict': self.scheduler.state_dict(),
             'rng_state': capture_rng_state(),
         }
@@ -750,6 +759,22 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             raise ValueError('checkpoint training counters must be nonnegative integers')
         if counters[2] < counters[0]:
             raise ValueError('checkpoint samples_seen cannot be less than successful optimizer updates')
+        saved_optimizer = payload['optimizer_state_dict']
+        parameters = [parameter for group in self.optimizer.param_groups for parameter in group['params']]
+        indices = [index for group in saved_optimizer['param_groups'] for index in group['params']]
+        if (any(isinstance(index, bool) or not isinstance(index, int) for index in indices)
+                or indices != list(range(len(parameters))) or not set(saved_optimizer['state']).issubset(indices)):
+            raise ValueError('checkpoint optimizer parameter IDs must match the canonical unique parameter order')
+        mapping = payload.get('optimizer_mapping_contract')
+        if mapping is not None or payload.get('checkpoint_version', 0) >= 28:
+            names = {id(parameter): name for name, parameter in self.model.named_parameters()}
+            expected = {index: names[id(parameter)] for index, parameter in enumerate(parameters)}
+            if mapping != 'named_parameters_v1' or payload.get('optimizer_parameter_manifest') != expected:
+                raise ValueError('checkpoint optimizer named parameter mapping differs from the active model')
+        else:
+            import warnings
+            warnings.warn('legacy optimizer checkpoint has no parameter names; resume trusts registration order',
+                          RuntimeWarning, stacklevel=2)
         active = getattr(self.model.trifuse, 'active_state_dict', dict)
         raw, ema = [active(payload[key]) for key in ('trifuse_state_dict', 'ema_trifuse_state_dict')]
         current = self.model.trifuse.state_dict()
@@ -870,7 +895,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         validate_consensus_checkpoint(payload)
         if payload.get('checkpoint_kind') == 'inference_only':
             raise ValueError('inference-only weights cannot resume the production training objective')
-        if (payload['checkpoint_version'] not in (24, 25, 26, CONSENSUS_CHECKPOINT_VERSION)
+        if (payload['checkpoint_version'] not in (24, 25, 26, 27, CONSENSUS_CHECKPOINT_VERSION)
                 or payload['runtime_config'].get('training_objective') != REAL_ENDPOINT_OBJECTIVE):
             raise ValueError('training objective differs or checkpoint is historical; load weights only')
         for key in ('inference_steps', 'endpoint_loss_weight', 'interface_loss_weight',
@@ -909,12 +934,11 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         for key, value in expected.items():
             if payload['runtime_config'].get(key) != value:
                 raise ValueError(f'consensus checkpoint runtime mismatch: {key}')
-        fresh_scheduler = self.scheduler.state_dict()
         self._restore_optimization(payload)
         self.resume_best_val_dockq = payload['training_state'].get('best_val_dockq', float('-inf'))
         if payload['runtime_config'].get('validation_dockq_protocol') != REAL_VALIDATION_DOCKQ_PROTOCOL:
             # Keep optimizer/LR, but do not compare different validation protocols.
             self.resume_best_val_dockq = float('-inf')
             self.resume_best_val_loss = float('inf')
-            fresh_scheduler['_last_lr'] = [group['lr'] for group in self.optimizer.param_groups]
-            self.scheduler.load_state_dict(fresh_scheduler)
+            self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5,
+                                              patience=10, min_lr=1e-7)

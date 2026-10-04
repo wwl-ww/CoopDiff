@@ -200,8 +200,11 @@ def _parse_native_complex(pdb_path: str) -> Optional[Dict[str, np.ndarray]]:
             ligand.append([x, y, z])
             lig_chains.add(chain)
         else:
+            # Match ProDy's default blank/A alternate-location selection.
+            if ln[16:17] not in (' ', 'A'):
+                continue
             atom_name = ln[12:16].strip()
-            resid = ln[22:26].strip()
+            resid = ln[22:27]  # insertion-coded residues are separate nodes
             chains.setdefault(chain, []).append((resid, atom_name, [x, y, z]))
 
     ligand = np.asarray(ligand, dtype=float)
@@ -319,15 +322,16 @@ def compute_poi_dockq(
 def compute_poi_com_dist(
     pred_poi: np.ndarray,
     native_complex_pdb: str,
+    featurized_e3_ca: Optional[np.ndarray] = None,
 ) -> Optional[Dict[str, float]]:
     """
     Frame-aware POI placement (E3-POI COM distance) vs the native complex.
 
     ``featurize_common`` centers the E3 at its COM (so the featurized E3 frame
     origin ≈ E3 COM), and the sampler emits POI relative to that same COM.
-    The native POI reduced to Cα (``_parse_native_complex``) is shifted by the
-    native E3 Cα COM to land in the same frame, so the E3-POI separation can be
-    compared directly.
+    When current E3 coordinates are supplied, native E3 is rigid-fitted into
+    that frame before measuring POI placement. The legacy two-argument call
+    assumes an E3-centered frame with the native orientation.
 
     Note: this intentionally does NOT report a Kabsch-aligned POI RMSD. The POI
     template is the native POI as a rigid body, so a Kabsch superposition always
@@ -345,6 +349,13 @@ def compute_poi_com_dist(
     if native is None or native['e3_ca'].shape[0] == 0:
         return None
     native_poi_e3 = native['poi_ca'] - native['e3_ca'].mean(axis=0)  # [N_poi, 3]
+    if featurized_e3_ca is not None:
+        if featurized_e3_ca.shape != native['e3_ca'].shape:
+            return None
+        from tricoopdiff.metrics.dockq import _fit_rigid
+
+        rotation, translation = _fit_rigid(native['e3_ca'], featurized_e3_ca)
+        native_poi_e3 = native['poi_ca'] @ rotation + translation
     if pred_poi.shape[0] != native_poi_e3.shape[0]:
         return None
     com_dist = float(np.linalg.norm(pred_poi.mean(axis=0) - native_poi_e3.mean(axis=0)))
@@ -609,7 +620,7 @@ def evaluate_model(
                     rec['poi_contact_density_ratio'] = poi_m['contact_density_ratio']
                 if poi_native_contacts is None:
                     poi_native_contacts = poi_m['n_native_contacts']
-            poi_c = compute_poi_com_dist(pred_poi, native_complex_pdb)
+            poi_c = compute_poi_com_dist(pred_poi, native_complex_pdb, e3_ca)
             if poi_c is not None:
                 rec['poi_com_dist'] = poi_c['poi_com_dist']
                 poi_native_com_dist = poi_c['native_e3_poi_com_dist']

@@ -576,6 +576,191 @@ def test_continuous_torsion_model_and_sampler_callback_cannot_drop_update_tag():
             raise AssertionError('continuous torsion motion silently fell back to the old Kabsch chart')
 
 
+def test_rotation_exponential_keeps_large_finite_angles_on_so3_without_dtype_or_gradient_change():
+    from tricoopdiff.geometry.rigid import is_proper_rotation, rotation_exp
+
+    for scale in (1e3, 1e4, 1e5, 1e8, 1e12, 1e20):
+        vector = torch.tensor([[scale, .3 * scale, -.7 * scale]], requires_grad=True)
+        rotation = rotation_exp(vector)
+        assert rotation.dtype == vector.dtype and is_proper_rotation(rotation, atol=1e-6), (
+            'large finite rotation angles produced non-rigid scale/shear')
+        reference = rotation_exp(vector.detach().double()).float()
+        assert torch.equal(rotation, reference)
+        (rotation * rotation.new_tensor([[1., 2., 3.], [4., 2., 5.], [6., 7., 3.]])).sum().backward()
+        assert vector.grad.dtype == vector.dtype and torch.isfinite(vector.grad).all()
+
+
+def test_rotation_rodrigues_matches_matrix_exponential_reference_in_normal_and_small_angle_charts():
+    from tricoopdiff.geometry.rigid import rotation_exp
+
+    for scale in (0., 1e-8, .999e-4, 1.001e-4, .1, 1., 10., 100.):
+        vector = torch.tensor([[scale, .3 * scale, -.7 * scale]], dtype=torch.float64, requires_grad=True)
+        skew = vector.new_zeros(1, 3, 3)
+        x, y, z = vector.unbind(-1)
+        skew[:, 0, 1], skew[:, 0, 2] = -z, y
+        skew[:, 1, 0], skew[:, 1, 2] = z, -x
+        skew[:, 2, 0], skew[:, 2, 1] = -y, x
+        actual, expected = rotation_exp(vector), torch.linalg.matrix_exp(skew)
+        assert torch.allclose(actual, expected, atol=1e-12, rtol=0.)
+        probe = actual.new_tensor([[1., 2., 3.], [4., 2., 5.], [6., 7., 3.]])
+        actual_gradient, = torch.autograd.grad((actual * probe).sum(), vector, retain_graph=True)
+        expected_gradient, = torch.autograd.grad((expected * probe).sum(), vector)
+        assert torch.isfinite(actual_gradient).all()
+        assert torch.allclose(actual_gradient, expected_gradient, atol=1e-11, rtol=0.)
+
+
+def test_large_angle_rigid_decoder_preserves_distance_and_valid_body_over_repeated_steps():
+    from tricoopdiff.geometry.rigid import is_proper_rotation
+    from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
+
+    ligand, poi, body, data = _folded_torsion_decoder_fixture(torch.float32)
+    original_distances = torch.cdist(poi, poi, compute_mode='donot_use_mm_for_euclid_dist')
+    velocities = {'rigid_output_mode': INDEPENDENT_RIGID_MODE, 'torsion_update_mode': CONTINUOUS_TORSION_MODE,
+                  'e3_ligand': {'tr': ligand.new_zeros(1, 3), 'rot': ligand.new_tensor([[1e4, 3e3, -7e3]])},
+                  'poi_ligand': {'tr': ligand.new_zeros(1, 3), 'rot': ligand.new_tensor([[-7e3, 1e4, 3e3]])},
+                  'torsion': ligand.new_empty(1, 0)}
+    center = poi.mean(1)
+    for _ in range(20):
+        ligand, poi, body = SDPIFlow.step(ligand, poi, body, velocities, ligand.new_ones(1), data)
+        assert is_proper_rotation(body, atol=5e-6)
+    distances = torch.cdist(poi, poi, compute_mode='donot_use_mm_for_euclid_dist')
+    assert torch.allclose(distances, original_distances, atol=5e-6, rtol=0.)
+    assert torch.allclose(poi.mean(1), center, atol=5e-6, rtol=0.)
+
+
+def test_continuous_horizontal_multitorsion_large_angles_have_correct_coordinate_gradients():
+    from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
+
+    _, data, _, poi, _ = fixture('CCCOCC')
+    ligand = data['coords'].clone().requires_grad_()
+    body = torch.eye(3, dtype=ligand.dtype)[None]
+    k = int(data['edge_mask'].sum())
+    assert k >= 2, 'this regression requires coupled rotatable bonds'
+    torsion = torch.linspace(-30., 40., k, dtype=ligand.dtype)[None].requires_grad_()
+
+    def decode(coords, values):
+        velocities = {'rigid_output_mode': INDEPENDENT_RIGID_MODE,
+                      'torsion_update_mode': CONTINUOUS_TORSION_MODE,
+                      'e3_ligand': {'tr': coords.new_zeros(1, 3), 'rot': coords.new_zeros(1, 3)},
+                      'poi_ligand': {'tr': coords.new_zeros(1, 3), 'rot': coords.new_zeros(1, 3)},
+                      'torsion': values}
+        return SDPIFlow.step(coords, poi, body, velocities, coords.new_tensor([.23]), data)[0]
+
+    assert torch.autograd.gradcheck(decode, (ligand, torsion), eps=1e-6, atol=1e-4, rtol=1e-3)
+
+
+def test_continuous_horizontal_spin_prior_preserves_geometric_scale_and_torsion_gradient():
+    from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
+
+    ligand, poi, body, data = _folded_torsion_decoder_fixture()
+    reference = reference_gradient = None
+    for scale in (1., 1e-5, 1e5):
+        coordinates = ligand * scale
+        angle = ligand.new_tensor([[2.]], requires_grad=True)
+        velocities = {'rigid_output_mode': INDEPENDENT_RIGID_MODE,
+                      'torsion_update_mode': CONTINUOUS_TORSION_MODE,
+                      'e3_ligand': {'tr': ligand.new_zeros(1, 3), 'rot': ligand.new_zeros(1, 3)},
+                      'poi_ligand': {'tr': ligand.new_zeros(1, 3), 'rot': ligand.new_zeros(1, 3)},
+                      'torsion': angle}
+        output = SDPIFlow.step(coordinates, poi * scale, body, velocities, ligand.new_tensor([.17]), data)[0] / scale
+        gradient, = torch.autograd.grad((output * torch.arange(12, dtype=ligand.dtype).reshape_as(output)).sum(), angle)
+        if reference is None:
+            reference, reference_gradient = output, gradient
+        assert torch.allclose(output, reference, atol=1e-10, rtol=0.)
+        assert torch.isfinite(gradient).all()
+        assert torch.allclose(gradient, reference_gradient, atol=1e-9, rtol=0.)
+
+
+def test_rotation_exponential_handles_representable_float64_norm_without_squaring_overflow():
+    from tricoopdiff.geometry.rigid import is_proper_rotation, rotation_exp
+
+    vector = torch.tensor([[1e200, 3e199, -7e199]], dtype=torch.float64, requires_grad=True)
+    rotation = rotation_exp(vector)
+    assert torch.isfinite(rotation).all() and is_proper_rotation(rotation, atol=1e-12)
+    probe = rotation.new_tensor([[1., 2., 3.], [4., 2., 5.], [6., 7., 3.]])
+    (rotation * probe).sum().backward()
+    assert torch.isfinite(vector.grad).all()
+    for value in (torch.tensor([[torch.finfo(torch.float64).max] * 3], dtype=torch.float64),
+                  torch.tensor([[float('inf'), 0., 0.]], dtype=torch.float64)):
+        try:
+            rotation_exp(value.double())
+        except ValueError as error:
+            assert 'norm' in str(error)
+        else:
+            raise AssertionError('unrepresentable rotation-vector norm was silently accepted')
+
+
+def test_horizontal_ridge_prior_has_no_first_order_rotor_orientation_dependence():
+    from rdkit import Chem
+    from tricoopdiff.initialization import validate_ligand_graph
+    from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
+
+    flow, data, _, poi, _ = fixture()
+    edges = data['edge_index']
+    selected = torch.where(data['edge_mask'])[0]
+    reversed_indices = [int(torch.where((edges[0] == edges[1, i]) &
+                                        (edges[1] == edges[0, i]))[0]) for i in selected]
+    order = np.argsort(reversed_indices)
+    reversed_mask = torch.zeros_like(data['edge_mask'])
+    reversed_mask[reversed_indices] = True
+    reversed_data = {**data, 'edge_mask': reversed_mask,
+                     'mask_rotate': (~data['mask_rotate'])[order]}
+    validate_ligand_graph(Chem.Mol(data['mol']), edges, reversed_mask,
+                          reversed_data['mask_rotate'])
+    ligand = data['coords']
+    body = torch.eye(3, dtype=ligand.dtype)[None]
+    speeds = torch.linspace(-2., 3., len(selected), dtype=ligand.dtype)[None]
+    velocity = {'rigid_output_mode': INDEPENDENT_RIGID_MODE,
+                'torsion_update_mode': CONTINUOUS_TORSION_MODE,
+                'e3_ligand': {'tr': ligand.new_zeros(1, 3), 'rot': ligand.new_zeros(1, 3)},
+                'poi_ligand': {'tr': ligand.new_zeros(1, 3), 'rot': ligand.new_zeros(1, 3)},
+                'torsion': speeds}
+    reverse_velocity = {**velocity, 'torsion': speeds[:, order]}
+    errors = []
+    for h in (1e-5, 5e-6):
+        a = flow.step(ligand, poi, body, velocity, ligand.new_tensor([h]), data)[0]
+        b = flow.step(ligand, poi, body, reverse_velocity, ligand.new_tensor([h]), reversed_data)[0]
+        errors.append(float((a - b).abs().max()))
+    assert errors[1] < .3 * errors[0], 'rotor orientation left a first-order gauge residual'
+    assert errors[1] / 5e-6 < 2e-5
+
+
+def test_horizontal_ridge_prior_multistep_near_collinear_gradients_match_finite_difference():
+    from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
+
+    flow, data, _, poi, _ = fixture()
+    n = data['coords'].shape[1]
+    index = torch.arange(n, dtype=torch.float64)
+    body = torch.eye(3, dtype=torch.float64)[None]
+    probe = torch.arange(n * 3, dtype=torch.float64).reshape(1, n, 3) / (n * 3)
+    for epsilon in (1e-3, 0.):
+        coords = torch.stack((index, index.sin() * epsilon, index.cos() * epsilon), -1)[None]
+        coords.requires_grad_()
+        speeds = torch.linspace(-9., 13., int(data['edge_mask'].sum()), dtype=coords.dtype)[None]
+        speeds.requires_grad_()
+
+        def decode(initial, parameters):
+            ligand = initial
+            for _ in range(20):
+                velocity = {'rigid_output_mode': INDEPENDENT_RIGID_MODE,
+                            'torsion_update_mode': CONTINUOUS_TORSION_MODE,
+                            'e3_ligand': {'tr': coords.new_zeros(1, 3), 'rot': coords.new_zeros(1, 3)},
+                            'poi_ligand': {'tr': coords.new_zeros(1, 3), 'rot': coords.new_zeros(1, 3)},
+                            'torsion': parameters * (1 + .05 * ligand[:, :, 2].mean().tanh())}
+                ligand, _, _ = flow.step(ligand, poi, body, velocity, coords.new_tensor([.05]), data)
+            return (ligand * probe).sum()
+
+        value = decode(coords, speeds)
+        gx, gv = torch.autograd.grad(value, (coords, speeds))
+        assert torch.isfinite(gx).all() and torch.isfinite(gv).all()
+        dx, dv = probe / probe.norm(), torch.ones_like(speeds) / speeds.numel() ** .5
+        h = 1e-7
+        difference = (decode(coords + h * dx, speeds + h * dv) -
+                      decode(coords - h * dx, speeds - h * dv)) / (2 * h)
+        exact = (gx * dx).sum() + (gv * dv).sum()
+        assert torch.allclose(difference, exact, atol=2e-6, rtol=1e-5)
+
+
 if __name__ == '__main__':
     for name, function in list(globals().items()):
         if name.startswith('test_'):

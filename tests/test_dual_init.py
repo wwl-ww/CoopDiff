@@ -97,7 +97,7 @@ def test_lazy_training_protocol_is_exactly_one_pose_per_expert():
             'fallback': 'sdpi_v1_on_any_invalid_expert_side',
             'base_seed': 41000,
             'expert_runtime': store.protocol['expert_runtime'],
-            'generation_version': 'raw_target_projection_v3',
+            'generation_version': 'raw_target_projection_v4',
             'frozen_expert': {
                 'diffdock_commit': 'test', 'score_checkpoint_sha256': 'abc',
                 'no_torsion': False,

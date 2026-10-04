@@ -186,12 +186,44 @@ def project_endpoint_coupling(ligand_data, native_poi, endpoint_ligand,
         angles = np.zeros(len(bonds), dtype=np.float64)
         optimization = {"success": True, "status": 0, "nfev": 0}
     else:
+        # Rotations live on circles, not a [-pi, pi] box. Start from native
+        # atom-corresponded local phases so an exactly reachable conformer is
+        # not replaced by a different local minimum of the rigid-fit residual.
+        neighbors = [set() for _ in native_ligand]
+        for u, v in _undirected_bonds(edge_index, len(native_ligand)):
+            neighbors[u].add(v)
+            neighbors[v].add(u)
+        initial_angles = np.zeros(len(bonds), dtype=np.float64)
+        for index, (u, v) in enumerate(bonds):
+            left, right = sorted(neighbors[u] - {v}), sorted(neighbors[v] - {u})
+            if not left or not right:
+                continue
+            phases, qualities = [], []
+            for coordinates in (native_ligand, endpoint_ligand):
+                axis = coordinates[v] - coordinates[u]
+                length = np.linalg.norm(axis)
+                if length <= 1e-10:
+                    break
+                axis /= length
+                a, b = coordinates[left] - coordinates[u], coordinates[right] - coordinates[v]
+                a -= (a @ axis)[:, None] * axis
+                b -= (b @ axis)[:, None] * axis
+                norms_a, norms_b = np.linalg.norm(a, axis=-1), np.linalg.norm(b, axis=-1)
+                quality = norms_a[:, None] * norms_b[None, :]
+                a /= np.maximum(norms_a[:, None], 1e-10)
+                b /= np.maximum(norms_b[:, None], 1e-10)
+                phases.append(np.arctan2(np.cross(a[:, None], b[None]) @ axis, a @ b.T))
+                qualities.append(quality)
+            if len(phases) == 2:
+                quality = qualities[0] * qualities[1]
+                selected = np.unravel_index(quality.argmax(), quality.shape)
+                if quality[selected] > 1e-20:
+                    initial_angles[index] = (phases[0][selected] - phases[1][selected] + np.pi) % (2 * np.pi) - np.pi
         fitted = least_squares(
-            residual, np.zeros(len(bonds), dtype=np.float64),
-            bounds=(-np.pi, np.pi), max_nfev=int(max_nfev),
+            residual, initial_angles, max_nfev=int(max_nfev),
             ftol=1e-10, xtol=1e-10, gtol=1e-10,
         )
-        angles = fitted.x
+        angles = (fitted.x + np.pi) % (2 * np.pi) - np.pi
         optimization = {
             "success": bool(fitted.success), "status": int(fitted.status),
             "nfev": int(fitted.nfev),
@@ -464,7 +496,7 @@ class LazyTrainingEndpointStore:
             "base_seed": self.base_seed,
             "frozen_expert": expert_base_identity(expert),
             "expert_runtime": expert_runtime_identity(expert),
-            "generation_version": 'raw_target_projection_v3',
+            "generation_version": 'raw_target_projection_v4',
         }
         self._records = {}
         self._input_signatures = {}

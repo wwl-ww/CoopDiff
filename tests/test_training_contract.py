@@ -587,11 +587,15 @@ def test_interface_checkpoint_preserves_batch_progress_and_rejects_loss_changes(
     old['runtime_config']['validation_dockq_protocol'] = 'outdated'
     old['scheduler_state_dict']['best'] = .01
     old['scheduler_state_dict']['num_bad_epochs'] = 9
+    restored.scheduler.step(.001)
+    assert restored.scheduler.best == .001 and restored.scheduler.last_epoch == 1
     with patch('tricoopdiff.train.torch.load', return_value=old):
         restored.load_checkpoint('unused.pt')
     assert restored.resume_best_val_loss == float('inf')
     assert restored.resume_best_val_dockq == float('-inf')
     assert restored.scheduler.best == float('inf') and restored.scheduler.num_bad_epochs == 0
+    assert restored.scheduler.last_epoch == 0
+    assert restored.scheduler._last_lr == [group['lr'] for group in restored.optimizer.param_groups]
     # Earlier objective checkpoints remain readable with their original contract.
     payload['checkpoint_version'] = 21
     payload['runtime_config']['training_objective'] = 'executed_endpoint_geometry_v1'
@@ -1101,7 +1105,7 @@ def test_v2_checkpoint_records_recipe_and_resumes_warmup_and_entry_parity():
     trainer, batch, coupling = _endpoint_trainer_fixture('ternary_endpoint_v2')
     trainer.train_step(**batch, coupling_override=coupling)
     payload = copy.deepcopy(trainer.checkpoint_payload())
-    assert payload['checkpoint_version'] == 27
+    assert payload['checkpoint_version'] == 28
     payload['checkpoint_version'] = 25  # Historical v2 weights retain their old recipe.
     assert payload['runtime_config']['ema_update_contract'] == 'optimizer_step_warmup_v1'
     assert payload['runtime_config']['near_target_supervision']['weight'] == .25
@@ -1291,6 +1295,59 @@ def test_failed_stochastic_microbatch_restores_rng_and_entry_phase():
     assert trainer.global_step == 0 and trainer.samples_seen == 2
     assert not trainer.optimizer.state
     assert all(parameter.grad is None for parameter in trainer.model.trifuse.parameters())
+
+
+def test_optimizer_manifest_rejects_same_shape_moment_swaps_before_live_mutation():
+    import copy
+    import warnings
+
+    trainer, _, _ = _endpoint_trainer_fixture('ternary_endpoint_v4')
+    trainer.model.trifuse.extra = torch.nn.Parameter(trainer.model.trifuse.motion.detach().clone())
+    trainer.ema['extra'] = trainer.model.trifuse.extra.detach().clone()
+    first, second = trainer.model.trifuse.motion, trainer.model.trifuse.extra
+    trainer._configure_optimizer([{'params': [first, second], 'lr': 1e-4, 'name': 'trifuse'}], 1e-4)
+    with patch.object(trainer, 'compute_loss', return_value={'loss_total': first.sum() + 2 * second.sum()}):
+        trainer.train_step()
+    assert not torch.equal(trainer.optimizer.state[first]['exp_avg'], trainer.optimizer.state[second]['exp_avg'])
+    payload = copy.deepcopy(trainer.checkpoint_payload())
+    assert payload['optimizer_parameter_manifest'] == {0: 'trifuse.motion', 1: 'trifuse.extra'}
+    optimizer = trainer.optimizer
+    before = {name: value.clone() for name, value in trainer.model.trifuse.state_dict().items()}
+    for corruption in ('reverse_ids', 'swap_names', 'missing_manifest', 'missing_contract_and_manifest', 'orphan_state'):
+        broken = copy.deepcopy(payload)
+        broken['trifuse_state_dict'] = {name: value + 1 for name, value in before.items()}
+        if corruption == 'reverse_ids':
+            broken['optimizer_state_dict']['param_groups'][0]['params'].reverse()
+        elif corruption == 'swap_names':
+            broken['optimizer_parameter_manifest'] = {0: 'trifuse.extra', 1: 'trifuse.motion'}
+        elif corruption == 'missing_manifest':
+            broken.pop('optimizer_parameter_manifest')
+        elif corruption == 'missing_contract_and_manifest':
+            broken.pop('optimizer_mapping_contract')
+            broken.pop('optimizer_parameter_manifest')
+        else:
+            broken['optimizer_state_dict']['state'][999] = copy.deepcopy(broken['optimizer_state_dict']['state'][0])
+        with patch('tricoopdiff.train.torch.load', return_value=broken):
+            try:
+                trainer.load_checkpoint('unused.pt')
+            except ValueError as error:
+                assert 'optimizer' in str(error)
+            else:
+                raise AssertionError(f'optimizer silently accepted {corruption}')
+        assert trainer.optimizer is optimizer
+        assert all(torch.equal(value, before[name]) for name, value in trainer.model.trifuse.state_dict().items())
+    # Old v4/27 checkpoints remain readable, without pretending names were known.
+    legacy = copy.deepcopy(payload)
+    legacy['checkpoint_version'] = 27
+    legacy.pop('optimizer_mapping_contract')
+    legacy.pop('optimizer_parameter_manifest')
+    with warnings.catch_warnings(record=True) as caught, \
+            patch('tricoopdiff.train.torch.load', return_value=legacy):
+        warnings.simplefilter('always')
+        trainer.load_checkpoint('unused.pt')
+    assert any('trusts registration order' in str(item.message) for item in caught)
+    assert torch.equal(trainer.optimizer.state[first]['exp_avg'], optimizer.state[first]['exp_avg'])
+    assert torch.equal(trainer.optimizer.state[second]['exp_avg'], optimizer.state[second]['exp_avg'])
 
 
 if __name__ == "__main__":

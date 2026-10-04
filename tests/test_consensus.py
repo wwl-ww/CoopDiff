@@ -1006,6 +1006,29 @@ def test_endpoint_profiles_isolate_torsion_recipe_and_continuous_decoder():
         raise AssertionError('v2 phase weights must not masquerade as v3')
 
 
+def test_bounded_vector_retains_large_finite_directions_and_coordinate_gradients():
+    from tricoopdiff.models.consensus import bounded_vector
+
+    for dtype, magnitude in ((torch.float32, 1e20), (torch.float64, 1e200)):
+        values = torch.tensor([[magnitude, 0., 0.]], dtype=dtype, requires_grad=True)
+        compressed = bounded_vector(values)
+        assert torch.equal(compressed, torch.tensor([[1., 0., 0.]], dtype=dtype)), (
+            'finite expert directions disappeared because their squared norm overflowed')
+        compressed.sum().backward()
+        assert torch.isfinite(values.grad).all() and values.grad[0, 1] > 0
+        assert torch.allclose(values.grad[0, 1] * magnitude, values.new_tensor(1.))
+    ordinary = torch.tensor([[0., 0., 0.], [.4, -.8, 2.]], requires_grad=True)
+    expected = ordinary / (1 + torch.linalg.vector_norm(ordinary, dim=-1, keepdim=True))
+    actual = bounded_vector(ordinary)
+    assert torch.equal(actual, expected), 'ordinary old-checkpoint arithmetic changed'
+    actual.sum().backward()
+    assert torch.isfinite(ordinary.grad).all()
+    values = torch.tensor([[1e20, -2e20, 3e20]])
+    rotation = so3_exp(torch.tensor([[.2, -.5, .7]]))[0]
+    assert torch.allclose(bounded_vector(values @ rotation.T),
+                          bounded_vector(values) @ rotation.T, atol=2e-7, rtol=0.)
+
+
 if __name__ == '__main__':
     torch.set_num_threads(2)
     for name, test in list(globals().items()):

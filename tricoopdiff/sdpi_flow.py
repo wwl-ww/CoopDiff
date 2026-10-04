@@ -271,6 +271,7 @@ class SDPIFlow:
             raise ValueError('finite torsion velocities and ligand graph sizes must agree')
         raw = rigid
         displacement = torch.zeros_like(rigid) if torsion_mode == CONTINUOUS_TORSION_MODE else None
+        gauge_prior = torch.zeros_like(rigid[:, 0]) if displacement is not None else None
         for index, (u, v) in enumerate(bonds):
             axis = raw[:, u] - raw[:, v]
             norm = torch.linalg.vector_norm(axis, dim=-1, keepdim=True)
@@ -280,6 +281,7 @@ class SDPIFlow:
                 initial_axis = rigid[:, u] - rigid[:, v]
                 initial_axis = initial_axis / torch.linalg.vector_norm(initial_axis, dim=-1, keepdim=True)
                 angle = initial_axis * (-dt * torsion[:, index])[:, None]
+                gauge_prior = gauge_prior + .5 * angle
                 displacement = displacement + torch.linalg.cross(
                     angle[:, None].expand_as(rigid), rigid - rigid[:, v:v + 1], dim=-1,
                 ) * masks[index][None, :, None]
@@ -302,11 +304,13 @@ class SDPIFlow:
                 inertia = centered.square().sum((1, 2))[:, None, None] * identity
                 inertia = inertia - centered.transpose(1, 2) @ centered
                 torque = torch.linalg.cross(centered, displacement.double(), dim=-1).sum(1)
-                # Relative zero-spin prior makes the unidentifiable axis of a
-                # truly collinear ligand finite, without a world-space axis.
+                # Symmetric half-side gauge keeps the ridge prior covariant
+                # under bond reversal plus complementary rotation fragments.
+                # A zero-spin prior would leave an orientation-dependent
+                # first-order residual, even though the ideal projection does not.
                 ridge = inertia.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(torch.finfo(torch.float64).tiny) * 1e-6
                 spin = torch.linalg.solve(inertia + ridge[:, None, None] * identity,
-                                          torque[:, :, None]).squeeze(-1)
+                                          (torque + ridge[:, None] * gauge_prior.double())[:, :, None]).squeeze(-1)
                 rotation = rotation_exp(-spin).to(rigid.dtype)
                 rigid = (raw - raw.mean(1, keepdim=True)) @ rotation.transpose(-1, -2) + center
         _check_coords(rigid)

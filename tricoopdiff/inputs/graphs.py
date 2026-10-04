@@ -7,9 +7,20 @@ validation against the pretrained expert's input contract.
 A third full ternary graph connects all three molecules for TriFuse coordination.
 """
 
+import math
+
 import torch
 from torch_geometric.data import HeteroData
 from torch_geometric.utils import subgraph
+
+
+def _validate_component(coords, features, name):
+    """Check graph metadata without synchronizing coordinate values on GPU."""
+    if coords.ndim != 2 or coords.shape[1] != 3 or coords.shape[0] == 0:
+        raise ValueError(f'{name} coordinates must be nonempty [N, 3]')
+    if features is not None and (features.ndim != 2 or features.shape[0] != len(coords)
+                                 or features.shape[1] == 0):
+        raise ValueError(f'{name} features must match its coordinate node count')
 
 
 def build_binary_graph(
@@ -28,6 +39,8 @@ def build_binary_graph(
     Coordinates are [N,3], features [N,D], internal edges [2,E]. Cross edges
     are rebuilt by the frozen expert from the current coordinates.
     """
+    _validate_component(receptor_coords, receptor_features, 'receptor')
+    _validate_component(ligand_coords, ligand_features, 'ligand')
     graph = HeteroData()
 
     graph['receptor'].pos = receptor_coords
@@ -133,6 +146,9 @@ def build_trifuse_graph(
     Returns:
         dict with keys: node_coords, node_features, node_types, batch
     """
+    _validate_component(e3_coords, e3_features, 'E3')
+    _validate_component(poi_coords, poi_features, 'POI')
+    _validate_component(ligand_coords, ligand_features, 'ligand')
     n_e3 = e3_coords.shape[0]
     n_poi = poi_coords.shape[0]
     n_lig = ligand_coords.shape[0]
@@ -225,6 +241,11 @@ def crop_receptor_to_ligand(
         dict with cropped ``coords``, ``features``, ``edge_index`` and the
         boolean ``mask`` over the original receptor residues.
     """
+    _validate_component(receptor_coords, receptor_features, 'receptor')
+    _validate_component(ligand_coords, None, 'ligand')
+    for value in (min_residues, min_residues_with_edges):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError('receptor crop minimum counts must be positive integers')
     if cutoff is None:
         return {
             'coords': receptor_coords,
@@ -234,15 +255,11 @@ def crop_receptor_to_ligand(
         }
 
     if torch.is_tensor(cutoff):
+        if cutoff.numel() != 1 or cutoff.dtype == torch.bool:
+            raise ValueError('receptor crop cutoff must be a finite nonnegative scalar')
         cutoff = float(cutoff.detach().cpu().item())
-
-    if receptor_coords.shape[0] == 0:
-        return {
-            'coords': receptor_coords,
-            'features': receptor_features,
-            'edge_index': rec_edge_index,
-            'mask': torch.zeros(0, dtype=torch.bool, device=receptor_coords.device),
-        }
+    if isinstance(cutoff, bool) or not math.isfinite(cutoff) or cutoff < 0:
+        raise ValueError('receptor crop cutoff must be a finite nonnegative scalar')
 
     dist2 = torch.sum(
         (receptor_coords.unsqueeze(1) - ligand_coords.unsqueeze(0)) ** 2,

@@ -146,6 +146,17 @@ def compute_fullatom_dockq(
     # TriCoopDiff predicts POI as a rigid body at Cα level. Apply that fitted
     # rigid transform to every protein2 atom before invoking full-atom DockQ.
     poi_r, poi_t = _fit_rigid(p2_ca, pred_poi_ca_pdb)
+    for role, source, target, rotation, translation in (
+            ('E3', np.asarray(featurized_e3_ca), p1_ca, frame_r, frame_t),
+            ('POI', p2_ca, pred_poi_ca_pdb, poi_r, poi_t)):
+        # A least-squares fit is not proof of rigid representability. Silently
+        # projecting a distorted prediction would score a different structure.
+        # Allow PDB rounding and accumulated float32 integration error only.
+        tolerance = 1e-3 + 64 * np.finfo(np.float32).eps * max(
+            float(np.abs(source).max()), float(np.abs(target).max()))
+        error = np.linalg.norm(source @ rotation + translation - target, axis=-1).max()
+        if not np.isfinite(error) or error > tolerance:
+            raise ValueError(f'{role} CA coordinates are not a rigid image of the input template')
     pred_p2_atoms = p2_atoms @ poi_r + poi_t
     if (metric_protein1_pdb is None) != (metric_protein2_pdb is None):
         raise ValueError('provide both metric protein templates or neither')
@@ -167,14 +178,30 @@ def compute_fullatom_dockq(
         pred_path = Path(temp_dir) / "predicted_complex.pdb"
         native_path = Path(temp_dir) / "native_proteins.pdb"
         # DockQ scores only the protein--protein interface, not the ligand.
-        records = [
-            *(line for line in p1_lines if line.startswith("ATOM")),
-            *(line for line in p2_pred_lines if line.startswith("ATOM")),
-        ]
         native_records = [line for line in Path(native_complex_pdb).read_text().splitlines()
                           if line.startswith('ATOM')]
         if not native_records:
             raise ValueError('native DockQ structure has no protein atoms')
+        native_chains = {line[21] for line in native_records}
+        first_chains = {line[21] for line in p1_lines if line.startswith('ATOM')}
+        second_chains = {line[21] for line in p2_pred_lines if line.startswith('ATOM')}
+        if len(native_chains) != 2:
+            raise ValueError('native DockQ structure must contain exactly two protein chains')
+        if len(first_chains) != 1 or len(second_chains) != 1:
+            raise ValueError('DockQ protein templates must each contain exactly one chain')
+        if (first_chains.isdisjoint(second_chains)
+                and first_chains | second_chains == native_chains):
+            # Explicit matching chain identities take precedence, including
+            # callers that legitimately exchange the two protein roles.
+            first_chain, second_chain = next(iter(first_chains)), next(iter(second_chains))
+        elif native_chains == {'A', 'B'}:
+            # The normalized DeepTernary protocol identifies protein1/E3 as A
+            # and protein2/POI as B, regardless of standalone input chain names.
+            first_chain, second_chain = 'A', 'B'
+        else:
+            raise ValueError('cannot identify DockQ protein roles from native chain names')
+        records = [*(f'{line[:21]}{first_chain}{line[22:]}' for line in p1_lines if line.startswith('ATOM')),
+                   *(f'{line[:21]}{second_chain}{line[22:]}' for line in p2_pred_lines if line.startswith('ATOM'))]
         records, native_records = _dockq_protein_records(records, native_records)
         pred_path.write_text("\n".join(records) + "\n")
         native_path.write_text('\n'.join(native_records) + '\n')

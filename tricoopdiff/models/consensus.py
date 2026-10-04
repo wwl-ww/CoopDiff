@@ -779,8 +779,17 @@ BRANCHES = ('e3_ligand', 'poi_ligand')
 
 
 def bounded_vector(value):
-    """Isotropic vector compression, preserving rotation equivariance."""
-    return value / (1 + torch.linalg.vector_norm(value, dim=-1, keepdim=True))
+    """Isotropic compression, retaining direction when the raw norm overflows."""
+    norm = torch.linalg.vector_norm(value, dim=-1, keepdim=True)
+    finite = torch.isfinite(norm)
+    ordinary = value / (1 + torch.where(finite, norm, torch.zeros_like(norm)))
+    scale = value.abs().amax(dim=-1, keepdim=True).clamp_min(1.)
+    scaled = value / scale
+    stable = scaled / (scale.reciprocal()
+                       + torch.linalg.vector_norm(scaled, dim=-1, keepdim=True))
+    # Ordinary inputs retain the historical float arithmetic exactly. Scaling
+    # is only needed when squaring finite components overflowed the raw norm.
+    return torch.where(finite, ordinary, stable)
 
 
 class TokenNegotiator(nn.Module):
@@ -1009,7 +1018,7 @@ class LegacyResidualMotion:
 
 ARCHITECTURE = 'residual_consensus_v2'
 DIRECT_ARCHITECTURE = 'ternary_geometry_independent_v1'
-CONSENSUS_CHECKPOINT_VERSION = 27
+CONSENSUS_CHECKPOINT_VERSION = 28
 INTERFACE_OBJECTIVE_CHECKPOINT_VERSION = 22
 OBJECTIVE_CONTRACT_CHECKPOINT_VERSION = 21
 ENDPOINT_PROTOCOL_CHECKPOINT_VERSION = 20

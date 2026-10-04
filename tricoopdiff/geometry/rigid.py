@@ -7,14 +7,31 @@ import torch
 
 def rotation_exp(vector):
     """SO(3) exponential with finite small-angle gradients and preserved dtype."""
-    if vector.shape[-1] != 3:
-        raise ValueError('rotation vectors must end in three coordinates')
-    matrix = vector.new_zeros((*vector.shape[:-1], 3, 3))
-    x, y, z = vector.unbind(-1)
+    if vector.shape[-1] != 3 or not vector.is_floating_point():
+        raise ValueError('rotation vectors must be floating point and end in three coordinates')
+    working = vector.double()
+    maximum = working.abs().amax(-1, keepdim=True)
+    norm_limit = (torch.finfo(torch.float64).max / 3.) ** .5
+    scale = torch.where(maximum > norm_limit, maximum, torch.ones_like(maximum))
+    angle = torch.linalg.vector_norm(working / scale, dim=-1, keepdim=True) * scale
+    # Every finite low-precision vector has a representable float64 norm;
+    # flow validates its velocities already, so avoid another GPU host sync.
+    if vector.dtype == torch.float64 and not torch.isfinite(angle).all():
+        raise ValueError('rotation-vector norm must be finite and representable in float64')
+    half = angle * .5
+    # Quaternion Rodrigues form avoids the scaling-and-squaring drift of
+    # matrix_exp for large finite angles. Use sinc only in its small-angle
+    # chart, and coherent half-angle sin/cos elsewhere to preserve SO(3).
+    xyz = torch.where(angle < 1e-4, working * (.5 * torch.sinc(half / torch.pi)),
+                      working / angle.clamp_min(1e-8) * half.sin())
+    matrix = working.new_zeros((*vector.shape[:-1], 3, 3))
+    x, y, z = xyz.unbind(-1)
     matrix[..., 0, 1], matrix[..., 0, 2] = -z, y
     matrix[..., 1, 0], matrix[..., 1, 2] = z, -x
     matrix[..., 2, 0], matrix[..., 2, 1] = -y, x
-    return torch.linalg.matrix_exp(matrix)
+    identity = torch.eye(3, device=vector.device, dtype=working.dtype)
+    rotation = identity + 2. * half.cos()[..., None] * matrix + 2. * (matrix @ matrix)
+    return rotation.to(vector.dtype)
 
 
 def is_proper_rotation(rotation, atol=1e-4):

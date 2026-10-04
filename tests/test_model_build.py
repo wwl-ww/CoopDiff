@@ -474,11 +474,22 @@ def test_frozen_expert_stays_eval():
         def __init__(self):
             super().__init__()
             self.dropout = nn.Dropout(0.5)
+            self.batchnorm = nn.BatchNorm1d(4)
             self.ns, self.nv = 4, 1
             self.sh_irreps = None
             self.device = "cpu"
 
+        def forward(self, features):
+            return self.dropout(self.batchnorm(features))
+
     frozen = FrozenDiffDock(DummyExpert(), num_conv_layers=1)
+    assert not frozen.training and not frozen.model.training, 'freezing must disable dropout/BN immediately'
+    features = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    running_mean = frozen.model.batchnorm.running_mean.clone()
+    first, second = frozen(features), frozen(features)
+    assert torch.equal(first, second), 'a frozen expert cannot produce training-mode dropout samples'
+    assert torch.equal(frozen.model.batchnorm.running_mean, running_mean)
+    assert frozen.model.batchnorm.num_batches_tracked == 0
     parent = nn.Module()
     parent.add_module("expert", frozen)
     parent.train()
@@ -534,15 +545,43 @@ def test_frozen_expert_features_preserve_scores_gradients_and_hook_cleanup():
         tr, rot, tor, scalars = expert.forward_features(coords)
         assert all(torch.equal(actual, expected)
                    for actual, expected in zip((tr, rot, tor), ordinary[:3]))
-        expected = expert.model.conv_layers[0](coords)[:, [0, 1, 5]].clamp(-.75, .75)
+        expected = torch.cat((ordinary[0][:, :2], ordinary[2][:, None]), dim=-1)
         assert torch.equal(scalars, expected), '0e/0o extraction must follow irrep sections'
         assert scalars.shape == (2, expert.node_scalar_dim)
+        native_gradient = torch.autograd.grad(expected.sum(), coords)[0]
         scalars.sum().backward()
+        assert torch.equal(coords.grad, native_gradient), 'features must preserve native post-clamp Jacobians'
         assert torch.isfinite(coords.grad).all() and coords.grad.abs().sum() > 0
         assert all(parameter.grad is None and not parameter.requires_grad
                    for parameter in expert.parameters())
         assert not expert.model.conv_layers[0]._forward_hooks
         assert set(expert.state_dict()) == original_keys
+    # At the production threshold, replacing scalar norm clipping with clamp
+    # differs by an ULP. Features must be the actual native post-clamp scalars.
+    configure_expert_policy(expert, 10000., 'irrep_norm')
+    coords = torch.linspace(10000. * 1.01, 10000. * 20., 1000).reshape(-1, 1).expand(-1, 3).clone()
+    ordinary = expert(coords)
+    expected = torch.cat((ordinary[0][:, :2], ordinary[2][:, None]), dim=-1)
+    assert torch.equal(expert.forward_features(coords)[3], expected)
+    assert not torch.equal(expected, expected.clamp(-10000., 10000.)), \
+        'fixture must expose native scalar norm-clamp rounding, not only approximate equality'
+    bad_coords = torch.tensor([[float('inf'), float('nan'), 1.]])
+    ordinary = expert(bad_coords)
+    expected = torch.cat((ordinary[0][:, :2], ordinary[2][:, None]), dim=-1)
+    assert torch.equal(torch.isnan(expert.forward_features(bad_coords)[3]), torch.isnan(expected)), \
+        'feature clipping must not conceal native invalid scalar activations'
+
+    # Non-reentrant checkpoint calls the native read again during backward.
+    # Hooks must remain local to each read and preserve the coordinate Jacobian.
+    from torch.utils.checkpoint import checkpoint
+    configure_expert_policy(expert, .75, 'irrep_norm')
+    coords = torch.tensor([[.1, .2, .3], [.2, .1, .2]], requires_grad=True)
+    direct = expert.forward_features(coords)[3]
+    direct_grad = torch.autograd.grad(direct.square().sum(), coords)[0]
+    recomputed = checkpoint(lambda value: expert.forward_features(value)[3], coords, use_reentrant=False)
+    recomputed_grad = torch.autograd.grad(recomputed.square().sum(), coords)[0]
+    assert torch.equal(recomputed, direct) and torch.equal(recomputed_grad, direct_grad)
+    assert not expert.model.conv_layers[0]._forward_hooks
     expert.model.fail = True
     try:
         expert.forward_features(coords)
@@ -571,6 +610,26 @@ def test_failed_expert_policy_configuration_preserves_the_live_policy():
             raise AssertionError('invalid numerical policies must fail')
         assert expert.model.activation_clamp == 10000.
         assert expert.model.activation_clamp_mode == 'irrep_norm'
+
+
+def test_expert_loader_cannot_mislabel_the_frozen_layer_count():
+    import tempfile
+    from unittest.mock import patch
+    from tricoopdiff.models.expert import build_diffdock_expert
+
+    source = Path(__file__).resolve().parents[1] / 'checkpoints/score_model/model_parameters.yml'
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / 'model_parameters.yml').write_text(source.read_text())
+        with patch('tricoopdiff.diffdock.factory.build_cg_model') as build:
+            for invalid in (6, 0, True, 11.0):
+                try:
+                    build_diffdock_expert(root, device='cpu', num_conv_layers=invalid)
+                except ValueError as error:
+                    assert 'frozen checkpoint architecture' in str(error)
+                else:
+                    raise AssertionError('wrapper layers must not disagree with the checkpoint')
+            assert not build.called, 'invalid overrides must fail before constructing/loading a model'
 
 
 def test_score_guard_handles_infinity():
@@ -660,6 +719,7 @@ if __name__ == "__main__":
     test_frozen_expert_stays_eval()
     test_frozen_expert_features_preserve_scores_gradients_and_hook_cleanup()
     test_failed_expert_policy_configuration_preserves_the_live_policy()
+    test_expert_loader_cannot_mislabel_the_frozen_layer_count()
     test_score_guard_handles_infinity()
     test_reflect_pipeline()
     test_deepternary_dockq_alignment()
