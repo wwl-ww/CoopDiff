@@ -369,9 +369,10 @@ class CGModel(torch.nn.Module):
             # |node_attr| < ~3e2, so a 1e4 clamp is transparent to normal inference
             # while preventing the exponential (10^2-10^4 per layer) runaway that
             # overflows float32 and produces NaN scores. Opt-in via NAN_CLAMP env.
-            _nan_clamp = os.environ.get("NAN_CLAMP")
+            _nan_clamp = getattr(self, 'activation_clamp', os.environ.get("NAN_CLAMP"))
             if _nan_clamp:
-                mode = validate_clamp_mode(os.environ.get('NAN_CLAMP_MODE', 'componentwise'))
+                mode = validate_clamp_mode(getattr(self, 'activation_clamp_mode',
+                                                  os.environ.get('NAN_CLAMP_MODE', 'componentwise')))
                 if mode == 'irrep_norm':
                     node_attr = clamp_irrep_features(
                         node_attr, self.conv_layers[l].out_irreps, float(_nan_clamp))

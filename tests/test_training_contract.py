@@ -96,12 +96,14 @@ def test_trainer_owns_recorded_activation_clamp_runtime():
             super().__init__()
             self.trifuse = torch.nn.Linear(2, 2)
             self.expert = torch.nn.Module()
+            self.expert.model = SimpleNamespace()
 
     with patch.dict('os.environ', {}, clear=True):
         trainer = TriCoopDiffTrainer(
             DummyModel(), SDPIFlow(), device='cpu', activation_clamp=37)
         assert trainer.activation_clamp == 37
-        assert os.environ['NAN_CLAMP'] == '37.0'
+        assert trainer.model.expert.model.activation_clamp == 37.
+        assert 'NAN_CLAMP' not in os.environ
 
 
 def test_consensus_builder_passes_only_active_model_dimensions():
@@ -230,6 +232,32 @@ def test_endpoint_training_and_sampling_execute_identical_full_trajectory():
     assert np.allclose(sampled['poi_coords'], trained['predicted_poi'][0].detach().numpy(), atol=1e-10)
 
 
+def test_rank_features_are_read_from_actual_final_pose_and_zero_clock():
+    from tricoopdiff.sampler import sample_single
+
+    trainer, batch, coupling = _endpoint_trainer_fixture()
+    trainer.diffusion.inference_steps = 1
+    state = trainer.diffusion.path(batch['ligand_data'], batch['poi_data']['coords'], coupling,
+                                  batch['ligand_data']['coords'].new_ones(1))[:3]
+    forward = trainer.model.forward
+
+    def read(ed, pd, ld, **kwargs):
+        out = forward(ed, pd, ld, **kwargs)
+        out['rank_features'] = ld['coords'].mean(1)
+        out['consensus_diagnostics'] = {'rigid_output_mode': 'independent_centroids_v1'}
+        return out
+
+    trainer.model.forward = read
+    initializer = SimpleNamespace(no_torsion=False,
+        initialize=lambda *args, **kwargs: (*[value.clone() for value in state], {}))
+    sampled = sample_single(trainer.model, trainer.diffusion, initializer, **batch,
+                            device='cpu', return_rank_features=True, return_trace=True)
+    assert np.allclose(sampled['rank_features'], sampled['ligand_coords'].mean(0))
+    assert trainer.model.calls[-1][0] == 0.
+    assert sampled['rank_feature_state'] == 'final_pose_t0_dt0_v1'
+    assert sampled['trace'][-1]['consensus']['rigid_output_mode'] == 'independent_centroids_v1'
+
+
 def test_endpoint_objective_cannot_silently_use_a_random_teacher_clock():
     trainer, batch, coupling = _endpoint_trainer_fixture()
     try:
@@ -277,6 +305,50 @@ def test_endpoint_checkpoint_roundtrip_and_objective_mismatch_guard():
             assert 'objective differs' in str(error)
         else:
             raise AssertionError('resume must not silently exchange endpoint and velocity supervision')
+
+
+def test_real_endpoint_uses_raw_geometry_and_an_attainable_target():
+    from tricoopdiff.train import REAL_ENDPOINT_OBJECTIVE
+    from tricoopdiff.initialization.endpoints import reachable_ligand_target
+
+    trainer, batch, _ = _endpoint_trainer_fixture()
+    trainer.training_objective = REAL_ENDPOINT_OBJECTIVE
+    trainer.model.expert.model.no_torsion = True
+    with torch.no_grad():
+        for parameter in trainer.model.trifuse.parameters():
+            parameter.zero_()
+    native = batch['ligand_data']['coords']
+    initial = (native - native.mean(1, keepdim=True)) * 1.2 + native.mean(1, keepdim=True)
+    target, report = reachable_ligand_target(
+        batch['ligand_data'], initial, batch['poi_data']['coords'],
+        batch['poi_data']['coords'], no_torsion=True)
+    override = {'initial_state': {'ligand': initial[0], 'poi': batch['poi_data']['coords'][0],
+                                  'body_frame': torch.eye(3, dtype=native.dtype)},
+                'target_ligand': target}
+    result = trainer.compute_loss(**batch, coupling_override=override, diagnostics=True)
+    assert torch.allclose(result['predicted_ligand'], initial, atol=1e-10)
+    assert torch.allclose(result['target_ligand'], initial, atol=1e-8)
+    assert result['components']['loss_ligand_geometry'] < 1e-16
+    assert (result['predicted_ligand'] - native).square().mean() > 1e-3
+    assert not report['endpoint_exactly_represented']
+    try:
+        trainer.compute_loss(**batch, coupling_override={'angles': np.zeros(1)})
+    except ValueError as error:
+        assert 'crystal-projected' in str(error)
+    else:
+        raise AssertionError('real endpoint trainer accepted a legacy projected starting state')
+
+
+def test_checkpoint_resume_restores_next_random_coupling_streams():
+    import random
+    trainer, _, _ = _endpoint_trainer_fixture()
+    payload = trainer.checkpoint_payload()
+    expected = (random.random(), np.random.random(), torch.rand(4))
+    restored, _, _ = _endpoint_trainer_fixture()
+    with patch('tricoopdiff.train.torch.load', return_value=payload):
+        restored.load_checkpoint('unused.pt')
+    actual = (random.random(), np.random.random(), torch.rand(4))
+    assert actual[:2] == expected[:2] and torch.equal(actual[2], expected[2])
 
 
 def test_resume_rejects_incomplete_ema_before_mutating_parameters():
@@ -495,6 +567,8 @@ def test_training_entry_keeps_dockq_best_separate_from_loss_best():
     trainer = Trainer()
     validation = [{'selection_loss': .1, 'selection_dockq': .7, 'by_source': {'sdpi': .1}},
                   {'selection_loss': .05, 'selection_dockq': .6, 'by_source': {'sdpi': .05}}]
+    for row in validation:
+        row['dockq_protocol'] = 'test_fullatom'
     with tempfile.TemporaryDirectory(prefix='tricoopdiff-training-test-') as output:
         args = parse_args(['--train_data', 'unused', '--val_data', 'unused',
                            '--output_dir', output, '--device', 'cpu', '--epochs', '2', '--batch_size', '2'])
@@ -538,7 +612,7 @@ def test_c_builder_records_online_single_pair_endpoint_protocol():
             patch('tricoopdiff.train.ConsensusTrainer') as trainer:
         build_trainer(args, 'cpu', input_dim=1281)
         assert trainer.call_args.kwargs['training_endpoint_protocol'] == (
-            'online_bitseed_training_c1_m1_v1'
+            'online_bitseed_raw_resampled_v2'
         )
 
 

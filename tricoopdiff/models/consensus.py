@@ -817,7 +817,7 @@ class LegacyResidualMotion:
 
 ARCHITECTURE = 'residual_consensus_v2'
 DIRECT_ARCHITECTURE = 'ternary_geometry_independent_v1'
-CONSENSUS_CHECKPOINT_VERSION = 23
+CONSENSUS_CHECKPOINT_VERSION = 24
 INTERFACE_OBJECTIVE_CHECKPOINT_VERSION = 22
 OBJECTIVE_CONTRACT_CHECKPOINT_VERSION = 21
 ENDPOINT_PROTOCOL_CHECKPOINT_VERSION = 20
@@ -932,7 +932,7 @@ class ConsensusFuse(LegacyResidualMotion, nn.Module):
             # shared B/C parameters; otherwise the factorial comparison starts
             # from different common weights.
             with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(0)
+                torch.random.default_generator.manual_seed(0)
                 self.source_embedding = nn.Embedding(len(SOURCE_NAMES), node_dim)
                 if not self.direct_ternary_motion:
                     self.source_gate_head = nn.Linear(node_dim, 4, bias=False)
@@ -1012,7 +1012,12 @@ class ConsensusFuse(LegacyResidualMotion, nn.Module):
             graph['lig_edge_mask'], graph['lig_mask_rotate'], context)
         tor_a, tor_b = (proposals[b]['tor'] for b in BRANCHES)
         opinions = torch.stack((tor_a.tanh(), tor_b.tanh()), -1)
-        predictions['torsion'] = self.direct_torsion_head(torch.cat((bonds, opinions), -1)).squeeze(-1)
+        if tor_a.shape == (1, 0) and tor_b.shape == (1, 0):
+            predictions['torsion'] = tor_a
+        else:
+            if bonds.shape[:2] != opinions.shape[:2]:
+                raise ValueError('expert torsion opinions must match canonical rotatable bonds')
+            predictions['torsion'] = self.direct_torsion_head(torch.cat((bonds, opinions), -1)).squeeze(-1)
         return {'normalized_velocity': predictions, 'rank_features': context,
                 'residual_penalty': context.new_zeros(()),
                 'consensus_diagnostics': {

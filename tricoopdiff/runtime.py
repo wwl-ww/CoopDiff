@@ -3,10 +3,44 @@
 import hashlib
 import json
 import os
+import random
+from functools import wraps
 from pathlib import Path
 import tempfile
 
 import torch
+import numpy as np
+
+
+def capture_rng_state():
+    """Capture every active RNG without initializing CUDA for CPU callers."""
+    return {'python': random.getstate(), 'numpy': np.random.get_state(),
+            'torch_cpu': torch.get_rng_state().clone(),
+            'torch_cuda': ([state.clone() for state in torch.cuda.get_rng_state_all()]
+                           if torch.cuda.is_initialized() else [])}
+
+
+def restore_rng_state(state):
+    """Restore checkpoint streams; reject a different visible CUDA topology."""
+    if state['torch_cuda'] and len(state['torch_cuda']) != torch.cuda.device_count():
+        raise ValueError('checkpoint CUDA RNG topology differs from this runtime')
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.set_rng_state(state['torch_cpu'].cpu())
+    if state['torch_cuda']:
+        torch.cuda.set_rng_state_all([value.cpu() for value in state['torch_cuda']])
+
+
+def preserve_rng(function):
+    """Keep diagnostic sampling from changing the caller's random streams."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        state = capture_rng_state()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            restore_rng_state(state)
+    return wrapped
 
 
 def sha256_file(path, chunk_size=1024 * 1024):

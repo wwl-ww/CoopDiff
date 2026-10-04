@@ -32,6 +32,14 @@ TriCoopDiff 研究蛋白–配体–蛋白三元装配：两个冻结 DiffDock �
 
 历史 FiLM 和诊断实验保留用于复核已有结果，不由生产模型导入。评估的主指标仍是蛋白–蛋白完整原子 DockQ。集合多样性已统一为固定 E3 坐标系下的 RMSD，报告以 `fixed_e3_v1` 标记，不能与旧的对齐后多样性直接比较。
 
+新生产训练使用 v24 的 `real_initialization_reachable_endpoint_v2`：从推理同款 ETKDG-SDPI 或原始 BiTSeed 起点执行完整轨迹，不再把训练输入投影回晶体内部几何。配体监督目标投影到该起点的刚体＋torsion 可达空间；蛋白和蛋白界面仍监督真实终点。目标投影是可达坐标替代指标，不等价于恢复精确晶体键长；投影未收敛时明确报错。
+
+BiTSeed 生产训练按样本 occurrence 重采，验证固定 occurrence 0；缓存按 occurrence 分文件保存，RAM 每个 case 仅保留最新记录。缓存包含专家配置和实例数值策略，新协议不可复用旧缓存。重采会增加二元专家计算与磁盘占用，不再享有每 case 只生成一次的旧成本。
+
+专家 clamp 属于实例，不受其他 trainer/runner 覆盖；专家 sigma 配置必须匹配生产 DiffDock-L 预条件器。v24 checkpoint 保存 Python、NumPy、Torch CPU/CUDA RNG 和专家运行身份；恢复要求相同 CUDA 拓扑。旧 checkpoint 可显式恢复旧训练目标，但没有 RNG 时不能声称连续轨迹精确恢复。切换到新监督必须作为新训练加载权重，不能伪装成原训练 resume。
+
+采样保留调用者 RNG。请求 rank features 时会额外读取最终构象，使用 `t=0, dt=0`，标记为 `final_pose_t0_dt0_v1`；不能与旧的最后一步更新前特征混用。
+
 ## 环境与检查
 
 从仓库根目录运行；代码未作为 Python 包安装。仓库有 [environment.yml](environment.yml)，但它是环境导出，不保证不同 CUDA/驱动机器可直接复建。

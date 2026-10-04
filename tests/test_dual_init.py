@@ -91,6 +91,8 @@ def test_lazy_training_protocol_is_exactly_one_pose_per_expert():
             'binary_retry_limit': 1, 'selection': 'single_pair_no_ranking',
             'fallback': 'sdpi_v1_on_any_invalid_expert_side',
             'base_seed': 41000,
+            'expert_runtime': store.protocol['expert_runtime'],
+            'generation_version': 'raw_target_projection_v2',
             'frozen_expert': {
                 'diffdock_commit': 'test', 'score_checkpoint_sha256': 'abc',
                 'no_torsion': False,
@@ -115,6 +117,54 @@ def _lazy_store(directory):
         'diffdock_commit': 'test', 'score_checkpoint_sha256': 'abc', 'no_torsion': False,
     }})()
     return LazyTrainingEndpointStore(directory, expert)
+
+
+def test_resampled_endpoints_use_occurrence_and_keep_validation_fixed():
+    from unittest.mock import patch
+    from tricoopdiff.initialization.endpoints import RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
+
+    with tempfile.TemporaryDirectory() as directory:
+        expert = _lazy_store(directory).expert
+        store = LazyTrainingEndpointStore(directory, expert, resample=True)
+        assert store.protocol['version'] == RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
+
+        def generate(case, batch, signature, occurrence):
+            record = deepcopy(payload()['entries'][0])
+            record['endpoint']['ligand'] += occurrence
+            record['target_ligand'] = np.zeros((4, 3))
+            return record
+
+        with patch.object(store, '_generate', side_effect=generate) as generation:
+            a, _ = store.coupling('demo', occurrence=0, batch=_input_batch())
+            repeated, _ = store.coupling('demo', occurrence=0, batch=_input_batch())
+            b, _ = store.coupling('demo', occurrence=1, batch=_input_batch())
+            validation, _ = store.coupling('demo', occurrence=0, batch=_input_batch())
+        assert generation.call_count == 3
+        assert np.array_equal(a['initial_state']['ligand'], repeated['initial_state']['ligand'])
+        assert not np.array_equal(a['initial_state']['ligand'], b['initial_state']['ligand'])
+        assert np.array_equal(a['initial_state']['ligand'], validation['initial_state']['ligand'])
+        assert store._path('demo', 0) != store._path('demo', 1)
+        assert len(store._records) == 1, 'resampling must not accumulate every occurrence in RAM'
+
+
+def test_cache_contract_includes_and_rechecks_actual_expert_policy():
+    from types import SimpleNamespace
+    from tricoopdiff.models.expert import configure_expert_policy
+
+    with tempfile.TemporaryDirectory() as directory:
+        expert = _lazy_store(directory).expert
+        expert.model = SimpleNamespace()
+        configure_expert_policy(expert, 100., 'irrep_norm')
+        a = LazyTrainingEndpointStore(directory, expert)
+        configure_expert_policy(expert, 1., 'componentwise')
+        b = LazyTrainingEndpointStore(directory, expert)
+        assert a.protocol != b.protocol
+        try:
+            a.coupling('demo', batch=_input_batch())
+        except ValueError as error:
+            assert 'runtime changed' in str(error)
+        else:
+            raise AssertionError('a cache must not outlive a change in expert policy')
 
 
 def test_endpoint_signature_tracks_geometry_chemistry_and_atom_order():

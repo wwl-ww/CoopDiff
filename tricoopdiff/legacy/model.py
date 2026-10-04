@@ -568,7 +568,7 @@ def _film_and_record_stream(stream, gamma, beta):
     model = stream['model']
     n_lig = stream['n_lig']
     clamp_fraction = node_attr.new_zeros(())
-    nan_clamp = os.environ.get('NAN_CLAMP')
+    nan_clamp = getattr(model, 'activation_clamp', os.environ.get('NAN_CLAMP'))
     if nan_clamp:
         threshold = float(nan_clamp)
         clamp_fraction = (
@@ -887,7 +887,7 @@ def _expert_forward_with_film(
         # CGModel.forward() path. The production entry point enables NAN_CLAMP
         # after every convolution; omitting it here meant zero-FiLM native and
         # inline forwards diverged only on the high-magnitude POI branch.
-        nan_clamp = os.environ.get("NAN_CLAMP")
+        nan_clamp = getattr(expert.model, 'activation_clamp', os.environ.get("NAN_CLAMP"))
         pre_clamp_fraction = node_attr.new_zeros(())
         if nan_clamp:
             threshold = float(nan_clamp)

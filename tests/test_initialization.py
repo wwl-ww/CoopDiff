@@ -39,6 +39,22 @@ def ligand_input(smiles="CCCOCC"):
     }
 
 
+def test_initializer_preserves_all_caller_random_streams():
+    import random
+    from tricoopdiff.runtime import capture_rng_state, restore_rng_state
+
+    data = ligand_input()
+    e3, poi = torch.randn(8, 3), torch.randn(9, 3)
+    state = capture_rng_state()
+    expected = (random.random(), np.random.random(), torch.rand(3))
+    restore_rng_state(state)
+    first = TernaryInitializer().initialize(e3, poi, data, seed=73)
+    second = TernaryInitializer().initialize(e3, poi, data, seed=73)
+    actual = (random.random(), np.random.random(), torch.rand(3))
+    assert expected[:2] == actual[:2] and torch.equal(expected[2], actual[2])
+    assert all(torch.equal(a, b) for a, b in zip(first[:3], second[:3]))
+
+
 def test_exact_inverse_and_pair_distances():
     torch.manual_seed(7)
     for seed in range(8):

@@ -11,6 +11,41 @@ import torch
 from tricoopdiff.runtime import configure_inference_reproducibility
 
 
+def test_rng_restore_replays_python_numpy_and_torch():
+    import random
+    import numpy as np
+    from tricoopdiff.runtime import capture_rng_state, restore_rng_state
+
+    state = capture_rng_state()
+    first = (random.random(), np.random.rand(4), torch.rand(5))
+    restore_rng_state(state)
+    second = (random.random(), np.random.rand(4), torch.rand(5))
+    assert first[0] == second[0]
+    assert np.array_equal(first[1], second[1]) and torch.equal(first[2], second[2])
+
+
+def test_expert_policies_are_instance_local_and_sigma_configs_are_checked():
+    from types import SimpleNamespace
+    from tricoopdiff.models.expert import configure_expert_policy, validate_expert_sigma_args
+
+    a, b = SimpleNamespace(model=SimpleNamespace()), SimpleNamespace(model=SimpleNamespace())
+    with patch.dict(os.environ, {'NAN_CLAMP': '777', 'NAN_CLAMP_MODE': 'componentwise'}):
+        configure_expert_policy(a, 100., 'irrep_norm')
+        configure_expert_policy(b, 1., 'componentwise')
+        assert a.model.activation_clamp == 100. and a.model.activation_clamp_mode == 'irrep_norm'
+        assert b.model.activation_clamp == 1. and os.environ['NAN_CLAMP'] == '777'
+    args = SimpleNamespace(tr_sigma_min=.1, tr_sigma_max=19., rot_sigma_min=.03,
+                           rot_sigma_max=1.55, tor_sigma_min=.0314, tor_sigma_max=3.14)
+    validate_expert_sigma_args(args)
+    args.tr_sigma_max = 99.
+    try:
+        validate_expert_sigma_args(args)
+    except ValueError as error:
+        assert 'tr_sigma_max' in str(error)
+    else:
+        raise AssertionError('mismatched expert sigma was accepted')
+
+
 def test_atomic_checkpoint_failure_preserves_existing_artifact(tmp_path):
     from tricoopdiff.runtime import atomic_torch_save
 

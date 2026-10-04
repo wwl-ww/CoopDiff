@@ -21,6 +21,7 @@ import torch
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.sdpi_flow import SDPIFlow, FLOW_VERSION
 from tricoopdiff.models.consensus import SOURCE_NAMES
+from tricoopdiff.runtime import preserve_rng
 
 
 def actual_candidate_source(init_mode, initialization):
@@ -68,6 +69,7 @@ def _sanitize_score(score):
 
 
 @torch.no_grad()
+@preserve_rng
 def sample_single(
     model,
     diffusion: SDPIFlow,
@@ -123,9 +125,6 @@ def sample_single(
         'trace' (per-step diagnostic dicts) when requested.
     """
     model.eval()
-    if seed is not None:
-        torch.manual_seed(seed)
-        np.random.seed(seed)
 
     if steps is None:
         steps = diffusion.inference_steps
@@ -181,7 +180,6 @@ def sample_single(
     trajectory = [] if return_trajectory else None
     trace = [] if return_trace else None
     nonfinite_score_steps = []
-    final_rank_features = None
 
     init_ligand_com = ligand_pos.mean(dim=1)[0]
     init_poi_com = poi_pos.mean(dim=1)[0]
@@ -219,11 +217,6 @@ def sample_single(
         out = diffusion.forward_state(
             model, e3_data, poi_data, ligand_data, ligand_pos, poi_pos,
             r_e3_to_poi, t_tr, dt_tr, source_index, conditions)
-        if return_rank_features:
-            features = out.get('rank_features')
-            if features is None or features.ndim != 2 or features.shape[0] != 1:
-                raise ValueError('model did not return rank_features [1,D]')
-            final_rank_features = features[0].detach().cpu().numpy().copy()
         if return_trace:
             step0_probe = getattr(model, '_last_step0_probe', None)
             setattr(model, '_debug_step0_probe', False)
@@ -337,7 +330,7 @@ def sample_single(
                 },
                 "step0_probe": step0_probe,
                 "consensus": {
-                    key: value.detach().cpu().tolist()
+                    key: (value.detach().cpu().tolist() if torch.is_tensor(value) else value)
                     for key, value in out.get('consensus_diagnostics', {}).items()
                 },
             }
@@ -365,9 +358,19 @@ def sample_single(
     if return_trace:
         result["trace"] = trace
     if return_rank_features:
-        if final_rank_features is None:
-            raise RuntimeError('no rank features were produced')
+        if nonfinite_score_steps:
+            raise FloatingPointError('rejected trajectories cannot provide final rank features')
+        final = diffusion.forward_state(
+            model, e3_data, poi_data, ligand_data, ligand_pos, poi_pos,
+            r_e3_to_poi, ligand_pos.new_zeros(1), ligand_pos.new_zeros(1),
+            source_index, conditions)
+        features = final.get('rank_features')
+        if (features is None or features.ndim != 2 or features.shape[0] != 1
+                or not torch.isfinite(features).all()):
+            raise ValueError('model did not return finite final rank_features [1,D]')
+        final_rank_features = features[0].detach().cpu().numpy().copy()
         result['rank_features'] = final_rank_features
+        result['rank_feature_state'] = 'final_pose_t0_dt0_v1'
     return result
 
 

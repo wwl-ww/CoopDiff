@@ -158,6 +158,7 @@ def main():
                 "dockq_source_sha256": sha256_file(runner.deepternary_root / 'DockQ/dockq_util.py'),
                 "dockq_binary_sha256": sha256_file(runner.deepternary_root / 'DockQ/fnat'),
                 "rank_features_saved": args.save_rank_features,
+                "rank_feature_state": ('final_pose_t0_dt0_v1' if args.save_rank_features else None),
             }
             if not args.no_resume and completed_report(
                     report_path, case, checkpoint, expected_config,

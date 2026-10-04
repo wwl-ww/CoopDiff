@@ -10,6 +10,10 @@ schema. This does not guarantee that generated poses are in-distribution.
 """
 
 import warnings
+import math
+import os
+import json
+import hashlib
 
 import torch
 import torch.nn as nn
@@ -21,11 +25,44 @@ from e3nn import o3
 # (required for zero_film_verification to pass).
 from tricoopdiff.diffdock.utils import so3, torus
 from tricoopdiff.runtime import sha256_file
+from tricoopdiff.geometry.equivariant_clamp import validate_clamp_mode
+
+
+EXPERT_SIGMA_BOUNDS = ((0.1, 19.0), (0.03, 1.55), (0.0314, 3.14))
+
+
+def configure_expert_policy(expert, limit, mode):
+    """Own numerical stabilization on the expert instance, never process state."""
+    if not math.isfinite(limit) or limit <= 0:
+        raise ValueError('expert activation clamp must be finite and positive')
+    model = getattr(expert, 'model', expert)
+    model.activation_clamp = float(limit)
+    model.activation_clamp_mode = validate_clamp_mode(mode)
+
+
+def expert_runtime_identity(expert):
+    """Generation identity includes configuration and actual numerical policy."""
+    model = getattr(expert, 'model', None)
+    return {**expert_base_identity(expert),
+            'model_parameters_sha256': getattr(expert, 'provenance', {}).get('model_parameters_sha256'),
+            'effective_model_config_sha256': getattr(expert, 'provenance', {}).get('effective_model_config_sha256'),
+            'activation_clamp': getattr(model, 'activation_clamp', None),
+            'activation_clamp_mode': getattr(model, 'activation_clamp_mode', 'componentwise'),
+            'sigma_bounds': [list(pair) for pair in EXPERT_SIGMA_BOUNDS]}
+
+
+def validate_expert_sigma_args(args):
+    """Reject configurations that disagree with the production preconditioner."""
+    for name, bounds in zip(('tr', 'rot', 'tor'), EXPERT_SIGMA_BOUNDS):
+        for suffix, expected in zip(('min', 'max'), bounds):
+            value = getattr(args, f'{name}_sigma_{suffix}', None)
+            if value != expected:
+                raise ValueError(f'incompatible expert {name}_sigma_{suffix}: {value}; expected {expected}')
 
 
 def expert_t_to_sigma(t_tr, t_rot, t_tor):
     """DiffDock-L input preconditioning, not a ternary diffusion process."""
-    bounds = ((0.1, 19.0), (0.03, 1.55), (0.0314, 3.14))
+    bounds = EXPERT_SIGMA_BOUNDS
     return tuple(low * (high / low) ** time
                  for time, (low, high) in zip((t_tr, t_rot, t_tor), bounds))
 
@@ -67,6 +104,12 @@ class FrozenDiffDock(nn.Module):
         """
         super().__init__()
         self.model = cg_model
+        # Snapshot legacy environment defaults only once. Production owners
+        # subsequently configure this instance explicitly.
+        self.model.activation_clamp = (float(os.environ['NAN_CLAMP'])
+                                       if os.environ.get('NAN_CLAMP') else None)
+        self.model.activation_clamp_mode = validate_clamp_mode(
+            os.environ.get('NAN_CLAMP_MODE', 'componentwise'))
         self.num_conv_layers = num_conv_layers
 
         # Freeze all parameters
@@ -330,6 +373,7 @@ def build_diffdock_expert(
     model_dir = Path(model_dir)
     with open(model_dir / "model_parameters.yml") as f:
         args = Namespace(**yaml.full_load(f))
+    validate_expert_sigma_args(args)
 
     if num_conv_layers is None:
         num_conv_layers = getattr(args, "num_conv_layers", 11)
@@ -364,6 +408,9 @@ def build_diffdock_expert(
         "diffdock_source": "vendored with repository stability patches",
         "score_checkpoint": str(ckpt_path.resolve()),
         "score_checkpoint_sha256": sha256_file(ckpt_path),
+        "model_parameters_sha256": sha256_file(model_dir / 'model_parameters.yml'),
+        "effective_model_config_sha256": hashlib.sha256(
+            json.dumps(vars(args), sort_keys=True).encode()).hexdigest(),
         "no_torsion": bool(getattr(args, "no_torsion", False)),
     }
     return expert

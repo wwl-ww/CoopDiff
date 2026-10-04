@@ -6,7 +6,6 @@ Legacy velocity supervision remains explicit, not a second training entry point.
 
 from contextlib import contextmanager
 import math
-import os
 from typing import Optional
 
 import numpy as np
@@ -24,9 +23,11 @@ from tricoopdiff.models.consensus import (
     production_model_config,
     LEGACY_CONSENSUS_CHECKPOINT_VERSION, PREVIOUS_CONSENSUS_CHECKPOINT_VERSION,
     SOURCE_CONTRACT_VERSION,
+    candidate_source_tensor,
 )
-from tricoopdiff.models.expert import expert_base_identity, validate_expert_base_identity
-from tricoopdiff.runtime import atomic_torch_save
+from tricoopdiff.models.expert import (expert_base_identity, validate_expert_base_identity,
+                                    configure_expert_policy, expert_runtime_identity)
+from tricoopdiff.runtime import atomic_torch_save, capture_rng_state, restore_rng_state
 from tricoopdiff.sdpi_flow import FLOW_VERSION, INDEPENDENT_RIGID_MODE, LEGACY_RIGID_MODE, SDPIFlow
 
 
@@ -76,12 +77,8 @@ class TriCoopDiffTrainer:
         if activation_clamp <= 0:
             raise ValueError("activation_clamp must be positive")
         self.activation_clamp = float(activation_clamp)
-        # The vendored expert integration currently reads this process-level
-        # setting inside each convolution. Configure it at the owning runtime
-        # boundary so library callers cannot silently run a different model
-        # from the trainer's recorded checkpoint contract.
-        os.environ['NAN_CLAMP'] = str(self.activation_clamp)
-        os.environ['NAN_CLAMP_MODE'] = 'componentwise'
+        # Numerical settings belong to this expert, not the process or another trainer.
+        configure_expert_policy(self.model.expert, self.activation_clamp, 'componentwise')
         if torsion_expert_aux_weight < 0:
             raise ValueError("torsion_expert_aux_weight must be non-negative")
         self.torsion_expert_aux_weight = float(torsion_expert_aux_weight)
@@ -292,9 +289,12 @@ VELOCITY_OBJECTIVE = 'sdpi_velocity_mse_v1'
 
 
 ENDPOINT_OBJECTIVE = 'executed_endpoint_geometry_v1'
+REAL_ENDPOINT_OBJECTIVE = 'real_initialization_reachable_endpoint_v2'
+ENDPOINT_OBJECTIVES = (ENDPOINT_OBJECTIVE, REAL_ENDPOINT_OBJECTIVE)
 
 
 VALIDATION_DOCKQ_PROTOCOL = 'training_coupling_protein_fullatom_v2'
+REAL_VALIDATION_DOCKQ_PROTOCOL = 'real_initialization_protein_fullatom_v3'
 
 
 def terminal_interface_losses(e3, native_poi, predicted_poi, cutoff):
@@ -341,7 +341,7 @@ def coarse_intercomponent_repulsion(e3, native_poi, native_ligand, poi, ligand, 
 def validate_consensus_checkpoint(payload):
     version = payload.get('checkpoint_version')
     if not isinstance(version, int) or not LEGACY_CONSENSUS_CHECKPOINT_VERSION <= version <= CONSENSUS_CHECKPOINT_VERSION:
-        raise ValueError('consensus requires checkpoint_version=18 through 23')
+        raise ValueError('consensus requires checkpoint_version=18 through 24')
     if payload.get('architecture') not in (ARCHITECTURE, DIRECT_ARCHITECTURE) or payload.get('generative_process') != FLOW_VERSION:
         raise ValueError('checkpoint does not describe a supported consensus SDPI flow')
     direct = payload.get('model_config', {}).get('direct_ternary_motion', False)
@@ -362,7 +362,7 @@ def validate_consensus_checkpoint(payload):
         raise ValueError('checkpoint architecture and rigid output configuration disagree')
     if direct and (version < ENDPOINT_PROTOCOL_CHECKPOINT_VERSION or
                    payload.get('model_config', {}).get('protein_pair_motion', False)):
-        raise ValueError('direct ternary motion requires version 20 through 23 without the legacy side head')
+        raise ValueError('direct ternary motion requires version 20 through 24 without the legacy side head')
     if payload.get('expert_lora_config') or payload.get('expert_lora_state_dict'):
         raise ValueError('Stage 1 consensus checkpoint cannot contain expert adapters')
     for key in ('trifuse_state_dict', 'ema_trifuse_state_dict', 'model_config', 'expert_base_identity'):
@@ -372,13 +372,13 @@ def validate_consensus_checkpoint(payload):
     if version >= INTERFACE_OBJECTIVE_CHECKPOINT_VERSION:
         batch_size = config.get('effective_batch_size')
         if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
-            raise ValueError('version 22/23 requires a positive effective batch size')
+            raise ValueError('version 22 through 24 requires a positive effective batch size')
     objective = config.get('training_objective', VELOCITY_OBJECTIVE)
     if version >= OBJECTIVE_CONTRACT_CHECKPOINT_VERSION and 'training_objective' not in config:
-        raise ValueError('version 21 through 23 requires an explicit training objective')
-    if payload.get('checkpoint_kind') != 'inference_only' and objective not in (VELOCITY_OBJECTIVE, ENDPOINT_OBJECTIVE):
+        raise ValueError('version 21 through 24 requires an explicit training objective')
+    if payload.get('checkpoint_kind') != 'inference_only' and objective not in (VELOCITY_OBJECTIVE, *ENDPOINT_OBJECTIVES):
         raise ValueError('checkpoint has an unknown training objective')
-    if objective == ENDPOINT_OBJECTIVE:
+    if objective in ENDPOINT_OBJECTIVES:
         steps = config.get('inference_steps')
         weight = config.get('endpoint_loss_weight')
         if (not isinstance(steps, int) or isinstance(steps, bool) or steps < 1
@@ -391,11 +391,11 @@ def validate_consensus_checkpoint(payload):
                     raise ValueError(f'endpoint training requires valid {key}')
             if config['interface_cutoff'] <= 0:
                 raise ValueError('interface cutoff must be positive')
-        if version == CONSENSUS_CHECKPOINT_VERSION:
+        if version >= 23:
             weight, cutoff = config.get('steric_loss_weight'), config.get('steric_cutoff')
             if (not isinstance(weight, (float, int)) or not math.isfinite(weight) or weight < 0
                     or not isinstance(cutoff, (float, int)) or not math.isfinite(cutoff) or cutoff <= 0):
-                raise ValueError('version 23 requires explicit valid coarse steric settings')
+                raise ValueError('version 23/24 requires explicit valid coarse steric settings')
     if 'expert_input_grad' in config and not isinstance(config['expert_input_grad'], bool):
         raise ValueError('expert_input_grad must be an explicit boolean')
     validate_clamp_mode(config.get('activation_clamp_mode', 'componentwise'))
@@ -416,9 +416,17 @@ def validate_consensus_checkpoint(payload):
     if version >= ENDPOINT_PROTOCOL_CHECKPOINT_VERSION:
         endpoint_protocol = config.get('training_endpoint_protocol')
         expected = ('none' if config.get('training_source_mix') == 'sdpi_only'
-                    else 'online_bitseed_training_c1_m1_v1')
+                    else ('online_bitseed_raw_resampled_v2' if objective == REAL_ENDPOINT_OBJECTIVE
+                          else 'online_bitseed_training_c1_m1_v1'))
         if endpoint_protocol != expected:
             raise ValueError('checkpoint has an invalid training endpoint protocol')
+    if objective == REAL_ENDPOINT_OBJECTIVE and version < 24:
+        raise ValueError('real initialization supervision requires checkpoint version 24')
+    if version >= 24 and payload.get('checkpoint_kind') != 'inference_only':
+        if not payload.get('rng_state'):
+            raise ValueError('version 24 training checkpoint requires complete RNG state')
+        if not config.get('expert_runtime_identity'):
+            raise ValueError('version 24 requires the expert runtime identity')
 
 
 class ConsensusTrainer(TriCoopDiffTrainer):
@@ -434,9 +442,10 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         kwargs['torsion_expert_aux_weight'] = 0.0
         super().__init__(*args, **kwargs)
         self.training_objective = training_objective or (
-            ENDPOINT_OBJECTIVE if getattr(self.model.trifuse, 'direct_ternary_motion', False)
-            else VELOCITY_OBJECTIVE)
-        if self.training_objective not in (VELOCITY_OBJECTIVE, ENDPOINT_OBJECTIVE):
+            REAL_ENDPOINT_OBJECTIVE if self.model.trifuse.config.get('model_profile') == PRODUCTION_MODEL_PROFILE
+            else (ENDPOINT_OBJECTIVE if getattr(self.model.trifuse, 'direct_ternary_motion', False)
+                  else VELOCITY_OBJECTIVE))
+        if self.training_objective not in (VELOCITY_OBJECTIVE, *ENDPOINT_OBJECTIVES):
             raise ValueError('unsupported training objective')
         if not math.isfinite(endpoint_loss_weight) or endpoint_loss_weight <= 0:
             raise ValueError('endpoint loss weight must be finite and positive')
@@ -456,14 +465,15 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         self.effective_batch_size = effective_batch_size
         self.resume_best_val_dockq = float('-inf')
         self.activation_clamp_mode = validate_clamp_mode(activation_clamp_mode)
-        os.environ['NAN_CLAMP_MODE'] = self.activation_clamp_mode
+        configure_expert_policy(self.model.expert, self.activation_clamp, self.activation_clamp_mode)
         self.residual_weight = float(residual_weight)
         self.ema_decay = float(ema_decay)
         if training_source_mix not in ('sdpi_only', 'sdpi_bitseed_1_1'):
             raise ValueError('training_source_mix must be sdpi_only or sdpi_bitseed_1_1')
         self.training_source_mix = training_source_mix
         expected_protocol = ('none' if training_source_mix == 'sdpi_only'
-                             else 'online_bitseed_training_c1_m1_v1')
+                             else ('online_bitseed_raw_resampled_v2' if self.training_objective == REAL_ENDPOINT_OBJECTIVE
+                                   else 'online_bitseed_training_c1_m1_v1'))
         if training_endpoint_protocol != expected_protocol:
             raise ValueError(
                 f'{training_source_mix} requires training endpoint protocol '
@@ -489,12 +499,44 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         ed = {**e3_data, 'coords': e3_data['coords'].to(self.device)}
         pd = {**poi_data, 'coords': poi_data['coords'].to(self.device)}
         ld = {**ligand_data, 'coords': ligand_data['coords'].to(self.device)}
-        coupling = coupling_override if coupling_override is not None else self.diffusion.sample_coupling(
-            ed['coords'], pd['coords'], ld,
-            no_torsion=bool(getattr(self.model.expert.model, 'no_torsion', False)))
+        real_initialization = self.training_objective == REAL_ENDPOINT_OBJECTIVE
+        no_torsion = bool(getattr(self.model.expert.model, 'no_torsion', False))
         steps = self.diffusion.inference_steps
         dt = ld['coords'].new_full((1,), 1 / steps)
-        ligand, poi, body, _ = self._training_state(ed, pd, ld, coupling, torch.ones_like(dt), dt)
+        target_ligand = ld['coords']
+        projection = None
+        if real_initialization:
+            source = int(candidate_source_tensor(source, dt).item())
+            from tricoopdiff.initialization import TernaryInitializer
+            from tricoopdiff.initialization.endpoints import reachable_ligand_target
+            if coupling_override is None:
+                if int(source) != 0:
+                    raise ValueError('BiTSeed training requires its actual sampled state')
+                seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
+                ligand, poi, body, _ = TernaryInitializer(no_torsion=no_torsion).initialize(
+                    ed['coords'][0], pd['coords'][0], ld, seed=seed)
+                target, projection = reachable_ligand_target(
+                    ld, ligand, poi, pd['coords'], no_torsion=no_torsion)
+            else:
+                if 'initial_state' not in coupling_override:
+                    raise ValueError('real initialization training rejects crystal-projected couplings')
+                state = coupling_override['initial_state']
+                ligand, poi, body = [torch.as_tensor(state[key], device=self.device,
+                                                    dtype=ld['coords'].dtype).reshape(1, -1, 3)
+                                     for key in ('ligand', 'poi', 'body_frame')]
+                if 'target_ligand' in coupling_override:
+                    target = coupling_override['target_ligand']
+                else:
+                    target, projection = reachable_ligand_target(
+                        ld, ligand, poi, pd['coords'], no_torsion=no_torsion)
+            target_ligand = torch.as_tensor(target, device=self.device,
+                                            dtype=ld['coords'].dtype).reshape_as(ld['coords'])
+            if ligand.shape != ld['coords'].shape or poi.shape != pd['coords'].shape:
+                raise ValueError('actual initialization atom counts must match the indexed inputs')
+        else:
+            coupling = coupling_override if coupling_override is not None else self.diffusion.sample_coupling(
+                ed['coords'], pd['coords'], ld, no_torsion=no_torsion)
+            ligand, poi, body, _ = self._training_state(ed, pd, ld, coupling, torch.ones_like(dt), dt)
         for t, dt in self.diffusion.reverse_times(ld['coords']):
             output = self._forward_state(ed, pd, ld, ligand, poi, body, t, dt, source, conditions)
             normalized = self.diffusion.normalized_predictions(output, t)
@@ -505,7 +547,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             ligand, poi, body = self.diffusion.differentiable_step(
                 ligand, poi, body, velocities, dt, ld)
         scales = self.diffusion.scales(ed['coords'], pd['coords'])
-        losses = {'loss_ligand_geometry': ((ligand - ld['coords']) / scales[0]).square().mean(),
+        losses = {'loss_ligand_geometry': ((ligand - target_ligand) / scales[0]).square().mean(),
                   'loss_protein_geometry': ((poi - pd['coords']) / scales[1]).square().mean()}
         total = sum(losses.values())
         interface_pairs = 0
@@ -515,7 +557,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             losses.update(interface)
             total = total + self.interface_loss_weight * sum(interface.values())
         if self.steric_loss_weight:
-            steric = coarse_intercomponent_repulsion(ed['coords'], pd['coords'], ld['coords'],
+            steric = coarse_intercomponent_repulsion(ed['coords'], pd['coords'], target_ligand,
                                                      poi, ligand, self.steric_cutoff)
             losses['loss_clash_geometry'] = steric
             total = total + self.steric_loss_weight * steric
@@ -525,6 +567,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         if diagnostics:
             return {'loss_total': total, 'components': losses, 'rms': {},
                     'predicted_ligand': ligand, 'predicted_poi': poi,
+                    'target_ligand': target_ligand, 'target_projection': projection,
                     'training_objective': self.training_objective}
         return {'loss_total': total, 'loss_score': total.detach().item(),
                 'native_interface_pairs': interface_pairs,
@@ -560,7 +603,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
     def validate_step(self, dockq_context=None, **batch):
         with self.ema_parameters():
             if dockq_context is not None:
-                if self.training_objective != ENDPOINT_OBJECTIVE:
+                if self.training_objective not in ENDPOINT_OBJECTIVES:
                     raise ValueError('terminal DockQ validation requires the endpoint objective')
                 from tricoopdiff.metrics.dockq import compute_fullatom_dockq
 
@@ -589,6 +632,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             'training_state': training_state,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
+            'rng_state': capture_rng_state(),
         }
 
     def _restore_optimization(self, payload):
@@ -606,6 +650,12 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         self.resume_epoch = int(state['epoch'])
         self.resume_best_val_loss = float(state['best_val_loss'])
         self.samples_seen = state.get('samples_seen', self.global_step)
+        if 'rng_state' in payload:
+            restore_rng_state(payload['rng_state'])
+        else:
+            import warnings
+            warnings.warn('legacy checkpoint has no RNG state; resume is not trajectory-exact',
+                          RuntimeWarning, stacklevel=2)
 
     def checkpoint_payload(self, epoch=0, best_val_loss=float('inf'), best_val_dockq=None):
         """Build the shared training/inference payload without writing files."""
@@ -632,7 +682,10 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 'steric_loss_weight': self.steric_loss_weight,
                 'steric_cutoff': self.steric_cutoff,
                 'effective_batch_size': self.effective_batch_size,
-                'validation_dockq_protocol': VALIDATION_DOCKQ_PROTOCOL,
+                'validation_dockq_protocol': (REAL_VALIDATION_DOCKQ_PROTOCOL
+                                              if self.training_objective == REAL_ENDPOINT_OBJECTIVE
+                                              else VALIDATION_DOCKQ_PROTOCOL),
+                'expert_runtime_identity': expert_runtime_identity(self.model.expert),
             },
             **self._optimization_payload({'epoch': epoch, 'best_val_loss': best_val_loss,
                                'best_val_dockq': (self.resume_best_val_dockq if best_val_dockq is None
@@ -655,10 +708,10 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             raise ValueError('training objective differs; load weights only rather than silently changing supervision')
         if payload['runtime_config'].get('inference_steps', 20) != self.diffusion.inference_steps:
             raise ValueError('checkpoint rollout length differs from the trainer')
-        if (self.training_objective == ENDPOINT_OBJECTIVE
+        if (self.training_objective in ENDPOINT_OBJECTIVES
                 and payload['runtime_config']['endpoint_loss_weight'] != self.endpoint_loss_weight):
             raise ValueError('checkpoint endpoint loss weight differs from the trainer')
-        if self.training_objective == ENDPOINT_OBJECTIVE:
+        if self.training_objective in ENDPOINT_OBJECTIVES:
             for key, old_default in (('interface_loss_weight', 0.0), ('interface_cutoff', 10.0),
                                      ('steric_loss_weight', 0.0), ('steric_cutoff', 2.0)):
                 if payload['runtime_config'].get(key, old_default) != getattr(self, key):
@@ -666,6 +719,9 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         if payload['runtime_config'].get('effective_batch_size', 1) != self.effective_batch_size:
             raise ValueError('checkpoint effective batch size differs from the trainer')
         validate_expert_base_identity(payload, self.model.expert)
+        if payload['checkpoint_version'] >= 24:
+            if payload['runtime_config']['expert_runtime_identity'] != expert_runtime_identity(self.model.expert):
+                raise ValueError('checkpoint expert runtime configuration differs')
         saved_grad = payload['runtime_config'].get('expert_input_grad', False)
         if saved_grad != getattr(self.model, 'expert_input_grad', True):
             raise ValueError('expert input-gradient contract differs; use matching '
@@ -695,7 +751,9 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 raise ValueError(f'consensus checkpoint runtime mismatch: {key}')
         self._restore_optimization(payload)
         self.resume_best_val_dockq = payload['training_state'].get('best_val_dockq', float('-inf'))
-        if payload['runtime_config'].get('validation_dockq_protocol') != VALIDATION_DOCKQ_PROTOCOL:
+        protocol = (REAL_VALIDATION_DOCKQ_PROTOCOL if self.training_objective == REAL_ENDPOINT_OBJECTIVE
+                    else VALIDATION_DOCKQ_PROTOCOL)
+        if payload['runtime_config'].get('validation_dockq_protocol') != protocol:
             # Old scores may include insertion-code duplicate contacts. Resume
             # weights/optimizer, but never compare corrected scores to them.
             self.resume_best_val_dockq = float('-inf')

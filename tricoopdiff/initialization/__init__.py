@@ -28,12 +28,12 @@ def receptor_prior(coords):
     return center, radius, radius * INITIAL_NOISE_STD_PROPORTION / 1.73
 
 
-def sample_binary_pose(shared, receptor):
+def sample_binary_pose(shared, receptor, *, rng=None, generator=None):
     """Sample and retain one Haar rotation and receptor-adaptive translation."""
     center, radius, sigma = receptor_prior(receptor)
-    rotation = torch.as_tensor(Rotation.random().as_matrix(),
+    rotation = torch.as_tensor(Rotation.random(random_state=rng).as_matrix(),
                                device=shared.device, dtype=shared.dtype)
-    delta = torch.randn(3, device=shared.device, dtype=shared.dtype) * sigma
+    delta = torch.randn(3, device=shared.device, dtype=shared.dtype, generator=generator) * sigma
     translation = center + delta - rotation @ shared.mean(0)
     return rotation, translation, {
         "receptor_center": center.tolist(), "rms_radius": radius.item(),
@@ -119,9 +119,8 @@ class TernaryInitializer:
 
         if seed is None:
             seed = random.SystemRandom().randrange(2**32)
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
+        rng = np.random.RandomState(seed)
+        generator = torch.Generator(device=e3_coords.device).manual_seed(seed)
         mol = ligand_data.get("mol")
         if isinstance(mol, bytes):
             mol = Chem.Mol(mol)
@@ -134,7 +133,7 @@ class TernaryInitializer:
                 raise ValueError(f"full-ligand atom count disagrees with {field}")
         mol = Chem.Mol(mol)
         mol.RemoveAllConformers()
-        conformer_seed = int(np.random.randint(0, 2**31 - 1))
+        conformer_seed = int(rng.randint(0, 2**31 - 1))
         embedded = Chem.AddHs(mol)
         params = (AllChem.ETKDGv2() if self.conformer_policy == "diffdock_v1_1"
                   else AllChem.ETKDGv3())
@@ -164,13 +163,14 @@ class TernaryInitializer:
         )
         torsions = np.zeros(len(bonds))
         if not self.no_torsion and len(bonds):
-            torsions = np.random.uniform(-np.pi, np.pi, len(bonds))
+            torsions = rng.uniform(-np.pi, np.pi, len(bonds))
             shared = modify_conformer_torsion_angles(
                 shared.cpu(), bonds, masks, torsions, as_numpy=False,
             ).to(device=e3_coords.device, dtype=e3_coords.dtype)
         transforms, sides = [], {}
         for name, receptor in (("e3", e3_coords), ("poi", poi_coords)):
-            rotation, translation, sides[name] = sample_binary_pose(shared, receptor)
+            rotation, translation, sides[name] = sample_binary_pose(
+                shared, receptor, rng=rng, generator=generator)
             transforms.append((rotation, translation))
         (ra, ta), (rb, tb) = transforms
         ligand = apply_rigid(shared, ra, ta)

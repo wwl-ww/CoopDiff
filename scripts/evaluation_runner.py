@@ -1,6 +1,5 @@
 """Reusable model runtime for in-process evaluation of many ternary cases."""
 
-import os
 from argparse import Namespace
 from pathlib import Path
 
@@ -47,7 +46,7 @@ class EvaluationRunner:
         if not self.checkpoint_path.is_absolute():
             self.checkpoint_path = self.root / self.checkpoint_path
         self.checkpoint_sha256 = sha256_file(self.checkpoint_path)
-        self.checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+        self.checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
         self.experimental_checkpoint = (
             self.checkpoint.get('architecture') == 'residual_consensus_factorial_v1'
         )
@@ -84,10 +83,8 @@ class EvaluationRunner:
         self.activation_clamp = float(
             self.checkpoint["runtime_config"]["activation_clamp"]
         )
-        os.environ["NAN_CLAMP"] = str(self.activation_clamp)
         self.activation_clamp_mode = self.checkpoint['runtime_config'].get(
             'activation_clamp_mode', 'componentwise')
-        os.environ['NAN_CLAMP_MODE'] = self.activation_clamp_mode
 
         self.model_dir = Path(model_dir)
         if not self.model_dir.is_absolute():
@@ -100,6 +97,12 @@ class EvaluationRunner:
             ckpt=expert_checkpoint,
             num_conv_layers=self.score_model_args.num_conv_layers,
         )
+        from tricoopdiff.models.expert import configure_expert_policy
+        configure_expert_policy(self.expert, self.activation_clamp, self.activation_clamp_mode)
+        if self.checkpoint.get('checkpoint_version', 0) >= 24:
+            from tricoopdiff.models.expert import expert_runtime_identity
+            if self.checkpoint['runtime_config'].get('expert_runtime_identity') != expert_runtime_identity(self.expert):
+                raise ValueError('evaluation expert runtime differs from the training checkpoint')
         self.reproducibility['checkpoint_expert_base_identity'] = (
             validate_expert_base_identity(self.checkpoint, self.expert)
         )
@@ -254,6 +257,7 @@ class EvaluationRunner:
             "condition_manifest_sha256": (sha256_file(condition_path) if condition_path else None),
             "condition_audit": condition_audit,
             "rank_features_saved": bool(return_rank_features),
+            "rank_feature_state": ('final_pose_t0_dt0_v1' if return_rank_features else None),
             "checkpoint_sha256": self.checkpoint_sha256,
             "expert_checkpoint_sha256": self.expert.provenance["score_checkpoint_sha256"],
             "expert_config_sha256": self.expert_config_sha256,

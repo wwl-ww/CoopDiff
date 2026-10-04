@@ -15,7 +15,7 @@ from tricoopdiff.initialization.candidates import (
     DualExpertAnchorInitializer, generate_hybrid_candidates,
     generate_sdpi_candidates,
 )
-from tricoopdiff.models.expert import expert_base_identity
+from tricoopdiff.models.expert import expert_base_identity, expert_runtime_identity
 from tricoopdiff.geometry.rigid import proper_rigid_fit
 from tricoopdiff.sdpi_flow import SDPIFlow, _raw_torsions
 from tricoopdiff.runtime import atomic_torch_save
@@ -347,6 +347,49 @@ def mixed_source_for_step(global_step):
 
 
 ONLINE_TRAINING_ENDPOINT_PROTOCOL = "online_bitseed_training_c1_m1_v1"
+RESAMPLED_TRAINING_ENDPOINT_PROTOCOL = "online_bitseed_raw_resampled_v2"
+
+
+def reachable_ligand_target(ligand_data, initial_ligand, initial_poi, native_poi,
+                            *, no_torsion=False):
+    """Project only the supervision target, never the inference-like input.
+
+    Bond lengths/rigid fragments stay those of the sampled conformer. Protein
+    supervision remains the unmodified native pose. This is an attainable
+    coordinate surrogate, not an assertion of exact native ligand geometry.
+    """
+    reference = {**ligand_data, 'coords': initial_ligand}
+    _, projected, report = project_endpoint_coupling(
+        reference, initial_poi, ligand_data['coords'], native_poi,
+        no_torsion=no_torsion)
+    if not report['torsion_optimization']['success']:
+        raise ValueError('reachable target torsion projection did not converge')
+    return projected['ligand'], report
+
+
+def validate_raw_endpoint_record(record):
+    """Raw inputs and reachable labels must not be confused with legacy couplings."""
+    if record.get('actual_source') not in ('sdpi', 'bitseed'):
+        raise ValueError('raw endpoint has an invalid source')
+    if (record.get('native_used_in_candidate_generation') is not False
+            or record.get('native_used_in_candidate_selection') is not False):
+        raise ValueError('raw endpoint must attest native-free initialization')
+    state = record['endpoint']
+    for key in ('ligand', 'poi'):
+        value = np.asarray(state[key])
+        if value.ndim != 2 or value.shape[1] != 3 or not len(value):
+            raise ValueError('raw endpoint coordinates must be nonempty [N,3]')
+        _finite_array(value, key)
+    body = np.asarray(state['body_frame'])
+    if (body.shape != (3, 3) or not np.isfinite(body).all()
+            or not np.allclose(body.T @ body, np.eye(3), atol=1e-4)
+            or not np.isclose(np.linalg.det(body), 1., atol=1e-4)):
+        raise ValueError('raw endpoint body frame must be a proper rotation')
+    target = np.asarray(record['target_ligand'])
+    if target.shape != np.asarray(state['ligand']).shape or not np.isfinite(target).all():
+        raise ValueError('reachable target must match the finite raw ligand shape')
+    if record['projection'].get('contract') != ENDPOINT_PROJECTION_VERSION:
+        raise ValueError('raw endpoint has an unknown reachable-target projection')
 
 
 ONLINE_TRAINING_BASE_SEED = 41_000
@@ -399,16 +442,21 @@ def _case_seed(case, base_seed):
 
 
 class LazyTrainingEndpointStore:
-    """Generate one two-expert endpoint on first case access, then replay it."""
+    """Cache per-occurrence real inputs, or explicitly replay legacy couplings.
+
+    New production training uses resample=True. Validation requests occurrence
+    zero. Only the latest occurrence per case stays resident in host memory.
+    """
 
     lazy = True
 
     def __init__(self, cache_dir, expert, *, binary_steps=20,
                  base_seed=ONLINE_TRAINING_BASE_SEED, read_only=False,
-                 wait_seconds=3600.):
+                 wait_seconds=3600., resample=False):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.expert = expert
+        self.resample = bool(resample)
         self.binary_steps = int(binary_steps)
         self.base_seed = int(base_seed)
         self.read_only = bool(read_only)
@@ -416,7 +464,8 @@ class LazyTrainingEndpointStore:
         if self.wait_seconds < 0:
             raise ValueError('endpoint cache wait_seconds must be nonnegative')
         self.protocol = {
-            "version": ONLINE_TRAINING_ENDPOINT_PROTOCOL,
+            "version": (RESAMPLED_TRAINING_ENDPOINT_PROTOCOL if self.resample
+                        else ONLINE_TRAINING_ENDPOINT_PROTOCOL),
             "conformers": 1,
             "poses_per_side": 1,
             "binary_steps": self.binary_steps,
@@ -425,18 +474,22 @@ class LazyTrainingEndpointStore:
             "fallback": "sdpi_v1_on_any_invalid_expert_side",
             "base_seed": self.base_seed,
             "frozen_expert": expert_base_identity(expert),
+            "expert_runtime": expert_runtime_identity(expert),
+            "generation_version": 'raw_target_projection_v2',
         }
         self._records = {}
         self._input_signatures = {}
+        self._occurrences = {}
 
-    def _path(self, case):
+    def _path(self, case, occurrence=0):
         safe = "".join(char if char.isalnum() or char in "-_." else "_"
                        for char in case)
         suffix = hashlib.sha256(case.encode("utf-8")).hexdigest()[:12]
-        return self.cache_dir / f"{safe}.{suffix}.pt"
+        occurrence_tag = f'.occ{occurrence}' if self.resample else ''
+        return self.cache_dir / f"{safe}.{suffix}{occurrence_tag}.pt"
 
-    def _load(self, case, input_signature):
-        path = self._path(case)
+    def _load(self, case, input_signature, occurrence=0):
+        path = self._path(case, occurrence)
         if not path.is_file():
             return None
         payload = torch.load(path, map_location="cpu", weights_only=False)
@@ -448,16 +501,22 @@ class LazyTrainingEndpointStore:
                 "use a new endpoint cache directory (old cache left unchanged)"
             )
         record = payload.get("record")
-        validate_endpoint_record(record)
+        if self.resample:
+            if (payload.get('occurrence') != occurrence or record.get('occurrence') != occurrence
+                    or record.get('case') != case):
+                raise ValueError('resampled endpoint occurrence mismatch')
+            validate_raw_endpoint_record(record)
+        else:
+            validate_endpoint_record(record)
         return record
 
-    def _generate(self, case, batch, input_signature):
+    def _generate(self, case, batch, input_signature, occurrence=0):
         e3, poi, ligand = batch["e3_data"], batch["poi_data"], batch["ligand_data"]
         initializer = DualExpertAnchorInitializer(
             self.expert, e3, poi, binary_steps=self.binary_steps,
             proposal_attempts=1, conformer_policy="etkdgv3_random",
         )
-        seed = _case_seed(case, self.base_seed)
+        seed = _case_seed(f'{case}:{occurrence}' if self.resample else case, self.base_seed)
         device = ligand["coords"].device
         devices = ([device.index if device.index is not None
                     else torch.cuda.current_device()] if device.type == "cuda" else [])
@@ -510,6 +569,26 @@ class LazyTrainingEndpointStore:
             raise AssertionError(f"{case}: C=1/M=1 must produce exactly one endpoint")
         candidate = candidates[0]
         actual_source = candidate["candidate_id"][0]
+        if self.resample:
+            target, projection = reachable_ligand_target(
+                ligand, candidate['ligand'], candidate['poi'], poi['coords'],
+                no_torsion=initializer.no_torsion)
+            record = {
+                'case': case, 'actual_source': actual_source,
+                'candidate_id': candidate['candidate_id'], 'occurrence': occurrence,
+                'native_used_in_candidate_generation': False,
+                'native_used_in_candidate_selection': False,
+                'endpoint': {'ligand': _cpu_array(candidate['ligand'][0]),
+                             'poi': _cpu_array(candidate['poi'][0]),
+                             'body_frame': _cpu_array(candidate['rotation'][0])},
+                'target_ligand': target, 'projection': projection,
+                'generation': generation,
+            }
+            validate_raw_endpoint_record(record)
+            atomic_torch_save({'case': case, 'occurrence': occurrence,
+                              'protocol': self.protocol, 'record': record,
+                              'input_signature': input_signature}, self._path(case, occurrence))
+            return record
         coupling, projected, projection = project_endpoint_coupling(
             ligand, poi["coords"], candidate["ligand"], candidate["poi"],
             no_torsion=initializer.no_torsion,
@@ -577,28 +656,40 @@ class LazyTrainingEndpointStore:
         return record
 
     def coupling(self, case, occurrence=0, *, batch=None):
-        del occurrence  # One immutable endpoint per case and experiment seed.
+        if not isinstance(occurrence, int) or isinstance(occurrence, bool) or occurrence < 0:
+            raise ValueError('endpoint occurrence must be a nonnegative integer')
+        if not self.resample:
+            occurrence = 0  # Explicit legacy protocol only.
         if batch is None:
             raise ValueError(f"{case}: batch is required to validate endpoint inputs")
+        if expert_runtime_identity(self.expert) != self.protocol['expert_runtime']:
+            raise ValueError('endpoint expert runtime changed after cache construction')
         input_signature = endpoint_input_signature(batch)
         record = self._records.get(case)
-        if record is not None and self._input_signatures[case] != input_signature:
-            raise ValueError(f"{case}: in-memory endpoint input signature mismatch")
+        if case in self._input_signatures and self._input_signatures[case] != input_signature:
+            raise ValueError(f'{case}: in-memory endpoint input signature mismatch')
+        if self._occurrences.get(case) != occurrence:
+            record = None
         if record is None:
-            record = self._load(case, input_signature)
+            record = self._load(case, input_signature, occurrence)
         if record is None:
             if self.read_only:
                 deadline = time.monotonic() + self.wait_seconds
                 while record is None and time.monotonic() < deadline:
                     time.sleep(min(.1, max(0., deadline - time.monotonic())))
-                    record = self._load(case, input_signature)
+                    record = self._load(case, input_signature, occurrence)
                 if record is None:
                     raise TimeoutError(
                         f'{case}: read-only endpoint follower timed out waiting for writer')
             else:
-                record = self._generate(case, batch, input_signature)
+                record = self._generate(case, batch, input_signature, occurrence)
         self._records[case] = record
         self._input_signatures[case] = input_signature
+        self._occurrences[case] = occurrence
+        if self.resample:
+            return {'initial_state': {name: np.asarray(value).copy()
+                                      for name, value in record['endpoint'].items()},
+                    'target_ligand': np.asarray(record['target_ligand']).copy()}, record
         coupling = {name: np.asarray(value).copy()
                     for name, value in record["coupling"].items()}
         return coupling, record

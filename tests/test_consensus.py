@@ -40,6 +40,18 @@ def test_zero_residual_preserves_each_interface_prior():
     assert result['rank_features'].shape == (1, 32)
 
 
+def test_direct_motion_accepts_no_torsion_on_a_flexible_chemical_graph():
+    _, graph, proposals, state = fixture()
+    for branch in BRANCHES:
+        proposals[branch]['tor'] = torch.empty(1, 0)
+    fuse = ConsensusFuse(node_dim=32, input_dim=16, num_transformer_layers=1,
+                         dropout=0, direct_ternary_motion=True).eval()
+    result = fuse(graph, proposals, state)['normalized_velocity']
+    assert graph['lig_edge_mask'].any()
+    assert result['torsion'].shape == (1, 0)
+    assert all(result[b]['tor'].shape == (1, 0) for b in BRANCHES)
+
+
 def test_nonzero_residual_is_se3_equivariant():
     fuse, graph, proposals, state = fixture()
     torch.nn.init.normal_(fuse.residual_head.weight, std=0.1)

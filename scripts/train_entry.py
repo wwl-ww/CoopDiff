@@ -240,6 +240,7 @@ def swap_protein_reference(e3_data, poi_data, ligand_data):
 def seed_training(seed, device):
     """Seed training RNGs independently of cache/featurization side effects."""
     np.random.seed(seed)
+    random.seed(seed)
     torch.manual_seed(seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
@@ -258,7 +259,6 @@ def main():
     args.generative_process = 'sdpi_flow_v1'
     if args.nan_clamp <= 0:
         raise SystemExit("FATAL: --nan-clamp must be positive")
-    os.environ["NAN_CLAMP"] = str(args.nan_clamp)
     device = torch.device(args.device)
     endpoint_store = None
     if args.training_arm in ("B", "C"):
@@ -331,6 +331,7 @@ def main():
         from tricoopdiff.initialization.endpoints import LazyTrainingEndpointStore
         endpoint_store = LazyTrainingEndpointStore(
             args.bitseed_lazy_cache_dir, model.expert,
+            resample=trainer.training_objective == 'real_initialization_reachable_endpoint_v2',
         )
 
     # ----------------------------------------------------------------
@@ -463,7 +464,7 @@ def main():
         print(f"  validation_by_source={validation['by_source']}")
         val_dockq = validation.get('selection_dockq')
         if val_dockq is not None:
-            print(f"  terminal_validation_DockQ={val_dockq:.4f} (full atom, training-coupling protocol)")
+            print(f"  terminal_validation_DockQ={val_dockq:.4f} (full atom, {validation['dockq_protocol']})")
 
         # Save best & periodic
         improved_loss = val_loss < best_val_loss
@@ -569,6 +570,13 @@ def build_trainer(args, device, input_dim=None):
     args.resolved_model_config = dict(model_config)
     if args.steric_loss_weight is None:
         args.steric_loss_weight = .05 if args.model_profile == 'production' else 0.
+    from tricoopdiff.train import REAL_ENDPOINT_OBJECTIVE
+    objective = (saved['runtime_config'].get('training_objective', 'sdpi_velocity_mse_v1')
+                 if args.resume else
+                 (REAL_ENDPOINT_OBJECTIVE if model_config.get('model_profile') else None))
+    if objective == REAL_ENDPOINT_OBJECTIVE and getattr(args, 'training_arm', 'A1') in ('B', 'C'):
+        from tricoopdiff.initialization.endpoints import RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
+        args.training_endpoint_protocol = RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
     trifuse = ConsensusFuse(**model_config)
 
     model = ConsensusCoopDiff(frozen_expert, trifuse,
@@ -593,6 +601,7 @@ def build_trainer(args, device, input_dim=None):
         interface_cutoff=args.interface_cutoff,
         effective_batch_size=args.batch_size,
         steric_loss_weight=args.steric_loss_weight,
+        training_objective=objective,
         training_source_mix=(
             'sdpi_only' if getattr(args, 'training_arm', 'A1') == 'A1'
             else 'sdpi_bitseed_1_1'
@@ -603,6 +612,7 @@ def build_trainer(args, device, input_dim=None):
         device=device,
     )
 
+    args.training_objective = trainer.training_objective
     return model, diffusion, trainer
 
 
@@ -676,7 +686,8 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
         cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()]
     numpy_state = np.random.get_state()
     python_state = random.getstate()
-    exact_dockq = getattr(trainer, 'training_objective', None) == 'executed_endpoint_geometry_v1'
+    from tricoopdiff.train import ENDPOINT_OBJECTIVES, REAL_ENDPOINT_OBJECTIVE, REAL_VALIDATION_DOCKQ_PROTOCOL
+    exact_dockq = getattr(trainer, 'training_objective', None) in ENDPOINT_OBJECTIVES
     scores = {'sdpi': [], 'bitseed': []}
     per_case = []
     ema_context = trainer.ema_parameters() if hasattr(trainer, 'ema_parameters') else nullcontext()
@@ -760,7 +771,9 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
             raise RuntimeError('full-atom validation produced no DockQ measurements')
         result.update(selection_dockq=float(np.mean(list(dockq_by_source.values()))),
                       dockq_by_source=dockq_by_source, per_case=per_case,
-                      dockq_protocol=VALIDATION_DOCKQ_PROTOCOL)
+                      dockq_protocol=(REAL_VALIDATION_DOCKQ_PROTOCOL
+                                      if trainer.training_objective == REAL_ENDPOINT_OBJECTIVE
+                                      else VALIDATION_DOCKQ_PROTOCOL))
     return result
 
 
