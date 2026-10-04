@@ -232,15 +232,23 @@ class TriCoopDiffTrainer:
         rng_before = capture_rng_state()
         results = []
         try:
-            for batch in batches:
-                loss_dict = self.compute_loss(**batch)
+            packed = getattr(self.model.trifuse, 'enhanced_conditions', False)
+            losses = (self.compute_losses(batches) if packed
+                      else (self.compute_loss(**batch) for batch in batches))
+            objective = None
+            for loss_dict in losses:
                 total = loss_dict['loss_total']
                 if not torch.isfinite(total):
                     raise NonFiniteTrainingError('non-finite total loss')
-                (total / len(batches)).backward()
+                if packed:
+                    objective = total if objective is None else objective + total
+                else:
+                    (total / len(batches)).backward()
                 results.append({k: v.item() if torch.is_tensor(v) else v
                                 for k, v in loss_dict.items()})
                 del loss_dict, total
+            if packed:
+                (objective / len(batches)).backward()
         except Exception:
             self.optimizer.zero_grad(set_to_none=True)
             restore_rng_state(rng_before)
@@ -311,6 +319,13 @@ NEAR_TARGET_SUPERVISION = {
     'rotation_std_radians': .05, 'torsion_std_radians': .05,
     'entry_selection': 'source_zero_clock_orthogonal_cycle8_v1',
 }
+STATE_RECOVERY_SUPERVISION = {
+    'weight': .25, 'start_times': [.75, .5, .25],
+    'translation_std_angstrom': .5, 'rotation_std_radians': .05,
+    'torsion_std_radians': .05,
+    'entry_selection': 'alternate_eight_sample_near_and_rollout_blocks_v1',
+    'batch_execution': 'ragged_native_experts_v1',
+}
 LEGACY_NEAR_TARGET_SUPERVISION = {
     **{key: value for key, value in NEAR_TARGET_SUPERVISION.items()
        if key not in ('start_times', 'entry_selection')},
@@ -378,7 +393,8 @@ def validate_consensus_checkpoint(payload):
                                            model_config['num_transformer_layers'],
                                            model_config.get('source_conditioning', False),
                                            model_profile=model_config['model_profile'],
-                                           expert_scalar_dim=model_config.get('expert_scalar_dim', 58))
+                                           expert_scalar_dim=model_config.get('expert_scalar_dim', 58),
+                                           expert_film_dim=model_config.get('expert_film_dim', 48))
         if model_config != expected:
             raise ValueError('checkpoint violates its production model profile')
     if bool(direct) != (payload.get('architecture') == DIRECT_ARCHITECTURE):
@@ -400,15 +416,20 @@ def validate_consensus_checkpoint(payload):
         raise ValueError('ternary endpoint v4 requires checkpoint version 27')
     if model_config.get('model_profile') == 'ternary_endpoint_v5' and version < 29:
         raise ValueError('conditional expert v5 requires checkpoint version 29')
+    if model_config.get('model_profile') == 'ternary_endpoint_v6' and version < 30:
+        raise ValueError('geometric conditional expert v6 requires checkpoint version 30')
     if version >= 25:
         profile = model_config.get('model_profile')
         new_recipe = profile in MODEL_PROFILES[1:]
         near_config = NEAR_TARGET_SUPERVISION if profile in MODEL_PROFILES[2:] else LEGACY_NEAR_TARGET_SUPERVISION
-        expected = {'training_recipe': ('endpoint_near_target_v2' if profile in MODEL_PROFILES[2:] else 'endpoint_near_target_v1')
+        expected = {'training_recipe': ('endpoint_state_recovery_v1' if profile == PRODUCTION_MODEL_PROFILE else
+                                        'endpoint_near_target_v2' if profile in MODEL_PROFILES[2:] else 'endpoint_near_target_v1')
                                        if new_recipe else 'endpoint_only_v1',
                     'ema_update_contract': 'optimizer_step_warmup_v1' if new_recipe else 'optimizer_step_fixed_v1',
                     'near_target_supervision': near_config if new_recipe else None,
                     'validation_weights': 'ema'}
+        if profile == PRODUCTION_MODEL_PROFILE:
+            expected['state_recovery_supervision'] = STATE_RECOVERY_SUPERVISION
         if any(config.get(key) != value for key, value in expected.items()):
             raise ValueError('checkpoint has an incompatible endpoint/EMA training recipe')
         if payload.get('checkpoint_kind') != 'inference_only':
@@ -518,7 +539,8 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         configure_expert_policy(self.model.expert, self.activation_clamp, self.activation_clamp_mode)
         self.ema_decay = float(ema_decay)
         profile = self.model.trifuse.config.get('model_profile')
-        self.training_recipe = ('endpoint_near_target_v2' if profile in MODEL_PROFILES[2:]
+        self.training_recipe = ('endpoint_state_recovery_v1' if profile == PRODUCTION_MODEL_PROFILE else
+                                'endpoint_near_target_v2' if profile in MODEL_PROFILES[2:]
                                 else 'endpoint_near_target_v1' if profile == 'ternary_endpoint_v2'
                                 else 'endpoint_only_v1')
         self.ema_update_contract = ('optimizer_step_warmup_v1'
@@ -529,6 +551,8 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                                        else None)
         self.near_target_weight = (self.near_target_supervision['weight']
                                    if self.near_target_supervision is not None else 0.0)
+        self.state_recovery_supervision = (dict(STATE_RECOVERY_SUPERVISION)
+                                          if profile == PRODUCTION_MODEL_PROFILE else None)
         if training_source_mix not in ('sdpi_only', 'sdpi_bitseed_1_1'):
             raise ValueError('training_source_mix must be sdpi_only or sdpi_bitseed_1_1')
         self.training_source_mix = training_source_mix
@@ -543,10 +567,34 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         self.set_phase(1)
         self.ema = {name: value.detach().clone() for name, value in self.model.trifuse.state_dict().items()}
 
-    def compute_loss(self, e3_data, poi_data, ligand_data, case='unknown',
+    def compute_loss(self, **batch):
+        return self.compute_losses([batch])[0]
+
+    def compute_losses(self, batches):
+        """Advance ragged trajectories together; all samples share one graph forward."""
+        trajectories = [self._loss_trajectory(**batch) for batch in batches]
+        pending, results = {}, [None] * len(batches)
+        for index, trajectory in enumerate(trajectories):
+            pending[index] = next(trajectory)
+        while pending:
+            indices = list(pending)
+            outputs = self.diffusion.forward_states(self.model, [pending[index] for index in indices])
+            pending = {}
+            for index, output in zip(indices, outputs):
+                try:
+                    pending[index] = trajectories[index].send(output)
+                except StopIteration as finished:
+                    results[index] = finished.value
+        return results
+
+    def _loss_trajectory(self, e3_data, poi_data, ligand_data, case='unknown',
                      t_override=None, t_pol_override=None, coupling_override=None,
                      diagnostics=False, source=0, conditions=None, near_target_zero=None,
-                     near_target_start_t=None):
+                     near_target_start_t=None, recovery_start_t=None):
+        if recovery_start_t is not None and (self.state_recovery_supervision is None
+                or recovery_start_t not in self.state_recovery_supervision['start_times']
+                or near_target_zero is not None):
+            raise ValueError('state recovery requires its recorded clock and a separate auxiliary entry')
         if near_target_start_t is not None and near_target_zero is None:
             raise ValueError('near-target start time requires an auxiliary entry')
         if near_target_zero is not None:
@@ -596,33 +644,31 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                                         dtype=ld['coords'].dtype).reshape_as(ld['coords'])
         if ligand.shape != ld['coords'].shape or poi.shape != pd['coords'].shape:
             raise ValueError('actual initialization atom counts must match the indexed inputs')
-        result = self._endpoint_rollout_loss(
-            ed, pd, ld, ligand, poi, body, target_ligand, source, conditions)
+        capture_index = (max(1, min(self.diffusion.inference_steps - 1,
+                                   round((1 - recovery_start_t) * self.diffusion.inference_steps)))
+                         if recovery_start_t is not None and self.diffusion.inference_steps > 1 else None)
+        result = yield from self._endpoint_rollout_loss(
+            ed, pd, ld, ligand, poi, body, target_ligand, source, conditions, capture_index=capture_index)
         result['loss_endpoint_main'] = result['loss_total']
         if near_target_zero is not None:
             near_ligand, near_poi = target_ligand.detach(), pd['coords'].detach()
             near_body = torch.eye(3, device=self.device, dtype=near_ligand.dtype).unsqueeze(0)
             if not near_target_zero:
-                velocities = {
-                    'rigid_output_mode': INDEPENDENT_RIGID_MODE,
-                    **({'torsion_update_mode': CONTINUOUS_TORSION_MODE}
-                       if getattr(self.model.trifuse, 'continuous_torsion', False) else {}),
-                    'torsion': near_ligand.new_empty((1, 0 if no_torsion else int(ld['edge_mask'].sum()))).normal_(
-                        0, self.near_target_supervision['torsion_std_radians']),
-                    **{branch: {'tr': near_ligand.new_empty((1, 3)).normal_(
-                                    0, self.near_target_supervision['translation_std_angstrom']),
-                                'rot': near_ligand.new_empty((1, 3)).normal_(
-                                    0, self.near_target_supervision['rotation_std_radians'])}
-                       for branch in ('e3_ligand', 'poi_ligand')},
-                }
-                with torch.no_grad():
-                    near_ligand, near_poi, near_body = self.diffusion.differentiable_step(
-                        near_ligand, near_poi, near_body, velocities, dt.new_ones((1,)), ld)
-            near = self._endpoint_rollout_loss(
+                near_ligand, near_poi, near_body = self._perturb_state(
+                    near_ligand, near_poi, near_body, ld, self.near_target_supervision)
+            near = yield from self._endpoint_rollout_loss(
                 ed, pd, ld, near_ligand, near_poi, near_body, target_ligand, source,
                 conditions, t_start=start_t, steps=max(1, math.ceil(self.diffusion.inference_steps * start_t)))
             result['components']['loss_near_target'] = near['loss_total']
             result['loss_total'] = result['loss_total'] + self.near_target_weight * near['loss_total']
+        if capture_index is not None:
+            recovery_state = self._perturb_state(*result.pop('recovery_state'), ld, self.state_recovery_supervision)
+            remaining = self.diffusion.inference_steps - capture_index
+            recovery = yield from self._endpoint_rollout_loss(
+                ed, pd, ld, *recovery_state, target_ligand, source, conditions,
+                t_start=remaining / self.diffusion.inference_steps, steps=remaining)
+            result['components']['loss_state_recovery'] = recovery['loss_total']
+            result['loss_total'] = result['loss_total'] + self.state_recovery_supervision['weight'] * recovery['loss_total']
         if not torch.isfinite(result['loss_total']):
             raise NonFiniteTrainingError(f'case={case}: non-finite executed endpoint loss')
         if diagnostics:
@@ -633,11 +679,29 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 'native_interface_pairs': result['native_interface_pairs'],
                 **{name: value.detach().item() for name, value in result['components'].items()}}
 
+    def _perturb_state(self, ligand, poi, body, ld, config):
+        no_torsion = bool(getattr(self.model.expert.model, 'no_torsion', False))
+        velocities = {
+            'rigid_output_mode': INDEPENDENT_RIGID_MODE,
+            **({'torsion_update_mode': CONTINUOUS_TORSION_MODE}
+               if getattr(self.model.trifuse, 'continuous_torsion', False) else {}),
+            'torsion': ligand.new_empty((1, 0 if no_torsion else int(ld['edge_mask'].sum()))).normal_(
+                0, config['torsion_std_radians']),
+            **{branch: {'tr': ligand.new_empty((1, 3)).normal_(0, config['translation_std_angstrom']),
+                        'rot': ligand.new_empty((1, 3)).normal_(0, config['rotation_std_radians'])}
+               for branch in ('e3_ligand', 'poi_ligand')},
+        }
+        with torch.no_grad():
+            return self.diffusion.differentiable_step(ligand, poi, body, velocities, ligand.new_ones(1), ld)
+
     def _endpoint_rollout_loss(self, ed, pd, ld, ligand, poi, body, target_ligand,
-                               source, conditions, t_start=1., steps=None):
+                               source, conditions, t_start=1., steps=None, capture_index=None):
         """One geometric objective for both full starts and reachable short starts."""
-        for t, dt in self.diffusion.reverse_times(ld['coords'], steps=steps, t_start=t_start):
-            output = self._forward_state(ed, pd, ld, ligand, poi, body, t, dt, source, conditions)
+        captured = {}
+        for index, (t, dt) in enumerate(self.diffusion.reverse_times(ld['coords'], steps=steps, t_start=t_start)):
+            if index == capture_index:
+                captured['recovery_state'] = tuple(value.detach() for value in (ligand, poi, body))
+            output = yield ed, pd, ld, ligand, poi, body, t, dt, source, conditions
             normalized = self.diffusion.normalized_predictions(output, t)
             velocities = self.diffusion.velocities(normalized, ed['coords'], pd['coords'])
             ligand, poi, body = self.diffusion.differentiable_step(
@@ -659,13 +723,13 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             total = total + self.steric_loss_weight * steric
         total = self.endpoint_loss_weight * total
         return {'loss_total': total, 'components': losses, 'native_interface_pairs': interface_pairs,
-                'predicted_ligand': ligand, 'predicted_poi': poi}
+                'predicted_ligand': ligand, 'predicted_poi': poi, **captured}
 
     def train_batch(self, batches):
         if len(batches) > self.effective_batch_size:
             raise ValueError('microbatch group exceeds the recorded effective batch size')
         if self.near_target_weight:
-            if self.training_recipe == 'endpoint_near_target_v2':
+            if self.training_recipe in ('endpoint_near_target_v2', 'endpoint_state_recovery_v1'):
                 batches = [{**batch, 'near_target_zero': ((self.samples_seen + offset) // 2) % 2 == 0,
                             'near_target_start_t': self.near_target_supervision['start_times'][
                                 ((self.samples_seen + offset) // 4) % 2]}
@@ -674,6 +738,12 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 batches = [{**batch, 'near_target_zero': (self.samples_seen + offset) % 2 == 0,
                             'near_target_start_t': self.near_target_supervision['start_t']}
                            for offset, batch in enumerate(batches)]
+        if self.state_recovery_supervision is not None and self.diffusion.inference_steps > 1:
+            batches = [({**batch, 'near_target_zero': None, 'near_target_start_t': None,
+                         'recovery_start_t': self.state_recovery_supervision['start_times'][
+                             ((self.samples_seen + offset) // 2) % 3]}
+                        if ((self.samples_seen + offset) // 8) % 2 == 0 else batch)
+                       for offset, batch in enumerate(batches)]
         result = super().train_batch(batches)
         decay = self.effective_ema_decay
         with torch.no_grad():
@@ -705,7 +775,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             self.model.trifuse.load_state_dict(raw)
 
     def validate_step(self, dockq_context=None, weights='ema', **batch):
-        if any(batch.get(key) is not None for key in ('near_target_zero', 'near_target_start_t')):
+        if any(batch.get(key) is not None for key in ('near_target_zero', 'near_target_start_t', 'recovery_start_t')):
             raise ValueError('validation evaluates the main endpoint only, not training-only auxiliary entries')
         if weights not in ('raw', 'ema'):
             raise ValueError('validation weights must be raw or ema')
@@ -876,6 +946,8 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 'training_recipe': self.training_recipe,
                 'ema_update_contract': self.ema_update_contract,
                 'near_target_supervision': self.near_target_supervision,
+                **({'state_recovery_supervision': self.state_recovery_supervision}
+                   if self.state_recovery_supervision is not None else {}),
                 'validation_weights': 'ema',
                 'validation_dockq_protocol': REAL_VALIDATION_DOCKQ_PROTOCOL,
                 'expert_runtime_identity': expert_runtime_identity(self.model.expert),
@@ -896,7 +968,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         validate_consensus_checkpoint(payload)
         if payload.get('checkpoint_kind') == 'inference_only':
             raise ValueError('inference-only weights cannot resume the production training objective')
-        if (payload['checkpoint_version'] not in (24, 25, 26, 27, 28, CONSENSUS_CHECKPOINT_VERSION)
+        if (payload['checkpoint_version'] not in (24, 25, 26, 27, 28, 29, CONSENSUS_CHECKPOINT_VERSION)
                 or payload['runtime_config'].get('training_objective') != REAL_ENDPOINT_OBJECTIVE):
             raise ValueError('training objective differs or checkpoint is historical; load weights only')
         for key in ('inference_steps', 'endpoint_loss_weight', 'interface_loss_weight',

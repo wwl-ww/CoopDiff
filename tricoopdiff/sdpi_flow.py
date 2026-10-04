@@ -120,6 +120,23 @@ class SDPIFlow:
 
     def forward_state(self, model, e3_data, poi_data, ligand_data,
                       ligand, poi, body, t, dt, source=0, conditions=None):
+        return self.forward_states(model, [(e3_data, poi_data, ligand_data, ligand,
+                                           poi, body, t, dt, source, conditions)])[0]
+
+    def forward_states(self, model, states):
+        """One shared clock/geometry contract for single and ragged batch execution."""
+        requests = [self._forward_inputs(model, *state) for state in states]
+        outputs = (model.forward_many(requests) if hasattr(model, 'forward_many')
+                   else [model(request['e3_data'], request['poi_data'], request['ligand_data'],
+                               **{key: value for key, value in request.items()
+                                  if key not in ('e3_data', 'poi_data', 'ligand_data')})
+                         for request in requests])
+        for output in outputs:
+            self._validate_output(model, output)
+        return outputs
+
+    def _forward_inputs(self, model, e3_data, poi_data, ligand_data,
+                        ligand, poi, body, t, dt, source=0, conditions=None):
         """Read the same current geometry and expert clock in both execution paths.
 
         Template coordinates supply fixed conditioning scales; moving coordinates
@@ -131,10 +148,13 @@ class SDPIFlow:
             tr_sigma, _, _ = self.t_to_sigma(t, t, t)
             crop = tr_sigma * 3 + 20
         condition_kwargs = {'conditions': conditions} if conditions is not None else {}
-        output = model(e3_data, {**poi_data, 'coords': poi},
-                       {**ligand_data, 'coords': ligand}, t_e3l=t, t_pol=t,
-                       r_e3_to_poi=body, diffusion_state=conditioning,
-                       receptor_crop_cutoff=crop, source=source, **condition_kwargs)
+        return dict(e3_data=e3_data, poi_data={**poi_data, 'coords': poi},
+                    ligand_data={**ligand_data, 'coords': ligand}, t_e3l=t, t_pol=t,
+                    r_e3_to_poi=body, diffusion_state=conditioning,
+                    receptor_crop_cutoff=crop, source=source, **condition_kwargs)
+
+    @staticmethod
+    def _validate_output(model, output):
         if (getattr(getattr(model, 'trifuse', None), 'direct_ternary_motion', False)
                 and output.get('normalized_velocity', {}).get('rigid_output_mode')
                 != INDEPENDENT_RIGID_MODE):
@@ -143,7 +163,6 @@ class SDPIFlow:
                 and output.get('normalized_velocity', {}).get('torsion_update_mode')
                 != CONTINUOUS_TORSION_MODE):
             raise ValueError('continuous torsion model must execute its horizontal update')
-        return output
 
     @staticmethod
     def scales(e3_coords, poi_coords):

@@ -464,7 +464,8 @@ def build_trainer(args, device, input_dim=None):
     model_config = production_model_config(args.node_dim, input_dim,
                                            args.num_transformer_layers,
                                            args.training_arm == 'C',
-                                           expert_scalar_dim=frozen_expert.node_scalar_dim)
+                                           expert_scalar_dim=frozen_expert.node_scalar_dim,
+                                           expert_film_dim=frozen_expert.ns)
     if args.resume:
         # Resume means reconstruct the saved architecture, not reinterpret it
         # using today's defaults. The trainer subsequently checks every runtime

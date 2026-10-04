@@ -128,7 +128,7 @@ def test_consensus_builder_passes_only_active_model_dimensions():
         '--train_data', 'unused.json', '--val_data', 'unused.json',
         '--output_dir', 'unused',
     ])
-    expert = SimpleNamespace(num_conv_layers=11, node_scalar_dim=58)
+    expert = SimpleNamespace(num_conv_layers=11, node_scalar_dim=58, ns=48)
     with patch('tricoopdiff.models.expert.build_diffdock_expert', return_value=expert), \
             patch('tricoopdiff.models.consensus.ConsensusFuse') as fuse, \
             patch('tricoopdiff.models.consensus.ConsensusCoopDiff') as model, \
@@ -144,7 +144,7 @@ def test_consensus_builder_passes_only_active_model_dimensions():
             global_node_attention=True,
             rotation_scale_normalization=True,
             dropout=0., source_conditioning=False,
-            model_profile='ternary_endpoint_v5', expert_scalar_dim=58,
+            model_profile='ternary_endpoint_v6', expert_scalar_dim=58, expert_film_dim=48,
         )
         assert model.call_args.kwargs['expert_input_grad'] is True
         assert result is model.return_value
@@ -615,7 +615,7 @@ def test_resume_builder_uses_saved_model_and_loss_recipe_not_current_defaults():
     args = parse_args(['--train_data', 'unused', '--val_data', 'unused',
                        '--output_dir', 'unused', '--resume', 'saved.pt'])
     with patch('train_entry.torch.load', return_value=payload), \
-            patch('tricoopdiff.models.expert.build_diffdock_expert', return_value=SimpleNamespace(num_conv_layers=11, node_scalar_dim=58)), \
+            patch('tricoopdiff.models.expert.build_diffdock_expert', return_value=SimpleNamespace(num_conv_layers=11, node_scalar_dim=58, ns=48)), \
             patch('tricoopdiff.models.consensus.ConsensusFuse') as fuse, \
             patch('tricoopdiff.models.consensus.ConsensusCoopDiff'), \
             patch('tricoopdiff.train.ConsensusTrainer') as builder:
@@ -933,7 +933,7 @@ def test_c_builder_records_online_single_pair_endpoint_protocol():
         '--output_dir', 'unused', '--training-arm', 'C',
     ])
     args.training_endpoint_protocol = 'online_bitseed_training_c1_m1_v1'
-    expert = SimpleNamespace(num_conv_layers=11, node_scalar_dim=58)
+    expert = SimpleNamespace(num_conv_layers=11, node_scalar_dim=58, ns=48)
     with patch('tricoopdiff.models.expert.build_diffdock_expert', return_value=expert), \
             patch('tricoopdiff.models.consensus.ConsensusFuse'), \
             patch('tricoopdiff.models.consensus.ConsensusCoopDiff'), \
@@ -1105,7 +1105,7 @@ def test_v2_checkpoint_records_recipe_and_resumes_warmup_and_entry_parity():
     trainer, batch, coupling = _endpoint_trainer_fixture('ternary_endpoint_v2')
     trainer.train_step(**batch, coupling_override=coupling)
     payload = copy.deepcopy(trainer.checkpoint_payload())
-    assert payload['checkpoint_version'] == 29
+    assert payload['checkpoint_version'] == 30
     payload['checkpoint_version'] = 25  # Historical v2 weights retain their old recipe.
     assert payload['runtime_config']['ema_update_contract'] == 'optimizer_step_warmup_v1'
     assert payload['runtime_config']['near_target_supervision']['weight'] == .25
@@ -1203,7 +1203,7 @@ def test_production_entry_rejects_old_v2_training_recipe_without_reinterpretatio
                        '--output_dir', 'unused', '--resume', 'saved.pt'])
     with patch('train_entry.torch.load', return_value=payload), \
             patch('tricoopdiff.models.expert.build_diffdock_expert',
-                  return_value=SimpleNamespace(node_scalar_dim=58)):
+                  return_value=SimpleNamespace(node_scalar_dim=58, ns=48)):
         try:
             build_trainer(args, 'cpu', input_dim=4)
         except ValueError as error:
@@ -1348,6 +1348,41 @@ def test_optimizer_manifest_rejects_same_shape_moment_swaps_before_live_mutation
     assert any('trusts registration order' in str(item.message) for item in caught)
     assert torch.equal(trainer.optimizer.state[first]['exp_avg'], optimizer.state[first]['exp_avg'])
     assert torch.equal(trainer.optimizer.state[second]['exp_avg'], optimizer.state[second]['exp_avg'])
+
+
+def test_state_recovery_uses_actual_prefix_and_remaining_clock():
+    from tricoopdiff.models.consensus import PRODUCTION_MODEL_PROFILE
+    from tricoopdiff.train import validate_consensus_checkpoint
+
+    trainer, batch, coupling = _endpoint_trainer_fixture(PRODUCTION_MODEL_PROFILE, inference_steps=8)
+    trainer.model.trifuse.enhanced_conditions = True
+    result = trainer.compute_loss(**batch, coupling_override=coupling, recovery_start_t=.75, diagnostics=True)
+    assert len(trainer.model.calls) == 14, 'recovery must execute only six remaining steps after the full eight'
+    assert trainer.model.calls[8][0] == .75
+    assert 'loss_state_recovery' in result['components'] and 'recovery_state' not in result
+    result['loss_total'].backward()
+    assert torch.isfinite(trainer.model.trifuse.motion.grad).all()
+    trainer.effective_batch_size = 2
+    trainer.model.calls.clear()
+    metrics = trainer.train_batch([{**batch, 'coupling_override': coupling}] * 2)
+    assert all('loss_state_recovery' in item for item in metrics)
+    assert trainer.global_step == 1 and trainer.samples_seen == 2
+    payload = trainer.checkpoint_payload()
+    validate_consensus_checkpoint(payload)
+    payload['runtime_config']['state_recovery_supervision'] = {
+        **payload['runtime_config']['state_recovery_supervision'], 'weight': .9}
+    try:
+        validate_consensus_checkpoint(payload)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('unrecorded state-recovery loss was accepted')
+    try:
+        trainer.validate_step(**batch, coupling_override=coupling, recovery_start_t=.75)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('training-only recovery entered validation selection loss')
 
 
 if __name__ == "__main__":

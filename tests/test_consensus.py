@@ -1127,7 +1127,8 @@ def test_conditional_prior_converts_binary_poi_motion_and_keeps_ternary_output()
                    for branch in BRANCHES}
     independent['torsion'] = torch.full((1, 1), 7.)
     result = fuse._combine_conditional_prior(
-        {'normalized_velocity': independent, 'rank_features': context, 'consensus_diagnostics': {}},
+        {'normalized_velocity': independent, 'rank_features': context, 'consensus_diagnostics': {},
+         'torsion_prior_weights': torch.full((1, 1, 2), .1)},
         graph, proposals, state)
     a, b = (proposals[branch] for branch in BRANCHES)
     lever = (graph['node_coords'][graph['node_types'] == 1].mean(0)
@@ -1149,11 +1150,14 @@ def test_endpoint_profiles_isolate_torsion_recipe_and_continuous_decoder():
     from tricoopdiff.models.consensus import production_model_config, PRODUCTION_MODEL_PROFILE
     from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, SDPIFlow
 
-    assert PRODUCTION_MODEL_PROFILE == 'ternary_endpoint_v5'
+    assert PRODUCTION_MODEL_PROFILE == 'ternary_endpoint_v6'
     configs = {version: production_model_config(32, 16, 1, model_profile=f'ternary_endpoint_v{version}')
-               for version in (1, 2, 3, 4, 5)}
-    assert production_model_config(32, 16, 1) == configs[5]
+               for version in (1, 2, 3, 4, 5, 6)}
+    assert production_model_config(32, 16, 1) == configs[6]
     models = {version: ConsensusFuse(**config).eval() for version, config in configs.items()}
+    assert not models[5].enhanced_conditions and models[6].enhanced_conditions
+    assert models[5].condition_film[0].out_features == 116
+    assert models[6].condition_film[0].out_features == 96
     assert not models[1].endpoint_v2 and not models[1].pooling.continuous_geometry
     assert 'expert_scalar_dim' not in configs[1]
     for version in (2, 3, 4):
@@ -1223,6 +1227,97 @@ def test_bounded_vector_retains_large_finite_directions_and_coordinate_gradients
     rotation = so3_exp(torch.tensor([[.2, -.5, .7]]))[0]
     assert torch.allclose(bounded_vector(values @ rotation.T),
                           bounded_vector(values) @ rotation.T, atol=2e-7, rtol=0.)
+
+
+def test_conditions_read_geometry_even_with_identical_partner_features():
+    from tricoopdiff.models.consensus import production_model_config
+
+    _, graph, _, state = fixture()
+    fuse = ConsensusFuse(**production_model_config(32, 16, 1)).eval()
+    for head in fuse.condition_film:
+        torch.nn.init.normal_(head.weight, std=.02)
+    partner = graph['node_types'] == 1
+    graph['node_features'][partner] = graph['node_features'][partner][0].clone()
+    graph['node_coords'].requires_grad_()
+    before = fuse.expert_conditions(graph, state)[0]
+    coords = graph['node_coords'].detach().clone()
+    coords[partner] += torch.tensor([40., -10., 5.])
+    after = fuse.expert_conditions({**graph, 'node_coords': coords}, state)[0]
+    assert not torch.allclose(before[0][0], after[0][0]), 'constant partner features erased its geometry'
+    sum(v.square().sum() for pair in before for v in pair).backward()
+    assert graph['node_coords'].grad[partner].abs().sum() > 0
+    for head in fuse.condition_film:
+        assert head.weight.grad.shape[0] == 96
+        assert (head.weight.grad.abs().sum(-1) > 0).all(), 'unused FiLM output rows remain'
+    assert fuse.condition_value[0].weight.grad.abs().sum() > 0
+
+
+def test_geometric_anchors_cover_homogeneous_protein_and_respect_symmetry():
+    from tricoopdiff.models.consensus import TernaryRelationEncoder
+
+    torch.manual_seed(42)
+    coords = (torch.randn(60, 3, dtype=torch.double) * 10).requires_grad_()
+    def anchors(x):
+        return TernaryRelationEncoder.anchor_geometry(x).softmax(-1) @ x
+    points = anchors(coords)
+    radius = (coords - coords.mean(0)).square().sum(-1).mean()
+    spread = (points - points.mean(0)).square().sum(-1).mean()
+    assert spread > .2 * radius, 'geometric anchors collapsed despite a spatially extended protein'
+    rotation = so3_exp(coords.new_tensor([.3, -.2, .7]))
+    assert torch.allclose(anchors(coords @ rotation.T + 8), points @ rotation.T + 8, atol=1e-10)
+    assert torch.allclose(anchors(coords[torch.randperm(len(coords))]), points, atol=1e-10)
+    points.square().sum().backward()
+    assert torch.isfinite(coords.grad).all() and coords.grad.abs().sum() > 0
+    symmetric = torch.tensor([[1., 0., 0.], [-1., 0., 0.], [0., 1., 0.], [0., -1., 0.]], dtype=torch.double)
+    assert torch.allclose(anchors(symmetric.flip(0)), anchors(symmetric)), 'ties depend on residue order'
+
+
+def test_motion_negotiation_reads_expert_conflicts_and_bond_types():
+    from tricoopdiff.models.consensus import production_model_config
+
+    _, graph, proposals, state = fixture()
+    fuse = ConsensusFuse(**production_model_config(32, 16, 1)).eval()
+    torch.nn.init.normal_(fuse.expert_prior_gate.weight, std=.1)
+    torch.nn.init.normal_(fuse.motion_head[-1].weight, std=.1)
+    before = fuse(graph, proposals, state)
+    changed = copy.deepcopy(proposals)
+    for key in ('tr', 'rot'):
+        changed['poi_ligand'][key] *= -7
+    after = fuse(graph, changed, state)
+    assert not torch.allclose(before['consensus_diagnostics']['conditional_prior_gates'],
+                              after['consensus_diagnostics']['conditional_prior_gates'])
+    assert not torch.allclose(before['ternary_velocity']['poi_ligand']['tr'],
+                              after['ternary_velocity']['poi_ligand']['tr'])
+    bonds = graph['lig_edge_attr'].roll(1, -1)
+    chemistry = fuse({**graph, 'lig_edge_attr': bonds}, proposals, state)
+    assert not torch.allclose(before['ternary_velocity']['poi_ligand']['tr'],
+                              chemistry['ternary_velocity']['poi_ligand']['tr']), 'rigid ternary field ignores bond types'
+
+    graph['node_coords'].requires_grad_()
+    output = fuse(graph, proposals, state)
+    output['ternary_velocity']['poi_ligand']['tr'].square().sum().backward()
+    assert fuse.pooling.local_pair_message[-1].weight.grad.abs().sum() > 0
+    assert torch.isfinite(graph['node_coords'].grad).all()
+    assert fuse.pooling.triangle_mix.grad.abs().sum() > 0
+    assert fuse.motion_head[-1].weight.grad[4].abs().sum() > 0, 'node contribution weights cannot learn'
+
+
+def test_per_bond_expert_selection_does_not_cancel_opposing_torsions():
+    from tricoopdiff.models.consensus import production_model_config
+
+    _, graph, proposals, state = fixture()
+    fuse = ConsensusFuse(**production_model_config(32, 16, 1)).eval()
+    proposals['e3_ligand']['tor'].fill_(1.)
+    proposals['poi_ligand']['tor'].fill_(-1.)
+    with torch.no_grad():
+        fuse.direct_torsion_head[-1].bias[1:] = torch.tensor([6., -6.])
+    first = fuse(graph, proposals, state)
+    with torch.no_grad():
+        fuse.direct_torsion_head[-1].bias[1:] *= -1
+    second = fuse(graph, proposals, state)
+    assert first['normalized_velocity']['torsion'].item() > .7
+    assert second['normalized_velocity']['torsion'].item() < -.7
+    assert first['ternary_velocity']['torsion'].item() == second['ternary_velocity']['torsion'].item() == 0
 
 
 if __name__ == '__main__':
