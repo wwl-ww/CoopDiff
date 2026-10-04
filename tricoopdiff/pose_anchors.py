@@ -25,6 +25,41 @@ def surface_frame(normal, tangent):
     return torch.stack((x_axis, y_axis, z_axis), dim=-2)
 
 
+class _ProperPolarRotation(torch.autograd.Function):
+    """Differentiate the rotation, not ambiguous SVD singular vectors.
+
+    The polar derivative uses sums of signed singular values, so repeated
+    positive singular values (including an exact identity fit) are regular.
+    """
+
+    @staticmethod
+    def forward(ctx, covariance):
+        u, singular, vh = torch.linalg.svd(covariance.double())
+        if bool((singular[..., 1] <= torch.finfo(covariance.dtype).eps
+                 * singular[..., 0]).any()):
+            raise ValueError('rigid fit is underdetermined for collinear coordinates')
+        sign = torch.ones_like(singular)
+        sign[..., -1] = torch.where(torch.det(u @ vh) < 0, -1., 1.)
+        q = (u * sign.unsqueeze(-2)) @ vh
+        ctx.save_for_backward(q, vh, singular * sign)
+        ctx.input_dtype = covariance.dtype
+        return q.to(covariance.dtype)
+
+    @staticmethod
+    def backward(ctx, gradient):
+        q, vh, signed = ctx.saved_tensors
+        a = q.transpose(-1, -2) @ gradient.double()
+        skew = vh @ (a - a.transpose(-1, -2)) @ vh.transpose(-1, -2)
+        denominator = signed.unsqueeze(-1) + signed.unsqueeze(-2)
+        # Reflection/near-collinear fits can genuinely be ill-conditioned;
+        # bound only that singular chart, not the ordinary polar derivative.
+        floor = signed.abs().amax(-1, keepdim=True).unsqueeze(-1).clamp_min(1.) * 1e-8
+        denominator = torch.where(denominator.abs() < floor,
+                                  torch.where(denominator < 0, -floor, floor), denominator)
+        k = vh.transpose(-1, -2) @ (skew / denominator) @ vh
+        return (q @ k).to(ctx.input_dtype)
+
+
 def proper_rigid_fit(source, target):
     """Return the proper least-squares row-coordinate transform source -> target."""
     if (source.shape != target.shape or source.ndim not in (2, 3)
@@ -37,14 +72,7 @@ def proper_rigid_fit(source, target):
     x = source - source_center.unsqueeze(-2)
     y = target - target_center.unsqueeze(-2)
     covariance = x.transpose(-1, -2) @ y
-    u, singular, vh = torch.linalg.svd(covariance)
-    if bool((singular[..., 1] <= torch.finfo(source.dtype).eps
-             * singular[..., 0]).any()):
-        raise ValueError("rigid fit is underdetermined for collinear coordinates")
-    sign = torch.ones((*source.shape[:-2], 3), dtype=source.dtype,
-                      device=source.device)
-    sign[..., -1] = torch.det(vh.transpose(-1, -2) @ u.transpose(-1, -2))
-    rotation = vh.transpose(-1, -2) @ torch.diag_embed(sign) @ u.transpose(-1, -2)
+    rotation = _ProperPolarRotation.apply(covariance).transpose(-1, -2)
     translation = target_center - (
         rotation @ source_center.unsqueeze(-1)
     ).squeeze(-1)

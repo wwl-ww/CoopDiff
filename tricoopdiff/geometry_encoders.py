@@ -270,7 +270,9 @@ class TernaryGeometryEncoder(nn.Module):
         geometry = torch.cat((
             torch.exp(-0.5 * ((distance[:, None] - self.rbf_centers) / self.rbf_width) ** 2),
             torch.log1p(distance[:, None] / self.max_distance)), dim=-1)
-        direction = F.normalize(delta, dim=-1, eps=1e-8)
+        # Sub-angstrom overlap has no reliable contact direction. Bound its
+        # coordinate Jacobian at 10/A rather than amplifying it up to 1e8/A.
+        direction = delta / distance[:, None].clamp_min(.1)
         if self.spatial_geometry:
             geometry = torch.cat((geometry, self._spatial_edge_geometry(
                 coords, types, receiver, direction)), dim=-1)
@@ -317,9 +319,8 @@ class TernaryGeometryEncoder(nn.Module):
                 total = total + self._distance_rbf_sum(chunk)
         return total / distances.numel()
 
-    def _pair_descriptor(self, coords_a: torch.Tensor,
-                         coords_b: torch.Tensor) -> torch.Tensor:
-        distances = torch.cdist(coords_a, coords_b).reshape(-1)
+    def _pair_descriptor(self, distances: torch.Tensor) -> torch.Tensor:
+        distances = distances.reshape(-1)
         rbf = self._distance_histogram(distances)
         scale = self.max_distance
         statistics = torch.stack((
@@ -339,10 +340,10 @@ class TernaryGeometryEncoder(nn.Module):
         features_b: torch.Tensor,
         coords_b: torch.Tensor,
         pair_index: int,
+        distances: torch.Tensor,
         return_contacts: bool = False,
     ):
         """Pool the closest feature-labelled contacts for one interface."""
-        distances = torch.cdist(coords_a, coords_b)
         n_pairs = distances.numel()
         k = min(self.max_pair_tokens, n_pairs)
         values, flat_indices = torch.topk(
@@ -373,19 +374,17 @@ class TernaryGeometryEncoder(nn.Module):
     def _ligand_centric_contacts(
         self,
         protein_features: torch.Tensor,
-        protein_coords: torch.Tensor,
         ligand_features: torch.Tensor,
-        ligand_coords: torch.Tensor,
         pair_index: int,
+        distances: torch.Tensor,
     ) -> torch.Tensor:
         """Return one contact token per ligand atom with guaranteed coverage."""
-        distances = torch.cdist(ligand_coords, protein_coords)
-        k = min(self.contacts_per_ligand, protein_coords.shape[0])
+        k = min(self.contacts_per_ligand, protein_features.shape[0])
         values, protein_indices = torch.topk(
             distances, k=k, dim=1, largest=False, sorted=True,
         )
         ligand_indices = torch.arange(
-            ligand_coords.shape[0], device=ligand_coords.device,
+            ligand_features.shape[0], device=ligand_features.device,
         )[:, None].expand(-1, k)
         offsets = values[..., None] - self.rbf_centers
         distance_rbf = torch.exp(-0.5 * (offsets / self.rbf_width) ** 2)
@@ -408,16 +407,17 @@ class TernaryGeometryEncoder(nn.Module):
         e3_coords: torch.Tensor,
         poi_coords: torch.Tensor,
         ligand_coords: torch.Tensor,
+        distances,
         lig_edge_index: torch.Tensor = None,
     ) -> torch.Tensor:
         """Return angle and SE(3)-invariant, reflection-sensitive handedness."""
-        e3_nearest = torch.cdist(ligand_coords, e3_coords).argmin(dim=1)
-        poi_nearest = torch.cdist(ligand_coords, poi_coords).argmin(dim=1)
+        e3_nearest = distances[0].argmin(dim=0)
+        poi_nearest = distances[1].argmin(dim=0)
         e3_direction = F.normalize(
-            e3_coords[e3_nearest] - ligand_coords, dim=-1, eps=1e-8,
+            e3_coords[e3_nearest] - ligand_coords, dim=-1, eps=.1,
         )
         poi_direction = F.normalize(
-            poi_coords[poi_nearest] - ligand_coords, dim=-1, eps=1e-8,
+            poi_coords[poi_nearest] - ligand_coords, dim=-1, eps=.1,
         )
         cosine = (e3_direction * poi_direction).sum(dim=-1)
 
@@ -427,7 +427,7 @@ class TernaryGeometryEncoder(nn.Module):
             bond_direction.index_add_(
                 0, source, ligand_coords[target] - ligand_coords[source],
             )
-        bond_direction = F.normalize(bond_direction, dim=-1, eps=1e-8)
+        bond_direction = F.normalize(bond_direction, dim=-1, eps=.1)
         handedness = (
             torch.cross(e3_direction, poi_direction, dim=-1) * bond_direction
         ).sum(dim=-1)
@@ -499,41 +499,42 @@ class TernaryGeometryEncoder(nn.Module):
                 component_coords.append(coords)
                 component_features_by_type.append(component_features)
                 centered = coords - coords.mean(dim=0, keepdim=True)
-                radius = torch.sqrt(centered.square().sum(dim=-1).mean())
+                radius = torch.linalg.vector_norm(centered) / math.sqrt(len(coords))
                 component_descriptors.extend((
                     radius / self.max_distance,
                     torch.log1p(coords.new_tensor(float(coords.shape[0]))) / 10.0,
                 ))
 
-            pair_descriptors = [
-                self._pair_descriptor(component_coords[a], component_coords[b])
+            pair_distances = [
+                torch.cdist(component_coords[a], component_coords[b])
                 for a, b in self.PAIRS
             ]
+            pair_descriptors = [self._pair_descriptor(distances) for distances in pair_distances]
             e3_contacts = self._ligand_centric_contacts(
-                component_features_by_type[0], component_coords[0],
-                component_features_by_type[2], component_coords[2], 0,
+                component_features_by_type[0], component_features_by_type[2], 0,
+                pair_distances[0].T,
             )
             pol_contacts = self._ligand_centric_contacts(
-                component_features_by_type[1], component_coords[1],
-                component_features_by_type[2], component_coords[2], 1,
+                component_features_by_type[1], component_features_by_type[2], 1,
+                pair_distances[1].T,
             )
             ligand_tokens = self.ligand_contact_fusion(torch.cat((
                 component_features_by_type[2], e3_contacts, pol_contacts,
                 self._ligand_direction_invariants(
                     component_coords[0], component_coords[1],
-                    component_coords[2], lig_edge_index,
+                    component_coords[2], pair_distances, lig_edge_index,
                 ),
             ), dim=-1))
             protein_pair = self._local_pair_token(
                 component_features_by_type[0], component_coords[0],
-                component_features_by_type[1], component_coords[1], 2,
+                component_features_by_type[1], component_coords[1], 2, pair_distances[2],
                 return_contacts=return_protein_pair_contacts,
             )
             if return_protein_pair_contacts:
                 pair_token, contact_tokens, left, right = protein_pair
                 protein_pair_outputs.append({
                     'tokens': contact_tokens,
-                    'direction': F.normalize(right - left, dim=-1, eps=1e-8),
+                    'direction': F.normalize(right - left, dim=-1, eps=.1),
                     # All rigid updates rotate about the ligand center.
                     'lever': ((left + right) / 2 - component_coords[2].mean(0)) / 10.0,
                 })

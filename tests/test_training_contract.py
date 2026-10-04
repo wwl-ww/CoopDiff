@@ -411,7 +411,7 @@ def test_validation_reports_actual_dockq_and_preserves_rng():
         result = validate(Trainer(), Loader(), torch.device('cpu'))
     assert result['selection_loss'] == .1 and result['selection_dockq'] == .6
     assert result['per_case'][0]['dockq'] == .6
-    assert result['dockq_protocol'] == 'training_coupling_endpoint_fullatom_v1'
+    assert result['dockq_protocol'] == 'training_coupling_protein_fullatom_v2'
     assert torch.equal(torch.get_rng_state(), before[0])
     assert np.array_equal(np.random.get_state()[1], before[1][1]) and random.getstate() == before[2]
 
@@ -555,6 +555,22 @@ def test_training_entry_has_no_lora_configuration():
         assert error.code == 2
     else:
         raise AssertionError('the production entry must not expose LoRA')
+
+
+def test_gradient_clipping_does_not_overflow_on_finite_float32_gradients():
+    from tricoopdiff.train import clip_grad_norm_finite, NonFiniteTrainingError
+    parameter = torch.nn.Parameter(torch.zeros(4))
+    parameter.grad = torch.tensor([1e30, -1e30, 1e30, -1e30])
+    norm = clip_grad_norm_finite([parameter])
+    assert torch.isfinite(norm) and norm > 1e30
+    assert torch.allclose(parameter.grad, torch.tensor([.5, -.5, .5, -.5]))
+    parameter.grad[0] = float('inf')
+    try:
+        clip_grad_norm_finite([parameter])
+    except NonFiniteTrainingError:
+        pass
+    else:
+        raise AssertionError('genuinely non-finite gradients must still fail')
 
 
 if __name__ == "__main__":

@@ -39,16 +39,6 @@ def _rotation_exp(vector):
     return torch.linalg.matrix_exp(matrix)
 
 
-def _align(moving, target):
-    """Proper Kabsch fit in float64, row-vector convention."""
-    cm, ct = moving.mean(0), target.mean(0)
-    u, _, vt = np.linalg.svd((moving - cm).T @ (target - ct))
-    correction = np.eye(3)
-    correction[-1, -1] = np.linalg.det(u @ vt)
-    rotation = (u @ correction @ vt).T
-    return (moving - cm) @ rotation.T + ct
-
-
 def _raw_torsions(coords, bonds, masks, angles):
     from .diffdock.utils.torsion import modify_conformer_torsion_angles
 
@@ -57,10 +47,6 @@ def _raw_torsions(coords, bonds, masks, angles):
     return modify_conformer_torsion_angles(
         coords.copy(), torch.as_tensor(bonds), masks, angles, as_numpy=True,
     )
-
-
-def _torsion_shape(coords, bonds, masks, angles):
-    return _align(_raw_torsions(coords, bonds, masks, angles), coords)
 
 
 def _horizontal_torsion_velocity(coords, bonds, masks, angular_velocity):
@@ -322,29 +308,6 @@ class SDPIFlow:
 
     @staticmethod
     def step(ligand, poi, body, velocities, dt, ligand_data, freeze_poi=False):
-        """Reverse Lie-Euler step; dt>0 means integrate from t to t-dt."""
-        _check_coords(ligand)
-        _check_coords(poi)
-        if dt.shape != (1,) or not torch.isfinite(dt).all() or not bool((dt > 0).all()):
-            raise ValueError('flow step must be one finite positive dt')
-        rigid, poi, body = SDPIFlow.rigid_step(ligand, poi, body, velocities, dt, freeze_poi)
-        torsion = velocities['torsion']
-        n_bonds = int(ligand_data['edge_mask'].sum())
-        if (torsion.ndim != 2 or torsion.shape[0] != 1 or torsion.shape[1] not in (0, n_bonds)
-                or not torch.isfinite(torsion).all()):
-            raise ValueError('torsion velocities must be finite [1, n_rot] (or empty for no_torsion)')
-        angles = (-dt[:, None] * torsion).detach().cpu().double().numpy()[0]
-        if len(angles):
-            bonds = ligand_data['edge_index'].T[ligand_data['edge_mask']].detach().cpu().numpy()
-            masks = ligand_data['mask_rotate']
-            if isinstance(masks, (list, tuple)):
-                masks = masks[0]
-            if torch.is_tensor(masks):
-                masks = masks.detach().cpu().numpy()
-            moved = _torsion_shape(rigid[0].detach().cpu().double().numpy(), bonds, masks, angles)
-            rigid = torch.as_tensor(moved, dtype=ligand.dtype, device=ligand.device)[None]
-        _check_coords(rigid)
-        _check_coords(poi)
-        if not torch.isfinite(body).all():
-            raise FloatingPointError('non-finite flow body frame')
-        return rigid, poi, body
+        """Inference and training execute the same reverse Lie-Euler decoder."""
+        return SDPIFlow.differentiable_step(
+            ligand, poi, body, velocities, dt, ligand_data, freeze_poi)

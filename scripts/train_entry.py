@@ -607,16 +607,6 @@ def build_trainer(args, device, input_dim=None):
     return model, diffusion, trainer
 
 
-def _guarded_train_step(trainer, batch):
-    """Abort immediately when a batch is numerically invalid."""
-    from tricoopdiff.train import NonFiniteTrainingError
-
-    try:
-        return trainer.train_step(**batch)
-    except NonFiniteTrainingError as error:
-        raise RuntimeError(f"training aborted on first non-finite batch: {error}") from error
-
-
 def _guarded_train_batch(trainer, batches):
     from tricoopdiff.train import NonFiniteTrainingError
 
@@ -681,6 +671,7 @@ def prepare_source_batch(batch, global_step, training_arm, endpoint_store):
 def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None,
              native_root='DeepTernary/data/TernaryDB/pdbs'):
     """Run a deterministic validation pass without perturbing training RNG."""
+    from tricoopdiff.consensus_train import VALIDATION_DOCKQ_PROTOCOL
     cuda_devices = []
     if device.type == 'cuda':
         cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()]
@@ -770,7 +761,7 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
             raise RuntimeError('full-atom validation produced no DockQ measurements')
         result.update(selection_dockq=float(np.mean(list(dockq_by_source.values()))),
                       dockq_by_source=dockq_by_source, per_case=per_case,
-                      dockq_protocol='training_coupling_endpoint_fullatom_v1')
+                      dockq_protocol=VALIDATION_DOCKQ_PROTOCOL)
     return result
 
 

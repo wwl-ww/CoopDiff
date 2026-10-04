@@ -1,34 +1,39 @@
-"""
-Training pipeline for interface-coordinate TriCoopDiff.
+"""Shared optimization and legacy SDPI velocity supervision.
 
-Gradient flow (the pretrained expert stays frozen while TriFuse is trainable):
-  L_E3L → frozen E3--Ligand expert → TriFuse
-  L_POL → frozen POI--Ligand expert → TriFuse
-  L_tor → per-bond coordinator → both expert torsion opinions
-
-Current supervised phase:
-  Phase 1: Train residual consensus and torsion coordination. Auxiliary
-  judge/state heads stay frozen because the dataset has no corresponding labels.
-
-Current implementation uses B=1 sequential optimization; batched variable-size
-graphs remain future work.
+Production endpoint supervision lives in ConsensusTrainer. Variable-size
+complexes accumulate microbatch gradients before one optimizer update.
 """
 
 import os
-
-import torch
-import numpy as np
 from typing import Optional
+
+import numpy as np
+import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from .model import TriCoopDiff
 from .sdpi_flow import INDEPENDENT_RIGID_MODE, LEGACY_RIGID_MODE, SDPIFlow
 
 
 class NonFiniteTrainingError(FloatingPointError):
     """Raised when a training sample cannot produce a valid optimization step."""
 
+
+def clip_grad_norm_finite(parameters, max_norm=1.0):
+    """Clip in float64 so large *finite* float32 gradients do not overflow."""
+    gradients = [p.grad for p in parameters if p.grad is not None]
+    if not gradients:
+        return torch.tensor(0., dtype=torch.float64)
+    if any(not torch.isfinite(g).all() for g in gradients):
+        raise NonFiniteTrainingError('non-finite trainable gradients')
+    norm = torch.stack([torch.linalg.vector_norm(g.double()) for g in gradients]).norm()
+    if not torch.isfinite(norm):
+        raise NonFiniteTrainingError('non-finite trainable gradient norm')
+    coefficient = (max_norm / (norm + 1e-6)).clamp(max=1.)
+    with torch.no_grad():
+        for gradient in gradients:
+            gradient.mul_(coefficient.to(device=gradient.device, dtype=gradient.dtype))
+    return norm
 
 class TriCoopDiffTrainer:
     """
@@ -39,7 +44,7 @@ class TriCoopDiffTrainer:
 
     def __init__(
         self,
-        model: TriCoopDiff,
+        model: torch.nn.Module,
         diffusion: SDPIFlow,
         lr: float = 1e-4,
         weight_decay: float = 1e-4,
@@ -228,10 +233,11 @@ class TriCoopDiffTrainer:
             for parameter in group['params']
             if parameter.requires_grad
         ]
-        grad_norm = torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
-        if not torch.isfinite(grad_norm):
+        try:
+            grad_norm = clip_grad_norm_finite(trainable, max_norm=1.0)
+        except NonFiniteTrainingError:
             self.optimizer.zero_grad(set_to_none=True)
-            raise NonFiniteTrainingError("non-finite trainable gradients")
+            raise
         self.optimizer.step()
         self.global_step += 1
         self.samples_seen += len(batches)
@@ -262,10 +268,10 @@ class TriCoopDiffTrainer:
         """
         if phase == 1:
             # Freeze judge and state heads
-            for param in self.model.trifuse.judge_head.parameters():
-                param.requires_grad = False
-            for param in self.model.trifuse.state_head.parameters():
-                param.requires_grad = False
+            for name in ('judge_head', 'state_head'):
+                head = getattr(self.model.trifuse, name, None)
+                if head is not None:
+                    head.requires_grad_(False)
         else:
             raise ValueError(
                 "only phase=1 is implemented; phase=2 requires explicit "

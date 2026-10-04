@@ -82,6 +82,8 @@ def test_unbound_metric_templates_receive_only_predicted_rigid_motion():
                 ('m1', coords, 'A'), ('m2', template, 'B')):
             (root / f'{name}.pdb').write_text(records(points, chain))
         (root / 'lig.pdb').write_text(records(coords, 'A').replace('ATOM  ', 'HETATM'))
+        native_path = root / 'native.pdb'
+        native_path.write_text((root / 'm1.pdb').read_text() + (root / 'm2.pdb').read_text())
 
         def capture(predicted, native):
             lines = Path(predicted).read_text().splitlines()
@@ -94,7 +96,7 @@ def test_unbound_metric_templates_receive_only_predicted_rigid_motion():
         with patch.dict(sys.modules, {'DockQ.dockq_util': SimpleNamespace(cal_dockq=capture)}):
             result = compute_fullatom_dockq(
                 coords, (coords + 10.) @ rotation + translation, coords,
-                root / 'p1.pdb', root / 'p2.pdb', root / 'lig.pdb', 'native', root,
+                root / 'p1.pdb', root / 'p2.pdb', root / 'lig.pdb', native_path, root,
                 metric_protein1_pdb=root / 'm1.pdb', metric_protein2_pdb=root / 'm2.pdb')
         assert result['dockq'] == .5
 

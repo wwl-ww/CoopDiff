@@ -12,9 +12,9 @@ from torch_geometric.data import HeteroData
 from torch_geometric.utils import subgraph
 
 
-def build_subgraph_e3l(
-    e3_coords: torch.Tensor,
-    e3_features: torch.Tensor,
+def build_binary_graph(
+    receptor_coords: torch.Tensor,
+    receptor_features: torch.Tensor,
     ligand_coords: torch.Tensor,
     ligand_features: torch.Tensor,
     rec_edge_index: torch.Tensor = None,
@@ -23,31 +23,15 @@ def build_subgraph_e3l(
     lig_edge_mask: torch.Tensor = None,
     lig_mask_rotate: torch.Tensor = None,
 ) -> HeteroData:
-    """
-    Build E3-L two-body subgraph.
+    """Build one DiffDock-compatible receptor/ligand graph in a shared frame.
 
-    Nodes: E3 residues + PROTAC atoms ONLY. No POI nodes.
-    Edges: E3 internal, PROTAC internal, E3-PROTAC cross edges.
-    This uses DiffDock's standard protein-ligand graph schema.
-
-    Args:
-        e3_coords: [N_e3, 3] E3 ligase residue coordinates (Cα positions)
-        e3_features: [N_e3, D_rec] E3 residue features
-        ligand_coords: [N_lig, 3] PROTAC atom coordinates
-        ligand_features: [N_lig, D_lig] PROTAC atom features
-        rec_edge_index: [2, E_rec] precomputed receptor internal edges
-        lig_edge_index: [2, E_lig] ligand internal edges
-        lig_edge_attr: [E_lig, D_edge] ligand edge attributes
-        lig_edge_mask: [E_lig] bool mask for rotatable bond edges
-        lig_mask_rotate: list of torsional update masks
-
-    Returns:
-        HeteroData graph compatible with DiffDock's CGModel forward pass.
+    Coordinates are [N,3], features [N,D], internal edges [2,E]. Cross edges
+    are rebuilt by the frozen expert from the current coordinates.
     """
     graph = HeteroData()
 
-    graph['receptor'].pos = e3_coords
-    graph['receptor'].x = e3_features
+    graph['receptor'].pos = receptor_coords
+    graph['receptor'].x = receptor_features
 
     graph['ligand'].pos = ligand_coords
     graph['ligand'].x = ligand_features
@@ -56,7 +40,7 @@ def build_subgraph_e3l(
     # and `data.num_graphs` in the score heads, so these MUST be set. Batch must
     # live on the same device as the coords (tor_sigma[ligand.batch] indexing and
     # the radius() fallback both reject cross-device index tensors on CUDA).
-    graph['receptor'].batch = torch.zeros(e3_coords.shape[0], dtype=torch.long, device=e3_coords.device)
+    graph['receptor'].batch = torch.zeros(receptor_coords.shape[0], dtype=torch.long, device=receptor_coords.device)
     graph['ligand'].batch = torch.zeros(ligand_coords.shape[0], dtype=torch.long, device=ligand_coords.device)
     graph.num_graphs = 1
 
@@ -77,6 +61,11 @@ def build_subgraph_e3l(
     # We do NOT precompute them here.
 
     return graph
+
+
+def build_subgraph_e3l(e3_coords, e3_features, *args, **kwargs):
+    """Historical E3-L API; graph construction is shared between both experts."""
+    return build_binary_graph(e3_coords, e3_features, *args, **kwargs)
 
 
 def build_subgraph_pol(
@@ -106,33 +95,9 @@ def build_subgraph_pol(
     Returns:
         HeteroData graph for POI-L subgraph.
     """
-    graph = HeteroData()
-
-    graph['receptor'].pos = poi_coords
-    graph['receptor'].x = poi_features
-
-    graph['ligand'].pos = ligand_coords_poi_frame
-    graph['ligand'].x = ligand_features
-
-    # Single-complex batching (see build_subgraph_e3l). Batch on the coords'
-    # device to avoid cross-device indexing on CUDA.
-    graph['receptor'].batch = torch.zeros(poi_coords.shape[0], dtype=torch.long, device=poi_coords.device)
-    graph['ligand'].batch = torch.zeros(ligand_coords_poi_frame.shape[0], dtype=torch.long, device=ligand_coords_poi_frame.device)
-    graph.num_graphs = 1
-
-    if rec_edge_index is not None:
-        graph['receptor', 'receptor'].edge_index = rec_edge_index
-
-    if lig_edge_index is not None:
-        graph['ligand', 'ligand'].edge_index = lig_edge_index
-    if lig_edge_attr is not None:
-        graph['ligand', 'ligand'].edge_attr = lig_edge_attr
-    if lig_edge_mask is not None:
-        graph['ligand'].edge_mask = lig_edge_mask
-    if lig_mask_rotate is not None:
-        graph['ligand'].mask_rotate = lig_mask_rotate
-
-    return graph
+    return build_binary_graph(
+        poi_coords, poi_features, ligand_coords_poi_frame, ligand_features,
+        rec_edge_index, lig_edge_index, lig_edge_attr, lig_edge_mask, lig_mask_rotate)
 
 
 def build_trifuse_graph(

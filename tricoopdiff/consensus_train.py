@@ -1,4 +1,4 @@
-"""Stage 1 training: frozen binary priors, residual consensus and EMA validation."""
+"""Executed ternary endpoint training, EMA validation and checkpoint contracts."""
 
 from contextlib import contextmanager
 import math
@@ -24,6 +24,7 @@ from .train import NonFiniteTrainingError, TriCoopDiffTrainer
 
 VELOCITY_OBJECTIVE = 'sdpi_velocity_mse_v1'
 ENDPOINT_OBJECTIVE = 'executed_endpoint_geometry_v1'
+VALIDATION_DOCKQ_PROTOCOL = 'training_coupling_protein_fullatom_v2'
 
 
 def terminal_interface_losses(e3, native_poi, predicted_poi, cutoff):
@@ -36,12 +37,15 @@ def terminal_interface_losses(e3, native_poi, predicted_poi, cutoff):
     if not count:
         zero = predicted_poi.sum() * 0
         return {'loss_interface_geometry': zero, 'loss_contact_geometry': zero}, 0
-    predicted_distances = torch.cdist(e3[0], predicted_poi[0])
+    e3_indices, poi_indices = contacts.nonzero(as_tuple=True)
+    predicted_distances = torch.linalg.vector_norm(
+        e3[0, e3_indices] - predicted_poi[0, poi_indices], dim=-1)
+    target_distances = torch.linalg.vector_norm(
+        e3[0, e3_indices] - native_poi[0, poi_indices], dim=-1)
     return {
         'loss_interface_geometry': ((predicted_poi[0, poi_interface]
                                     - native_poi[0, poi_interface]) / cutoff).square().mean(),
-        'loss_contact_geometry': ((predicted_distances[contacts]
-                                  - target_distances[contacts]) / cutoff).square().mean(),
+        'loss_contact_geometry': ((predicted_distances - target_distances) / cutoff).square().mean(),
     }, count
 
 
@@ -66,21 +70,13 @@ def coarse_intercomponent_repulsion(e3, native_poi, native_ligand, poi, ligand, 
 
 def validate_consensus_checkpoint(payload):
     version = payload.get('checkpoint_version')
-    if version not in (LEGACY_CONSENSUS_CHECKPOINT_VERSION,
-                       PREVIOUS_CONSENSUS_CHECKPOINT_VERSION,
-                       ENDPOINT_PROTOCOL_CHECKPOINT_VERSION,
-                       OBJECTIVE_CONTRACT_CHECKPOINT_VERSION,
-                       INTERFACE_OBJECTIVE_CHECKPOINT_VERSION,
-                       CONSENSUS_CHECKPOINT_VERSION):
+    if not isinstance(version, int) or not LEGACY_CONSENSUS_CHECKPOINT_VERSION <= version <= CONSENSUS_CHECKPOINT_VERSION:
         raise ValueError('consensus requires checkpoint_version=18 through 23')
     if payload.get('architecture') not in (ARCHITECTURE, DIRECT_ARCHITECTURE) or payload.get('generative_process') != FLOW_VERSION:
         raise ValueError('checkpoint does not describe a supported consensus SDPI flow')
     direct = payload.get('model_config', {}).get('direct_ternary_motion', False)
-    if payload.get('model_config', {}).get('global_node_context', False) and not direct:
-        raise ValueError('global node context requires direct ternary motion')
-    if payload.get('model_config', {}).get('spatial_geometry', False) and not direct:
-        raise ValueError('spatial geometry requires direct ternary motion')
-    for key in ('motion_attention', 'global_node_attention', 'rotation_scale_normalization'):
+    for key in ('global_node_context', 'spatial_geometry', 'motion_attention',
+                'global_node_attention', 'rotation_scale_normalization'):
         if payload.get('model_config', {}).get(key, False) and not direct:
             raise ValueError(f'{key} requires direct ternary motion')
     model_config = payload.get('model_config', {})
@@ -94,9 +90,7 @@ def validate_consensus_checkpoint(payload):
             raise ValueError('checkpoint violates its production model profile')
     if bool(direct) != (payload.get('architecture') == DIRECT_ARCHITECTURE):
         raise ValueError('checkpoint architecture and rigid output configuration disagree')
-    if direct and (version not in (ENDPOINT_PROTOCOL_CHECKPOINT_VERSION, OBJECTIVE_CONTRACT_CHECKPOINT_VERSION,
-                                  INTERFACE_OBJECTIVE_CHECKPOINT_VERSION,
-                                  CONSENSUS_CHECKPOINT_VERSION) or
+    if direct and (version < ENDPOINT_PROTOCOL_CHECKPOINT_VERSION or
                    payload.get('model_config', {}).get('protein_pair_motion', False)):
         raise ValueError('direct ternary motion requires version 20 through 23 without the legacy side head')
     if payload.get('expert_lora_config') or payload.get('expert_lora_state_dict'):
@@ -105,13 +99,12 @@ def validate_consensus_checkpoint(payload):
         if not payload.get(key):
             raise ValueError(f'consensus checkpoint missing {key}')
     config = payload.get('runtime_config', {})
-    if version in (INTERFACE_OBJECTIVE_CHECKPOINT_VERSION, CONSENSUS_CHECKPOINT_VERSION):
+    if version >= INTERFACE_OBJECTIVE_CHECKPOINT_VERSION:
         batch_size = config.get('effective_batch_size')
         if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
             raise ValueError('version 22/23 requires a positive effective batch size')
     objective = config.get('training_objective', VELOCITY_OBJECTIVE)
-    if version in (OBJECTIVE_CONTRACT_CHECKPOINT_VERSION, INTERFACE_OBJECTIVE_CHECKPOINT_VERSION,
-                   CONSENSUS_CHECKPOINT_VERSION) and 'training_objective' not in config:
+    if version >= OBJECTIVE_CONTRACT_CHECKPOINT_VERSION and 'training_objective' not in config:
         raise ValueError('version 21 through 23 requires an explicit training objective')
     if payload.get('checkpoint_kind') != 'inference_only' and objective not in (VELOCITY_OBJECTIVE, ENDPOINT_OBJECTIVE):
         raise ValueError('checkpoint has an unknown training objective')
@@ -121,7 +114,7 @@ def validate_consensus_checkpoint(payload):
         if (not isinstance(steps, int) or isinstance(steps, bool) or steps < 1
                 or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight <= 0):
             raise ValueError('endpoint objective requires explicit rollout steps and positive loss weight')
-        if version in (INTERFACE_OBJECTIVE_CHECKPOINT_VERSION, CONSENSUS_CHECKPOINT_VERSION):
+        if version >= INTERFACE_OBJECTIVE_CHECKPOINT_VERSION:
             for key in ('interface_loss_weight', 'interface_cutoff'):
                 value = config.get(key)
                 if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
@@ -143,20 +136,14 @@ def validate_consensus_checkpoint(payload):
     if config['activation_clamp'] <= 0 or config['residual_weight'] < 0 or not 0 <= config['ema_decay'] < 1:
         raise ValueError('invalid consensus runtime range')
     validate_score_norm_version(config)
-    if version in (PREVIOUS_CONSENSUS_CHECKPOINT_VERSION,
-                   ENDPOINT_PROTOCOL_CHECKPOINT_VERSION,
-                   OBJECTIVE_CONTRACT_CHECKPOINT_VERSION,
-                   INTERFACE_OBJECTIVE_CHECKPOINT_VERSION,
-                   CONSENSUS_CHECKPOINT_VERSION):
+    if version >= PREVIOUS_CONSENSUS_CHECKPOINT_VERSION:
         if config.get('flow_time_contract') != 'shared_flow_expert_clock_v1':
             raise ValueError('checkpoint has an unknown flow/expert time contract')
         if config.get('candidate_source_contract') != SOURCE_CONTRACT_VERSION:
             raise ValueError('checkpoint has an unknown candidate source contract')
         if config.get('training_source_mix') not in ('sdpi_only', 'sdpi_bitseed_1_1'):
             raise ValueError('checkpoint has an invalid training source mix')
-    if version in (ENDPOINT_PROTOCOL_CHECKPOINT_VERSION, OBJECTIVE_CONTRACT_CHECKPOINT_VERSION,
-                   INTERFACE_OBJECTIVE_CHECKPOINT_VERSION,
-                   CONSENSUS_CHECKPOINT_VERSION):
+    if version >= ENDPOINT_PROTOCOL_CHECKPOINT_VERSION:
         endpoint_protocol = config.get('training_endpoint_protocol')
         expected = ('none' if config.get('training_source_mix') == 'sdpi_only'
                     else 'online_bitseed_training_c1_m1_v1')
@@ -349,6 +336,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 'steric_loss_weight': self.steric_loss_weight,
                 'steric_cutoff': self.steric_cutoff,
                 'effective_batch_size': self.effective_batch_size,
+                'validation_dockq_protocol': VALIDATION_DOCKQ_PROTOCOL,
             },
             'trifuse_state_dict': self.model.trifuse.state_dict(),
             'ema_trifuse_state_dict': self.ema,
@@ -406,30 +394,28 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         expected = {'activation_clamp': self.activation_clamp,
                     'residual_weight': self.residual_weight, 'ema_decay': self.ema_decay,
                     'optimizer_groups': self.optimizer_config}
-        if payload['checkpoint_version'] in (
-                PREVIOUS_CONSENSUS_CHECKPOINT_VERSION,
-                ENDPOINT_PROTOCOL_CHECKPOINT_VERSION,
-                OBJECTIVE_CONTRACT_CHECKPOINT_VERSION,
-                INTERFACE_OBJECTIVE_CHECKPOINT_VERSION,
-                CONSENSUS_CHECKPOINT_VERSION):
+        if payload['checkpoint_version'] >= PREVIOUS_CONSENSUS_CHECKPOINT_VERSION:
             expected.update({
                 'flow_time_contract': 'shared_flow_expert_clock_v1',
                 'candidate_source_contract': SOURCE_CONTRACT_VERSION,
                 'training_source_mix': self.training_source_mix,
             })
-        if payload['checkpoint_version'] in (ENDPOINT_PROTOCOL_CHECKPOINT_VERSION,
-                                            OBJECTIVE_CONTRACT_CHECKPOINT_VERSION,
-                                            INTERFACE_OBJECTIVE_CHECKPOINT_VERSION, CONSENSUS_CHECKPOINT_VERSION):
+        if payload['checkpoint_version'] >= ENDPOINT_PROTOCOL_CHECKPOINT_VERSION:
             expected['training_endpoint_protocol'] = self.training_endpoint_protocol
         for key, value in expected.items():
             if payload['runtime_config'].get(key) != value:
                 raise ValueError(f'consensus checkpoint runtime mismatch: {key}')
         self.model.trifuse.load_state_dict(payload['trifuse_state_dict'])
-        self.ema = {name: value.clone() for name, value in payload['ema_trifuse_state_dict'].items()}
+        ema_state = getattr(self.model.trifuse, 'active_state_dict', dict)(payload['ema_trifuse_state_dict'])
+        self.ema = {name: value.clone() for name, value in ema_state.items()}
         self.optimizer.load_state_dict(payload['optimizer_state_dict'])
         self.scheduler.load_state_dict(payload['scheduler_state_dict'])
         self.global_step = payload['global_step']
         self.resume_epoch = payload['training_state']['epoch']
         self.resume_best_val_loss = payload['training_state']['best_val_loss']
         self.resume_best_val_dockq = payload['training_state'].get('best_val_dockq', float('-inf'))
+        if payload['runtime_config'].get('validation_dockq_protocol') != VALIDATION_DOCKQ_PROTOCOL:
+            # Old scores may include insertion-code duplicate contacts. Resume
+            # weights/optimizer, but never compare corrected scores to them.
+            self.resume_best_val_dockq = float('-inf')
         self.samples_seen = payload['training_state'].get('samples_seen', self.global_step)

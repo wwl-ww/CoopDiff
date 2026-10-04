@@ -244,6 +244,18 @@ def test_flow_checkpoint_rejects_old_or_wrong_process():
             raise AssertionError('incompatible checkpoint accepted')
 
 
+def test_rigid_fit_gradient_is_regular_at_repeated_singular_values():
+    from tricoopdiff.pose_anchors import proper_rigid_fit, _ProperPolarRotation
+    covariance = torch.randn(2, 3, 3, dtype=torch.float64, requires_grad=True)
+    assert torch.autograd.gradcheck(_ProperPolarRotation.apply, (covariance,), atol=2e-5)
+    source = torch.tensor([[1., 0., 0.], [-1., 0., 0.], [0., 1., 0.],
+                           [0., -1., 0.], [0., 0., 1.], [0., 0., -1.]], requires_grad=True)
+    target = source.detach().clone().requires_grad_(True)
+    rotation, translation, _ = proper_rigid_fit(source, target)
+    (rotation * torch.randn(3, 3)).sum().add(translation.sum()).backward()
+    assert torch.isfinite(source.grad).all() and torch.isfinite(target.grad).all()
+
+
 if __name__ == '__main__':
     for name, function in list(globals().items()):
         if name.startswith('test_'):

@@ -299,7 +299,7 @@ def test_direct_motion_is_identity_without_an_additive_expert_prior():
                for b in BRANCHES for c in ('tr', 'rot'))
     assert torch.count_nonzero(predicted['torsion']) == 0
     assert output['residual_penalty'] == 0
-    assert not any(p.requires_grad for p in fuse.residual_head.parameters())
+    assert not hasattr(fuse, 'residual_head'), 'direct motion must not instantiate an unused residual head'
 
 
 def test_direct_motion_uses_joint_geometry_and_is_equivariant():
@@ -571,6 +571,87 @@ def test_rotation_levers_are_scale_normalized_and_have_finite_degenerate_gradien
     degenerate = torch.zeros(3, 3, requires_grad=True)
     rotation_levers(degenerate, True).square().sum().backward()
     assert torch.isfinite(degenerate.grad).all()
+
+
+def test_chunked_expert_tensor_products_preserve_outputs_and_gradients():
+    from e3nn import o3
+    from torch_scatter import scatter
+    from tricoopdiff.diffdock.models.tensor_layers import tp_scatter_multigroup
+    torch.manual_seed(73)
+    tp = o3.FullyConnectedTensorProduct('2x0e', '1x0e', '2x0e', shared_weights=False).double()
+    layers = torch.nn.ModuleList([torch.nn.Linear(3, tp.weight_numel).double() for _ in range(2)])
+    nodes = torch.randn(17, 2, dtype=torch.float64, requires_grad=True)
+    attributes = [torch.randn(1400, 3, dtype=torch.float64, requires_grad=True),
+                  torch.randn(1300, 3, dtype=torch.float64, requires_grad=True)]
+    indices = torch.randint(17, (2, 2700))
+    harmonics = torch.randn(2700, 1, dtype=torch.float64, requires_grad=True)
+    weights = torch.rand(2700, 1, dtype=torch.float64, requires_grad=True)
+    inputs = [nodes, *attributes, harmonics, weights, *layers.parameters()]
+    direct = torch.cat([layers[0](attributes[0]), layers[1](attributes[1])]) * weights
+    reference = scatter(tp(nodes[indices[1]], harmonics, direct), indices[0], dim=0, dim_size=17, reduce='mean')
+    expected = torch.autograd.grad(reference.square().sum(), inputs)
+    actual = tp_scatter_multigroup(tp, layers, nodes, indices, attributes, harmonics, edge_weight=weights)
+    gradients = torch.autograd.grad(actual.square().sum(), inputs)
+    assert torch.allclose(actual, reference, atol=1e-10, rtol=1e-8)
+    assert all(torch.allclose(a, b, atol=1e-9, rtol=1e-7) for a, b in zip(gradients, expected))
+
+
+def test_direct_model_contains_only_active_heads_and_migrates_old_weights():
+    from tricoopdiff.consensus import production_model_config
+    model = ConsensusFuse(**production_model_config(32, 16, 1, True))
+    obsolete = ('gate_head', 'residual_head', 'source_gate_head',
+                'torsion_coordinator', 'judge_head', 'state_head')
+    assert not any(name.startswith(tuple(prefix + '.' for prefix in obsolete))
+                   for name in model.state_dict())
+    state = copy.deepcopy(model.state_dict())
+    historical = dict(state)
+    for name in obsolete:
+        historical[name + '.unused.weight'] = torch.randn(2, 3)
+    model.load_state_dict(historical, strict=True)
+    assert all(torch.equal(value, model.state_dict()[name]) for name, value in state.items())
+    parent = torch.nn.Module()
+    parent.add_module('trifuse', model)
+    parent.load_state_dict({'trifuse.' + name: value for name, value in historical.items()}, strict=True)
+    assert len(model.active_state_dict(historical)) == len(state)
+    historical['unknown.weight'] = torch.randn(2, 3)
+    try:
+        model.load_state_dict(historical, strict=True)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError('migration must not hide genuinely unknown weights')
+
+
+def test_joint_direction_has_bounded_gradient_at_overlapping_nodes():
+    from tricoopdiff.geometry_encoders import TernaryGeometryEncoder
+    encoder = TernaryGeometryEncoder(16, 32, joint_geometry=True, spatial_geometry=True)
+    coords = torch.zeros(6, 3, requires_grad=True)
+    features = torch.randn(6, 32)
+    _, joint = encoder._joint_contacts(features, coords, torch.tensor([0, 0, 1, 1, 2, 2]))
+    joint['direction'].sum().backward()
+    assert torch.isfinite(coords.grad).all() and coords.grad.abs().max() <= 100
+
+
+def test_geometry_reuses_pair_distances_and_handles_single_node_components():
+    from unittest.mock import patch
+    from tricoopdiff.geometry_encoders import TernaryGeometryEncoder
+    encoder = TernaryGeometryEncoder(16, 32, joint_geometry=True, spatial_geometry=True)
+    coords = torch.zeros(5, 3, requires_grad=True)
+    features = torch.randn(5, 16)
+    with patch('torch.cdist', wraps=torch.cdist) as distances:
+        result = encoder(features, coords, torch.tensor([0, 0, 1, 1, 2]))
+    assert distances.call_count == 6, 'each component pair and kNN distance matrix should be built once'
+    (result['global'].sum() + result['ligand_tokens'][0].sum()).backward()
+    assert torch.isfinite(coords.grad).all(), 'zero-radius components must not create sqrt(0) gradient NaNs'
+
+
+def test_consensus_rejects_unknown_architecture_arguments():
+    try:
+        ConsensusFuse(typo_dimension=64)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('unknown architecture options must not be silently ignored')
 
 
 if __name__ == '__main__':

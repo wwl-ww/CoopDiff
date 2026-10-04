@@ -54,14 +54,6 @@ def _ligand_records(path):
     return _records(ligand_path, "HETATM")
 
 
-def _ca_coords(lines):
-    return np.asarray([
-        [float(line[30:38]), float(line[38:46]), float(line[46:54])]
-        for line in lines
-        if line.startswith("ATOM") and line[12:16].strip() == "CA"
-    ])
-
-
 def _featurized_ca_coords(path):
     """Use DiffDock's residue/alternate-location selection and atom order."""
     import prody as pr
@@ -98,6 +90,26 @@ def _replace_coords(lines, indices, coords, chain=None):
     return output
 
 
+def _dockq_protein_records(model_records, native_records):
+    """Keep insertion-coded residues distinct for legacy integer-only fnat."""
+    residue_ids = sorted({line[22:27] for line in (*model_records, *native_records)},
+                         key=lambda key: (int(key[:4]), key[4]))
+    if len(residue_ids) > 9999:
+        raise ValueError('DockQ residue numbering exceeds PDB four-column capacity')
+    numbering = {key: index + 1 for index, key in enumerate(residue_ids)}
+    def normalize(records):
+        selected = {}
+        for line in records:
+            key = (line[21:27], line[12:16])
+            # One atom per residue; prefer blank/A alternate location, as the
+            # protein featurizer does, without merging inserted residues.
+            if key not in selected or line[16] < selected[key][16]:
+                selected[key] = line
+        return [f'{line[:16]} {line[17:22]}{numbering[line[22:27]]:4d} {line[27:]}'
+                for line in selected.values()]
+    return normalize(model_records), normalize(native_records)
+
+
 def compute_fullatom_dockq(
     pred_ligand,
     pred_poi_ca,
@@ -110,16 +122,19 @@ def compute_fullatom_dockq(
     metric_protein1_pdb=None,
     metric_protein2_pdb=None,
 ):
-    """Rebuild a predicted ternary PDB and call DeepTernary's ``cal_dockq``."""
+    """Rebuild both proteins and call DeepTernary's full-atom ``cal_dockq``.
+
+    ``pred_ligand``, ``pred_poi_ca``, and ``featurized_e3_ca`` must all use the
+    same model-local E3 frame. The E3 coordinates are rigid-fitted to the input
+    PDB to map predictions back to its absolute frame.
+    """
     p1_lines, _, _ = _records(protein1_pdb, "ATOM")
     p2_lines, p2_indices, p2_atoms = _records(protein2_pdb, "ATOM")
-    lig_lines, lig_indices, _ = _ligand_records(ligand_pdb)
     p1_ca = _featurized_ca_coords(protein1_pdb)
     p2_ca = _featurized_ca_coords(protein2_pdb)
 
     # Move TriCoopDiff's shared E3 frame back into the original PDB frame.
     frame_r, frame_t = _fit_rigid(np.asarray(featurized_e3_ca), p1_ca)
-    pred_ligand_pdb = np.asarray(pred_ligand) @ frame_r + frame_t
     pred_poi_ca_pdb = np.asarray(pred_poi_ca) @ frame_r + frame_t
 
     # TriCoopDiff predicts POI as a rigid body at Cα level. Apply that fitted
@@ -136,8 +151,6 @@ def compute_fullatom_dockq(
         p2_lines, p2_indices, p2_atoms = _records(metric_protein2_pdb, 'ATOM')
         pred_p2_atoms = p2_atoms @ poi_r + poi_t
     p2_pred_lines = _replace_coords(p2_lines, p2_indices, pred_p2_atoms)
-    p1_chain = next(line[21] for line in p1_lines if line.startswith("ATOM"))
-    lig_pred_lines = _replace_coords(lig_lines, lig_indices, pred_ligand_pdb, chain=p1_chain)
 
     deepternary_root = Path(deepternary_root).resolve()
     if str(deepternary_root) not in sys.path:
@@ -146,17 +159,28 @@ def compute_fullatom_dockq(
 
     with tempfile.TemporaryDirectory(prefix="tricoopdiff-dockq-") as temp_dir:
         pred_path = Path(temp_dir) / "predicted_complex.pdb"
+        native_path = Path(temp_dir) / "native_proteins.pdb"
+        # DockQ scores only the protein--protein interface, not the ligand.
         records = [
-            *(line for line in p1_lines if line.startswith(("ATOM", "HETATM", "CONECT"))),
-            *(line for line in p2_pred_lines if line.startswith(("ATOM", "HETATM", "CONECT"))),
-            *(line for line in lig_pred_lines if line.startswith(("ATOM", "HETATM", "CONECT"))),
+            *(line for line in p1_lines if line.startswith("ATOM")),
+            *(line for line in p2_pred_lines if line.startswith("ATOM")),
         ]
+        native_records = [line for line in Path(native_complex_pdb).read_text().splitlines()
+                          if line.startswith('ATOM')]
+        if not native_records:
+            raise ValueError('native DockQ structure has no protein atoms')
+        records, native_records = _dockq_protein_records(records, native_records)
         pred_path.write_text("\n".join(records) + "\n")
-        fnat, irms, lrms, dockq = cal_dockq(str(pred_path), str(native_complex_pdb))
+        native_path.write_text('\n'.join(native_records) + '\n')
+        fnat, irms, lrms, dockq = cal_dockq(str(pred_path), str(native_path))
+    if (not np.isfinite([fnat, irms, lrms, dockq]).all()
+            or not 0 <= fnat <= 1 or not 0 <= dockq <= 1 or min(irms, lrms) < 0):
+        raise ValueError(f'invalid full-atom DockQ result: {(fnat, irms, lrms, dockq)}')
     return {
         "dockq": float(dockq),
         "fnat": float(fnat),
         "irms": float(irms),
         "lrms": float(lrms),
         "method": "DeepTernary/DockQ/dockq_util.py::cal_dockq",
+        "protocol": "protein_protein_fullatom_v2",
     }
