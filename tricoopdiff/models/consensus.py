@@ -1,6 +1,6 @@
 """Frozen binary reads and trainable ternary motion.
 
-Legacy checkpoints retain their original residual/direct field. Production v5
+Legacy checkpoints retain their original residual/direct field. Production v7
 conditions frozen binary reads on the other interface, preserves explicit
 ternary relations, and decodes independent ligand/POI motion from local fields.
 All vectors use the E3 frame; native targets never enter the model.
@@ -18,6 +18,24 @@ from tricoopdiff.inputs.graphs import build_binary_graph, build_trifuse_graph, c
 from tricoopdiff.models.expert import _set_time_embeddings
 from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.diffdock.constants import lig_feature_dims
+
+
+PACKED_BATCH_LIMITS = {'nodes': 4096, 'pairs': 300000}
+
+
+def packed_groups(items, limits=PACKED_BATCH_LIMITS):
+    """Bound ragged graph residency; one oversized complex runs alone."""
+    group, nodes, pairs = [], 0, 0
+    for item in items:
+        a, b, l = [item[key]['coords'].shape[-2] for key in ('e3_data', 'poi_data', 'ligand_data')]
+        n, p = a + b + 2 * l, 2 * a * b + 2 * l * (a + b) + (32 + l) ** 2
+        if group and (nodes + n > limits['nodes'] or pairs + p > limits['pairs']):
+            yield group
+            group, nodes, pairs = [], 0, 0
+        group.append(item)
+        nodes, pairs = nodes + n, pairs + p
+    if group:
+        yield group
 
 
 class LigandFeatureEncoder(nn.Module):
@@ -785,15 +803,18 @@ class TernaryRelationEncoder(nn.Module):
     of residue ordering. No contact radius removes distant candidate interfaces.
     """
 
-    def __init__(self, input_dim, hidden_dim, *, geometric_anchors=False):
+    def __init__(self, input_dim, hidden_dim, *, geometric_anchors=False, refined=False):
         super().__init__()
         self.geometric_anchors = geometric_anchors
+        self.refined = refined
         self.hidden_dim = hidden_dim
         self.protein_feature_proj = nn.Linear(input_dim, hidden_dim)
         self.ligand_feature_encoder = LigandFeatureEncoder(hidden_dim)
         self.type_embedding = nn.Embedding(3, hidden_dim)
         self.anchor_queries = nn.Parameter(torch.randn(2, 16, hidden_dim) * .02)
         self.bond_message = nn.Linear(2 * hidden_dim + (4 if geometric_anchors else 0), hidden_dim)
+        if refined:
+            self.bond_message = nn.Sequential(self.bond_message, nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
         self.pair_type = nn.Embedding(9, hidden_dim)
         self.pair_input = nn.Sequential(nn.Linear(2 * hidden_dim + 4, hidden_dim), nn.SiLU())
         self.pair_updates = nn.ModuleList([
@@ -857,6 +878,19 @@ class TernaryRelationEncoder(nn.Module):
         seeds = torch.stack(seeds)
         return -(seeds[:, None] - coords[None]).square().sum(-1) / (scale / 16.)
 
+    def ligand_messages(self, features, edge_index, edge_attr):
+        if edge_index is None or not edge_index.numel():
+            return features
+        source, destination = edge_index
+        inputs = [features[source], features[destination]]
+        if self.geometric_anchors:
+            if edge_attr is None or edge_attr.shape != (len(source), 4):
+                raise ValueError('ternary bond messages require four bond-type features per edge')
+            inputs.append(edge_attr.to(features))
+        values = self.bond_message(torch.cat(inputs, -1))
+        counts = torch.bincount(source, minlength=len(features)).to(features).clamp_min(1.)
+        return features + torch.zeros_like(features).index_add(0, source, values) / counts[:, None]
+
     def forward(self, node_features, node_coords, node_types, *, lig_edge_index=None,
                 lig_edge_attr=None, node_residual=None):
         types, coords = node_types.long(), node_coords
@@ -868,17 +902,9 @@ class TernaryRelationEncoder(nn.Module):
         if node_residual is not None:
             features = features + node_residual
         if lig_edge_index is not None and lig_edge_index.numel():
-            source, destination = lig_edge_index
             lig_features = features[ligand]
-            message_inputs = [lig_features[source], lig_features[destination]]
-            if self.geometric_anchors:
-                if lig_edge_attr is None or lig_edge_attr.shape != (len(source), 4):
-                    raise ValueError('ternary bond messages require four bond-type features per edge')
-                message_inputs.append(lig_edge_attr.to(features))
-            values = self.bond_message(torch.cat(message_inputs, -1))
-            counts = torch.bincount(source, minlength=len(lig_features)).to(features).clamp_min(1.)
-            message = torch.zeros_like(lig_features).index_add(0, source, values) / counts[:, None]
-            features = features.index_copy(0, ligand.nonzero().flatten(), lig_features + message)
+            features = features.index_copy(0, ligand.nonzero().flatten(),
+                                           self.ligand_messages(lig_features, lig_edge_index, lig_edge_attr))
         centers = torch.stack([coords[types == component].mean(0) for component in range(3)])
         if self.geometric_anchors:
             # Full-resolution protein interfaces complement the global anchors.
@@ -1203,7 +1229,7 @@ class LegacyResidualMotion:
 
 ARCHITECTURE = 'residual_consensus_v2'
 DIRECT_ARCHITECTURE = 'ternary_geometry_independent_v1'
-CONSENSUS_CHECKPOINT_VERSION = 30
+CONSENSUS_CHECKPOINT_VERSION = 31
 INTERFACE_OBJECTIVE_CHECKPOINT_VERSION = 22
 OBJECTIVE_CONTRACT_CHECKPOINT_VERSION = 21
 ENDPOINT_PROTOCOL_CHECKPOINT_VERSION = 20
@@ -1216,16 +1242,17 @@ FEATURE_PRODUCTION_MODEL_PROFILE = 'ternary_endpoint_v2'
 PREVIOUS_PRODUCTION_MODEL_PROFILE = 'ternary_endpoint_v3'
 HORIZONTAL_MODEL_PROFILE = 'ternary_endpoint_v4'
 CONDITIONAL_MODEL_PROFILE = 'ternary_endpoint_v5'
-PRODUCTION_MODEL_PROFILE = 'ternary_endpoint_v6'
+GEOMETRIC_MODEL_PROFILE = 'ternary_endpoint_v6'
+PRODUCTION_MODEL_PROFILE = 'ternary_endpoint_v7'
 MODEL_PROFILES = (LEGACY_PRODUCTION_MODEL_PROFILE, FEATURE_PRODUCTION_MODEL_PROFILE,
                   PREVIOUS_PRODUCTION_MODEL_PROFILE, HORIZONTAL_MODEL_PROFILE,
-                  CONDITIONAL_MODEL_PROFILE, PRODUCTION_MODEL_PROFILE)
+                  CONDITIONAL_MODEL_PROFILE, GEOMETRIC_MODEL_PROFILE, PRODUCTION_MODEL_PROFILE)
 
 
 def production_model_config(node_dim, input_dim, num_transformer_layers=3,
                             source_conditioning=False, *,
                             model_profile=PRODUCTION_MODEL_PROFILE,
-                            expert_scalar_dim=58, expert_film_dim=48):
+                            expert_scalar_dim=58, expert_film_dim=48, expert_vector_dim=20):
     """One explicit new-model recipe; older weights retain their own config."""
     if model_profile not in MODEL_PROFILES:
         raise ValueError(f'unknown model profile: {model_profile}')
@@ -1240,10 +1267,14 @@ def production_model_config(node_dim, input_dim, num_transformer_layers=3,
         if isinstance(expert_scalar_dim, bool) or not isinstance(expert_scalar_dim, int) or expert_scalar_dim <= 0:
             raise ValueError('expert scalar dimension must be positive')
         config['expert_scalar_dim'] = expert_scalar_dim
-    if model_profile == PRODUCTION_MODEL_PROFILE:
+    if model_profile in MODEL_PROFILES[5:]:
         if isinstance(expert_film_dim, bool) or not isinstance(expert_film_dim, int) or not 0 < expert_film_dim <= expert_scalar_dim:
             raise ValueError('expert FiLM dimension must be positive and no larger than scalar read width')
         config['expert_film_dim'] = expert_film_dim
+    if model_profile == PRODUCTION_MODEL_PROFILE:
+        if isinstance(expert_vector_dim, bool) or not isinstance(expert_vector_dim, int) or expert_vector_dim < 1:
+            raise ValueError('expert vector width must be positive')
+        config['expert_vector_dim'] = expert_vector_dim
     return config
 
 
@@ -1295,7 +1326,7 @@ class ConsensusFuse(LegacyResidualMotion, nn.Module):
                  motion_attention=False,
                  global_node_attention=False,
                  rotation_scale_normalization=False,
-                 model_profile=None, expert_scalar_dim=58, expert_film_dim=48):
+                 model_profile=None, expert_scalar_dim=58, expert_film_dim=48, expert_vector_dim=20):
         super().__init__()
         self.config = dict(node_dim=node_dim, input_dim=input_dim or node_dim,
                            num_transformer_layers=num_transformer_layers, dropout=dropout,
@@ -1308,7 +1339,8 @@ class ConsensusFuse(LegacyResidualMotion, nn.Module):
         self.endpoint_v3 = model_profile in MODEL_PROFILES[2:]
         self.continuous_torsion = model_profile in MODEL_PROFILES[3:]
         self.mutual_experts = model_profile in MODEL_PROFILES[4:]
-        self.enhanced_conditions = model_profile == PRODUCTION_MODEL_PROFILE
+        self.enhanced_conditions = model_profile in MODEL_PROFILES[5:]
+        self.refined_conditions = model_profile == PRODUCTION_MODEL_PROFILE
         for name, enabled in (('global_node_context', global_node_context),
                               ('spatial_geometry', spatial_geometry),
                               ('motion_attention', motion_attention),
@@ -1332,15 +1364,18 @@ class ConsensusFuse(LegacyResidualMotion, nn.Module):
                 self.config['expert_scalar_dim'] = expert_scalar_dim
             if self.enhanced_conditions:
                 self.config['expert_film_dim'] = expert_film_dim
+            if self.refined_conditions:
+                self.config['expert_vector_dim'] = expert_vector_dim
             expected = production_model_config(node_dim, self.config['input_dim'],
                                                num_transformer_layers, source_conditioning,
                                                model_profile=model_profile,
                                                expert_scalar_dim=expert_scalar_dim,
-                                               expert_film_dim=expert_film_dim)
+                                               expert_film_dim=expert_film_dim, expert_vector_dim=expert_vector_dim)
             if self.config != expected:
                 raise ValueError('production model profile cannot silently change its architecture or dropout')
         self.pooling = (TernaryRelationEncoder(self.config['input_dim'], node_dim,
-                                              geometric_anchors=self.enhanced_conditions)
+                                              geometric_anchors=self.enhanced_conditions,
+                                              refined=self.refined_conditions)
                         if self.mutual_experts else TernaryGeometryEncoder(self.config['input_dim'], node_dim,
                                              joint_geometry=self.direct_ternary_motion,
                                              global_node_context=global_node_context,
@@ -1419,6 +1454,10 @@ class ConsensusFuse(LegacyResidualMotion, nn.Module):
             for head in (self.motion_head, self.direct_torsion_head):
                 nn.init.zeros_(head[-1].weight)
                 nn.init.zeros_(head[-1].bias)
+            if self.refined_conditions:
+                self.expert_vector_mix = nn.Linear(2 * node_dim, 4 * expert_vector_dim)
+                nn.init.zeros_(self.expert_vector_mix.weight)
+                nn.init.zeros_(self.expert_vector_mix.bias)
             if self.enhanced_conditions:
                 with torch.no_grad():
                     self.direct_torsion_head[-1].bias[1:].fill_(-2.)
@@ -1550,10 +1589,17 @@ class ConsensusFuse(LegacyResidualMotion, nn.Module):
         if self.enhanced_conditions:
             gate_input = torch.cat((gate_input, self.proposal_evidence(graph, proposals)), -1)
         gates = self.expert_prior_gate(gate_input).sigmoid()
+        if self.refined_conditions:
+            at, ar, bt, br = [gates[:, i:i + 1] * bounded_vector(value)
+                              for i, value in enumerate((a['tr'], a['rot'], b['tr'], b['rot']))]
+            angular = ar - br
+            prior = (at, ar, (scales[:, :1] * at - scales[:, 1:] * bt
+                              + math.pi * torch.linalg.cross(angular, lever)) / scales[:, 1:], angular)
         for index, (branch, component) in enumerate(
                 (branch, component) for branch in BRANCHES for component in ('tr', 'rot')):
             prediction[branch][component] = (prediction[branch][component]
-                                             + gates[:, index:index + 1] * bounded_vector(prior[index]))
+                                             + (prior[index] if self.refined_conditions else
+                                                gates[:, index:index + 1] * bounded_vector(prior[index])))
         if self.enhanced_conditions:
             opinions = torch.stack((a['tor'].tanh(), b['tor'].tanh()), -1)
             prediction['torsion'] = prediction['torsion'] + (result['torsion_prior_weights'] * opinions).sum(-1)
@@ -1589,10 +1635,16 @@ class ConsensusFuse(LegacyResidualMotion, nn.Module):
         basis = torch.stack((direction, transverse), dim=-2)
         field = torch.einsum('ij,ijcb,ijbd->icd', joint['read'][selected],
                               coefficients[..., :4].reshape(len(nodes), len(anchors), 2, 2), basis)
+        if self.refined_conditions:
+            vectors = bounded_vector(joint['expert_vectors'][selected])
+            mix = self.expert_vector_mix(torch.cat((features, context.expand(len(nodes), -1)), -1))
+            field = field + torch.einsum('ncv,nvd->ncd', mix.reshape(len(nodes), 2, -1), vectors) / math.sqrt(vectors.shape[1])
         identity = torch.eye(3, device=nodes.device, dtype=torch.float64)
         if self.enhanced_conditions:
             weights = (joint['read'][selected] * coefficients[..., 4]).sum(-1).softmax(0)
             translation = (weights[:, None] * field[:, 0]).sum(0, keepdim=True)
+            if self.refined_conditions:
+                weights = .8 * weights + .2 / len(nodes)
             lever, local, weights = lever.double(), field[:, 1].double(), weights.double()
             lever = lever - (weights[:, None] * lever).sum(0)
             local = local - (weights[:, None] * local).sum(0)
@@ -1652,6 +1704,9 @@ class ConsensusFuse(LegacyResidualMotion, nn.Module):
         coords, types, raw = (graph[key] for key in ('node_coords', 'node_types', 'node_features'))
         tokens = self.pooling.protein_feature_proj(raw[types != 2])
         ligand = self.pooling.ligand_feature_encoder(raw[types == 2])
+        if self.refined_conditions:
+            ligand = self.pooling.ligand_messages(ligand + self.pooling.type_embedding.weight[2],
+                                                 graph['lig_edge_index'], graph['lig_edge_attr'])
         proteins = [tokens[types[types != 2] == component] for component in (0, 1)]
         positions = [coords[types == component] for component in (0, 1, 2)]
         results = []
@@ -1711,6 +1766,11 @@ class ConsensusFuse(LegacyResidualMotion, nn.Module):
             pooling_kwargs['return_protein_pair_contacts'] = True
         pooled = self.pooling(graph['node_features'], coords, types,
                               lig_edge_index=graph['lig_edge_index'], **pooling_kwargs)
+        if self.refined_conditions:
+            vectors = graph.get('expert_node_vectors')
+            if vectors is None or vectors.shape != (len(coords), 2 * self.config['expert_vector_dim'], 3):
+                raise ValueError('v7 requires per-node vectors from both frozen experts')
+            pooled['joint_geometry']['expert_vectors'] = vectors
         if self.mutual_experts:
             evidence_input = diffusion_state
             if self.enhanced_conditions:
@@ -1772,6 +1832,8 @@ class ConsensusCoopDiff(nn.Module):
             raise ValueError('conditional experts require autograd through their frozen computation')
         if getattr(trifuse, 'enhanced_conditions', False) and frozen_expert.ns != trifuse.config['expert_film_dim']:
             raise ValueError('FiLM width must match the frozen expert leading even-scalar width')
+        if getattr(trifuse, 'refined_conditions', False) and frozen_expert.node_vector_dim != trifuse.config['expert_vector_dim']:
+            raise ValueError('expert vector width differs from model configuration')
         self.checkpoint_ternary = bool(checkpoint_ternary)
         self._conditioning = SDPIFlow()
 
@@ -1786,6 +1848,8 @@ class ConsensusCoopDiff(nn.Module):
         # stores intermediate attributes on its private graph.
         def read(private_graph, film):
             if getattr(self.trifuse, 'endpoint_v2', False):
+                if getattr(self.trifuse, 'refined_conditions', False):
+                    return self.expert.forward_features(private_graph.clone(), film=film, return_vectors=True)
                 if film is not None:
                     return self.expert.forward_features(private_graph.clone(), film=film)
                 return self.expert.forward_features(private_graph.clone())
@@ -1826,12 +1890,12 @@ class ConsensusCoopDiff(nn.Module):
                           for channel in (0, 1)) for layer in range(len(films[0]))]
         outputs = self._read_expert(packed, film)
         torsions = outputs[2].reshape(-1).split(torsion_counts)
-        features = None
-        if len(outputs) > 3:
-            ligand, receptor = outputs[3].split((sum(ligand_counts), sum(receptor_counts)))
-            features = [torch.cat(pair) for pair in zip(ligand.split(ligand_counts), receptor.split(receptor_counts))]
+        features = []
+        for nodes in outputs[3:]:
+            ligand, receptor = nodes.split((sum(ligand_counts), sum(receptor_counts)))
+            features.append([torch.cat(pair) for pair in zip(ligand.split(ligand_counts), receptor.split(receptor_counts))])
         return [(outputs[0][i:i + 1], outputs[1][i:i + 1], torsions[i],
-                 *(() if features is None else (features[i],))) for i in range(len(graphs))]
+                 *(values[i] for values in features)) for i in range(len(graphs))]
 
     def forward(self, e3_data, poi_data, ligand_data, t_e3l, t_pol=None,
                 r_e3_to_poi=None, receptor_crop_cutoff=None, diffusion_state=None,
@@ -1872,7 +1936,7 @@ class ConsensusCoopDiff(nn.Module):
             raise ValueError('model-v2 requires explicit diffusion_state [1,9]')
         frame = (r_e3_to_poi[0] if r_e3_to_poi is not None
                  else torch.eye(3, device=t_e3l.device, dtype=ligand_data['coords'].dtype))
-        raw, node_reads = {}, []
+        raw, node_reads, vector_reads = {}, [], []
         graph = build_trifuse_graph(
             e3_data['coords'][0], e3_data['features'][0],
             poi_data['coords'][0], poi_data['features'][0],
@@ -1919,6 +1983,13 @@ class ConsensusCoopDiff(nn.Module):
                 receptor_scalars = scalars.new_zeros(len(rec_pos), scalars.shape[1]).index_copy(
                     0, visible.nonzero().flatten(), scalars[n_lig:])
                 node_reads.append((scalars[:n_lig], receptor_scalars, visible))
+                if getattr(self.trifuse, 'refined_conditions', False):
+                    vectors = outputs[4] @ rotation.T
+                    if not torch.isfinite(vectors).all():
+                        raise FloatingPointError('non-finite expert vector features')
+                    receptor_vectors = vectors.new_zeros(len(rec_pos), *vectors.shape[1:]).index_copy(
+                        0, visible.nonzero().flatten(), vectors[n_lig:])
+                    vector_reads.append((vectors[:n_lig], receptor_vectors))
             if not all(torch.isfinite(v).all() for v in (tr, rot, tor)):
                 raise FloatingPointError(f'{branch}: non-finite frozen proposal')
             raw[branch] = {'tr': tr @ rotation.T, 'rot': rot @ rotation.T,
@@ -1937,6 +2008,11 @@ class ConsensusCoopDiff(nn.Module):
                              b[1].new_zeros(len(b[1]), 1), b[2][:, None].to(b[1])), -1)
             ligand = torch.cat((a[0], b[0], a[0].new_ones(len(a[0]), 2)), -1)
             graph['expert_node_features'] = torch.cat((e3, poi, ligand), 0)
+        if vector_reads:
+            a, b = vector_reads
+            graph['expert_node_vectors'] = torch.cat((
+                torch.cat((a[1], torch.zeros_like(a[1])), 1),
+                torch.cat((torch.zeros_like(b[1]), b[1]), 1), torch.cat((a[0], b[0]), 1)), 0)
         condition_kwargs = {'conditions': conditions} if conditions is not None else {}
         if self.checkpoint_ternary and self.training and torch.is_grad_enabled():
             result = checkpoint(self.trifuse, graph, proposals, diffusion_state,

@@ -128,7 +128,7 @@ def test_consensus_builder_passes_only_active_model_dimensions():
         '--train_data', 'unused.json', '--val_data', 'unused.json',
         '--output_dir', 'unused',
     ])
-    expert = SimpleNamespace(num_conv_layers=11, node_scalar_dim=58, ns=48)
+    expert = SimpleNamespace(num_conv_layers=11, node_scalar_dim=58, ns=48, node_vector_dim=20)
     with patch('tricoopdiff.models.expert.build_diffdock_expert', return_value=expert), \
             patch('tricoopdiff.models.consensus.ConsensusFuse') as fuse, \
             patch('tricoopdiff.models.consensus.ConsensusCoopDiff') as model, \
@@ -144,7 +144,7 @@ def test_consensus_builder_passes_only_active_model_dimensions():
             global_node_attention=True,
             rotation_scale_normalization=True,
             dropout=0., source_conditioning=False,
-            model_profile='ternary_endpoint_v6', expert_scalar_dim=58, expert_film_dim=48,
+            model_profile='ternary_endpoint_v7', expert_scalar_dim=58, expert_film_dim=48, expert_vector_dim=20,
         )
         assert model.call_args.kwargs['expert_input_grad'] is True
         assert result is model.return_value
@@ -196,6 +196,8 @@ def _endpoint_trainer_fixture(profile=None, inference_steps=3):
     model = Model()
     trainer = ConsensusTrainer(model, flow, device='cpu', ema_decay=.999 if profile else 0.)
     batch = {'e3_data': {'coords': e3}, 'poi_data': {'coords': poi}, 'ligand_data': ligand}
+    if profile == 'ternary_endpoint_v7':
+        batch['fullatom_targets'] = {'e3': e3[0].clone(), 'poi': poi[0].clone()}
     initial = flow.path(ligand, poi, coupling, ligand['coords'].new_ones(1))[:3]
     override = {'initial_state': dict(zip(('ligand', 'poi', 'body_frame'), initial)),
                 'target_ligand': ligand['coords']}
@@ -615,7 +617,7 @@ def test_resume_builder_uses_saved_model_and_loss_recipe_not_current_defaults():
     args = parse_args(['--train_data', 'unused', '--val_data', 'unused',
                        '--output_dir', 'unused', '--resume', 'saved.pt'])
     with patch('train_entry.torch.load', return_value=payload), \
-            patch('tricoopdiff.models.expert.build_diffdock_expert', return_value=SimpleNamespace(num_conv_layers=11, node_scalar_dim=58, ns=48)), \
+            patch('tricoopdiff.models.expert.build_diffdock_expert', return_value=SimpleNamespace(num_conv_layers=11, node_scalar_dim=58, ns=48, node_vector_dim=20)), \
             patch('tricoopdiff.models.consensus.ConsensusFuse') as fuse, \
             patch('tricoopdiff.models.consensus.ConsensusCoopDiff'), \
             patch('tricoopdiff.train.ConsensusTrainer') as builder:
@@ -860,12 +862,45 @@ def test_validation_reports_actual_dockq_and_preserves_rng():
     assert not trainer.model.training, 'validation must preserve the caller model mode'
 
 
+def test_sparse_auxiliary_metrics_do_not_impute_zeros():
+    from train_entry import summarize_metrics
+    means, counts = summarize_metrics([
+        {'loss_total': 2., 'loss_near_target': 4.},
+        {'loss_total': 4., 'loss_state_recovery': 8.}])
+    assert means == {'loss_total': 3., 'loss_near_target': 4., 'loss_state_recovery': 8.}
+    assert counts == {'loss_total': 2, 'loss_near_target': 1, 'loss_state_recovery': 1}
+
+
+def test_fullatom_terminal_loss_tracks_actual_rigid_motion():
+    from tricoopdiff.train import fullatom_interface_target, terminal_fullatom_loss
+    native = torch.tensor([[[2., 0., 0.], [3., 1., 0.]]], dtype=torch.double)
+    target = fullatom_interface_target({'e3': torch.zeros(1, 3), 'poi': native[0]}, native)
+    body = torch.eye(3, dtype=torch.double).unsqueeze(0)
+    assert terminal_fullatom_loss(target, native, native, body).item() == 0.
+    moved = (native + 1.).requires_grad_()
+    loss = terminal_fullatom_loss(target, native, moved, body)
+    gradient, = torch.autograd.grad(loss, moved)
+    assert loss > 0 and torch.isfinite(gradient).all() and gradient.norm() > 0
+
+
+def test_packed_budget_preserves_order_and_oversized_singletons():
+    from tricoopdiff.models.consensus import packed_groups
+    def item(size):
+        return {key: {'coords': torch.zeros(size, 3)}
+                for key in ('e3_data', 'poi_data', 'ligand_data')}
+    items = [item(2), item(2), item(20), item(2)]
+    groups = list(packed_groups(items, {'nodes': 16, 'pairs': 100000}))
+    assert [len(group) for group in groups] == [2, 1, 1]
+    assert all(a is b for a, b in zip(items, sum(groups, [])))
+
+
 def test_training_entry_keeps_dockq_best_separate_from_loss_best():
     import train_entry
     from tricoopdiff.train import REAL_ENDPOINT_OBJECTIVE
 
     class Trainer:
         training_objective = REAL_ENDPOINT_OBJECTIVE
+        fullatom_interface_weight = 0.
         global_step = samples_seen = resume_epoch = 0
         resume_best_val_loss = float('inf')
         resume_best_val_dockq = float('-inf')
@@ -933,7 +968,7 @@ def test_c_builder_records_online_single_pair_endpoint_protocol():
         '--output_dir', 'unused', '--training-arm', 'C',
     ])
     args.training_endpoint_protocol = 'online_bitseed_training_c1_m1_v1'
-    expert = SimpleNamespace(num_conv_layers=11, node_scalar_dim=58, ns=48)
+    expert = SimpleNamespace(num_conv_layers=11, node_scalar_dim=58, ns=48, node_vector_dim=20)
     with patch('tricoopdiff.models.expert.build_diffdock_expert', return_value=expert), \
             patch('tricoopdiff.models.consensus.ConsensusFuse'), \
             patch('tricoopdiff.models.consensus.ConsensusCoopDiff'), \
@@ -1105,7 +1140,7 @@ def test_v2_checkpoint_records_recipe_and_resumes_warmup_and_entry_parity():
     trainer, batch, coupling = _endpoint_trainer_fixture('ternary_endpoint_v2')
     trainer.train_step(**batch, coupling_override=coupling)
     payload = copy.deepcopy(trainer.checkpoint_payload())
-    assert payload['checkpoint_version'] == 30
+    assert payload['checkpoint_version'] == 31
     payload['checkpoint_version'] = 25  # Historical v2 weights retain their old recipe.
     assert payload['runtime_config']['ema_update_contract'] == 'optimizer_step_warmup_v1'
     assert payload['runtime_config']['near_target_supervision']['weight'] == .25
@@ -1203,7 +1238,7 @@ def test_production_entry_rejects_old_v2_training_recipe_without_reinterpretatio
                        '--output_dir', 'unused', '--resume', 'saved.pt'])
     with patch('train_entry.torch.load', return_value=payload), \
             patch('tricoopdiff.models.expert.build_diffdock_expert',
-                  return_value=SimpleNamespace(node_scalar_dim=58, ns=48)):
+                  return_value=SimpleNamespace(node_scalar_dim=58, ns=48, node_vector_dim=20)):
         try:
             build_trainer(args, 'cpu', input_dim=4)
         except ValueError as error:

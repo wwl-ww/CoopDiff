@@ -301,7 +301,12 @@ class FrozenDiffDock(nn.Module):
         irreps = o3.Irreps(self.model.conv_layers[-1].out_irreps)
         return sum(multiplicity for multiplicity, irrep in irreps if irrep.l == 0)
 
-    def forward_features(self, data, film=None):
+    @property
+    def node_vector_dim(self) -> int:
+        return sum(multiplicity for multiplicity, irrep in o3.Irreps(self.model.conv_layers[-1].out_irreps)
+                   if irrep.l == 1)
+
+    def forward_features(self, data, film=None, *, return_vectors=False):
         """Return native scores and scalar nodes in ligand/cropped-receptor order.
 
         Coordinates and optional node-wise FiLM retain autograd through frozen
@@ -357,6 +362,16 @@ class FrozenDiffDock(nn.Module):
                 scalars = clamp_irrep_features(scalars, f'{scalars.shape[-1]}x0e', float(limit))
             else:
                 scalars = scalars.clamp(min=-float(limit), max=float(limit))
+        if return_vectors:
+            features = captured[0]
+            if limit:
+                features = (clamp_irrep_features(features, irreps, float(limit))
+                            if self.model.activation_clamp_mode == 'irrep_norm'
+                            else features.clamp(-float(limit), float(limit)))
+            vectors = torch.cat([features[:, section].reshape(len(features), multiplicity, 3)
+                                 for (multiplicity, irrep), section in zip(irreps, irreps.slices())
+                                 if irrep.l == 1], dim=1)
+            return tr, rot, tor, scalars, vectors
         return tr, rot, tor, scalars
 
 

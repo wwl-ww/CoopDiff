@@ -21,7 +21,7 @@ from tricoopdiff.models.consensus import (
     ENDPOINT_PROTOCOL_CHECKPOINT_VERSION,
     OBJECTIVE_CONTRACT_CHECKPOINT_VERSION,
     INTERFACE_OBJECTIVE_CHECKPOINT_VERSION, PRODUCTION_MODEL_PROFILE, MODEL_PROFILES,
-    production_model_config,
+    production_model_config, packed_groups, PACKED_BATCH_LIMITS,
     LEGACY_CONSENSUS_CHECKPOINT_VERSION, PREVIOUS_CONSENSUS_CHECKPOINT_VERSION,
     SOURCE_CONTRACT_VERSION,
     candidate_source_tensor,
@@ -233,22 +233,17 @@ class TriCoopDiffTrainer:
         results = []
         try:
             packed = getattr(self.model.trifuse, 'enhanced_conditions', False)
-            losses = (self.compute_losses(batches) if packed
-                      else (self.compute_loss(**batch) for batch in batches))
-            objective = None
-            for loss_dict in losses:
-                total = loss_dict['loss_total']
-                if not torch.isfinite(total):
+            groups = (packed_groups(batches) if getattr(self.model.trifuse, 'refined_conditions', False)
+                      else [batches] if packed else ([batch] for batch in batches))
+            for group in groups:
+                losses = self.compute_losses(group) if packed else [self.compute_loss(**group[0])]
+                objective = sum(loss['loss_total'] for loss in losses)
+                if not torch.isfinite(objective):
                     raise NonFiniteTrainingError('non-finite total loss')
-                if packed:
-                    objective = total if objective is None else objective + total
-                else:
-                    (total / len(batches)).backward()
-                results.append({k: v.item() if torch.is_tensor(v) else v
-                                for k, v in loss_dict.items()})
-                del loss_dict, total
-            if packed:
                 (objective / len(batches)).backward()
+                results.extend({key: value.item() if torch.is_tensor(value) else value
+                                for key, value in loss.items()} for loss in losses)
+                del losses, objective
         except Exception:
             self.optimizer.zero_grad(set_to_none=True)
             restore_rng_state(rng_before)
@@ -355,6 +350,43 @@ def terminal_interface_losses(e3, native_poi, predicted_poi, cutoff):
     }, count
 
 
+def fullatom_interface_target(targets, reference):
+    """Prepare heavy-atom contacts once; targets never enter the model forward."""
+    if targets is None or set(targets) != {'e3', 'poi'}:
+        raise ValueError('v7 training requires fullatom_targets for both proteins')
+    atoms = [torch.as_tensor(targets[key], device=reference.device, dtype=reference.dtype)
+             for key in ('e3', 'poi')]
+    if any(value.ndim != 2 or value.shape[1] != 3 or not len(value)
+           or not torch.isfinite(value).all() for value in atoms):
+        raise ValueError('fullatom_targets must contain finite nonempty [N,3] coordinates')
+    a, b = atoms
+    fixed, moving = [], []
+    interface = torch.zeros(len(b), device=b.device, dtype=torch.bool)
+    with torch.no_grad():
+        for chunk in a.split(256):
+            distance = torch.cdist(chunk, b, compute_mode='donot_use_mm_for_euclid_dist')
+            row, column = (distance <= 5.).nonzero(as_tuple=True)
+            fixed.append(chunk[row])
+            moving.append(b[column])
+            interface |= (distance <= 10.).any(0)
+    return torch.cat(fixed), torch.cat(moving), b[interface]
+
+
+def terminal_fullatom_loss(target, native_poi, poi, body):
+    fixed, contacts, interface = target
+    center, native_center = poi.mean(1), native_poi.mean(1)
+    def transform(atoms):
+        return (atoms - native_center) @ body[0].T + center
+    loss = poi.sum() * 0
+    if len(contacts):
+        before = torch.linalg.vector_norm(contacts - fixed, dim=-1)
+        after = torch.linalg.vector_norm(transform(contacts) - fixed, dim=-1)
+        loss = loss + ((after - before) / 5.).square().mean()
+    if len(interface):
+        loss = loss + ((transform(interface) - interface) / 4.).square().mean()
+    return loss
+
+
 def coarse_intercomponent_repulsion(e3, native_poi, native_ligand, poi, ligand, cutoff=2.):
     """Conservative short-range CA/ligand penalty, not all-atom sterics.
 
@@ -394,7 +426,8 @@ def validate_consensus_checkpoint(payload):
                                            model_config.get('source_conditioning', False),
                                            model_profile=model_config['model_profile'],
                                            expert_scalar_dim=model_config.get('expert_scalar_dim', 58),
-                                           expert_film_dim=model_config.get('expert_film_dim', 48))
+                                           expert_film_dim=model_config.get('expert_film_dim', 48),
+                                           expert_vector_dim=model_config.get('expert_vector_dim', 20))
         if model_config != expected:
             raise ValueError('checkpoint violates its production model profile')
     if bool(direct) != (payload.get('architecture') == DIRECT_ARCHITECTURE):
@@ -418,18 +451,23 @@ def validate_consensus_checkpoint(payload):
         raise ValueError('conditional expert v5 requires checkpoint version 29')
     if model_config.get('model_profile') == 'ternary_endpoint_v6' and version < 30:
         raise ValueError('geometric conditional expert v6 requires checkpoint version 30')
+    if model_config.get('model_profile') == 'ternary_endpoint_v7' and version < 31:
+        raise ValueError('vector conditional expert v7 requires checkpoint version 31')
     if version >= 25:
         profile = model_config.get('model_profile')
         new_recipe = profile in MODEL_PROFILES[1:]
         near_config = NEAR_TARGET_SUPERVISION if profile in MODEL_PROFILES[2:] else LEGACY_NEAR_TARGET_SUPERVISION
-        expected = {'training_recipe': ('endpoint_state_recovery_v1' if profile == PRODUCTION_MODEL_PROFILE else
+        expected = {'training_recipe': ('endpoint_fullatom_recovery_v1' if profile == PRODUCTION_MODEL_PROFILE else
+                                        'endpoint_state_recovery_v1' if profile == 'ternary_endpoint_v6' else
                                         'endpoint_near_target_v2' if profile in MODEL_PROFILES[2:] else 'endpoint_near_target_v1')
                                        if new_recipe else 'endpoint_only_v1',
                     'ema_update_contract': 'optimizer_step_warmup_v1' if new_recipe else 'optimizer_step_fixed_v1',
                     'near_target_supervision': near_config if new_recipe else None,
                     'validation_weights': 'ema'}
-        if profile == PRODUCTION_MODEL_PROFILE:
+        if profile in MODEL_PROFILES[5:]:
             expected['state_recovery_supervision'] = STATE_RECOVERY_SUPERVISION
+        if profile == PRODUCTION_MODEL_PROFILE:
+            expected.update(packed_batch_limits=PACKED_BATCH_LIMITS, fullatom_interface_weight=.25)
         if any(config.get(key) != value for key, value in expected.items()):
             raise ValueError('checkpoint has an incompatible endpoint/EMA training recipe')
         if payload.get('checkpoint_kind') != 'inference_only':
@@ -539,7 +577,8 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         configure_expert_policy(self.model.expert, self.activation_clamp, self.activation_clamp_mode)
         self.ema_decay = float(ema_decay)
         profile = self.model.trifuse.config.get('model_profile')
-        self.training_recipe = ('endpoint_state_recovery_v1' if profile == PRODUCTION_MODEL_PROFILE else
+        self.training_recipe = ('endpoint_fullatom_recovery_v1' if profile == PRODUCTION_MODEL_PROFILE else
+                                'endpoint_state_recovery_v1' if profile == 'ternary_endpoint_v6' else
                                 'endpoint_near_target_v2' if profile in MODEL_PROFILES[2:]
                                 else 'endpoint_near_target_v1' if profile == 'ternary_endpoint_v2'
                                 else 'endpoint_only_v1')
@@ -552,7 +591,8 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         self.near_target_weight = (self.near_target_supervision['weight']
                                    if self.near_target_supervision is not None else 0.0)
         self.state_recovery_supervision = (dict(STATE_RECOVERY_SUPERVISION)
-                                          if profile == PRODUCTION_MODEL_PROFILE else None)
+                                          if profile in MODEL_PROFILES[5:] else None)
+        self.fullatom_interface_weight = .25 if profile == PRODUCTION_MODEL_PROFILE else 0.
         if training_source_mix not in ('sdpi_only', 'sdpi_bitseed_1_1'):
             raise ValueError('training_source_mix must be sdpi_only or sdpi_bitseed_1_1')
         self.training_source_mix = training_source_mix
@@ -590,7 +630,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
     def _loss_trajectory(self, e3_data, poi_data, ligand_data, case='unknown',
                      t_override=None, t_pol_override=None, coupling_override=None,
                      diagnostics=False, source=0, conditions=None, near_target_zero=None,
-                     near_target_start_t=None, recovery_start_t=None):
+                     near_target_start_t=None, recovery_start_t=None, fullatom_targets=None):
         if recovery_start_t is not None and (self.state_recovery_supervision is None
                 or recovery_start_t not in self.state_recovery_supervision['start_times']
                 or near_target_zero is not None):
@@ -614,6 +654,8 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         ed = {**e3_data, 'coords': e3_data['coords'].to(self.device)}
         pd = {**poi_data, 'coords': poi_data['coords'].to(self.device)}
         ld = {**ligand_data, 'coords': ligand_data['coords'].to(self.device)}
+        atom_target = (fullatom_interface_target(fullatom_targets, ld['coords'])
+                       if self.fullatom_interface_weight else None)
         no_torsion = bool(getattr(self.model.expert.model, 'no_torsion', False))
         dt = ld['coords'].new_full((1,), 1 / self.diffusion.inference_steps)
         projection = None
@@ -648,7 +690,8 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                                    round((1 - recovery_start_t) * self.diffusion.inference_steps)))
                          if recovery_start_t is not None and self.diffusion.inference_steps > 1 else None)
         result = yield from self._endpoint_rollout_loss(
-            ed, pd, ld, ligand, poi, body, target_ligand, source, conditions, capture_index=capture_index)
+            ed, pd, ld, ligand, poi, body, target_ligand, source, conditions,
+            capture_index=capture_index, atom_target=atom_target)
         result['loss_endpoint_main'] = result['loss_total']
         if near_target_zero is not None:
             near_ligand, near_poi = target_ligand.detach(), pd['coords'].detach()
@@ -658,7 +701,8 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                     near_ligand, near_poi, near_body, ld, self.near_target_supervision)
             near = yield from self._endpoint_rollout_loss(
                 ed, pd, ld, near_ligand, near_poi, near_body, target_ligand, source,
-                conditions, t_start=start_t, steps=max(1, math.ceil(self.diffusion.inference_steps * start_t)))
+                conditions, t_start=start_t, steps=max(1, math.ceil(self.diffusion.inference_steps * start_t)),
+                atom_target=atom_target)
             result['components']['loss_near_target'] = near['loss_total']
             result['loss_total'] = result['loss_total'] + self.near_target_weight * near['loss_total']
         if capture_index is not None:
@@ -666,7 +710,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             remaining = self.diffusion.inference_steps - capture_index
             recovery = yield from self._endpoint_rollout_loss(
                 ed, pd, ld, *recovery_state, target_ligand, source, conditions,
-                t_start=remaining / self.diffusion.inference_steps, steps=remaining)
+                t_start=remaining / self.diffusion.inference_steps, steps=remaining, atom_target=atom_target)
             result['components']['loss_state_recovery'] = recovery['loss_total']
             result['loss_total'] = result['loss_total'] + self.state_recovery_supervision['weight'] * recovery['loss_total']
         if not torch.isfinite(result['loss_total']):
@@ -695,7 +739,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             return self.diffusion.differentiable_step(ligand, poi, body, velocities, ligand.new_ones(1), ld)
 
     def _endpoint_rollout_loss(self, ed, pd, ld, ligand, poi, body, target_ligand,
-                               source, conditions, t_start=1., steps=None, capture_index=None):
+                               source, conditions, t_start=1., steps=None, capture_index=None, atom_target=None):
         """One geometric objective for both full starts and reachable short starts."""
         captured = {}
         for index, (t, dt) in enumerate(self.diffusion.reverse_times(ld['coords'], steps=steps, t_start=t_start)):
@@ -710,6 +754,9 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         losses = {'loss_ligand_geometry': ((ligand - target_ligand) / scales[0]).square().mean(),
                   'loss_protein_geometry': ((poi - pd['coords']) / scales[1]).square().mean()}
         total = sum(losses.values())
+        if atom_target is not None:
+            losses['loss_fullatom_interface'] = terminal_fullatom_loss(atom_target, pd['coords'], poi, body)
+            total = total + self.fullatom_interface_weight * losses['loss_fullatom_interface']
         interface_pairs = 0
         if self.interface_loss_weight:
             interface, interface_pairs = terminal_interface_losses(
@@ -729,7 +776,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         if len(batches) > self.effective_batch_size:
             raise ValueError('microbatch group exceeds the recorded effective batch size')
         if self.near_target_weight:
-            if self.training_recipe in ('endpoint_near_target_v2', 'endpoint_state_recovery_v1'):
+            if self.training_recipe in ('endpoint_near_target_v2', 'endpoint_state_recovery_v1', 'endpoint_fullatom_recovery_v1'):
                 batches = [{**batch, 'near_target_zero': ((self.samples_seen + offset) // 2) % 2 == 0,
                             'near_target_start_t': self.near_target_supervision['start_times'][
                                 ((self.samples_seen + offset) // 4) % 2]}
@@ -948,6 +995,9 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 'near_target_supervision': self.near_target_supervision,
                 **({'state_recovery_supervision': self.state_recovery_supervision}
                    if self.state_recovery_supervision is not None else {}),
+                **({'packed_batch_limits': dict(PACKED_BATCH_LIMITS),
+                    'fullatom_interface_weight': self.fullatom_interface_weight}
+                   if self.fullatom_interface_weight else {}),
                 'validation_weights': 'ema',
                 'validation_dockq_protocol': REAL_VALIDATION_DOCKQ_PROTOCOL,
                 'expert_runtime_identity': expert_runtime_identity(self.model.expert),
@@ -968,7 +1018,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         validate_consensus_checkpoint(payload)
         if payload.get('checkpoint_kind') == 'inference_only':
             raise ValueError('inference-only weights cannot resume the production training objective')
-        if (payload['checkpoint_version'] not in (24, 25, 26, 27, 28, 29, CONSENSUS_CHECKPOINT_VERSION)
+        if (payload['checkpoint_version'] not in (24, 25, 26, 27, 28, 29, 30, CONSENSUS_CHECKPOINT_VERSION)
                 or payload['runtime_config'].get('training_objective') != REAL_ENDPOINT_OBJECTIVE):
             raise ValueError('training objective differs or checkpoint is historical; load weights only')
         for key in ('inference_steps', 'endpoint_loss_weight', 'interface_loss_weight',

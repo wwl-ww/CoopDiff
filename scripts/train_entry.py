@@ -205,6 +205,36 @@ def seed_training(seed, device):
         torch.cuda.manual_seed_all(seed)
 
 
+def summarize_metrics(records):
+    """Means over observed values; absent auxiliary losses are not zeros."""
+    groups = {}
+    for record in records:
+        for key, value in record.items():
+            groups.setdefault(key, []).append(float(value))
+    return ({key: float(np.mean(values)) for key, values in groups.items()},
+            {key: len(values) for key, values in groups.items()})
+
+
+def fullatom_targets(entry, e3_data, poi_data, flipped=False):
+    """Scoring-only heavy atoms in the same fixed frame as the CA templates."""
+    import prody as pr
+    from tricoopdiff.metrics.dockq import _featurized_ca_coords
+
+    paths = (entry['protein2'], entry['protein1']) if flipped else (entry['protein1'], entry['protein2'])
+    result = {}
+    for name, path, data in zip(('e3', 'poi'), paths, (e3_data, poi_data)):
+        reference = data['coords'][0]
+        ca = reference.new_tensor(_featurized_ca_coords(path))
+        if ca.shape != reference.shape or not torch.allclose(
+                ca - ca.mean(0), reference - reference.mean(0), atol=.01, rtol=1e-4):
+            raise ValueError('full-atom target and featurized protein do not share the same rigid template')
+        atoms = pr.parsePDB(str(path)).select('protein and not hydrogen')
+        if atoms is None:
+            raise ValueError('full-atom supervision requires protein heavy atoms')
+        result[name] = reference.new_tensor(atoms.getCoords()) - ca.mean(0) + reference.mean(0)
+    return result
+
+
 def append_metric(output_dir, payload):
     """Append one flush-safe structured training or validation event."""
     path = Path(output_dir) / 'metrics.jsonl'
@@ -294,11 +324,13 @@ def main():
         shuffle=True, device=str(device), cache_dir=args.cache_dir,
         skip_on_error=False, max_clusters=args.max_train_clusters,
         random_flip_proteins=args.random_flip_proteins,
+        fullatom_supervision=bool(trainer.fullatom_interface_weight),
     )
     val_loader = TernaryDataLoader(
         args.val_data, score_model_args,
         shuffle=False, device=str(device), cache_dir=args.cache_dir,
         skip_on_error=False, max_clusters=args.max_val_clusters,
+        fullatom_supervision=bool(trainer.fullatom_interface_weight),
     )
     # Check scoring dependencies before spending an epoch on training.
     for entry in val_loader._epoch_entries():
@@ -347,14 +379,14 @@ def main():
                     'training_objective': trainer.training_objective,
                     **loss_dict,
                 })
-            loss_dict = {key: float(np.mean([loss[key] for loss in group_losses]))
-                         for key in group_losses[0]}
+            loss_dict, _ = summarize_metrics(group_losses)
 
             if batch_idx % args.log_interval == 0:
                 print(f"  Epoch {epoch} | Batch {batch_idx} | "
                       f"loss={loss_dict['loss_total']:.4f} | "
                       f"endpoint_main={loss_dict.get('loss_endpoint_main', loss_dict['loss_total']):.4f} | "
-                      f"near_target={loss_dict.get('loss_near_target', 0.):.4f} | "
+                      f"near_target={loss_dict.get('loss_near_target', 'n/a')} | "
+                      f"recovery={loss_dict.get('loss_state_recovery', 'n/a')} | "
                       f"ligand_geometry={loss_dict['loss_ligand_geometry']:.4f} | "
                       f"protein_geometry={loss_dict['loss_protein_geometry']:.4f}")
 
@@ -385,15 +417,18 @@ def main():
         trainer.scheduler_step(val_loss)
 
         # Log
-        train_loss_avg = np.mean([d['loss_total'] for d in train_losses]) if train_losses else float('nan')
-        train_main_avg = np.mean([d.get('loss_endpoint_main', d['loss_total']) for d in train_losses])
-        train_near_avg = np.mean([d.get('loss_near_target', 0.) for d in train_losses])
-        train_ligand_avg = np.mean([d['loss_ligand_geometry'] for d in train_losses])
-        train_protein_avg = np.mean([d['loss_protein_geometry'] for d in train_losses])
+        train_means, train_counts = summarize_metrics(train_losses)
+        append_metric(args.output_dir, {'event': 'train_epoch', 'epoch': epoch,
+                                       'means': train_means, 'counts': train_counts})
+        train_loss_avg = train_means['loss_total']
+        train_main_avg = train_means.get('loss_endpoint_main', train_loss_avg)
+        train_ligand_avg = train_means['loss_ligand_geometry']
+        train_protein_avg = train_means['loss_protein_geometry']
         dt = time.time() - t0
         print(f"  Epoch {epoch}/{args.epochs} | "
               f"train_loss={train_loss_avg:.4f} | "
-              f"endpoint_main={train_main_avg:.4f} | near_target={train_near_avg:.4f} | "
+              f"endpoint_main={train_main_avg:.4f} | near_target={train_means.get('loss_near_target', 'n/a')} | "
+              f"recovery={train_means.get('loss_state_recovery', 'n/a')} | "
               f"ligand_geometry={train_ligand_avg:.4f} | "
               f"protein_geometry={train_protein_avg:.4f} | "
               f"val_loss={val_loss:.4f} | "
@@ -465,7 +500,8 @@ def build_trainer(args, device, input_dim=None):
                                            args.num_transformer_layers,
                                            args.training_arm == 'C',
                                            expert_scalar_dim=frozen_expert.node_scalar_dim,
-                                           expert_film_dim=frozen_expert.ns)
+                                           expert_film_dim=frozen_expert.ns,
+                                           expert_vector_dim=frozen_expert.node_vector_dim)
     if args.resume:
         # Resume means reconstruct the saved architecture, not reinterpret it
         # using today's defaults. The trainer subsequently checks every runtime
@@ -709,7 +745,7 @@ class TernaryDataLoader:
     def __init__(self, data_json, score_model_args, shuffle=True, device="cuda",
                  cache_dir=None, skip_on_error=False, max_clusters=None,
                  random_flip_proteins=False, cache_read_only=False,
-                 cache_wait_seconds=3600.):
+                 cache_wait_seconds=3600., fullatom_supervision=False):
         self.entries, self.clusters, self.entries_by_case = _load_index(data_json)
         if max_clusters is not None:
             if max_clusters <= 0:
@@ -729,6 +765,7 @@ class TernaryDataLoader:
         self.random_flip_proteins = bool(random_flip_proteins)
         self.cache_read_only = bool(cache_read_only)
         self.cache_wait_seconds = float(cache_wait_seconds)
+        self.fullatom_supervision = bool(fullatom_supervision)
         self.skipped = []
 
     def __iter__(self):
@@ -786,7 +823,8 @@ class TernaryDataLoader:
             cache_read_only=self.cache_read_only,
             cache_wait_seconds=self.cache_wait_seconds,
         )
-        if self.random_flip_proteins and np.random.random() < 0.5:
+        flipped = self.random_flip_proteins and np.random.random() < 0.5
+        if flipped:
             # Re-express the entire ternary state in the old POI-centered frame,
             # then exchange branch identities. This matches DeepTernary's
             # training-only random protein flip while preserving the invariant
@@ -799,6 +837,8 @@ class TernaryDataLoader:
             'e3_data': e3_data,
             'poi_data': poi_data,
             'ligand_data': ligand_data,
+            **({'fullatom_targets': fullatom_targets(entry, e3_data, poi_data, flipped)}
+               if getattr(self, 'fullatom_supervision', False) else {}),
         }
 
 

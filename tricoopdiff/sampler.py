@@ -22,7 +22,7 @@ import torch
 
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.sdpi_flow import SDPIFlow, FLOW_VERSION
-from tricoopdiff.models.consensus import SOURCE_NAMES
+from tricoopdiff.models.consensus import SOURCE_NAMES, packed_groups
 from tricoopdiff.runtime import evaluation_context
 
 
@@ -70,8 +70,7 @@ def _sampling_context(function):
     return wrapped
 
 
-@_sampling_context
-def sample_single(
+def _sample_trajectory(
     model,
     diffusion: SDPIFlow,
     initializer: TernaryInitializer,
@@ -217,9 +216,8 @@ def sample_single(
             setattr(model, '_debug_step0_probe', True)
             setattr(model, '_last_step0_probe', None)
         try:
-            out = diffusion.forward_state(
-                model, e3_data, poi_data, ligand_data, ligand_pos, poi_pos,
-                r_e3_to_poi, t_tr, dt_tr, source_index, conditions)
+            out = yield (e3_data, poi_data, ligand_data, ligand_pos, poi_pos,
+                         r_e3_to_poi, t_tr, dt_tr, source_index, conditions)
         finally:
             if return_trace:
                 setattr(model, '_debug_step0_probe', probe_enabled)
@@ -347,10 +345,9 @@ def sample_single(
     if return_trace:
         result["trace"] = trace
     if return_rank_features and not nonfinite_score_steps:
-        final = diffusion.forward_state(
-            model, e3_data, poi_data, ligand_data, ligand_pos, poi_pos,
-            r_e3_to_poi, ligand_pos.new_zeros(1), ligand_pos.new_zeros(1),
-            source_index, conditions)
+        final = yield (e3_data, poi_data, ligand_data, ligand_pos, poi_pos,
+                       r_e3_to_poi, ligand_pos.new_zeros(1), ligand_pos.new_zeros(1),
+                       source_index, conditions)
         features = final.get('rank_features')
         if (features is None or features.ndim != 2 or features.shape[0] != 1
                 or not torch.isfinite(features).all()):
@@ -359,6 +356,36 @@ def sample_single(
         result['rank_features'] = final_rank_features
         result['rank_feature_state'] = 'final_pose_t0_dt0_v1'
     return result
+
+
+def _run_trajectories(model, diffusion, trajectories):
+    pending, results = {}, [None] * len(trajectories)
+    try:
+        for index, trajectory in enumerate(trajectories):
+            pending[index] = next(trajectory)
+        while pending:
+            work = [dict(zip(('e3_data', 'poi_data', 'ligand_data'), state[:3]), index=index)
+                    for index, state in pending.items()]
+            next_pending = {}
+            for group in packed_groups(work):
+                indices = [item['index'] for item in group]
+                outputs = diffusion.forward_states(model, [pending[index] for index in indices])
+                for index, output in zip(indices, outputs):
+                    try:
+                        next_pending[index] = trajectories[index].send(output)
+                    except StopIteration as finished:
+                        results[index] = finished.value
+            pending = next_pending
+    finally:
+        for trajectory in trajectories:
+            trajectory.close()
+    return results
+
+
+@_sampling_context
+def sample_single(model, diffusion, *args, **kwargs):
+    """One walker through the same executor used by packed ensemble inference."""
+    return _run_trajectories(model, diffusion, [_sample_trajectory(model, diffusion, *args, **kwargs)])[0]
 
 
 def sample_ensemble(
@@ -398,19 +425,13 @@ def sample_ensemble(
     if n_walkers < 1:
         raise ValueError("at least one walker is required")
 
-    results = []
-    for i in range(n_walkers):
-        print(f"[sample] walker {i + 1}/{n_walkers}, seed={seeds[i]}", flush=True)
-        results.append(
-            sample_single(
-                model, diffusion, initializer, e3_data, poi_data, ligand_data,
-                steps=steps, device=device, seed=seeds[i], freeze_poi=freeze_poi,
-                init_mode=init_mode,
-                t_anchor=t_anchor,
-                translation_velocity_scale=translation_velocity_scale,
-                rotation_velocity_scale=rotation_velocity_scale,
-                return_rank_features=return_rank_features,
-                conditions=conditions,
-            )
-        )
-    return results
+    trajectories = [
+        _sample_trajectory(model, diffusion, initializer, e3_data, poi_data, ligand_data,
+                           steps=steps, device=device, seed=seed, freeze_poi=freeze_poi,
+                           init_mode=init_mode, t_anchor=t_anchor,
+                           translation_velocity_scale=translation_velocity_scale,
+                           rotation_velocity_scale=rotation_velocity_scale,
+                           return_rank_features=return_rank_features, conditions=conditions)
+        for seed in seeds]
+    with evaluation_context(model):
+        return _run_trajectories(model, diffusion, trajectories)
