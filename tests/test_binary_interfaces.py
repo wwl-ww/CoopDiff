@@ -115,6 +115,62 @@ def test_receptor_crop_rejects_invalid_radius_and_fallback_counts():
     assert torch.equal(coords, torch.zeros(2, 3)) and torch.equal(features, torch.ones(2, 1))
 
 
+def test_native_film_zero_identity_gradients_and_hook_cleanup():
+    from types import SimpleNamespace
+    from tricoopdiff.models.expert import FrozenDiffDock
+
+    class Layer(torch.nn.Module):
+        out_irreps = '2x0e + 1x1o'
+
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(5, 5)
+
+        def forward(self, value):
+            return self.linear(value).tanh()
+
+    class Expert(torch.nn.Module):
+        ns, nv, sh_irreps, device = 2, 1, '0e + 1o', 'cpu'
+
+        def __init__(self):
+            super().__init__()
+            self.conv_layers = torch.nn.ModuleList([Layer() for _ in range(3)])
+
+        def forward(self, data):
+            coords = torch.cat((data['ligand'].pos, data['receptor'].pos))
+            features = torch.cat((coords, coords[:, :2]), -1)
+            for layer in self.conv_layers:
+                features = layer(features)
+            return features.mean(0)[None, :3], features.mean(0)[None, 2:5], features[:1, 0]
+
+    torch.manual_seed(73)
+    expert = FrozenDiffDock(Expert(), num_conv_layers=3)
+    data = {'ligand': SimpleNamespace(pos=torch.randn(4, 3)),
+            'receptor': SimpleNamespace(pos=torch.randn(6, 3))}
+    before = {name: value.clone() for name, value in expert.state_dict().items()}
+    native = expert.forward_features(data)
+    zeros = [(torch.zeros(10, 2), torch.zeros(10, 2)) for _ in range(3)]
+    conditioned = expert.forward_features(data, film=zeros)
+    assert all(torch.equal(a, b) for a, b in zip(native, conditioned)), 'zero FiLM changed the frozen baseline'
+    film = [(torch.randn(10, 2, requires_grad=True), torch.randn(10, 2, requires_grad=True)) for _ in range(3)]
+    conditioned = expert.forward_features(data, film=film)
+    assert not torch.equal(native[0], conditioned[0]), 'FiLM did not enter native score generation'
+    sum(value.square().sum() for value in conditioned).backward()
+    assert all(value.grad is not None and torch.isfinite(value.grad).all()
+               and value.grad.abs().sum() > 0 for pair in film for value in pair)
+    assert all(parameter.grad is None and not parameter.requires_grad for parameter in expert.parameters())
+    invalid = [zeros[0], (torch.zeros(9, 2), torch.zeros(9, 2)), zeros[2]]
+    try:
+        expert.forward_features(data, film=invalid)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('invalid condition node order/size was accepted')
+    assert all(not layer._forward_hooks for layer in expert.model.conv_layers)
+    assert all(torch.equal(value, expert.state_dict()[name]) for name, value in before.items())
+    assert all(torch.equal(a, b) for a, b in zip(native, expert.forward_features(data)))
+
+
 if __name__ == '__main__':
     test_metrics_do_not_align_away_docking_error()
     test_initialization_ignores_native_coordinates()

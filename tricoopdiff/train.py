@@ -20,7 +20,7 @@ from tricoopdiff.models.consensus import (
     ARCHITECTURE, DIRECT_ARCHITECTURE, CONSENSUS_CHECKPOINT_VERSION,
     ENDPOINT_PROTOCOL_CHECKPOINT_VERSION,
     OBJECTIVE_CONTRACT_CHECKPOINT_VERSION,
-    INTERFACE_OBJECTIVE_CHECKPOINT_VERSION, PRODUCTION_MODEL_PROFILE,
+    INTERFACE_OBJECTIVE_CHECKPOINT_VERSION, PRODUCTION_MODEL_PROFILE, MODEL_PROFILES,
     production_model_config,
     LEGACY_CONSENSUS_CHECKPOINT_VERSION, PREVIOUS_CONSENSUS_CHECKPOINT_VERSION,
     SOURCE_CONTRACT_VERSION,
@@ -372,8 +372,7 @@ def validate_consensus_checkpoint(payload):
             raise ValueError(f'{key} requires direct ternary motion')
     model_config = payload.get('model_config', {})
     if model_config.get('model_profile') is not None:
-        if model_config['model_profile'] not in ('ternary_endpoint_v1', 'ternary_endpoint_v2',
-                                               'ternary_endpoint_v3', PRODUCTION_MODEL_PROFILE):
+        if model_config['model_profile'] not in MODEL_PROFILES:
             raise ValueError('unknown checkpoint model profile')
         expected = production_model_config(model_config['node_dim'], model_config['input_dim'],
                                            model_config['num_transformer_layers'],
@@ -399,11 +398,13 @@ def validate_consensus_checkpoint(payload):
         raise ValueError('ternary endpoint v3 requires checkpoint version 26')
     if model_config.get('model_profile') == 'ternary_endpoint_v4' and version < 27:
         raise ValueError('ternary endpoint v4 requires checkpoint version 27')
+    if model_config.get('model_profile') == 'ternary_endpoint_v5' and version < 29:
+        raise ValueError('conditional expert v5 requires checkpoint version 29')
     if version >= 25:
         profile = model_config.get('model_profile')
-        new_recipe = profile in ('ternary_endpoint_v2', 'ternary_endpoint_v3', 'ternary_endpoint_v4')
-        near_config = NEAR_TARGET_SUPERVISION if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4') else LEGACY_NEAR_TARGET_SUPERVISION
-        expected = {'training_recipe': ('endpoint_near_target_v2' if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4') else 'endpoint_near_target_v1')
+        new_recipe = profile in MODEL_PROFILES[1:]
+        near_config = NEAR_TARGET_SUPERVISION if profile in MODEL_PROFILES[2:] else LEGACY_NEAR_TARGET_SUPERVISION
+        expected = {'training_recipe': ('endpoint_near_target_v2' if profile in MODEL_PROFILES[2:] else 'endpoint_near_target_v1')
                                        if new_recipe else 'endpoint_only_v1',
                     'ema_update_contract': 'optimizer_step_warmup_v1' if new_recipe else 'optimizer_step_fixed_v1',
                     'near_target_supervision': near_config if new_recipe else None,
@@ -517,13 +518,13 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         configure_expert_policy(self.model.expert, self.activation_clamp, self.activation_clamp_mode)
         self.ema_decay = float(ema_decay)
         profile = self.model.trifuse.config.get('model_profile')
-        self.training_recipe = ('endpoint_near_target_v2' if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4')
+        self.training_recipe = ('endpoint_near_target_v2' if profile in MODEL_PROFILES[2:]
                                 else 'endpoint_near_target_v1' if profile == 'ternary_endpoint_v2'
                                 else 'endpoint_only_v1')
         self.ema_update_contract = ('optimizer_step_warmup_v1'
                                     if self.training_recipe != 'endpoint_only_v1'
                                     else 'optimizer_step_fixed_v1')
-        self.near_target_supervision = (dict(NEAR_TARGET_SUPERVISION) if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4')
+        self.near_target_supervision = (dict(NEAR_TARGET_SUPERVISION) if profile in MODEL_PROFILES[2:]
                                        else dict(LEGACY_NEAR_TARGET_SUPERVISION) if profile == 'ternary_endpoint_v2'
                                        else None)
         self.near_target_weight = (self.near_target_supervision['weight']
@@ -605,7 +606,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 velocities = {
                     'rigid_output_mode': INDEPENDENT_RIGID_MODE,
                     **({'torsion_update_mode': CONTINUOUS_TORSION_MODE}
-                       if self.model.trifuse.config.get('model_profile') == 'ternary_endpoint_v4' else {}),
+                       if getattr(self.model.trifuse, 'continuous_torsion', False) else {}),
                     'torsion': near_ligand.new_empty((1, 0 if no_torsion else int(ld['edge_mask'].sum()))).normal_(
                         0, self.near_target_supervision['torsion_std_radians']),
                     **{branch: {'tr': near_ligand.new_empty((1, 3)).normal_(
@@ -895,7 +896,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         validate_consensus_checkpoint(payload)
         if payload.get('checkpoint_kind') == 'inference_only':
             raise ValueError('inference-only weights cannot resume the production training objective')
-        if (payload['checkpoint_version'] not in (24, 25, 26, 27, CONSENSUS_CHECKPOINT_VERSION)
+        if (payload['checkpoint_version'] not in (24, 25, 26, 27, 28, CONSENSUS_CHECKPOINT_VERSION)
                 or payload['runtime_config'].get('training_objective') != REAL_ENDPOINT_OBJECTIVE):
             raise ValueError('training objective differs or checkpoint is historical; load weights only')
         for key in ('inference_steps', 'endpoint_loss_weight', 'interface_loss_weight',

@@ -1,9 +1,9 @@
 """
 Frozen DiffDock two-body expert wrapper.
 
-Wraps DiffDock's CGModel with all parameters frozen. Production ternary models
-read independently computed node features from E3-L and POI-L. Legacy per-layer
-FiLM orchestration remains available for historical checkpoint implementations.
+Wraps DiffDock's CGModel with all parameters frozen. Binary reads can receive
+trainable, node-wise structural FiLM without replacing the native computation.
+Legacy per-layer orchestration remains available for historical checkpoints.
 
 Each subgraph contains one protein and ligand, preserving DiffDock's input
 schema. This does not guarantee that generated poses are in-distribution.
@@ -88,8 +88,8 @@ class FrozenDiffDock(nn.Module):
     """
     Frozen weights with differentiable scores and SO(3)-invariant node features.
 
-    ``forward_features`` reads native final-layer scalars without changing the
-    expert computation. Per-layer FiLM APIs are retained for legacy models.
+    ``forward_features`` reads final-layer scalars, with optional late FiLM;
+    absent/zero FiLM retains the native expert. Legacy APIs remain supported.
     """
 
     def __init__(self, cg_model: nn.Module, num_conv_layers: int = 11):
@@ -301,11 +301,12 @@ class FrozenDiffDock(nn.Module):
         irreps = o3.Irreps(self.model.conv_layers[-1].out_irreps)
         return sum(multiplicity for multiplicity, irrep in irreps if irrep.l == 0)
 
-    def forward_features(self, data):
+    def forward_features(self, data, film=None):
         """Return native scores and scalar nodes in ligand/cropped-receptor order.
 
-        Coordinates retain autograd through the frozen expert. The temporary
-        read-only hook does not replace native forward or alter checkpoint keys.
+        Coordinates and optional node-wise FiLM retain autograd through frozen
+        weights. FiLM modifies only the leading even scalars in the final three
+        convolutions; native vector channels, residuals and score heads remain.
         Odd scalars are SO(3) invariant, not invariant under reflections.
         """
         layer = self.model.conv_layers[-1]
@@ -314,12 +315,36 @@ class FrozenDiffDock(nn.Module):
                     if irrep.l == 0]
         if not sections:
             raise ValueError('expert final layer has no scalar node channels')
-        captured = []
-        hook = layer.register_forward_hook(lambda module, inputs, output: captured.append(output))
+        captured, hooks = [], []
         try:
+            if film is not None:
+                layers = self.model.conv_layers[-3:]
+                count = len(data['ligand'].pos) + len(data['receptor'].pos)
+                if len(film) != len(layers):
+                    raise ValueError('FiLM must match the final expert convolution count')
+                for conv, (gamma, beta) in zip(layers, film):
+                    if (gamma.ndim != 2 or gamma.shape != beta.shape
+                            or gamma.shape[0] != count or gamma.shape[1] < self.ns
+                            or not torch.isfinite(gamma).all() or not torch.isfinite(beta).all()):
+                        raise ValueError('FiLM requires finite per-node scalar scale/bias')
+                    leading = o3.Irreps(conv.out_irreps)[0]
+                    if leading[1] != o3.Irrep('0e') or leading[0] < self.ns:
+                        raise ValueError('FiLM requires leading even expert scalars')
+
+                    def modulate(module, inputs, output, gamma=gamma, beta=beta):
+                        scalar = output[:, :self.ns]
+                        scalar = scalar * (1 + .1 * gamma[:, :self.ns].tanh())
+                        scalar = scalar + .1 * beta[:, :self.ns].tanh()
+                        return torch.cat((scalar, output[:, self.ns:]), -1)
+
+                    hooks.append(conv.register_forward_hook(modulate))
+            # Capture AFTER modulation, before the native numerical clamp.
+            hooks.append(layer.register_forward_hook(
+                lambda module, inputs, output: captured.append(output)))
             tr, rot, tor = self.model(data)[:3]
         finally:
-            hook.remove()
+            for hook in hooks:
+                hook.remove()
         if len(captured) != 1 or captured[0].ndim != 2 or captured[0].shape[1] != irreps.dim:
             raise ValueError('expert final-layer node output does not match its irreps')
         scalars = torch.cat([captured[0][:, section] for section in sections], dim=-1)
