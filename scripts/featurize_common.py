@@ -51,11 +51,14 @@ os.chdir(_PROJECT_ROOT)
 # v6 fixes the directed k-NN convention and small-receptor self loops.
 # v7 also avoids distance cancellation for translated PDB coordinates.
 # v8 centers the exact retained ligand atoms, including isotope hydrogens.
+# v9 adds intrinsic monomer backbone/sidechain geometry (v8 can be enriched).
 # v5 caches contain reversed directed receptor edges and cannot be reused.
-_FEATURIZE_CACHE_VERSION = 8
+_FEATURIZE_CACHE_VERSION = 9
+LOCAL_GEOMETRY_DIM = 32
 
 
-def _featurize_signature(protein1, protein2, ligand_path, score_model_args):
+def _featurize_signature(protein1, protein2, ligand_path, score_model_args,
+                         cache_version=_FEATURIZE_CACHE_VERSION):
     """Fingerprint source structures and model preprocessing arguments."""
     digest = hashlib.sha256()
     for path in (protein1, protein2, ligand_path):
@@ -67,7 +70,60 @@ def _featurize_signature(protein1, protein2, ligand_path, score_model_args):
     digest.update(
         json.dumps(vars(score_model_args), sort_keys=True, default=str).encode()
     )
+    if cache_version is not None:
+        digest.update(f'featurize_schema_v{cache_version}'.encode())
     return digest.hexdigest()
+
+
+def protein_local_geometry(pdb_path, receptor):
+    """Intrinsic monomer scalars [1,N,32], in exactly DiffDock's residue order.
+
+    Ten summaries (N/CA, C/CA, O/CA distances, N-CA-C cosine,
+    sidechain count/mean/max radius and centroid radius/N/C cosines), their
+    validity masks, then four chi sines, cosines and masks. No partner pose is
+    used. Missing atoms are masked, never confused with measured zero angles.
+    """
+    import prody as pr
+    from tricoopdiff.diffdock.datasets.parse_chi import get_coords, get_chi_angles
+
+    pdb = pr.parsePDB(str(pdb_path))
+    atoms = get_coords(pdb)
+    ca = atoms[:, 1]
+    reference = receptor['coords'].detach().cpu().numpy().reshape(-1, 3)
+    if (ca.shape != reference.shape or not np.isfinite(ca).all()
+            or not np.allclose(ca - ca.mean(0), reference - reference.mean(0), atol=.01, rtol=1e-4)):
+        raise ValueError(f'{pdb_path}: local geometry CA ordering does not match receptor graph')
+    relative = atoms - ca[:, None]
+    valid = np.isfinite(relative).all(-1)
+    relative = np.nan_to_num(relative, nan=0., posinf=0., neginf=0.)
+    radius = np.linalg.norm(relative, axis=-1)
+    unit = relative / np.maximum(radius[..., None], 1e-12)
+    side_mask = valid[:, 4:]
+    count = side_mask.sum(1)
+    centroid = (relative[:, 4:] * side_mask[..., None]).sum(1) / np.maximum(count[:, None], 1)
+    centroid_radius = np.linalg.norm(centroid, axis=-1)
+    centroid_unit = centroid / np.maximum(centroid_radius[:, None], 1e-12)
+    values = np.stack((radius[:, 0] / 2, radius[:, 2] / 2, radius[:, 3] / 3,
+        (unit[:, 0] * unit[:, 2]).sum(-1), count / 10,
+        (radius[:, 4:] * side_mask).sum(1) / np.maximum(count, 1) / 5,
+        (radius[:, 4:] * side_mask).max(1) / 10, centroid_radius / 5,
+        (centroid_unit * unit[:, 0]).sum(-1), (centroid_unit * unit[:, 2]).sum(-1)), axis=-1)
+    present = valid & (radius > 1e-10)
+    side_present = count > 0
+    masks = np.stack((present[:, 0], present[:, 2], present[:, 3],
+        present[:, 0] & present[:, 2], np.ones(len(ca), dtype=bool), side_present,
+        side_present, side_present, side_present & present[:, 0] & (centroid_radius > 1e-10),
+        side_present & present[:, 2] & (centroid_radius > 1e-10)), axis=-1)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        angles = np.deg2rad(get_chi_angles(atoms, pdb.ca.getSequence()))
+    angle_mask = np.isfinite(angles)
+    angles = np.nan_to_num(angles)
+    features = np.concatenate((values * masks, masks, np.sin(angles) * angle_mask,
+                               np.cos(angles) * angle_mask, angle_mask), axis=-1)
+    if features.shape != (len(ca), LOCAL_GEOMETRY_DIM) or not np.isfinite(features).all():
+        raise ValueError(f'{pdb_path}: invalid intrinsic protein geometry')
+    return torch.as_tensor(features, device=receptor['coords'].device,
+                           dtype=receptor['coords'].dtype).unsqueeze(0)
 
 
 def _protein_ca_centroid(pdb_path):
@@ -233,7 +289,7 @@ def _strip_batch_and_cpu(data):
     for k, v in data.items():
         if torch.is_tensor(v):
             v = v.detach().cpu()
-        if k in ("coords", "features"):
+        if k in ("coords", "features", "local_geometry"):
             v = v[0]  # drop the leading B=1 dim
         out[k] = v
     return out
@@ -245,7 +301,7 @@ def _to_device_and_batch(data, device):
     for k, v in data.items():
         if torch.is_tensor(v):
             v = v.to(device)
-        if k in ("coords", "features"):
+        if k in ("coords", "features", "local_geometry"):
             v = v.unsqueeze(0)  # re-add the leading B=1 dim
         out[k] = v
     return out
@@ -253,7 +309,7 @@ def _to_device_and_batch(data, device):
 
 def featurize_complex(case_label, protein1, protein2, ligand_path,
                       score_model_args, device, cache_dir=None,
-                      cache_read_only=False, cache_wait_seconds=3600.):
+                      cache_read_only=False, cache_wait_seconds=3600., cache_only=False):
     """Featurize one ternary complex into the three B=1 data dicts.
 
     Args:
@@ -298,14 +354,38 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
                 # which PyTorch 2.6's default weights_only=True refuses to unpickle.
                 # The file is written by us (trusted), so full unpickling is safe.
                 cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+                # v8 already has correct atom order/frames/ESM. Enrich it from
+                # source monomers without rebuilding embeddings or graphs.
+                if (cached.get('cache_version') in (7, 8) and cached.get('source_signature') ==
+                        _featurize_signature(protein1, protein2, ligand_path, score_model_args,
+                                             cache_version=None)):
+                    if cached['cache_version'] == 7:
+                        # v7 differed only in retained/isotope-H ligand centering.
+                        # Correct that translation from source, retaining ESM and topology.
+                        position = cached['ligand_data']['coords']
+                        center = _ligand_centroid(ligand_path, remove_hs=score_model_args.remove_hs) - _protein_ca_centroid(protein1)
+                        cached['ligand_data']['coords'] = position - position.mean(0) + position.new_tensor(center)
+                    for key, path in (('e3_data', protein1), ('poi_data', protein2)):
+                        cached[key]['local_geometry'] = protein_local_geometry(path, cached[key])[0].cpu()
+                    cached.update(cache_version=_FEATURIZE_CACHE_VERSION, source_signature=cache_signature)
+                    if not cache_read_only:
+                        atomic_torch_save(cached, cache_path)
                 if (
                     cached.get('cache_version') == _FEATURIZE_CACHE_VERSION
                     and cached.get('source_signature') == cache_signature
                 ):
+                    for key in ('e3_data', 'poi_data'):
+                        geometry = cached[key].get('local_geometry')
+                        if (not torch.is_tensor(geometry) or geometry.shape !=
+                                (cached[key]['coords'].shape[0], LOCAL_GEOMETRY_DIM)
+                                or not torch.isfinite(geometry).all()):
+                            raise ValueError(f'{case_label}: v9 cache lacks valid {key} local_geometry')
                     e3 = _to_device_and_batch(cached['e3_data'], device)
                     poi = _to_device_and_batch(cached['poi_data'], device)
                     lig = _to_device_and_batch(cached['ligand_data'], device)
                     return e3, poi, lig, cached['receptor_feat_dim']
+            if cache_only:
+                raise FileNotFoundError(f'{case_label}: no compatible feature cache; ESM rebuilding disabled')
             if not cache_read_only:
                 break
             if time.monotonic() >= deadline:
@@ -315,6 +395,8 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
             # A stale cache can be atomically replaced by the writer while the
             # follower waits.  It must never featurize or publish independently.
 
+    if cache_only:
+        raise FileNotFoundError(f'{case_label}: cache-only mode requires a compatible cache directory')
     embeddings_map = generate_esm_embeddings([protein1, protein2], device)
 
     e3_graph = featurize_subgraph(
@@ -331,6 +413,8 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
 
     e3_data = extract_receptor(e3_graph, device)
     poi_data = extract_receptor(poi_graph, device)
+    e3_data['local_geometry'] = protein_local_geometry(protein1, e3_data)
+    poi_data['local_geometry'] = protein_local_geometry(protein2, poi_data)
     ligand_data = extract_ligand(e3_graph, device)  # ligand identical in both
     receptor_feat_dim = e3_data['features'].shape[-1]
 

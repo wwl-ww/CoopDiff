@@ -22,7 +22,8 @@ def fixture():
              'lig_mask_rotate': torch.tensor([[False, False, True, True]]),
              'lig_edge_attr': torch.nn.functional.one_hot(torch.zeros(6, dtype=torch.long), 4).float(),
              'expert_node_features': torch.cat((torch.randn(15, 116), torch.ones(15, 2)), -1),
-             'expert_node_vectors': torch.zeros(15, 40, 3)}
+             'expert_node_vectors': torch.zeros(15, 40, 3),
+             'protein_local_geometry': torch.zeros(11, 32)}
     proposals = {b: {c: torch.randn(1, 1 if c == 'tor' else 3)
                       for c in ('tr', 'rot', 'tor')} for b in BRANCHES}
     fuse = ConsensusFuse(node_dim=32, input_dim=16, num_transformer_layers=1, dropout=0).eval()
@@ -1153,12 +1154,14 @@ def test_endpoint_profiles_isolate_torsion_recipe_and_continuous_decoder():
     from tricoopdiff.models.consensus import production_model_config, PRODUCTION_MODEL_PROFILE
     from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, SDPIFlow
 
-    assert PRODUCTION_MODEL_PROFILE == 'ternary_endpoint_v7'
+    assert PRODUCTION_MODEL_PROFILE == 'ternary_endpoint_v9'
     configs = {version: production_model_config(32, 16, 1, model_profile=f'ternary_endpoint_v{version}')
-               for version in (1, 2, 3, 4, 5, 6, 7)}
-    assert production_model_config(32, 16, 1) == configs[7]
+               for version in (1, 2, 3, 4, 5, 6, 7, 8, 9)}
+    assert production_model_config(32, 16, 1) == configs[9]
     models = {version: ConsensusFuse(**config).eval() for version, config in configs.items()}
     assert not models[5].enhanced_conditions and models[6].enhanced_conditions
+    assert not models[7].joint_conditions and models[8].joint_conditions
+    assert not models[7].bond_context_encoder.symmetric and models[8].bond_context_encoder.symmetric
     assert models[5].condition_film[0].out_features == 116
     assert models[6].condition_film[0].out_features == 96
     assert not models[1].endpoint_v2 and not models[1].pooling.continuous_geometry
@@ -1273,6 +1276,81 @@ def test_geometric_anchors_cover_homogeneous_protein_and_respect_symmetry():
     assert torch.isfinite(coords.grad).all() and coords.grad.abs().sum() > 0
     symmetric = torch.tensor([[1., 0., 0.], [-1., 0., 0.], [0., 1., 0.], [0., -1., 0.]], dtype=torch.double)
     assert torch.allclose(anchors(symmetric.flip(0)), anchors(symmetric)), 'ties depend on residue order'
+
+
+def test_symmetric_bond_context_matches_reversed_fragments_and_gradients():
+    from tricoopdiff.models.consensus import BondContextEncoder
+
+    _, graph, _, _ = fixture()
+    encoder = BondContextEncoder(32, chemical_context=True, symmetric=True).double()
+    tokens = torch.randn(4, 32, dtype=torch.double, requires_grad=True)
+    coords = graph['node_coords'][-4:].double().requires_grad_()
+    context = torch.randn(1, 32, dtype=torch.double, requires_grad=True)
+    edge, mask, rotate = (graph[key] for key in ('lig_edge_index', 'lig_edge_mask', 'lig_mask_rotate'))
+    attributes = graph['lig_edge_attr'].double()
+    a = encoder(tokens, coords, edge, mask, rotate, context, attributes)
+    b = encoder(tokens, coords, edge.flip(0), mask, ~rotate, context, attributes)
+    assert torch.allclose(a, b, atol=1e-12, rtol=1e-12), 'bond bookkeeping changes symmetric tokens'
+    probe = torch.randn_like(a)
+    ga = torch.autograd.grad((a * probe).sum(), (tokens, coords, context), retain_graph=True)
+    gb = torch.autograd.grad((b * probe).sum(), (tokens, coords, context), retain_graph=True)
+    for left, right in zip(ga, gb):
+        assert torch.isfinite(left).all() and left.abs().sum() > 0
+        assert torch.allclose(left, right, atol=1e-11, rtol=1e-10), 'bond reversal changes gradients'
+    direction = torch.randn_like(coords)
+    step = 1e-5
+    values = [encoder(tokens, coords + sign * step * direction, edge, mask, rotate,
+                      context, attributes) for sign in (-1, 1)]
+    numeric = ((values[1] - values[0]) * probe).sum() / (2 * step)
+    assert torch.allclose(numeric, (ga[1] * direction).sum(), atol=1e-7, rtol=1e-5)
+
+
+def test_stable_anchors_retain_coverage_and_equivariance():
+    from tricoopdiff.models.consensus import TernaryRelationEncoder
+
+    def anchors(x):
+        return TernaryRelationEncoder.anchor_geometry(x, stable=True).softmax(-1) @ x
+
+    for seed in (42, 71, 73):
+        torch.manual_seed(seed)
+        coords = torch.randn(60, 3, dtype=torch.double) * 10
+        points = anchors(coords)
+        radius = (coords - coords.mean(0)).square().sum(-1).mean()
+        spread = (points - points.mean(0)).square().sum(-1).mean()
+        assert spread > .2 * radius, f'stable anchors lost spatial coverage: seed={seed}, ratio={spread/radius}'
+        rotation = so3_exp(coords.new_tensor([.3, -.2, .7]))
+        assert torch.allclose(anchors(coords @ rotation.T + 8), points @ rotation.T + 8, atol=1e-9)
+        assert torch.allclose(anchors(coords[torch.randperm(len(coords))]), points, atol=1e-9)
+
+
+def test_stable_anchors_near_collinear_differences_and_perturbations():
+    from tricoopdiff.models.consensus import TernaryRelationEncoder
+
+    torch.manual_seed(73)
+    base = torch.zeros(45, 3, dtype=torch.double)
+    base[:, 0] = torch.linspace(-3, 3, len(base))
+    noise = torch.randn_like(base)
+    probe = torch.randn(16, 3, dtype=torch.double)
+    for epsilon in (0., .001, .03):
+        coords = (base + epsilon * noise).requires_grad_()
+
+        def objective(x):
+            points = TernaryRelationEncoder.anchor_geometry(x, stable=True).softmax(-1) @ x
+            return (points.sin() * probe).sum()
+
+        gradient = torch.autograd.grad(objective(coords), coords)[0]
+        assert torch.isfinite(gradient).all()
+        for _ in range(3):
+            direction = torch.randn_like(coords) * .1
+            step = 1e-5
+            numeric = (objective(coords + step * direction) - objective(coords - step * direction)) / (2 * step)
+            assert torch.allclose(numeric, (gradient * direction).sum(), atol=1e-6, rtol=1e-4), (
+                'stable anchor local derivatives disagree with finite differences', epsilon)
+            perturbed = (coords.detach() + 1e-4 * direction).requires_grad_()
+            changed = torch.autograd.grad(objective(perturbed), perturbed)[0]
+            assert torch.isfinite(changed).all()
+            assert torch.linalg.vector_norm(changed - gradient) < .1 * (1 + torch.linalg.vector_norm(gradient)), (
+                'stable anchor gradients amplify tiny coordinate perturbations', epsilon)
 
 
 def test_motion_negotiation_reads_expert_conflicts_and_bond_types():
@@ -1390,6 +1468,83 @@ def test_rigid_prior_can_reject_expert_a_and_retain_expert_b():
         assert torch.allclose(reference['poi_ligand'][channel],
                               rejected['poi_ligand'][channel], atol=1e-10), (
             'rejected expert A still changes the retained expert B motion', channel)
+
+
+def test_joint_film_retains_chemical_geometry_correspondence():
+    from tricoopdiff.models.consensus import production_model_config
+    for version in (7, 8):
+        torch.manual_seed(73)
+        _, graph, _, state = fixture()
+        graph = {key: value.double() if torch.is_tensor(value) and value.is_floating_point() else value
+                 for key, value in graph.items()}
+        fuse = ConsensusFuse(**production_model_config(32, 16, 1,
+                             model_profile=f'ternary_endpoint_v{version}')).double().eval()
+        with torch.no_grad():
+            for module in (fuse.condition_query, fuse.condition_key, fuse.condition_distance):
+                for parameter in module.parameters(): parameter.zero_()
+            for head in fuse.condition_film: head.weight.normal_(0, .1)
+        before = fuse.expert_conditions(graph, state.double())[0][0][0]
+        features = graph['node_features'].clone()
+        indices = (graph['node_types'] == 1).nonzero().flatten()[:2]
+        features[indices] = features[indices.flip(0)]
+        after = fuse.expert_conditions({**graph, 'node_features': features}, state.double())[0][0][0]
+        difference = (after - before).abs().max()
+        assert difference < 1e-12 if version == 7 else difference > 1e-8
+
+
+def test_local_protein_geometry_reaches_conditioning_and_ternary_context():
+    from tricoopdiff.models.consensus import production_model_config
+    _, graph, proposals, state = fixture()
+    fuse = ConsensusFuse(**production_model_config(32, 16, 1)).eval()
+    for head in fuse.condition_film:
+        torch.nn.init.normal_(head.weight, std=.05)
+    before = fuse(graph, proposals, state)['rank_features']
+    condition = fuse.expert_conditions(graph, state)[0][0][0]
+    geometry = graph['protein_local_geometry'].clone()
+    geometry[5:, 20:24] = .7
+    geometry.requires_grad_()
+    changed = {**graph, 'protein_local_geometry': geometry}
+    after = fuse(changed, proposals, state)['rank_features']
+    assert not torch.allclose(before, after)
+    assert not torch.allclose(condition, fuse.expert_conditions(changed, state)[0][0][0])
+    after.square().sum().backward()
+    assert torch.isfinite(geometry.grad).all() and geometry.grad.abs().sum() > 0
+    missing = {key: value for key, value in graph.items() if key != 'protein_local_geometry'}
+    try:
+        fuse(missing, proposals, state)
+    except ValueError as error:
+        assert 'protein_local_geometry' in str(error)
+    else:
+        raise AssertionError('v9 silently ignored missing protein geometry')
+
+
+def test_expert_coordinate_stop_preserves_film_and_forward():
+    from torch_geometric.data import HeteroData
+    from tricoopdiff.models.consensus import ConsensusCoopDiff
+
+    class Expert(torch.nn.Module):
+        def forward_features(self, graph, film=None, return_vectors=False):
+            return graph['ligand'].pos.square().sum() + graph['receptor'].pos.square().sum() + film.square().sum()
+
+    model = ConsensusCoopDiff.__new__(ConsensusCoopDiff)
+    torch.nn.Module.__init__(model)
+    model.expert = Expert()
+    model.trifuse = torch.nn.Identity()
+    model.trifuse.endpoint_v2 = model.trifuse.refined_conditions = True
+    model.expert_input_grad = True
+    graph = HeteroData()
+    graph['ligand'].pos = torch.randn(4, 3, requires_grad=True)
+    graph['receptor'].pos = torch.randn(6, 3, requires_grad=True)
+    film = torch.ones(3, requires_grad=True)
+    model.expert_coordinate_grad = True
+    original = model._read_expert(graph, film)
+    model.expert_coordinate_grad = False
+    stopped = model._read_expert(graph, film)
+    assert torch.equal(original, stopped), 'coordinate stop changed expert forward'
+    stopped.backward()
+    assert graph['ligand'].pos.grad is None and graph['receptor'].pos.grad is None
+    assert torch.equal(film.grad, 2 * film.detach()), 'FiLM learning path was severed'
+    assert graph['ligand'].pos.requires_grad, 'shared trajectory was detached in place'
 
 
 if __name__ == '__main__':

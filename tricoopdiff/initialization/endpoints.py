@@ -144,7 +144,7 @@ def _fit_numpy_rigid(source, target):
 
 def project_endpoint_coupling(ligand_data, native_poi, endpoint_ligand,
                               endpoint_poi, *, no_torsion=False,
-                              max_nfev=400, exact_atol=1e-3):
+                              max_nfev=4000, exact_atol=1e-3):
     """Project an external endpoint into the SDPI torsion-plus-SE(3) chart.
 
     The returned coupling can be passed directly to :meth:`SDPIFlow.path`.
@@ -219,6 +219,8 @@ def project_endpoint_coupling(ligand_data, native_poi, endpoint_ligand,
                 selected = np.unravel_index(quality.argmax(), quality.shape)
                 if quality[selected] > 1e-20:
                     initial_angles[index] = (phases[0][selected] - phases[1][selected] + np.pi) % (2 * np.pi) - np.pi
+        # Strained conformers can need >400 evaluations to reach the same
+        # strict tolerance. This is a ceiling, not work forced on easy cases.
         fitted = least_squares(
             residual, initial_angles, max_nfev=int(max_nfev),
             ftol=1e-10, xtol=1e-10, gtol=1e-10,
@@ -373,8 +375,22 @@ ONLINE_TRAINING_ENDPOINT_PROTOCOL = "online_bitseed_training_c1_m1_v1"
 RESAMPLED_TRAINING_ENDPOINT_PROTOCOL = "online_bitseed_raw_resampled_v2"
 
 
+def ligand_symmetries(ligand_data):
+    """Exact graph automorphisms preserving elements, bonds and stereochemistry."""
+    from rdkit import Chem
+    mol = ligand_data.get('mol')
+    if isinstance(mol, bytes):
+        mol = Chem.Mol(mol)
+    if mol is None or mol.GetNumAtoms() != ligand_data['coords'].shape[-2]:
+        raise ValueError('symmetric supervision requires the indexed RDKit molecule')
+    matches = mol.GetSubstructMatches(mol, uniquify=False, useChirality=True, maxMatches=4097)
+    if not matches or len(matches) > 4096:
+        raise ValueError('ligand automorphism enumeration is empty or exceeds 4096; refusing a truncated loss')
+    return np.asarray(sorted(set(matches)), dtype=np.int64)
+
+
 def reachable_ligand_target(ligand_data, initial_ligand, initial_poi, native_poi,
-                            *, no_torsion=False):
+                            *, no_torsion=False, symmetries=None, return_candidates=False):
     """Project only the supervision target, never the inference-like input.
 
     Bond lengths/rigid fragments stay those of the sampled conformer. Protein
@@ -382,12 +398,30 @@ def reachable_ligand_target(ligand_data, initial_ligand, initial_poi, native_poi
     coordinate surrogate, not an assertion of exact native ligand geometry.
     """
     reference = {**ligand_data, 'coords': initial_ligand}
-    _, projected, report = project_endpoint_coupling(
-        reference, initial_poi, ligand_data['coords'], native_poi,
-        no_torsion=no_torsion)
-    if not report['torsion_optimization']['success']:
-        raise ValueError('reachable target torsion projection did not converge')
-    return projected['ligand'], report
+    native = _coordinates(ligand_data['coords'], 'native ligand')
+    permutations = (np.arange(len(native))[None] if symmetries is None else symmetries)
+    if not len(permutations):
+        raise ValueError('reachable target requires at least one atom correspondence')
+    best = None
+    candidates = []
+    for permutation in permutations:
+        _, projected, report = project_endpoint_coupling(
+            reference, initial_poi, native[permutation], native_poi,
+            no_torsion=no_torsion)
+        if report['torsion_optimization']['success']:
+            candidates.append(projected['ligand'])
+            if best is None or report['ligand_projection_rmsd_angstrom'] < best[1]['ligand_projection_rmsd_angstrom']:
+                best = projected, report
+    if best is None:
+        raise ValueError('reachable target torsion projection did not converge: '
+                         f'last_optimizer={report["torsion_optimization"]}, '
+                         f'last_rmsd={report["ligand_projection_rmsd_angstrom"]:.6g} A')
+    projected, report = best
+    if symmetries is not None:
+        report = {**report, 'symmetry_contract': 'stereo_graph_automorphisms_v1',
+                  'symmetry_count': len(symmetries)}
+    result = projected['ligand'], report
+    return (*result, np.stack(candidates).reshape(-1, len(native), 3)) if return_candidates else result
 
 
 def validate_raw_endpoint_record(record):
@@ -578,9 +612,12 @@ class LazyTrainingEndpointStore:
             raise AssertionError(f"{case}: C=1/M=1 must produce exactly one endpoint")
         candidate = candidates[0]
         actual_source = candidate["candidate_id"][0]
-        target, projection = reachable_ligand_target(
-            ligand, candidate['ligand'], candidate['poi'], poi['coords'],
-            no_torsion=initializer.no_torsion)
+        try:
+            target, projection = reachable_ligand_target(
+                ligand, candidate['ligand'], candidate['poi'], poi['coords'],
+                no_torsion=initializer.no_torsion)
+        except ValueError as error:
+            raise ValueError(f'{case}, occurrence={occurrence}: {error}') from error
         record = {
             'case': case, 'actual_source': actual_source,
             'candidate_id': candidate['candidate_id'], 'occurrence': occurrence,

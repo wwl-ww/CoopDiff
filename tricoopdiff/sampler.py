@@ -91,6 +91,7 @@ def _sample_trajectory(
     return_rank_features: bool = False,
     return_body_frame: bool = False,
     conditions=None,
+    allow_step_change=False,
 ) -> dict:
     """
     Run one reverse-flow trajectory (single walker) from t=1 to t=0.
@@ -128,6 +129,9 @@ def _sample_trajectory(
         steps = diffusion.inference_steps
     if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
         raise ValueError("steps must be a positive integer")
+    trained_steps = getattr(model, 'trained_inference_steps', None)
+    if trained_steps is not None and steps != trained_steps and not allow_step_change:
+        raise ValueError('sampling steps differ from training; use allow_step_change only for an explicit step-consistency experiment')
     for name, value in (("translation_velocity_scale", translation_velocity_scale),
                         ("rotation_velocity_scale", rotation_velocity_scale)):
         if not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
@@ -333,11 +337,25 @@ def _sample_trajectory(
         "poi_coords": poi_pos[0].detach().cpu().numpy(),
         "initialization": initialization,
         "valid": not nonfinite_score_steps,
+        "numerically_valid": not nonfinite_score_steps,
+        "physical_valid": None,
+        "physical_check_scope": "not_checked",
         "nonfinite_score_steps": nonfinite_score_steps,
         "termination_reason": (
             "nonfinite_score" if nonfinite_score_steps else "completed"
         ),
     }
+    if not nonfinite_score_steps and ligand_data.get('mol') is not None:
+        from tricoopdiff.geometry.reflect import (atom_vdw_radii, ligand_atomic_numbers,
+                                                 ligand_nonbonded_mask, steric_pair_penalty)
+        radii = atom_vdw_radii(ligand_atomic_numbers(ligand_data), ligand_pos)
+        _, clashes, pairs = steric_pair_penalty(ligand_pos[0], ligand_pos[0], radii, radii,
+                                               mask=ligand_nonbonded_mask(ligand_data, ligand_pos.device))
+        result.update(physical_check_scope='ligand_internal_nonbonded_only',
+                      ligand_internal_clash_pairs=int(clashes), ligand_internal_checked_pairs=pairs,
+                      ligand_internal_valid=bool(clashes == 0))
+        # No protein heavy atoms here: absence of internal clashes is NOT
+        # a certificate of complete ternary physical validity.
     if return_trajectory:
         result["trajectory"] = trajectory
     if return_body_frame:

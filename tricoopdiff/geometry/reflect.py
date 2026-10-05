@@ -30,6 +30,64 @@ VDW_RADII = {
     53: 1.98,  # I
 }
 
+
+def ligand_nonbonded_mask(ligand_data, device):
+    """Unique distal pairs; exclude self and graph-distance 1, 2 and 3."""
+    import torch
+    count = ligand_data['coords'].shape[-2]
+    edges = ligand_data['edge_index'].detach().cpu().numpy()
+    separation = _bond_separation_lookup(count, edges)
+    return torch.as_tensor(np.triu(separation < 0, 1), device=device)
+
+
+def atom_vdw_radii(numbers, reference):
+    """Shared element radii in Angstrom; unknown elements use carbon radius."""
+    return reference.new_tensor([VDW_RADII.get(int(z), 1.70) for z in numbers])
+
+
+def ligand_atomic_numbers(ligand_data):
+    from rdkit import Chem
+    molecule = ligand_data.get('mol')
+    if isinstance(molecule, bytes):
+        molecule = Chem.Mol(molecule)
+    if molecule is None or molecule.GetNumAtoms() != ligand_data['coords'].shape[-2]:
+        raise ValueError('physical checks require atom-aligned ligand chemistry')
+    return [atom.GetAtomicNum() for atom in molecule.GetAtoms()]
+
+
+def steric_pair_penalty(left, right, left_radii, right_radii, *, mask=None,
+                        target_left=None, target_right=None):
+    """0.8*VDW exclusion, optional native caps; also report uncapped clashes.
+
+    Chunked across left atoms. Pair eligibility comes from topology, never
+    distance-based bond inference (which would hide collapsed nonbonded atoms).
+    """
+    import torch
+    total = (left.sum() + right.sum()) * 0
+    count = left.new_zeros(())
+    eligible = 0
+    for start in range(0, len(left), 128):
+        delta = right[None] - left[start:start + 128, None]
+        distance = torch.linalg.vector_norm(delta, dim=-1)
+        threshold = .8 * (left_radii[start:start + 128, None] + right_radii[None])
+        valid = torch.ones_like(distance, dtype=torch.bool) if mask is None else mask[start:start + 128]
+        count = count + ((distance.detach() < threshold) & valid).sum()
+        limit = threshold
+        if target_left is not None:
+            native_delta = (target_right[None] - target_left[start:start + 128, None]).detach()
+            native_distance = torch.linalg.vector_norm(native_delta, dim=-1)
+            limit = torch.minimum(limit, native_distance)
+        penalty = ((limit - distance).clamp_min(0) / threshold).square()
+        if target_left is not None:
+            direction = native_delta / native_distance[..., None].clamp_min(1e-12)
+            core = .02
+            envelope = (1 - delta.square().sum(-1) / core**2).clamp_min(0).square()
+            penalty = penalty * (1 + envelope * (1 - (delta * direction).sum(-1) / core))
+        total = total + (penalty * valid).sum()
+        eligible += int(valid.sum())
+    # Normalize by atoms, not all possible pairs: distant pairs cannot dilute clashes.
+    return total / max(len(left) + len(right), 1), count, eligible
+
 # Covalent radii (Å) for common elements. Used to skip covalently bonded (1-2)
 # atom pairs in clash detection — a bonded pair sits near the sum of covalent
 # radii, well inside any VDW clash threshold, and is not a steric clash.

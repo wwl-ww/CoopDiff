@@ -147,6 +147,8 @@ class EvaluationRunner:
                 or not torch.isfinite(weights[name].to(current[name])).all() for name in current):
             raise ValueError('evaluation EMA weights must match the finite active model dtype')
         model.trifuse.load_state_dict(weights, strict=True)
+        if self.checkpoint['runtime_config'].get('step_contract') == 'fixed_training_steps_v1':
+            model.trained_inference_steps = self.checkpoint['runtime_config']['inference_steps']
         self.model = model.eval()
         self.input_dim = input_dim
 

@@ -23,6 +23,7 @@ CHECKPOINT_VERSION = 17
 INDEPENDENT_RIGID_MODE = 'independent_centroids_v1'
 LEGACY_RIGID_MODE = 'dual_interfaces_v1'
 CONTINUOUS_TORSION_MODE = 'continuous_horizontal_v1'
+SYMMETRIC_TORSION_MODE = 'symmetric_horizontal_v1'
 
 
 def _check_coords(coords):
@@ -159,9 +160,10 @@ class SDPIFlow:
                 and output.get('normalized_velocity', {}).get('rigid_output_mode')
                 != INDEPENDENT_RIGID_MODE):
             raise ValueError('direct model must execute independent centroid motion')
-        if (getattr(getattr(model, 'trifuse', None), 'continuous_torsion', False)
+        symmetric = getattr(getattr(model, 'trifuse', None), 'symmetric_torsion', False)
+        if ((symmetric or getattr(getattr(model, 'trifuse', None), 'continuous_torsion', False))
                 and output.get('normalized_velocity', {}).get('torsion_update_mode')
-                != CONTINUOUS_TORSION_MODE):
+                != (SYMMETRIC_TORSION_MODE if symmetric else CONTINUOUS_TORSION_MODE)):
             raise ValueError('continuous torsion model must execute its horizontal update')
 
     @staticmethod
@@ -270,7 +272,7 @@ class SDPIFlow:
             raise FloatingPointError('non-finite flow body frame')
         torsion = velocities['torsion']
         torsion_mode = velocities.get('torsion_update_mode')
-        if torsion_mode not in (None, CONTINUOUS_TORSION_MODE):
+        if torsion_mode not in (None, CONTINUOUS_TORSION_MODE, SYMMETRIC_TORSION_MODE):
             raise ValueError(f'unknown torsion update mode: {torsion_mode!r}')
         # A no_torsion expert can disable torsions even when the chemical graph
         # contains rotatable bonds. Match the production empty-output contract.
@@ -289,7 +291,8 @@ class SDPIFlow:
                 or masks.shape != (len(bonds), ligand.shape[1])):
             raise ValueError('finite torsion velocities and ligand graph sizes must agree')
         raw = rigid
-        displacement = torch.zeros_like(rigid) if torsion_mode == CONTINUOUS_TORSION_MODE else None
+        symmetric = torsion_mode == SYMMETRIC_TORSION_MODE
+        displacement = torch.zeros_like(rigid) if torsion_mode in (CONTINUOUS_TORSION_MODE, SYMMETRIC_TORSION_MODE) else None
         gauge_prior = torch.zeros_like(rigid[:, 0]) if displacement is not None else None
         for index, (u, v) in enumerate(bonds):
             axis = raw[:, u] - raw[:, v]
@@ -300,14 +303,21 @@ class SDPIFlow:
                 initial_axis = rigid[:, u] - rigid[:, v]
                 initial_axis = initial_axis / torch.linalg.vector_norm(initial_axis, dim=-1, keepdim=True)
                 angle = initial_axis * (-dt * torsion[:, index])[:, None]
-                gauge_prior = gauge_prior + .5 * angle
+                if not symmetric:
+                    gauge_prior = gauge_prior + .5 * angle
+                pivot = (rigid[:, u:u + 1] + rigid[:, v:v + 1]) * .5 if symmetric else rigid[:, v:v + 1]
+                side = masks[index].to(rigid.dtype) - (.5 if symmetric else 0.)
                 displacement = displacement + torch.linalg.cross(
-                    angle[:, None].expand_as(rigid), rigid - rigid[:, v:v + 1], dim=-1,
-                ) * masks[index][None, :, None]
-            rotation = rotation_exp(axis / norm * (-dt * torsion[:, index])[:, None])
-            pivot = raw[:, v:v + 1]
+                    angle[:, None].expand_as(rigid), rigid - pivot, dim=-1,
+                ) * side[None, :, None]
+            rotation = rotation_exp(axis / norm * (-dt * torsion[:, index])[:, None]
+                                    * (.5 if symmetric else 1.))
+            pivot = (raw[:, u:u + 1] + raw[:, v:v + 1]) * .5 if symmetric else raw[:, v:v + 1]
             moved = (raw - pivot) @ rotation.transpose(-1, -2) + pivot
-            raw = torch.where(masks[index][None, :, None], moved, raw)
+            # Reversing the axis and complementing the mask swaps the two
+            # half-rotations exactly, not merely their infinitesimal tangent.
+            stationary = (raw - pivot) @ rotation + pivot if symmetric else raw
+            raw = torch.where(masks[index][None, :, None], moved, stationary)
         if len(bonds):
             if displacement is None:
                 rotation, translation, _ = proper_rigid_fit(raw, rigid)
@@ -323,7 +333,9 @@ class SDPIFlow:
                 inertia = centered.square().sum((1, 2))[:, None, None] * identity
                 inertia = inertia - centered.transpose(1, 2) @ centered
                 torque = torch.linalg.cross(centered, displacement.double(), dim=-1).sum(1)
-                # Symmetric half-side gauge keeps the ridge prior covariant
+                # The symmetric finite chart already removes half-side spin;
+                # its zero prior is the same tangent as the historical chart.
+                # Symmetric half-side gauge keeps the legacy ridge prior covariant
                 # under bond reversal plus complementary rotation fragments.
                 # A zero-spin prior would leave an orientation-dependent
                 # first-order residual, even though the ideal projection does not.

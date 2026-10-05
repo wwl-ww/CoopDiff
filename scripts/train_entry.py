@@ -27,6 +27,7 @@ import argparse
 import random
 import json
 import os
+import pickle
 import sys
 import time
 from contextlib import nullcontext
@@ -96,6 +97,10 @@ def parse_args(argv=None):
     p.add_argument('--native-root', default='DeepTernary/data/TernaryDB/pdbs',
                    help='Native complexes for exact terminal training-validation DockQ; not the MGD benchmark protocol')
     p.add_argument('--ema-decay', type=float, default=0.999)
+    p.add_argument('--expert-coordinate-grad', action=argparse.BooleanOptionalAction, default=None,
+                   help='Explicit full expert geometry Jacobian ablation; new runs default to the stopped-coordinate approximation')
+    p.add_argument('--structural-supervision', action=argparse.BooleanOptionalAction, default=None,
+                   help='Element-aware sterics and independent E3-L/POI-L contacts; defaults on for new runs')
     # Phase
     p.add_argument("--phase", type=int, default=1, choices=[1],
                    help="Frozen experts with trainable ternary motion (the supervised phase)")
@@ -112,6 +117,8 @@ def parse_args(argv=None):
     # Featurization
     p.add_argument("--cache_dir", default="results/featurize_cache",
                    help="Dir for on-disk featurization cache (per-case .pt)")
+    p.add_argument('--cache-only', action='store_true',
+                   help='Train/validate only source-verified cached cases; never rebuild ESM')
 
     # Hardware
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -232,6 +239,9 @@ def fullatom_targets(entry, e3_data, poi_data, flipped=False):
         if atoms is None:
             raise ValueError('full-atom supervision requires protein heavy atoms')
         result[name] = reference.new_tensor(atoms.getCoords()) - ca.mean(0) + reference.mean(0)
+        from rdkit import Chem
+        result[name + '_atomic_numbers'] = [Chem.GetPeriodicTable().GetAtomicNumber(str(element).strip().capitalize())
+                                            for element in atoms.getElements()]
     return result
 
 
@@ -290,10 +300,18 @@ def main():
 
     print("[0/6] Determining receptor feature dim from first sample...")
     score_model_args = _load_score_model_args(args.expert_model_dir)
+    prepared_loader = None
+    if args.cache_only:
+        prepared_loader = TernaryDataLoader(args.train_data, score_model_args,
+            shuffle=True, device=str(device), cache_dir=args.cache_dir,
+            max_clusters=args.max_train_clusters, random_flip_proteins=args.random_flip_proteins,
+            cache_only=True)
+        entries = prepared_loader.entries
     first = entries[0]
     _, _, _, input_dim = featurize_complex(
         first["case"], first["protein1"], first["protein2"], first["ligand"],
         score_model_args, str(device), cache_dir=args.cache_dir,
+        **({'cache_only': True} if args.cache_only else {}),
     )
     print(f"  receptor_feat_dim={input_dim} (from {first['case']})")
     # A cold ESM/graph cache can consume framework RNG state while a warm cache
@@ -319,19 +337,28 @@ def main():
     # 2. Load data
     # ----------------------------------------------------------------
     print("[2/6] Loading data...")
-    train_loader = TernaryDataLoader(
+    train_loader = prepared_loader or TernaryDataLoader(
         args.train_data, score_model_args,
         shuffle=True, device=str(device), cache_dir=args.cache_dir,
         skip_on_error=False, max_clusters=args.max_train_clusters,
         random_flip_proteins=args.random_flip_proteins,
         fullatom_supervision=bool(trainer.fullatom_interface_weight),
     )
+    train_loader.fullatom_supervision = bool(trainer.fullatom_interface_weight)
     val_loader = TernaryDataLoader(
         args.val_data, score_model_args,
         shuffle=False, device=str(device), cache_dir=args.cache_dir,
         skip_on_error=False, max_clusters=args.max_val_clusters,
         fullatom_supervision=bool(trainer.fullatom_interface_weight),
+        cache_only=args.cache_only,
     )
+    if args.cache_only:
+        from tricoopdiff.runtime import atomic_json
+        manifest = {'train': train_loader.cache_selection, 'validation': val_loader.cache_selection}
+        path = Path(args.output_dir) / 'cache_subset.json'
+        if args.resume and (not path.is_file() or json.loads(path.read_text()) != manifest):
+            raise ValueError('cache-only resume requires the identical recorded dataset subset')
+        atomic_json(manifest, path)
     # Check scoring dependencies before spending an epoch on training.
     for entry in val_loader._epoch_entries():
         validation_metric_context(entry, args.native_root)
@@ -363,6 +390,7 @@ def main():
 
     for epoch in range(start_epoch, args.epochs + 1):
         train_losses = []
+        projection_cases = []
         n_skipped = 0
         t0 = time.time()
         for batch_idx, microbatches in enumerate(iter_training_batches(train_loader, args.batch_size)):
@@ -372,6 +400,8 @@ def main():
             group_losses = _guarded_train_batch(trainer, microbatches)
             train_losses.extend(group_losses)
             for batch, loss_dict in zip(microbatches, group_losses):
+                if 'projection_rmsd_angstrom' in loss_dict:
+                    projection_cases.append({'case': batch['case'], 'rmsd_angstrom': loss_dict['projection_rmsd_angstrom']})
                 append_metric(args.output_dir, {
                     'event': 'train_step', 'epoch': epoch,
                     'global_step': trainer.global_step, 'case': batch['case'],
@@ -420,6 +450,12 @@ def main():
         train_means, train_counts = summarize_metrics(train_losses)
         append_metric(args.output_dir, {'event': 'train_epoch', 'epoch': epoch,
                                        'means': train_means, 'counts': train_counts})
+        if projection_cases:
+            values = [row['rmsd_angstrom'] for row in projection_cases]
+            append_metric(args.output_dir, {'event': 'projection_summary', 'epoch': epoch,
+                'p50_p90_p99_max_angstrom': np.percentile(values, [50, 90, 99, 100]).tolist(),
+                'above_1A': sum(value > 1 for value in values),
+                'worst_cases': sorted(projection_cases, key=lambda row: row['rmsd_angstrom'], reverse=True)[:10]})
         train_loss_avg = train_means['loss_total']
         train_main_avg = train_means.get('loss_endpoint_main', train_loss_avg)
         train_ligand_avg = train_means['loss_ligand_geometry']
@@ -532,9 +568,17 @@ def build_trainer(args, device, input_dim=None):
         from tricoopdiff.initialization.endpoints import RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
         args.training_endpoint_protocol = RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
     trifuse = ConsensusFuse(**model_config)
+    coordinate_grad = getattr(args, 'expert_coordinate_grad', None)
+    structural = getattr(args, 'structural_supervision', None)
+    if coordinate_grad is None:
+        coordinate_grad = saved['runtime_config'].get('expert_coordinate_grad', True) if args.resume else False
+    if structural is None:
+        structural = saved['runtime_config'].get('structural_supervision', False) if args.resume else True
+    args.expert_coordinate_grad, args.structural_supervision = coordinate_grad, structural
 
     model = ConsensusCoopDiff(frozen_expert, trifuse,
                              expert_input_grad=True,
+                             expert_coordinate_grad=coordinate_grad,
                              checkpoint_ternary=getattr(args, 'checkpoint_ternary', True))
 
     # Build diffusion
@@ -554,6 +598,7 @@ def build_trainer(args, device, input_dim=None):
         interface_cutoff=args.interface_cutoff,
         effective_batch_size=args.batch_size,
         steric_loss_weight=args.steric_loss_weight,
+        structural_supervision=structural,
         training_source_mix=(
             'sdpi_only' if getattr(args, 'training_arm', 'A1') == 'A1'
             else 'sdpi_bitseed_1_1'
@@ -636,7 +681,9 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
     """Run a deterministic validation pass without perturbing training RNG."""
     from tricoopdiff.train import REAL_ENDPOINT_OBJECTIVE, REAL_VALIDATION_DOCKQ_PROTOCOL
     exact_dockq = getattr(trainer, 'training_objective', None) == REAL_ENDPOINT_OBJECTIVE
+    balanced = bool(getattr(trainer, 'symmetric_supervision', False))
     scores = {'sdpi': [], 'bitseed': []}
+    requested_losses, requested_scores = {'sdpi': [], 'bitseed': []}, {'sdpi': [], 'bitseed': []}
     per_case = []
     if weights not in ('raw', 'ema'):
         raise ValueError('validation weights must be raw or ema')
@@ -661,9 +708,12 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
                     "produced a non-finite loss"
                 )
             losses['sdpi'].append(loss_dict['loss_total'])
+            requested_losses['sdpi'].append(loss_dict['loss_total'])
             if exact_dockq:
                 scores['sdpi'].append(loss_dict['dockq'])
+                requested_scores['sdpi'].append(loss_dict['dockq'])
                 per_case.append({'case': batch['case'], 'source': 'sdpi',
+                                 'requested_source': 'sdpi',
                                  'loss': loss_dict['loss_total'],
                                  'loss_endpoint_main': loss_dict.get('loss_endpoint_main', loss_dict['loss_total']),
                                  **{key: loss_dict[key] for key in ('dockq', 'fnat', 'irms', 'lrms')}})
@@ -692,9 +742,12 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
                         "produced a non-finite BiTSeed loss"
                     )
                 losses[actual_source].append(endpoint_loss['loss_total'])
+                requested_losses['bitseed'].append(endpoint_loss['loss_total'])
                 if exact_dockq:
                     scores[actual_source].append(endpoint_loss['dockq'])
+                    requested_scores['bitseed'].append(endpoint_loss['dockq'])
                     per_case.append({'case': batch['case'], 'source': actual_source,
+                                     'requested_source': 'bitseed',
                                      'loss': endpoint_loss['loss_total'],
                                      'loss_endpoint_main': endpoint_loss.get('loss_endpoint_main', endpoint_loss['loss_total']),
                                      **{key: endpoint_loss[key] for key in ('dockq', 'fnat', 'irms', 'lrms')}})
@@ -704,8 +757,13 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
         for source, values in losses.items() if values
     }
     selection = float(np.mean(list(by_source.values()))) if by_source else float('nan')
+    by_requested_source = {source: float(np.mean(values))
+                           for source, values in requested_losses.items() if values}
+    if balanced and by_requested_source:
+        selection = float(np.mean(list(by_requested_source.values())))
     result = {
         'selection_loss': selection, 'by_source': by_source,
+        'by_requested_source': by_requested_source,
         'selection_loss_component': 'loss_endpoint_main' if exact_dockq else 'loss_total',
         'source_counts': {source: len(values) for source, values in losses.items()},
         'bitseed_fallback_count': fallback_count,
@@ -718,9 +776,13 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
         dockq_by_source = {source: float(np.mean(values)) for source, values in scores.items() if values}
         if not dockq_by_source:
             raise RuntimeError('full-atom validation produced no DockQ measurements')
-        result.update(selection_dockq=float(np.mean(list(dockq_by_source.values()))),
+        dockq_requested = {source: float(np.mean(values))
+                           for source, values in requested_scores.items() if values}
+        result.update(selection_dockq=float(np.mean(list(
+                          (dockq_requested if balanced else dockq_by_source).values()))),
+                      dockq_by_requested_source=dockq_requested,
                       dockq_by_source=dockq_by_source, per_case=per_case,
-                      dockq_protocol=REAL_VALIDATION_DOCKQ_PROTOCOL)
+                      dockq_protocol=getattr(trainer, 'validation_dockq_protocol', REAL_VALIDATION_DOCKQ_PROTOCOL))
     return result
 
 
@@ -745,8 +807,40 @@ class TernaryDataLoader:
     def __init__(self, data_json, score_model_args, shuffle=True, device="cuda",
                  cache_dir=None, skip_on_error=False, max_clusters=None,
                  random_flip_proteins=False, cache_read_only=False,
-                 cache_wait_seconds=3600., fullatom_supervision=False):
+                 cache_wait_seconds=3600., fullatom_supervision=False, cache_only=False):
         self.entries, self.clusters, self.entries_by_case = _load_index(data_json)
+        self.cache_only = bool(cache_only)
+        if self.cache_only:
+            from featurize_common import _featurize_signature, _FEATURIZE_CACHE_VERSION
+            retained, excluded = [], []
+            for entry in self.entries:
+                try:
+                    path = Path(cache_dir) / (entry['case'].replace('/', '_') + '.pt')
+                    cached = torch.load(path, map_location='cpu', weights_only=False)
+                    version = cached.get('cache_version')
+                    if version not in (7, 8, _FEATURIZE_CACHE_VERSION):
+                        raise ValueError('incompatible cache schema')
+                    signature = _featurize_signature(entry['protein1'], entry['protein2'], entry['ligand'],
+                        score_model_args, cache_version=None if version in (7, 8) else version)
+                    if cached.get('source_signature') != signature:
+                        raise ValueError('cache source signature mismatch')
+                    retained.append(entry)
+                except (OSError, ValueError, RuntimeError, EOFError, pickle.UnpicklingError) as error:
+                    excluded.append({'case': entry['case'], 'reason': type(error).__name__ + ': ' + str(error)})
+            self.entries = retained
+            self.entries_by_case = {entry['case']: entry for entry in retained}
+            original_clusters = len(self.clusters or [])
+            if self.clusters:
+                self.clusters = [{**cluster,
+                    'items': [case for case in cluster['items'] if case in self.entries_by_case],
+                    'representative': [case for case in cluster.get('representative', []) if case in self.entries_by_case]}
+                    for cluster in self.clusters if any(case in self.entries_by_case for case in cluster['items'])]
+            self.cache_selection = {'included': [entry['case'] for entry in retained], 'excluded': excluded,
+                                    'original_clusters': original_clusters, 'retained_clusters': len(self.clusters or [])}
+            print(f'[cache-only] {data_json}: {len(retained)} included, {len(excluded)} excluded; '
+                  f'{len(self.clusters or [])}/{original_clusters} clusters', flush=True)
+            if not retained:
+                raise ValueError(f'{data_json}: no compatible cached cases remain')
         if max_clusters is not None:
             if max_clusters <= 0:
                 raise ValueError('max_clusters must be positive')
@@ -758,6 +852,9 @@ class TernaryDataLoader:
                     entry['case']: entry for entry in self.entries
                 }
         self.score_model_args = score_model_args
+        if self.cache_only:
+            self.cache_selection['selected_clusters'] = self.clusters
+            self.cache_selection['selected_entries'] = [entry['case'] for entry in self.entries]
         self.shuffle = shuffle
         self.device = device
         self.cache_dir = cache_dir
@@ -822,6 +919,7 @@ class TernaryDataLoader:
             self.score_model_args, self.device, cache_dir=self.cache_dir,
             cache_read_only=self.cache_read_only,
             cache_wait_seconds=self.cache_wait_seconds,
+            **({'cache_only': True} if getattr(self, 'cache_only', False) else {}),
         )
         flipped = self.random_flip_proteins and np.random.random() < 0.5
         if flipped:

@@ -144,7 +144,7 @@ def test_consensus_builder_passes_only_active_model_dimensions():
             global_node_attention=True,
             rotation_scale_normalization=True,
             dropout=0., source_conditioning=False,
-            model_profile='ternary_endpoint_v7', expert_scalar_dim=58, expert_film_dim=48, expert_vector_dim=20,
+            model_profile='ternary_endpoint_v9', expert_scalar_dim=58, expert_film_dim=48, expert_vector_dim=20,
         )
         assert model.call_args.kwargs['expert_input_grad'] is True
         assert result is model.return_value
@@ -196,7 +196,7 @@ def _endpoint_trainer_fixture(profile=None, inference_steps=3):
     model = Model()
     trainer = ConsensusTrainer(model, flow, device='cpu', ema_decay=.999 if profile else 0.)
     batch = {'e3_data': {'coords': e3}, 'poi_data': {'coords': poi}, 'ligand_data': ligand}
-    if profile == 'ternary_endpoint_v7':
+    if profile in ('ternary_endpoint_v7', 'ternary_endpoint_v8', 'ternary_endpoint_v9'):
         batch['fullatom_targets'] = {'e3': e3[0].clone(), 'poi': poi[0].clone()}
     initial = flow.path(ligand, poi, coupling, ligand['coords'].new_ones(1))[:3]
     override = {'initial_state': dict(zip(('ligand', 'poi', 'body_frame'), initial)),
@@ -213,8 +213,8 @@ def test_direct_trainer_supervises_executed_endpoint_not_teacher_velocities():
     assert len(trainer.model.calls) == 3
     assert all(source == 1 for _, source in trainer.model.calls)
     assert np.allclose([clock for clock, _ in trainer.model.calls], [1., 2/3, 1/3])
-    assert set(result['components']) == {'loss_ligand_geometry', 'loss_protein_geometry',
-                                         'loss_interface_geometry', 'loss_contact_geometry'}
+    assert {'loss_ligand_geometry', 'loss_protein_geometry',
+            'loss_interface_geometry', 'loss_contact_geometry'}.issubset(result['components'])
     scales = trainer.diffusion.scales(batch['e3_data']['coords'], batch['poi_data']['coords'])
     expected = .1 * (((result['predicted_ligand'] - batch['ligand_data']['coords']) / scales[0]).square().mean()
                      + ((result['predicted_poi'] - batch['poi_data']['coords']) / scales[1]).square().mean()
@@ -883,6 +883,125 @@ def test_fullatom_terminal_loss_tracks_actual_rigid_motion():
     assert loss > 0 and torch.isfinite(gradient).all() and gradient.norm() > 0
 
 
+def test_fullatom_repulsion_sees_sidechain_clashes_and_preserves_native():
+    from tricoopdiff.train import fullatom_repulsion
+    native = torch.tensor([[[4., 0., 0.], [4., 1., 0.]]], dtype=torch.double)
+    ligand = torch.tensor([[[20., 0., 0.]]], dtype=torch.double)
+    targets = {'e3': torch.tensor([[0., 0., 0.]], dtype=torch.double), 'poi': native[0]}
+    body = torch.eye(3, dtype=torch.double).unsqueeze(0)
+    assert fullatom_repulsion(targets, native, ligand, native, ligand, body, 2.) == 0
+    moved = (native - native.new_tensor([3., 0., 0.])).requires_grad_()
+    value = fullatom_repulsion(targets, native, ligand, moved, ligand, body, 2.)
+    gradient, = torch.autograd.grad(value, moved)
+    assert value > 0 and gradient.norm() > 0 and torch.isfinite(gradient).all()
+
+
+def test_requested_source_selection_is_not_reweighted_by_fallback():
+    from tricoopdiff.train import REAL_ENDPOINT_OBJECTIVE, BALANCED_VALIDATION_DOCKQ_PROTOCOL
+    class Loader:
+        entries_by_case = {case: {'case': case} for case in ('a', 'b')}
+        def __iter__(self):
+            yield from ({'case': case} for case in ('a', 'b'))
+    class Store:
+        def coupling(self, case):
+            return {}, {'actual_source': 'sdpi' if case == 'a' else 'bitseed'}
+    class Trainer:
+        model = torch.nn.Linear(1, 1)
+        training_objective = REAL_ENDPOINT_OBJECTIVE
+        symmetric_supervision = True
+        validation_dockq_protocol = BALANCED_VALIDATION_DOCKQ_PROTOCOL
+        def validate_step(self, **batch):
+            q = .9 if batch['case'] == 'a' else .1
+            return dict(loss_total=q, dockq=q, fnat=q, irms=1., lrms=1.)
+    with patch('train_entry.validation_metric_context', return_value={}):
+        result = validate(Trainer(), Loader(), torch.device('cpu'), 'B', Store())
+    assert abs(result['selection_dockq'] - .5) < 1e-12
+    assert abs(result['selection_loss'] - .5) < 1e-12
+    assert result['source_counts'] == {'sdpi': 3, 'bitseed': 1}
+    assert result['dockq_protocol'] == BALANCED_VALIDATION_DOCKQ_PROTOCOL
+
+
+def test_old_symmetric_objective_is_readable_but_cannot_silently_resume():
+    from tricoopdiff.train import validate_consensus_checkpoint
+    trainer, _, _ = _endpoint_trainer_fixture('ternary_endpoint_v9')
+    payload = trainer.checkpoint_payload()
+    payload['checkpoint_version'] = 33
+    payload['runtime_config']['training_recipe'] = 'endpoint_symmetric_fullatom_v1'
+    validate_consensus_checkpoint(payload)
+    with patch('tricoopdiff.train.torch.load', return_value=payload):
+        try:
+            trainer.load_checkpoint('unused.pt')
+        except ValueError as error:
+            assert 'training_recipe' in str(error)
+        else:
+            raise AssertionError('old loss was silently replaced during resume')
+
+
+def test_every_symmetric_target_retains_the_initial_rigid_shape():
+    from test_sdpi_flow import fixture
+    from tricoopdiff.initialization.endpoints import ligand_symmetries, reachable_ligand_target, _fit_numpy_rigid
+    _, ligand, _, poi, _ = fixture('OCO')
+    native = torch.tensor([[[1., 0., 0.], [0., 0., 0.], [0., 2., 0.]]], dtype=torch.double)
+    ligand['coords'] = native
+    permutations = ligand_symmetries(ligand)
+    _, _, targets = reachable_ligand_target(ligand, native, poi, poi,
+        no_torsion=True, symmetries=permutations, return_candidates=True)
+    assert len(targets) == len(permutations) == 2
+    for target in targets:
+        assert _fit_numpy_rigid(native[0].numpy(), target)[2] < 1e-10
+    assert _fit_numpy_rigid(native[0].numpy(), targets[0][permutations[-1]])[2] > .5
+
+
+def test_exact_overlap_repulsion_has_equivariant_escape_gradient():
+    from tricoopdiff.train import fullatom_repulsion
+    from tricoopdiff.geometry.rigid import rotation_exp
+    native = torch.tensor([[[3., 0., 0.]]], dtype=torch.double)
+    fixed = torch.zeros(1, 3, dtype=torch.double)
+    ligand = torch.tensor([[[20., 0., 0.]]], dtype=torch.double)
+    moved = torch.zeros_like(native, requires_grad=True)
+    body = torch.eye(3, dtype=torch.double)[None]
+    def objective(p):
+        return fullatom_repulsion({'e3': fixed, 'poi': native[0]}, native, ligand, p, ligand, body, 2.)
+    loss = objective(moved)
+    grad, = torch.autograd.grad(loss, moved)
+    assert torch.isfinite(grad).all() and grad[0, 0, 0] < 0
+    assert objective(moved.detach() - 1e-6 * grad) < loss
+    rotation = rotation_exp(torch.tensor([.3, -.2, .4], dtype=torch.double))
+    rotated = (moved.detach() @ rotation.T + 8).requires_grad_()
+    transformed = fullatom_repulsion({'e3': fixed @ rotation.T + 8, 'poi': native[0] @ rotation.T + 8},
+        native @ rotation.T + 8, ligand @ rotation.T + 8, rotated, ligand @ rotation.T + 8, body, 2.)
+    other, = torch.autograd.grad(transformed, rotated)
+    assert torch.allclose(transformed, loss) and torch.allclose(other, grad @ rotation.T)
+    assert objective(native) == 0
+
+
+def test_symmetric_endpoint_projection_and_loss_respect_atom_equivalence():
+    from tricoopdiff.initialization.endpoints import ligand_symmetries, reachable_ligand_target
+    from test_sdpi_flow import fixture
+    _, ligand, e3, poi, _ = fixture('c1ccccc1')
+    permutations = ligand_symmetries(ligand)
+    assert len(permutations) == 12
+    permuted = ligand['coords'][:, permutations[-1]].clone()
+    projected, report, candidates = reachable_ligand_target(ligand, permuted, poi, poi,
+                                               symmetries=permutations, return_candidates=True)
+    assert report['symmetry_count'] == 12
+    assert report['ligand_projection_rmsd_angstrom'] < 1e-6
+    trainer, _, _ = _endpoint_trainer_fixture()
+    trainer.diffusion.reverse_times = lambda *args, **kwargs: []
+    trainer.interface_loss_weight = 0.
+    generator = trainer._endpoint_rollout_loss({'coords': e3}, {'coords': poi}, ligand,
+        permuted, poi, torch.eye(3).double()[None], ligand['coords'], 0, None,
+        target_candidates=torch.as_tensor(candidates))
+    try:
+        next(generator)
+    except StopIteration as stop:
+        assert stop.value['components']['loss_ligand_geometry'] < 1e-12
+    else:
+        raise AssertionError('zero-step fixture unexpectedly invoked a model')
+    _, chiral, *_ = fixture('F[C@](Cl)(Br)I')
+    assert len(ligand_symmetries(chiral)) == 1
+
+
 def test_packed_budget_preserves_order_and_oversized_singletons():
     from tricoopdiff.models.consensus import packed_groups
     def item(size):
@@ -1140,7 +1259,7 @@ def test_v2_checkpoint_records_recipe_and_resumes_warmup_and_entry_parity():
     trainer, batch, coupling = _endpoint_trainer_fixture('ternary_endpoint_v2')
     trainer.train_step(**batch, coupling_override=coupling)
     payload = copy.deepcopy(trainer.checkpoint_payload())
-    assert payload['checkpoint_version'] == 31
+    assert payload['checkpoint_version'] == 36
     payload['checkpoint_version'] = 25  # Historical v2 weights retain their old recipe.
     assert payload['runtime_config']['ema_update_contract'] == 'optimizer_step_warmup_v1'
     assert payload['runtime_config']['near_target_supervision']['weight'] == .25
@@ -1418,6 +1537,58 @@ def test_state_recovery_uses_actual_prefix_and_remaining_clock():
         pass
     else:
         raise AssertionError('training-only recovery entered validation selection loss')
+
+
+def test_checkpoint_rejects_coordinate_gradient_contract_change():
+    trainer, _, _ = _endpoint_trainer_fixture()
+    trainer.model.expert_coordinate_grad = False
+    payload = trainer.checkpoint_payload()
+    assert payload['runtime_config']['expert_coordinate_grad'] is False
+    restored, _, _ = _endpoint_trainer_fixture()
+    restored.model.expert_coordinate_grad = True
+    with patch('tricoopdiff.train.torch.load', return_value=payload):
+        try:
+            restored.load_checkpoint('unused.pt')
+        except ValueError as error:
+            assert 'coordinate-gradient contract' in str(error)
+        else:
+            raise AssertionError('resume silently changed expert coordinate gradients')
+    restored.model.expert_coordinate_grad = False
+    with patch('tricoopdiff.train.torch.load', return_value=payload):
+        restored.load_checkpoint('unused.pt')
+
+
+def test_element_sterics_and_topology_exclusions():
+    from tricoopdiff.geometry.reflect import ligand_nonbonded_mask, steric_pair_penalty
+    left = torch.tensor([[0., 0., 0.]])
+    right = torch.tensor([[2.5, 0., 0.]], requires_grad=True)
+    penalty, count, _ = steric_pair_penalty(left, right, torch.tensor([1.7]), torch.tensor([1.7]))
+    assert penalty > 0 and count == 1, 'carbon overlap at 2.5 A was missed'
+    penalty.backward()
+    assert right.grad[0, 0] < 0
+    edges = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]])
+    ld = {'coords': torch.zeros(1, 5, 3), 'edge_index': edges}
+    mask = ligand_nonbonded_mask(ld, 'cpu')
+    assert mask.sum() == 1 and mask[0, 4], 'bonded/1-3/1-4 pairs were not excluded'
+    coords = torch.tensor([[0., 0., 0.], [1., 0., 0.], [2., 0., 0.], [3., 0., 0.], [.1, 0., 0.]])
+    penalty, count, _ = steric_pair_penalty(coords, coords, torch.full((5,), 1.7), torch.full((5,), 1.7), mask=mask)
+    assert count == 1 and penalty > 0, 'distal intraligand overlap was hidden'
+
+
+def test_both_ligand_interfaces_are_supervised_independently():
+    from rdkit import Chem
+    from tricoopdiff.train import structural_endpoint_losses
+    ligand = torch.tensor([[[0., 0., 0.], [1.5, 0., 0.]]])
+    ld = {'coords': ligand, 'mol': Chem.MolFromSmiles('CC'),
+          'edge_index': torch.tensor([[0, 1], [1, 0]])}
+    a, b = torch.tensor([[0., 3., 0.]]), torch.tensor([[0., -3., 0.]])
+    targets = {'e3': a, 'poi': b, 'e3_atomic_numbers': [6], 'poi_atomic_numbers': [6]}
+    body = torch.eye(3)[None]
+    native = structural_endpoint_losses(targets, b[None], ld, b[None], ligand, body, ligand)
+    assert native['loss_e3_ligand_contacts'] == native['loss_poi_ligand_contacts'] == 0
+    assert all(value == 0 for key, value in native.items() if key.endswith('_steric'))
+    changed = structural_endpoint_losses(targets, b[None], ld, b[None] + 4, ligand, body, ligand)
+    assert changed['loss_e3_ligand_contacts'] == 0 and changed['loss_poi_ligand_contacts'] > 0
 
 
 if __name__ == "__main__":

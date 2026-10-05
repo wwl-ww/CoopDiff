@@ -205,3 +205,43 @@ def test_ligand_centroid_matches_retained_graph_atoms(tmp_path):
         expected = retained.GetConformer().GetPositions().mean(axis=0)
         assert np.allclose(_ligand_centroid(str(path), remove_hs), expected), \
             'native ligand frame must use the same atoms as the input graph'
+
+
+def test_protein_local_geometry_is_intrinsic_masked_and_sidechain_sensitive():
+    import sys
+    import numpy as np
+    import torch
+    import prody as pr
+    from unittest.mock import patch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+    from featurize_common import protein_local_geometry
+
+    pdb = pr.AtomGroup('monomer')
+    xyz = np.array([[-1., 0., 0.], [0., 0., 0.], [1., 1., 0.], [2., 1., 0.],
+                    [0., -1., 1.], [1., -2., 1.], [3., 0., 0.], [4., 0., 0.], [5., 1., 0.]])
+    pdb.setCoords(xyz)
+    pdb.setNames(['N', 'CA', 'C', 'O', 'CB', 'OG', 'N', 'CA', 'C'])
+    pdb.setResnames(['SER'] * 6 + ['GLY'] * 3)
+    pdb.setResnums([1] * 6 + [2] * 3)
+    pdb.setChids(['A'] * 9)
+    receptor = {'coords': torch.tensor(xyz[[1, 7]])[None]}
+    with patch('prody.parsePDB', return_value=pdb):
+        original = protein_local_geometry('unused.pdb', receptor)
+        assert original.shape == (1, 2, 32) and torch.isfinite(original).all()
+        assert original[0, 1, 12] == 0 and original[0, 1, 28:].sum() == 0
+        assert original[0, 0, 28] == 1, 'present SER chi must not be masked'
+        rotation = np.array([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
+        pdb.setCoords(xyz @ rotation + 37.)
+        moved = protein_local_geometry('unused.pdb', {'coords': receptor['coords'] @ torch.tensor(rotation) + 9.})
+        assert torch.allclose(original, moved, atol=1e-10)
+        changed = xyz.copy()
+        changed[5] += [1., .5, .8]
+        pdb.setCoords(changed)
+        assert not torch.allclose(original, protein_local_geometry('unused.pdb', receptor))
+        try:
+            protein_local_geometry('unused.pdb', {'coords': receptor['coords'].flip(1)})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('misordered CA template accepted local sidechain features')

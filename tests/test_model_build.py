@@ -595,6 +595,75 @@ def test_frozen_expert_features_preserve_scores_gradients_and_hook_cleanup():
     print('  [OK] Frozen feature scores, coordinate gradients and hook cleanup')
 
 
+def test_integrated_experts_pack_both_branches_without_losing_ragged_identity():
+    """One 2B call preserves FiLM, scalar/vector rows, torsions and gradients."""
+    from types import MethodType, SimpleNamespace
+    from torch_geometric.data import HeteroData
+    from tricoopdiff.models.consensus import ConsensusCoopDiff
+
+    class Expert(torch.nn.Module):
+        ns, node_scalar_dim, node_vector_dim = 2, 2, 1
+
+        def __init__(self):
+            super().__init__()
+            self.model = SimpleNamespace(no_torsion=False)
+            self.calls = 0
+
+        def forward_features(self, graph, film=None, return_vectors=False):
+            self.calls += 1
+            positions = torch.cat((graph['ligand'].pos, graph['receptor'].pos))
+            scalars = positions[:, :2] * (1 + film[0][0]) + film[0][1]
+            tr = positions.new_zeros(graph.num_graphs, 3).index_add(
+                0, graph['ligand'].batch, graph['ligand'].pos)
+            torsion = graph['ligand'].pos[graph['ligand'].edge_mask, 0]
+            return tr, tr * .1, torsion, scalars, positions[:, None]
+
+    fuse = torch.nn.Module()
+    fuse.endpoint_v2 = fuse.enhanced_conditions = fuse.refined_conditions = True
+    fuse.integrated_conditions = True
+    fuse.config = {'expert_scalar_dim': 2, 'expert_film_dim': 2, 'expert_vector_dim': 1}
+    model = ConsensusCoopDiff(Expert(), fuse)
+    inputs, pairs = [], []
+    torch.manual_seed(91)
+    for case in range(2):
+        pair = []
+        for branch in range(2):
+            graph = HeteroData()
+            for kind, count in (('ligand', 3 + case), ('receptor', 4 + case + branch)):
+                value = torch.randn(count, 3, requires_grad=True)
+                inputs.append(value)
+                graph[kind].pos = value
+                graph[kind].batch = torch.zeros(count, dtype=torch.long)
+            graph['ligand'].edge_mask = torch.arange(3 + case) <= case
+            graph.num_graphs = 1
+            count = len(graph['ligand'].pos) + len(graph['receptor'].pos)
+            film = tuple(torch.randn(count, 2, requires_grad=True) for _ in range(2))
+            inputs.extend(film)
+            pair.append((graph, [film]))
+        pairs.append(pair)
+
+    def trajectory(self, pair):
+        if self.trifuse.integrated_conditions:
+            return (yield pair)
+        return [(yield pair[0]), (yield pair[1])]
+
+    model._forward_one = MethodType(trajectory, model)
+    requests = [{'pair': pair} for pair in pairs]
+    together = model.forward_many(requests)
+    assert model.expert.calls == 1, 'v9 must combine both independent expert branches'
+    fuse.integrated_conditions = False
+    model.expert.calls = 0
+    separate = model.forward_many(requests)
+    assert model.expert.calls == 2, 'older profiles must preserve their two-pass execution'
+    flat = lambda results: [value for case in results for branch in case for value in branch]
+    for actual, expected in zip(flat(together), flat(separate)):
+        assert torch.allclose(actual, expected), 'packed branch/node/FiLM ordering changed'
+    gradients = [torch.autograd.grad(sum(value.square().sum() for value in flat(result)), inputs)
+                 for result in (together, separate)]
+    for actual, expected in zip(*gradients):
+        assert torch.isfinite(actual).all() and torch.allclose(actual, expected, atol=1e-6)
+
+
 def test_failed_expert_policy_configuration_preserves_the_live_policy():
     from types import SimpleNamespace
     from tricoopdiff.models.expert import configure_expert_policy
@@ -718,6 +787,7 @@ if __name__ == "__main__":
     test_initializer_body_frame()
     test_frozen_expert_stays_eval()
     test_frozen_expert_features_preserve_scores_gradients_and_hook_cleanup()
+    test_integrated_experts_pack_both_branches_without_losing_ragged_identity()
     test_failed_expert_policy_configuration_preserves_the_live_policy()
     test_expert_loader_cannot_mislabel_the_frozen_layer_count()
     test_score_guard_handles_infinity()

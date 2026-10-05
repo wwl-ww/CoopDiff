@@ -568,6 +568,10 @@ def evaluate_model(
             continue
         rec = {
             'seed': seed + walker_index,
+            'numerically_valid': r.get('numerically_valid', True),
+            'physical_valid': r.get('physical_valid'),
+            'physical_check_scope': r.get('physical_check_scope', 'not_checked'),
+            'ligand_internal_clash_pairs': r.get('ligand_internal_clash_pairs'),
             'pred': pred,
             'pred_poi': pred_poi,
             'protac_rmsd': compute_rmsd(pred, ref_lig, align_first=True),
