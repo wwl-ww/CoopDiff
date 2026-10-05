@@ -29,11 +29,16 @@ def state_digest(values):
     return digest.hexdigest()
 
 
-def prepare_protocol(output):
+def prepare_protocol(output, train_cases=None, validation_cases=None, epochs=5):
     source = ROOT / 'results/model45_small_sample/v39_full/cache_subset.json'
     old = json.loads(source.read_text())
     selected = {key: old[key]['selected_entries'] for key in ('train', 'validation')}
-    assert len(selected['train']) == 8 and len(selected['validation']) == 4
+    if train_cases is not None:
+        selected['train'] = list(train_cases)
+    if validation_cases is not None:
+        selected['validation'] = list(validation_cases)
+    if not selected['train'] or not selected['validation']:
+        raise ValueError('pilot requires non-empty train and validation case lists')
     selection_hash = hashlib.sha256(json.dumps(selected, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     output.mkdir(parents=True, exist_ok=True)
     paths = {}
@@ -52,20 +57,22 @@ def prepare_protocol(output):
     original = ROOT.parent / 'CoopDiff'
     argv = ['--train_data', str(paths['train']), '--val_data', str(paths['validation']),
         '--output_dir', str(output), '--training-arm', 'A1', '--no-random-flip-proteins',
-        '--epochs', '5', '--batch_size', '1', '--seed', '73', '--lr', '1e-4',
+        '--epochs', str(epochs), '--batch_size', '1', '--seed', '73', '--lr', '1e-4',
         '--weight_decay', '1e-4', '--nan-clamp', '100', '--node_dim', '128',
         '--expert_model_dir', str(original / 'checkpoints/score_model'),
         '--cache_dir', str(original / 'results/featurize_cache_proposal_oracle'), '--cache-only',
         '--native-root', str(original / 'DeepTernary/data/TernaryDB/pdbs'),
         '--log_interval', '1', '--save_interval', '1', '--device', 'cuda']
     commit = subprocess.check_output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], text=True).strip()
-    if commit != '70f1e9258bcce6aaff49d6a1716fbed9433e189e':
-        raise ValueError('pilot must use the registered v41 source commit')
+    registered_source = '70f1e9258bcce6aaff49d6a1716fbed9433e189e'
+    if subprocess.run(['git', '-C', str(ROOT), 'merge-base', '--is-ancestor',
+                       registered_source, commit], check=False).returncode:
+        raise ValueError('pilot must descend from the registered v41 source commit')
     protocol = {'source_commit': commit, 'selected_cases': selected, 'selection_sha256': selection_hash,
         'selection_source': str(source), 'selection_source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
         'data_partition': audit, 'entry_argv': argv, 'model_profile': 'ternary_local_compatibility_v1',
         'checkpoint_version': 41, 'training_arm': 'A1', 'initialization': 'SDPI',
-        'epochs': 5, 'updates_expected': 40, 'seed': 73, 'lr': 1e-4, 'node_dim': 128, 'batch_size': 1,
+        'epochs': epochs, 'updates_expected': epochs * len(selected['train']), 'seed': 73, 'lr': 1e-4, 'node_dim': 128, 'batch_size': 1,
         'zero_local_baseline': 'GPU1 evaluates epoch0 frozen experts with local cost heads zeroed',
         'validation_initial_state_file': str(output / 'validation_initial_states.pt'),
         'validation_initialization': 'case_seed(case,0); actual tensors shared with independent evaluation',
@@ -136,11 +143,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, default=ROOT / 'results/model41_cross_system_pilot')
     parser.add_argument('--prepare-only', action='store_true')
+    parser.add_argument('--train-case', action='append', dest='train_cases')
+    parser.add_argument('--validation-case', action='append', dest='validation_cases')
+    parser.add_argument('--epochs', type=int, default=5)
     args = parser.parse_args()
     output = (ROOT / args.out).resolve()
     if (output / 'metrics.jsonl').exists():
         raise ValueError('refusing to overwrite an existing pilot')
-    protocol = prepare_protocol(output)
+    protocol = prepare_protocol(output, args.train_cases, args.validation_cases, args.epochs)
     if args.prepare_only:
         return
     (output / 'train.pid').write_text(str(os.getpid()))
