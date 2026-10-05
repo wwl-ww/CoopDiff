@@ -39,7 +39,10 @@ def fixture():
     proposals = {b: {c: torch.randn(1, 1 if c == 'tor' else 3)
                       for c in ('tr', 'rot', 'tor')} for b in BRANCHES}
     fuse = ConsensusFuse(node_dim=32, input_dim=16, num_transformer_layers=1, dropout=0).eval()
-    return fuse, graph, proposals, torch.randn(1, 9)
+    clock = torch.randn(1, 9)
+    clock[:, 5:8] = .05
+    clock[:, -1] = 1.
+    return fuse, graph, proposals, clock
 
 
 
@@ -742,7 +745,7 @@ def test_joint_point_jacobian_matches_actual_symmetric_update():
 
 def test_constraint_model_equivariance_backward_and_no_torsion():
     fuse, graph, proposals, state = fixture()
-    for head in (fuse.constraint_head.contact_head[-1],):
+    for head in (fuse.constraint_head.precision_head[-1],):
         torch.nn.init.normal_(head.weight, std=.03)
     graph['node_coords'].requires_grad_()
     base = fuse(graph, proposals, state)
@@ -755,12 +758,15 @@ def test_constraint_model_equivariance_backward_and_no_torsion():
         for key in ('tr', 'rot'):
             assert torch.allclose(moved['normalized_velocity'][name][key],
                                   base['normalized_velocity'][name][key] @ rotation.T, atol=2e-5)
-    assert torch.allclose(moved['normalized_velocity']['torsion'], base['normalized_velocity']['torsion'], atol=2e-5)
+    # Relative damping exposes weak torsion modes; compare float32 velocities
+    # to 3e-5 relative tolerance (well below 1e-4 rad per executed step).
+    assert torch.allclose(moved['normalized_velocity']['torsion'], base['normalized_velocity']['torsion'],
+                          atol=2e-5, rtol=3e-5)
     values = base['normalized_velocity']
     loss = sum(values[name][key].square().sum() for name in ('e3_ligand', 'poi_ligand') for key in ('tr', 'rot'))
     (loss + values['torsion'].square().sum()).backward()
     assert torch.isfinite(graph['node_coords'].grad).all()
-    for module in (fuse.constraint_head.contact_head[-1], fuse.pooling.pair_updates[0][-1]):
+    for module in (fuse.constraint_head.precision_head[-1], fuse.pooling.pair_updates[0][-1]):
         assert module.weight.grad is not None and torch.isfinite(module.weight.grad).all()
         assert module.weight.grad.abs().sum() > 0, 'joint solver must train both constraints and their encoder'
     for branch in proposals.values():
@@ -781,12 +787,12 @@ def test_constraint_checkpoint_is_explicit_and_cannot_load_as_v9():
     # Validator-only payload: use the real profile and solver identity. Normal
     # training/inference save/load with native experts is checked by the smoke.
     payload = trainer.checkpoint_payload()
-    assert payload['runtime_config']['constraint_solver_contract'] == 'terminal_geometry_repair_v3'
+    assert payload['runtime_config']['constraint_solver_contract'] == 'finite_displacement_detached_goal_v4'
     validate_consensus_checkpoint(payload)
     for mutation in ('version', 'contract', 'operator', 'probe'):
         invalid = copy.deepcopy(payload)
         if mutation == 'version':
-            invalid['checkpoint_version'] = 38
+            invalid['checkpoint_version'] = 39
         elif mutation == 'contract':
             invalid['runtime_config']['constraint_solver_contract'] = 'unknown'
         elif mutation == 'operator':
@@ -836,15 +842,17 @@ def test_constraint_motion_has_no_train_eval_drift():
 
 
 def test_terminal_distance_controller_corrects_both_signs_and_stops_at_goal():
-    from tricoopdiff.models.constraint_motion import terminal_distance_rate
+    from tricoopdiff.models.constraint_motion import solve_terminal_velocity
     current = torch.tensor([.5, 1., 2.])
     goal = torch.ones(3)
-    for time in (0., .05, .5, 1.):
-        rate = terminal_distance_rate(current, goal, torch.tensor(time))
-        after = current - .05 * rate
-        assert rate[0] < 0 and rate[1] == 0 and rate[2] > 0
+    matrix = torch.zeros(3, 12)
+    matrix[:, :3] = torch.eye(3)
+    for dt in (.05, .5, 1.):
+        velocity, _ = solve_terminal_velocity(matrix, current - goal, torch.ones(3) / 3, torch.tensor(dt))
+        after = current - dt * velocity[:3]
+        assert velocity[0] < 0 and velocity[1] == 0 and velocity[2] > 0
         assert torch.all((after - goal).abs() <= (current - goal).abs())
-        assert rate.abs().max() <= 2. and torch.isfinite(rate).all()
+        assert torch.isfinite(velocity).all()
 
 
 def test_terminal_geometry_supervision_respects_symmetry_and_stops_target_gradients():
@@ -887,7 +895,7 @@ def test_target_geometry_does_not_consume_native_labels_and_has_no_free_torsion_
     native = [graph['node_coords'][graph['node_types'] == kind] for kind in range(3)]
     loss = terminal_geometry_loss(baseline['target_geometry'], native[0], native[1], native[2][None])
     loss.backward()
-    assert fuse.constraint_head.contact_head[-1].weight.grad.abs().sum() > 0
+    assert fuse.constraint_head.distance_head[-1].weight.grad.abs().sum() > 0
     assert not hasattr(fuse.constraint_head, 'expert_precision')
     assert not hasattr(fuse.constraint_head, 'torsion_precision')
 
@@ -898,7 +906,7 @@ def test_uniform_reliability_changes_do_not_control_speed():
     # All reliability logits are initialized identically. Change their common
     # scale without changing the terminal distances or binary suggestions.
     with torch.no_grad():
-        fuse.constraint_head.contact_head[-1].bias[1].fill_(2.)
+        fuse.constraint_head.precision_head[-1].bias[0].fill_(2.)
     after = fuse(graph, proposals, state)['normalized_velocity']
     for branch in BRANCHES:
         for component in ('tr', 'rot'):
@@ -999,7 +1007,7 @@ def test_operator_flow_is_equivariant_and_supports_rigid_ligands():
         for a, b in zip(first['operator_update']['state'][:2], second['operator_update']['state'][:2]):
             assert torch.allclose(a @ rotation.T + 7., b, atol=2e-4)
         assert first['normalized_velocity']['torsion'].shape == (1, int(ld['edge_mask'].sum()))
-        for key in ('order', 'split', 'repair_first', 'repair_second'):
+        for key in ('order_first', 'order_second', 'split', 'repair_first', 'repair_second'):
             assert torch.allclose(first['consensus_diagnostics'][key], second['consensus_diagnostics'][key], atol=1e-5)
 
 

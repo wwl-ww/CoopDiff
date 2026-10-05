@@ -11,9 +11,9 @@ import torch
 from torch import nn
 
 
-CONSTRAINT_SOLVER_CONTRACT = 'terminal_geometry_repair_v3'
+CONSTRAINT_SOLVER_CONTRACT = 'finite_displacement_detached_goal_v4'
 TARGET_GEOMETRY_LOSS_WEIGHT = 0.1
-DISTANCE_SCALE = 10.0  # Angstrom: distance-rate residual normalization.
+DISTANCE_SCALE = 10.0  # Angstrom: distance and Jacobian normalization.
 SOLVER_RIDGE = 0.01    # Isotropic in the normalized rigid/torsion coordinates.
 
 
@@ -95,12 +95,15 @@ def solve_velocity(matrix, target, precision, ridge=SOLVER_RIDGE):
     discontinuities. Weights are residual precisions, not calibrated confidence.
     """
     if (matrix.ndim != 2 or target.shape != (len(matrix),)
-            or precision.shape != target.shape or not math.isfinite(ridge) or ridge <= 0):
+            or precision.shape != target.shape):
         raise ValueError('invalid constraint solve dimensions or ridge')
     if (not torch.isfinite(matrix).all() or not torch.isfinite(target).all()
             or not torch.isfinite(precision).all() or bool((precision < 0).any())):
         raise ValueError('constraint solve requires finite evidence and nonnegative precision')
     a, b, w = matrix.double(), target.double(), precision.double()
+    ridge = torch.as_tensor(ridge, device=a.device, dtype=a.dtype)
+    if ridge.ndim != 0 or not torch.isfinite(ridge) or ridge <= 0:
+        raise ValueError('constraint ridge must be a finite positive scalar')
     normal = a.T @ (w[:, None] * a)
     normal = normal + ridge * torch.eye(a.shape[1], device=a.device, dtype=a.dtype)
     rhs = a.T @ (w * b)
@@ -115,13 +118,27 @@ def solve_velocity(matrix, target, precision, ridge=SOLVER_RIDGE):
     return solution.to(matrix.dtype), diagnostics
 
 
-def terminal_distance_rate(distance, predicted_distance, time):
-    """Forward-clock rate: reverse integration moves toward the predicted goal.
+def solve_terminal_velocity(matrix, error, precision, dt):
+    """Finite Gauss--Newton displacement expressed in forward-clock units.
 
-    Distances are normalized by 10 A. A clock floor bounds the final correction;
-    the limit of two normalized distance units also bounds far-start requests.
+    Damping is relative to the observable geometry; no distance-rate tanh or
+    artificial remaining-time floor. dt=0 is an exact no-op. This is a
+    step-size-conditioned discrete flow, not a step-size-independent ODE.
     """
-    return 2. * torch.tanh((distance - predicted_distance) / (2. * time.clamp_min(.2)))
+    from tricoopdiff.models.operator_flow import limit_step
+    duration = torch.as_tensor(dt, device=matrix.device, dtype=matrix.dtype).reshape(())
+    if not torch.isfinite(duration) or duration < 0:
+        raise ValueError('repair duration must be finite and nonnegative')
+    # Relative isotropic damping retains SE(3) covariance and a positive floor
+    # for completely unobserved modes. Keep its geometry derivative explicit.
+    spectral_scale = (matrix.double().square() * precision.double()[:, None]).sum() / matrix.shape[1]
+    ridge = 1e-3 * spectral_scale + 1e-8
+    displacement, diagnostics = solve_velocity(matrix, error, precision, ridge=ridge)
+    diagnostics['repair_ridge'] = ridge.detach()
+    if not bool(duration.detach() > 0):
+        return displacement * 0., diagnostics
+    velocity = limit_step(displacement / duration, duration)
+    return velocity, diagnostics
 
 
 def terminal_geometry_loss(predictions, e3, poi, ligand_candidates):
@@ -155,13 +172,18 @@ class ConstraintMotionHead(nn.Module):
 
     def __init__(self, hidden_dim):
         super().__init__()
-        self.contact_head = nn.Sequential(
-            nn.LayerNorm(4 * hidden_dim + 4), nn.Linear(4 * hidden_dim + 4, hidden_dim),
-            nn.SiLU(), nn.Linear(hidden_dim, 2))
-        nn.init.zeros_(self.contact_head[-1].weight)
-        nn.init.zeros_(self.contact_head[-1].bias)
+        def head():
+            return nn.Sequential(nn.LayerNorm(4 * hidden_dim + 4),
+                nn.Linear(4 * hidden_dim + 4, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        # Independent parameters: endpoint control must not change the terminal
+        # distance readout to compensate for insufficient corrective motion.
+        self.distance_head = head()
+        self.precision_head = head()
+        for network in (self.distance_head, self.precision_head):
+            nn.init.zeros_(network[-1].weight)
+            nn.init.zeros_(network[-1].bias)
         with torch.no_grad():
-            self.contact_head[-1].bias[1] = -2.
+            self.precision_head[-1].bias.fill_(-2.)
 
     def forward(self, joint, graph, proposals, context, diffusion_state):
         coords, types = graph['node_coords'], graph['node_types']
@@ -198,21 +220,21 @@ class ConstraintMotionHead(nn.Module):
                                 joint['latent_features'][None, anchor].expand(shape),
                                 joint['relation'][receiver][:, anchor], context[:, None].expand(shape),
                                 joint['geometry'][receiver][:, anchor]), -1)
-            values = self.contact_head(inputs)
-            predicted_distance = torch.nn.functional.softplus(values[..., 0])
+            predicted_distance = torch.nn.functional.softplus(self.distance_head(inputs)[..., 0])
+            precision_logits = self.precision_head(inputs)[..., 0]
             distance = torch.sqrt(delta.square().sum(-1) + .01) / DISTANCE_SCALE
             geometry_predictions.append({
                 'distance': predicted_distance, 'receiver_type': receiver_type,
                 'anchor_type': anchor_type,
                 'anchor_weights': joint['material_weights'][anchor_type].detach()})
             matrices.append(jacobian.reshape(-1, width))
-            targets.append(terminal_distance_rate(distance, predicted_distance,
-                                                  diffusion_state[0, -1]).reshape(-1))
-            weights.append((.001 + values[..., 1].sigmoid()).reshape(-1) / (len(left) * len(right)))
+            targets.append((distance - predicted_distance.detach()).reshape(-1))
+            weights.append((.001 + precision_logits.sigmoid()).reshape(-1) / (len(left) * len(right)))
         relative_weights = torch.cat(weights)
         total_weight = relative_weights.sum()
         relative_weights = relative_weights / total_weight
-        velocity, diagnostics = solve_velocity(torch.cat(matrices), torch.cat(targets), relative_weights)
+        velocity, diagnostics = solve_terminal_velocity(
+            torch.cat(matrices), torch.cat(targets), relative_weights, diffusion_state[0, 5])
         from tricoopdiff.sdpi_flow import INDEPENDENT_RIGID_MODE, SYMMETRIC_TORSION_MODE
         predictions = {'rigid_output_mode': INDEPENDENT_RIGID_MODE,
                        'torsion_update_mode': SYMMETRIC_TORSION_MODE,

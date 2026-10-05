@@ -11,7 +11,7 @@ from tricoopdiff.models.constraint_motion import binary_rigid_maps, DISTANCE_SCA
 from tricoopdiff.sdpi_flow import SDPIFlow, INDEPENDENT_RIGID_MODE, SYMMETRIC_TORSION_MODE
 
 
-OPERATOR_FLOW_CONTRACT = 'finite_response_two_stage_v1'
+OPERATOR_FLOW_CONTRACT = 'independent_stage_finite_repair_v2'
 PROBE_STEP = .025
 EXPERT_EVALUATIONS_PER_STEP = 6
 
@@ -47,6 +47,20 @@ def lift_binary(proposal, branch, state, e3_coords, scales):
     target = torch.cat([bounded_vector(proposal[key])[0] for key in ('tr', 'rot')]).double()
     rigid = mapping.T @ torch.linalg.solve(mapping @ mapping.T, target)
     return torch.cat((rigid.to(ligand), proposal['tor'][0].tanh()))
+
+
+def limit_step(vector, duration, max_angle=.5):
+    """Limit the executed angular increment, preserving the field direction.
+
+    Applies after repair/expert blending as well as to the repair solve. Rigid
+    norms and torsion magnitudes are invariant to the global coordinate frame.
+    """
+    angular = vector[[3, 4, 5, 9, 10, 11]].reshape(2, 3).norm(dim=-1).max()
+    if len(vector) > 12:
+        angular = torch.maximum(angular, vector[12:].abs().max())
+    step_angle = angular * torch.pi * duration.reshape(())
+    fraction = (max_angle / step_angle.clamp_min(1e-12)).clamp_max(1.)
+    return vector * fraction
 
 
 def advance(state, vector, duration, scales, ligand_data):
@@ -91,35 +105,40 @@ def goal_probe_evidence(predictions, states, e3_coords):
             receiver = ligand[0] if item['receiver_type'] == 2 else poi[0]
             delta = anchors[None] - receiver[:, None]
             distance = (delta.square().sum(-1) + .01).sqrt() / DISTANCE_SCALE
-            errors.append((torch.log1p(distance) - torch.log1p(item['distance'])).square().mean())
+            errors.append((torch.log1p(distance) - torch.log1p(item['distance'].detach())).square().mean())
         features.append(torch.stack((errors[0], errors[1] - errors[0], errors[2] - errors[0])))
     return torch.cat(features)[None]
 
 
 class OperatorController(nn.Module):
-    """Continuous order preference, positive time split, and two repair gates.
+    """Independent expert preferences, positive time split, and repair gains.
 
-    The first expert mixture is alpha*A+(1-alpha)*B; the second reverses the
-    preference after rereading experts at the executed intermediate state.
-    Only velocities are mixed; each substep executes exact rigid transforms.
+    Each stage has its own expert preference, avoiding first-order cancellation
+    at a balanced initialization. Positive repair gains can exceed one; experts
+    are attenuated by 1/(1+gain), without a convex-combination movement ceiling.
     """
 
     def __init__(self, hidden_dim):
         super().__init__()
         self.policy = nn.Sequential(nn.LayerNorm(hidden_dim + 39),
-            nn.Linear(hidden_dim + 39, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 4))
+            nn.Linear(hidden_dim + 39, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 5))
         # Small nonzero readout lets response features receive gradients from
         # the first optimizer update while starting near balanced control.
         nn.init.normal_(self.policy[-1].weight, std=.01)
         nn.init.zeros_(self.policy[-1].bias)
+        with torch.no_grad():
+            self.policy[-1].bias[3:].fill_(0.541324854612918)  # inverse softplus(1)
 
     def forward(self, context, base, cross, predictions, states, e3_coords):
         evidence = torch.cat((response_invariants(base, cross),
                               goal_probe_evidence(predictions, states, e3_coords)), -1)
-        controls = self.policy(torch.cat((context, evidence), -1)).sigmoid()[0]
-        return {'order': controls[0], 'split': .25 + .5 * controls[1],
-                'repair_first': controls[2], 'repair_second': controls[3]}, evidence
+        logits = self.policy(torch.cat((context, evidence), -1))[0]
+        controls = logits[:3].sigmoid()
+        gains = torch.nn.functional.softplus(logits[3:])
+        return {'order_first': controls[0], 'order_second': controls[1],
+                'split': .25 + .5 * controls[2],
+                'repair_first': gains[0], 'repair_second': gains[1]}, evidence
 
     @staticmethod
     def blend(fields, repair, order, repair_weight):
-        return (1 - repair_weight) * (order * fields[0] + (1 - order) * fields[1]) + repair_weight * repair
+        return (order * fields[0] + (1 - order) * fields[1]) / (1 + repair_weight) + repair_weight * repair

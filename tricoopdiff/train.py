@@ -535,11 +535,11 @@ def validate_consensus_checkpoint(payload):
     if model_config.get('model_profile') == 'ternary_endpoint_v9' and version < 33:
         raise ValueError('integrated conditional expert v9 requires checkpoint version 33')
     if model_config.get('model_profile') == 'ternary_constraints_v1':
-        if (version < 39 or config.get('constraint_solver_contract') != CONSTRAINT_SOLVER_CONTRACT
+        if (version < 40 or config.get('constraint_solver_contract') != CONSTRAINT_SOLVER_CONTRACT
                 or config.get('target_geometry_loss_weight') != TARGET_GEOMETRY_LOSS_WEIGHT
                 or config.get('operator_flow_contract') != OPERATOR_FLOW_CONTRACT
                 or config.get('operator_probe_step') != PROBE_STEP):
-            raise ValueError('constraint operator motion requires checkpoint v39 and its execution contract')
+            raise ValueError('constraint operator motion requires checkpoint v40 and its execution contract')
     if version >= 25:
         profile = model_config.get('model_profile')
         new_recipe = profile in MODEL_PROFILES[1:]

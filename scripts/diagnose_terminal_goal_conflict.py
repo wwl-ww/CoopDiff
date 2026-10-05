@@ -1,7 +1,7 @@
 """One-dimensional diagnostic of terminal-label/control-setpoint conflict.
 
 This is a mathematical reduction, not a protein prediction experiment. It uses
-production terminal_distance_rate and finite-horizon Euler timing. A positive
+historical v39 terminal_distance_rate and finite-horizon Euler timing. A positive
 endpoint gradient at a perfectly labelled goal shows an incentive to move the
 predicted goal away from its label to compensate for finite-time underreach.
 """
@@ -12,7 +12,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
-from tricoopdiff.models.constraint_motion import terminal_distance_rate
+from diagnose_control_reachability import terminal_distance_rate
 
 
 def diagnose():

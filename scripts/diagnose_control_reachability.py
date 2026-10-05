@@ -19,9 +19,14 @@ from tricoopdiff.initialization.endpoints import reachable_ligand_target
 from tricoopdiff.metrics.dockq import compute_fullatom_dockq
 from tricoopdiff.models.operator_flow import advance
 from tricoopdiff.models.constraint_motion import (
-    horizontal_torsion_jacobian, point_jacobian, solve_velocity, terminal_distance_rate,
+    horizontal_torsion_jacobian, point_jacobian, solve_velocity,
 )
 from tricoopdiff.sdpi_flow import SDPIFlow
+
+
+def terminal_distance_rate(distance, predicted_distance, time):
+    """Frozen v39 feedback for historical diagnostic comparisons only."""
+    return 2. * torch.tanh((distance - predicted_distance) / (2. * time.clamp_min(.2)))
 
 
 def bound(vector):

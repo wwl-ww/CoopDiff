@@ -1181,7 +1181,7 @@ class TorsionCoordinator(nn.Module):
 
 ARCHITECTURE = 'residual_consensus_v2'
 DIRECT_ARCHITECTURE = 'ternary_geometry_independent_v1'
-CONSENSUS_CHECKPOINT_VERSION = 39
+CONSENSUS_CHECKPOINT_VERSION = 40
 INTERFACE_OBJECTIVE_CHECKPOINT_VERSION = 22
 OBJECTIVE_CONTRACT_CHECKPOINT_VERSION = 21
 ENDPOINT_PROTOCOL_CHECKPOINT_VERSION = 20
@@ -1699,7 +1699,7 @@ class ConsensusCoopDiff(nn.Module):
             return result
         from tricoopdiff.models.operator_flow import (
             OPERATOR_FLOW_CONTRACT, PROBE_STEP, EXPERT_EVALUATIONS_PER_STEP,
-            advance, lift_binary, pack_velocity, unpack_velocity,
+            advance, lift_binary, limit_step, pack_velocity, unpack_velocity,
         )
         e3 = request['e3_data']['coords']
         ld = request['ligand_data']
@@ -1733,12 +1733,16 @@ class ConsensusCoopDiff(nn.Module):
             probes[probe_index].close()
         controls, evidence = self.trifuse.operator_controller(
             result['rank_features'], base, cross, result['target_geometry'], (state, *probe_states), e3)
+        # The outer-dt repair is a candidate displacement: execute only split
+        # of it here, then recompute a full correction over the remaining dt.
         first = self.trifuse.operator_controller.blend(
-            base, unpack_velocity(result['normalized_velocity']), controls['order'], controls['repair_first'])
+            base, unpack_velocity(result['normalized_velocity']), controls['order_first'], controls['repair_first'])
+        first = limit_step(first, dt * controls['split'])
         middle = advance(state, first, dt * controls['split'], scales, ld)
         middle_request = at_state(middle)
         middle_clock = clock.clone()
         middle_clock[:, 5:8] = dt * (1 - controls['split'])
+        middle_clock[:, -1] = (clock[:, -1] - dt * controls['split']).clamp_min(0.)
         middle_request['diffusion_state'] = middle_clock
         second_reader = self._read_state(**middle_request)
         second_reads, _, _ = next(second_reader)
@@ -1753,7 +1757,8 @@ class ConsensusCoopDiff(nn.Module):
                      for i, name in enumerate(BRANCHES)]
         second = self.trifuse.operator_controller.blend(
             refreshed, unpack_velocity(middle_result['normalized_velocity']),
-            1 - controls['order'], controls['repair_second'])
+            controls['order_second'], controls['repair_second'])
+        second = limit_step(second, dt * (1 - controls['split']))
         final = advance(middle, second, dt * (1 - controls['split']), scales, ld)
         # Mean substep velocities are diagnostics only. Applying them as a
         # single Euler update would discard the actual ordered composition.
