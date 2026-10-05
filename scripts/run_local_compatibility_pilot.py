@@ -69,7 +69,8 @@ def prepare_protocol(output):
         'zero_local_baseline': 'GPU1 evaluates epoch0 frozen experts with local cost heads zeroed',
         'validation_initial_state_file': str(output / 'validation_initial_states.pt'),
         'validation_initialization': 'case_seed(case,0); actual tensors shared with independent evaluation',
-        'final_evaluation': 'independent GPU1 paired raw/EMA versus zero-local on same actual states',
+        'final_evaluation': ('independent GPU1 paired raw checkpoint versus zero-local on the same actual states; '
+                             'EMA is exploratory only because short-run averaging lags training'),
         'scope': 'cross-system small development pilot; no generalization or BiTSeed coverage claim',
         'code_sha256': {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in (
             'tricoopdiff/models/consensus.py', 'tricoopdiff/models/local_compatibility.py',
