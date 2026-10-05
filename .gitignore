@@ -77,3 +77,11 @@ results/
 /.agents/
 /.skills/
 /skills/
+
+# Shared artifact/dependency symlinks in isolated worktrees.
+/checkpoints
+/data
+/DeepTernary
+/hf_cache
+/torch_cluster
+/torch_scatter

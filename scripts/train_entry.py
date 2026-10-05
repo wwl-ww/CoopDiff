@@ -548,12 +548,8 @@ def build_trainer(args, device, input_dim=None):
         if saved['runtime_config'].get('training_objective') != 'real_initialization_reachable_endpoint_v2':
             raise ValueError('historical checkpoints are inference/weight sources, not production resumes')
         model_config = dict(saved['model_config'])
-        if model_config.get('model_profile') == 'ternary_endpoint_v2':
-            raise ValueError('v2 used the historical coupled near-target recipe; load weights only, not a production resume')
-        if model_config.get('model_profile') == 'ternary_endpoint_v3':
-            raise ValueError('v3 used the historical torsion decoder; load weights only, not a production resume')
-        if not model_config.get('model_profile'):
-            raise ValueError('an older custom checkpoint cannot resume as the production profile')
+        if model_config.get('model_profile') != 'ternary_constraints_v1':
+            raise ValueError('model-4.5 cannot resume historical motion heads; use model-v4')
         if model_config['input_dim'] != input_dim:
             raise ValueError('resume checkpoint input features do not match the data')
         for key, option, old_default in (('interface_loss_weight', '--interface-loss-weight', 0.),

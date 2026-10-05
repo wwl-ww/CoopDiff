@@ -1,5 +1,7 @@
 # TriCoopDiff / BiTSeed
 
+`model-4.5` 分支以 `ternary_constraints_v1` 替换旧运动输出路径（checkpoint v37）：保留 v9 的冻结条件专家、三元编码、蛋白刚体和20步流更新，以可微加权最小二乘联合求解刚体／共享 torsion 速度。训练默认使用新架构；旧模型对照与旧权重运行使用 `model-v4` worktree。实现与实验门槛见[模型与坐标契约](doc/TriCoopDiff%20模型架构图.md)。这是一版架构原型，不代表 DockQ 改善；尚未实现多模态接触模式生成或协同性自由能预测。
+
 TriCoopDiff 研究蛋白–配体–蛋白三元装配：两个冻结 DiffDock 专家提供二元建议，残差共识模型协调双界面运动。BiTSeed 是在线初始化模块，不是精修模型或排序器。
 
 ## 当前研究状态

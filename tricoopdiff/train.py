@@ -530,6 +530,10 @@ def validate_consensus_checkpoint(payload):
         raise ValueError('symmetric conditional expert v8 requires checkpoint version 32')
     if model_config.get('model_profile') == 'ternary_endpoint_v9' and version < 33:
         raise ValueError('integrated conditional expert v9 requires checkpoint version 33')
+    if model_config.get('model_profile') == 'ternary_constraints_v1':
+        from tricoopdiff.models.constraint_motion import CONSTRAINT_SOLVER_CONTRACT
+        if version < 37 or config.get('constraint_solver_contract') != CONSTRAINT_SOLVER_CONTRACT:
+            raise ValueError('constraint motion requires checkpoint v37 and its recorded solver contract')
     if version >= 25:
         profile = model_config.get('model_profile')
         new_recipe = profile in MODEL_PROFILES[1:]
@@ -1113,6 +1117,8 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 'structural_supervision': self.structural_supervision,
                 'structure_loss_contract': 'dual_contacts025_vdw08_exclude123_v1' if self.structural_supervision else 'legacy',
                 'step_contract': 'fixed_training_steps_v1',
+                **({'constraint_solver_contract': 'joint_distance_velocity_v1'}
+                   if getattr(self.model.trifuse, 'constraint_motion', False) else {}),
                 'training_objective': self.training_objective,
                 'endpoint_loss_weight': self.endpoint_loss_weight,
                 'inference_steps': self.diffusion.inference_steps,
@@ -1149,7 +1155,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         validate_consensus_checkpoint(payload)
         if payload.get('checkpoint_kind') == 'inference_only':
             raise ValueError('inference-only weights cannot resume the production training objective')
-        if (payload['checkpoint_version'] not in (24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, CONSENSUS_CHECKPOINT_VERSION)
+        if (payload['checkpoint_version'] not in (24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, CONSENSUS_CHECKPOINT_VERSION)
                 or payload['runtime_config'].get('training_objective') != REAL_ENDPOINT_OBJECTIVE):
             raise ValueError('training objective differs or checkpoint is historical; load weights only')
         for key in ('inference_steps', 'endpoint_loss_weight', 'interface_loss_weight',

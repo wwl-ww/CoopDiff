@@ -138,13 +138,8 @@ def test_consensus_builder_passes_only_active_model_dimensions():
             node_dim=args.node_dim, input_dim=1281,
             num_transformer_layers=args.num_transformer_layers,
             direct_ternary_motion=True,
-            global_node_context=True,
-            spatial_geometry=True,
-            motion_attention=True,
-            global_node_attention=True,
-            rotation_scale_normalization=True,
             dropout=0., source_conditioning=False,
-            model_profile='ternary_endpoint_v9', expert_scalar_dim=58, expert_film_dim=48, expert_vector_dim=20,
+            model_profile='ternary_constraints_v1', expert_scalar_dim=58, expert_film_dim=48, expert_vector_dim=20,
         )
         assert model.call_args.kwargs['expert_input_grad'] is True
         assert result is model.return_value
@@ -171,6 +166,7 @@ def _endpoint_trainer_fixture(profile=None, inference_steps=3):
             super().__init__()
             self.trifuse = torch.nn.Module()
             self.trifuse.direct_ternary_motion = True
+            self.trifuse.constraint_motion = profile == 'ternary_constraints_v1'
             self.trifuse.config = {'direct_ternary_motion': True, 'node_dim': 4}
             if profile is not None:
                 self.trifuse.config = production_model_config(4, 4, 1, model_profile=profile)
@@ -196,7 +192,7 @@ def _endpoint_trainer_fixture(profile=None, inference_steps=3):
     model = Model()
     trainer = ConsensusTrainer(model, flow, device='cpu', ema_decay=.999 if profile else 0.)
     batch = {'e3_data': {'coords': e3}, 'poi_data': {'coords': poi}, 'ligand_data': ligand}
-    if profile in ('ternary_endpoint_v7', 'ternary_endpoint_v8', 'ternary_endpoint_v9'):
+    if profile in ('ternary_endpoint_v7', 'ternary_endpoint_v8', 'ternary_endpoint_v9', 'ternary_constraints_v1'):
         batch['fullatom_targets'] = {'e3': e3[0].clone(), 'poi': poi[0].clone()}
     initial = flow.path(ligand, poi, coupling, ligand['coords'].new_ones(1))[:3]
     override = {'initial_state': dict(zip(('ligand', 'poi', 'body_frame'), initial)),
@@ -230,9 +226,8 @@ def test_direct_trainer_supervises_executed_endpoint_not_teacher_velocities():
 def test_endpoint_training_and_sampling_execute_identical_full_trajectory():
     from tricoopdiff.sampler import sample_single
 
-    trainer, batch, coupling = _endpoint_trainer_fixture()
+    trainer, batch, coupling = _endpoint_trainer_fixture(inference_steps=20)
     flow = trainer.diffusion
-    flow.inference_steps = 20
     state = [coupling['initial_state'][key] for key in ('ligand', 'poi', 'body_frame')]
     original_forward = trainer.model.forward
 
@@ -332,8 +327,7 @@ def test_sampling_rejects_initialization_atom_mismatch_before_model():
 def test_rank_features_are_read_from_actual_final_pose_and_zero_clock():
     from tricoopdiff.sampler import sample_single
 
-    trainer, batch, coupling = _endpoint_trainer_fixture()
-    trainer.diffusion.inference_steps = 1
+    trainer, batch, coupling = _endpoint_trainer_fixture(inference_steps=1)
     state = [coupling['initial_state'][key] for key in ('ligand', 'poi', 'body_frame')]
     forward = trainer.model.forward
 
@@ -609,9 +603,9 @@ def test_interface_checkpoint_preserves_batch_progress_and_rejects_loss_changes(
 def test_resume_builder_uses_saved_model_and_loss_recipe_not_current_defaults():
     from tricoopdiff.models.consensus import production_model_config
 
-    trainer, _, _ = _endpoint_trainer_fixture()
+    trainer, _, _ = _endpoint_trainer_fixture('ternary_constraints_v1')
     payload = trainer.checkpoint_payload()
-    payload['model_config'] = production_model_config(32, 16, 2, model_profile='ternary_endpoint_v1')
+    payload['model_config'] = production_model_config(32, 16, 2)
     payload['runtime_config']['steric_loss_weight'] = .05
     payload['runtime_config']['interface_loss_weight'] = .7
     args = parse_args(['--train_data', 'unused', '--val_data', 'unused',
@@ -1259,7 +1253,7 @@ def test_v2_checkpoint_records_recipe_and_resumes_warmup_and_entry_parity():
     trainer, batch, coupling = _endpoint_trainer_fixture('ternary_endpoint_v2')
     trainer.train_step(**batch, coupling_override=coupling)
     payload = copy.deepcopy(trainer.checkpoint_payload())
-    assert payload['checkpoint_version'] == 36
+    assert payload['checkpoint_version'] == 37
     payload['checkpoint_version'] = 25  # Historical v2 weights retain their old recipe.
     assert payload['runtime_config']['ema_update_contract'] == 'optimizer_step_warmup_v1'
     assert payload['runtime_config']['near_target_supervision']['weight'] == .25
@@ -1361,7 +1355,7 @@ def test_production_entry_rejects_old_v2_training_recipe_without_reinterpretatio
         try:
             build_trainer(args, 'cpu', input_dim=4)
         except ValueError as error:
-            assert 'historical coupled near-target recipe' in str(error)
+            assert 'cannot resume historical motion heads' in str(error)
         else:
             raise AssertionError('production silently resumed the coupled v2 recipe')
 
