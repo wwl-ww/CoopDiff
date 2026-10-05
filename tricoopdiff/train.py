@@ -28,10 +28,7 @@ from tricoopdiff.models.consensus import (
 )
 from tricoopdiff.models.expert import (expert_base_identity, validate_expert_base_identity,
                                     configure_expert_policy, expert_runtime_identity)
-from tricoopdiff.models.constraint_motion import (
-    CONSTRAINT_SOLVER_CONTRACT, TARGET_GEOMETRY_LOSS_WEIGHT, terminal_geometry_loss,
-)
-from tricoopdiff.models.operator_flow import OPERATOR_FLOW_CONTRACT, PROBE_STEP
+from tricoopdiff.models.local_compatibility import LOCAL_COMPATIBILITY_CONTRACT
 from tricoopdiff.runtime import (atomic_torch_save, capture_rng_state, evaluation_context,
                                 preserve_rng, restore_rng_state)
 from tricoopdiff.sdpi_flow import (
@@ -236,8 +233,9 @@ class TriCoopDiffTrainer:
         rng_before = capture_rng_state()
         results = []
         try:
-            packed = getattr(self.model.trifuse, 'enhanced_conditions', False)
-            groups = (packed_groups(batches) if getattr(self.model.trifuse, 'refined_conditions', False)
+            integrated = getattr(self.model.trifuse, 'integrated_conditions', False)
+            packed = integrated or getattr(self.model.trifuse, 'enhanced_conditions', False)
+            groups = (packed_groups(batches) if integrated or getattr(self.model.trifuse, 'refined_conditions', False)
                       else [batches] if packed else ([batch] for batch in batches))
             for group in groups:
                 losses = self.compute_losses(group) if packed else [self.compute_loss(**group[0])]
@@ -534,12 +532,15 @@ def validate_consensus_checkpoint(payload):
         raise ValueError('symmetric conditional expert v8 requires checkpoint version 32')
     if model_config.get('model_profile') == 'ternary_endpoint_v9' and version < 33:
         raise ValueError('integrated conditional expert v9 requires checkpoint version 33')
-    if model_config.get('model_profile') == 'ternary_constraints_v1':
-        if (version < 40 or config.get('constraint_solver_contract') != CONSTRAINT_SOLVER_CONTRACT
-                or config.get('target_geometry_loss_weight') != TARGET_GEOMETRY_LOSS_WEIGHT
-                or config.get('operator_flow_contract') != OPERATOR_FLOW_CONTRACT
-                or config.get('operator_probe_step') != PROBE_STEP):
-            raise ValueError('constraint operator motion requires checkpoint v40 and its execution contract')
+    if model_config.get('model_profile') == 'ternary_local_compatibility_v1':
+        if version != 41 or config.get('local_compatibility_contract') != LOCAL_COMPATIBILITY_CONTRACT:
+            raise ValueError('local compatibility requires checkpoint v41 and its protected binary contract')
+        if config.get('expert_input_grad') is not False:
+            raise ValueError('local compatibility uses frozen, unconditioned binary experts')
+        obsolete = {'constraint_solver_contract', 'target_geometry_loss_weight',
+                    'operator_flow_contract', 'operator_probe_step'}
+        if obsolete.intersection(config):
+            raise ValueError('local compatibility cannot resume an old constraint/operator execution contract')
     if version >= 25:
         profile = model_config.get('model_profile')
         new_recipe = profile in MODEL_PROFILES[1:]
@@ -864,21 +865,14 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                                target_candidates=None, fullatom_targets=None):
         """One geometric objective for both full starts and reachable short starts."""
         captured = {}
-        geometry_losses = []
         for index, (t, dt) in enumerate(self.diffusion.reverse_times(ld['coords'], steps=steps, t_start=t_start)):
             if index == capture_index:
                 captured['recovery_state'] = tuple(value.detach() for value in (ligand, poi, body))
             output = yield ed, pd, ld, ligand, poi, body, t, dt, source, conditions
-            if getattr(self.model.trifuse, 'constraint_motion', False):
-                stages = output.get('geometry_stages', [output['target_geometry']])
-                geometry_losses.append(torch.stack([terminal_geometry_loss(
-                    stage, ed['coords'][0], pd['coords'][0],
-                    target_candidates if target_candidates is not None else target_ligand)
-                    for stage in stages]).mean())
             normalized = self.diffusion.normalized_predictions(output, t)
             velocities = self.diffusion.velocities(normalized, ed['coords'], pd['coords'])
-            ligand, poi, body = self.diffusion.apply_output(
-                ligand, poi, body, velocities, dt, ld, output)
+            ligand, poi, body = self.diffusion.differentiable_step(
+                ligand, poi, body, velocities, dt, ld)
         scales = self.diffusion.scales(ed['coords'], pd['coords'])
         if target_candidates is not None:
             with torch.no_grad():
@@ -912,9 +906,6 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             losses['loss_clash_geometry'] = steric
             total = total + self.steric_loss_weight * steric
         total = self.endpoint_loss_weight * total
-        if geometry_losses:
-            losses['loss_target_geometry'] = torch.stack(geometry_losses).mean()
-            total = total + TARGET_GEOMETRY_LOSS_WEIGHT * losses['loss_target_geometry']
         return {'loss_total': total, 'components': losses, 'native_interface_pairs': interface_pairs,
                 'predicted_ligand': ligand, 'predicted_poi': poi, **captured}
 
@@ -1134,11 +1125,8 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 'structure_loss_contract': 'dual_contacts025_vdw08_exclude123_v1' if self.structural_supervision else 'legacy',
                 'step_contract': 'fixed_training_steps_v1',
                 'data_partition': getattr(self, 'data_partition', None),
-                **({'constraint_solver_contract': CONSTRAINT_SOLVER_CONTRACT,
-                    'operator_flow_contract': OPERATOR_FLOW_CONTRACT,
-                    'operator_probe_step': PROBE_STEP,
-                    'target_geometry_loss_weight': TARGET_GEOMETRY_LOSS_WEIGHT}
-                   if getattr(self.model.trifuse, 'constraint_motion', False) else {}),
+                **({'local_compatibility_contract': LOCAL_COMPATIBILITY_CONTRACT}
+                   if self.model.trifuse.config.get('model_profile') == 'ternary_local_compatibility_v1' else {}),
                 'training_objective': self.training_objective,
                 'endpoint_loss_weight': self.endpoint_loss_weight,
                 'inference_steps': self.diffusion.inference_steps,

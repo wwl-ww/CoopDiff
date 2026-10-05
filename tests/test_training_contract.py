@@ -139,9 +139,10 @@ def test_consensus_builder_passes_only_active_model_dimensions():
             num_transformer_layers=args.num_transformer_layers,
             direct_ternary_motion=True,
             dropout=0., source_conditioning=False,
-            model_profile='ternary_constraints_v1', expert_scalar_dim=58, expert_film_dim=48, expert_vector_dim=20,
+            model_profile='ternary_local_compatibility_v1',
+            local_cutoff=8., local_mobility=.1, local_action_limit=.25,
         )
-        assert model.call_args.kwargs['expert_input_grad'] is True
+        assert model.call_args.kwargs['expert_input_grad'] is False
         assert result is model.return_value
         assert trained is trainer.return_value
         assert trainer.call_args.kwargs['activation_clamp_mode'] == 'irrep_norm'
@@ -166,7 +167,7 @@ def _endpoint_trainer_fixture(profile=None, inference_steps=3):
             super().__init__()
             self.trifuse = torch.nn.Module()
             self.trifuse.direct_ternary_motion = True
-            self.trifuse.constraint_motion = profile == 'ternary_constraints_v1'
+            self.expert_input_grad = profile != 'ternary_local_compatibility_v1'
             self.trifuse.config = {'direct_ternary_motion': True, 'node_dim': 4}
             if profile is not None:
                 self.trifuse.config = production_model_config(4, 4, 1, model_profile=profile)
@@ -180,11 +181,7 @@ def _endpoint_trainer_fixture(profile=None, inference_steps=3):
 
         def forward(self, *args, **kwargs):
             self.calls.append((float(kwargs['t_e3l']), kwargs['source']))
-            return {'target_geometry': [{
-                'distance': torch.cdist(ligand['coords'][0], e3[0]) / 10.,
-                'receiver_type': 2, 'anchor_type': 0,
-                'anchor_weights': torch.eye(len(e3[0]), dtype=e3.dtype)}],
-                'normalized_velocity': {
+            return {'normalized_velocity': {
                 'rigid_output_mode': 'independent_centroids_v1',
                 **({'torsion_update_mode': 'continuous_horizontal_v1'}
                    if profile == 'ternary_endpoint_v4' else {}),
@@ -196,7 +193,7 @@ def _endpoint_trainer_fixture(profile=None, inference_steps=3):
     model = Model()
     trainer = ConsensusTrainer(model, flow, device='cpu', ema_decay=.999 if profile else 0.)
     batch = {'e3_data': {'coords': e3}, 'poi_data': {'coords': poi}, 'ligand_data': ligand}
-    if profile in ('ternary_endpoint_v7', 'ternary_endpoint_v8', 'ternary_endpoint_v9', 'ternary_constraints_v1'):
+    if profile in ('ternary_endpoint_v7', 'ternary_endpoint_v8', 'ternary_endpoint_v9', 'ternary_local_compatibility_v1'):
         batch['fullatom_targets'] = {'e3': e3[0].clone(), 'poi': poi[0].clone()}
     initial = flow.path(ligand, poi, coupling, ligand['coords'].new_ones(1))[:3]
     override = {'initial_state': dict(zip(('ligand', 'poi', 'body_frame'), initial)),
@@ -607,7 +604,7 @@ def test_interface_checkpoint_preserves_batch_progress_and_rejects_loss_changes(
 def test_resume_builder_uses_saved_model_and_loss_recipe_not_current_defaults():
     from tricoopdiff.models.consensus import production_model_config
 
-    trainer, _, _ = _endpoint_trainer_fixture('ternary_constraints_v1')
+    trainer, _, _ = _endpoint_trainer_fixture('ternary_local_compatibility_v1')
     payload = trainer.checkpoint_payload()
     payload['model_config'] = production_model_config(32, 16, 2)
     payload['runtime_config']['steric_loss_weight'] = .05
@@ -624,6 +621,42 @@ def test_resume_builder_uses_saved_model_and_loss_recipe_not_current_defaults():
     assert builder.call_args.kwargs['steric_loss_weight'] == .05
     assert builder.call_args.kwargs['interface_loss_weight'] == .7
     assert args.resolved_model_config['dropout'] == 0
+
+
+def test_local_checkpoint_records_protected_binary_contract_and_rejects_old_execution():
+    import copy
+    from tricoopdiff.models.local_compatibility import LOCAL_COMPATIBILITY_CONTRACT
+    from tricoopdiff.train import validate_consensus_checkpoint
+
+    trainer, batch, coupling = _endpoint_trainer_fixture('ternary_local_compatibility_v1')
+    payload = trainer.checkpoint_payload()
+    runtime = payload['runtime_config']
+    assert payload['checkpoint_version'] == 41
+    assert runtime['local_compatibility_contract'] == LOCAL_COMPATIBILITY_CONTRACT
+    assert runtime['expert_input_grad'] is False
+    removed = ('constraint_solver_contract', 'target_geometry_loss_weight',
+               'operator_flow_contract', 'operator_probe_step')
+    assert not any(key in runtime for key in removed)
+    output = trainer.compute_loss(**batch, coupling_override=coupling, diagnostics=True)
+    assert 'loss_target_geometry' not in output['components']
+    output['loss_total'].backward()
+    assert torch.isfinite(trainer.model.trifuse.motion.grad).all()
+    for change in ('version', 'contract', 'conditioned_expert', *removed):
+        bad = copy.deepcopy(payload)
+        if change == 'version':
+            bad['checkpoint_version'] = 40
+        elif change == 'contract':
+            bad['runtime_config']['local_compatibility_contract'] = 'unknown'
+        elif change == 'conditioned_expert':
+            bad['runtime_config']['expert_input_grad'] = True
+        else:
+            bad['runtime_config'][change] = 'obsolete'
+        try:
+            validate_consensus_checkpoint(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'local checkpoint accepted incompatible {change}')
 
 
 def test_resume_rejects_changed_data_partition_before_loading_weights():
@@ -1274,7 +1307,7 @@ def test_v2_checkpoint_records_recipe_and_resumes_warmup_and_entry_parity():
     trainer, batch, coupling = _endpoint_trainer_fixture('ternary_endpoint_v2')
     trainer.train_step(**batch, coupling_override=coupling)
     payload = copy.deepcopy(trainer.checkpoint_payload())
-    assert payload['checkpoint_version'] == 40
+    assert payload['checkpoint_version'] == 41
     payload['checkpoint_version'] = 25  # Historical v2 weights retain their old recipe.
     assert payload['runtime_config']['ema_update_contract'] == 'optimizer_step_warmup_v1'
     assert payload['runtime_config']['near_target_supervision']['weight'] == .25
@@ -1376,7 +1409,7 @@ def test_production_entry_rejects_old_v2_training_recipe_without_reinterpretatio
         try:
             build_trainer(args, 'cpu', input_dim=4)
         except ValueError as error:
-            assert 'cannot resume historical motion heads' in str(error)
+            assert 'cannot resume an archived model profile' in str(error)
         else:
             raise AssertionError('production silently resumed the coupled v2 recipe')
 

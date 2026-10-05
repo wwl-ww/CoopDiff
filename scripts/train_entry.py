@@ -515,7 +515,7 @@ def main():
 
 def build_trainer(args, device, input_dim=None):
     """Build model, diffusion, and trainer."""
-    from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse, production_model_config
+    from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse, PRODUCTION_MODEL_PROFILE, production_model_config
     from tricoopdiff.models.expert import build_diffdock_expert
     from tricoopdiff.sdpi_flow import SDPIFlow
     from tricoopdiff.train import ConsensusTrainer
@@ -537,10 +537,7 @@ def build_trainer(args, device, input_dim=None):
 
     model_config = production_model_config(args.node_dim, input_dim,
                                            args.num_transformer_layers,
-                                           args.training_arm == 'C',
-                                           expert_scalar_dim=frozen_expert.node_scalar_dim,
-                                           expert_film_dim=frozen_expert.ns,
-                                           expert_vector_dim=frozen_expert.node_vector_dim)
+                                           args.training_arm == 'C')
     if args.resume:
         # Resume means reconstruct the saved architecture, not reinterpret it
         # using today's defaults. The trainer subsequently checks every runtime
@@ -551,8 +548,8 @@ def build_trainer(args, device, input_dim=None):
         if saved['runtime_config'].get('training_objective') != 'real_initialization_reachable_endpoint_v2':
             raise ValueError('historical checkpoints are inference/weight sources, not production resumes')
         model_config = dict(saved['model_config'])
-        if model_config.get('model_profile') != 'ternary_constraints_v1':
-            raise ValueError('model-4.5 cannot resume historical motion heads; use model-v4')
+        if model_config.get('model_profile') != PRODUCTION_MODEL_PROFILE:
+            raise ValueError('local compatibility cannot resume an archived model profile; start a new run')
         if model_config['input_dim'] != input_dim:
             raise ValueError('resume checkpoint input features do not match the data')
         for key, option, old_default in (('interface_loss_weight', '--interface-loss-weight', 0.),
@@ -576,7 +573,7 @@ def build_trainer(args, device, input_dim=None):
     args.expert_coordinate_grad, args.structural_supervision = coordinate_grad, structural
 
     model = ConsensusCoopDiff(frozen_expert, trifuse,
-                             expert_input_grad=True,
+                             expert_input_grad=False,
                              expert_coordinate_grad=coordinate_grad,
                              checkpoint_ternary=getattr(args, 'checkpoint_ternary', True))
 

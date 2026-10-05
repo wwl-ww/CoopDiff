@@ -12,6 +12,18 @@ import torch
 import numpy as np
 
 
+def test_current_model_build():
+    """The production build contains only the local compatibility parameters."""
+    from tricoopdiff.models.consensus import ConsensusFuse, PRODUCTION_MODEL_PROFILE
+    from tricoopdiff.models.local_compatibility import LocalCompatibilityCorrection
+    model = ConsensusFuse(node_dim=32, input_dim=16)
+    assert model.config['model_profile'] == PRODUCTION_MODEL_PROFILE == 'ternary_local_compatibility_v1'
+    assert isinstance(model.local_compatibility, LocalCompatibilityCorrection)
+    assert set(model._modules) == {'local_compatibility'}, 'a retired global trainable module remains in production'
+    assert all(parameter.requires_grad for parameter in model.parameters())
+    print(f"  [OK] Protected-binary model build: {sum(p.numel() for p in model.parameters()):,} trainable parameters")
+
+
 def test_trifuse_build():
     """TriFuse builds with correct output shapes."""
     from tricoopdiff.legacy.trifuse import TriFuse
@@ -596,33 +608,32 @@ def test_frozen_expert_features_preserve_scores_gradients_and_hook_cleanup():
 
 
 def test_integrated_experts_pack_both_branches_without_losing_ragged_identity():
-    """One 2B call preserves FiLM, scalar/vector rows, torsions and gradients."""
+    """Every trajectory reads two native scores, with no feature hook or FiLM."""
     from types import MethodType, SimpleNamespace
     from torch_geometric.data import HeteroData
     from tricoopdiff.models.consensus import ConsensusCoopDiff
 
     class Expert(torch.nn.Module):
-        ns, node_scalar_dim, node_vector_dim = 2, 2, 1
-
         def __init__(self):
             super().__init__()
             self.model = SimpleNamespace(no_torsion=False)
-            self.calls = 0
+            self.scale = torch.nn.Parameter(torch.tensor(1.))
+            self.logical_reads = []
 
-        def forward_features(self, graph, film=None, return_vectors=False):
-            self.calls += 1
-            positions = torch.cat((graph['ligand'].pos, graph['receptor'].pos))
-            scalars = positions[:, :2] * (1 + film[0][0]) + film[0][1]
+        def forward(self, graph):
+            self.logical_reads.append(graph.num_graphs)
+            positions = graph['ligand'].pos
             tr = positions.new_zeros(graph.num_graphs, 3).index_add(
-                0, graph['ligand'].batch, graph['ligand'].pos)
-            torsion = graph['ligand'].pos[graph['ligand'].edge_mask, 0]
-            return tr, tr * .1, torsion, scalars, positions[:, None]
+                0, graph['ligand'].batch, positions) * self.scale
+            torsion = positions[graph['ligand'].edge_mask, 0]
+            return tr, tr * .1, torsion
+
+        def forward_features(self, *args, **kwargs):
+            raise AssertionError('protected experts must not enter feature/FiLM hooks')
 
     fuse = torch.nn.Module()
-    fuse.endpoint_v2 = fuse.enhanced_conditions = fuse.refined_conditions = True
     fuse.integrated_conditions = True
-    fuse.config = {'expert_scalar_dim': 2, 'expert_film_dim': 2, 'expert_vector_dim': 1}
-    model = ConsensusCoopDiff(Expert(), fuse)
+    model = ConsensusCoopDiff(Expert(), fuse, expert_coordinate_grad=True)
     inputs, pairs = [], []
     torch.manual_seed(91)
     for case in range(2):
@@ -631,37 +642,38 @@ def test_integrated_experts_pack_both_branches_without_losing_ragged_identity():
             graph = HeteroData()
             for kind, count in (('ligand', 3 + case), ('receptor', 4 + case + branch)):
                 value = torch.randn(count, 3, requires_grad=True)
-                inputs.append(value)
+                if kind == 'ligand':
+                    inputs.append(value)
                 graph[kind].pos = value
                 graph[kind].batch = torch.zeros(count, dtype=torch.long)
             graph['ligand'].edge_mask = torch.arange(3 + case) <= case
             graph.num_graphs = 1
-            count = len(graph['ligand'].pos) + len(graph['receptor'].pos)
-            film = tuple(torch.randn(count, 2, requires_grad=True) for _ in range(2))
-            inputs.extend(film)
-            pair.append((graph, [film]))
+            pair.append((graph, None))
         pairs.append(pair)
 
     def trajectory(self, pair):
-        if self.trifuse.integrated_conditions:
-            return (yield pair)
-        return [(yield pair[0]), (yield pair[1])]
+        return (yield pair)
 
     model._forward_one = MethodType(trajectory, model)
-    requests = [{'pair': pair} for pair in pairs]
-    together = model.forward_many(requests)
-    assert model.expert.calls == 1, 'v9 must combine both independent expert branches'
-    fuse.integrated_conditions = False
-    model.expert.calls = 0
-    separate = model.forward_many(requests)
-    assert model.expert.calls == 2, 'older profiles must preserve their two-pass execution'
+    together = model.forward_many([{'pair': pair} for pair in pairs])
+    assert model.expert.logical_reads == [4], 'B=2 must issue exactly four logical native reads'
+    model.expert.logical_reads.clear()
+    separate = [model.forward_many([{'pair': pair}])[0] for pair in pairs]
+    assert model.expert.logical_reads == [2, 2], 'every step must issue exactly two native reads'
     flat = lambda results: [value for case in results for branch in case for value in branch]
     for actual, expected in zip(flat(together), flat(separate)):
-        assert torch.allclose(actual, expected), 'packed branch/node/FiLM ordering changed'
+        assert torch.allclose(actual, expected), 'packed branch or torsion order changed'
     gradients = [torch.autograd.grad(sum(value.square().sum() for value in flat(result)), inputs)
                  for result in (together, separate)]
     for actual, expected in zip(*gradients):
         assert torch.isfinite(actual).all() and torch.allclose(actual, expected, atol=1e-6)
+    assert not model.expert.scale.requires_grad and model.expert.scale.grad is None
+    try:
+        model._read_expert(pairs[0][0][0], film=torch.ones(1))
+    except ValueError as error:
+        assert 'unmodulated' in str(error)
+    else:
+        raise AssertionError('trainable FiLM was admitted into the protected expert')
 
 
 def test_failed_expert_policy_configuration_preserves_the_live_policy():
@@ -768,6 +780,7 @@ def test_deepternary_dockq_alignment():
 if __name__ == "__main__":
     print("=== TriCoopDiff Smoke Tests ===\n")
 
+    test_current_model_build()
     test_trifuse_build()
     test_trifuse_reads_geometry_and_preserves_rigid_invariance()
     test_trifuse_links_chemical_features_to_local_contacts()

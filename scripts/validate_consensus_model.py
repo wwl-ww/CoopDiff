@@ -20,7 +20,7 @@ from featurize_common import featurize_complex
 from train_entry import _load_index, _load_score_model_args, fullatom_targets
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.models.consensus import (
-    ConsensusCoopDiff, ConsensusFuse, CONSTRAINT_MODEL_PROFILE, production_model_config,
+    ConsensusCoopDiff, ConsensusFuse, PRODUCTION_MODEL_PROFILE, production_model_config,
 )
 from tricoopdiff.models.expert import build_diffdock_expert
 from tricoopdiff.runtime import atomic_json, configure_inference_reproducibility, evaluation_context
@@ -64,8 +64,7 @@ def main():
     expert = build_diffdock_expert(args.expert_model_dir, args.device)
     expert_snapshot = {name: value.detach().cpu().clone() for name, value in expert.state_dict().items()}
     fuse = ConsensusFuse(**production_model_config(args.node_dim, input_dim, 1,
-        model_profile=CONSTRAINT_MODEL_PROFILE, expert_scalar_dim=expert.node_scalar_dim,
-        expert_film_dim=expert.ns, expert_vector_dim=expert.node_vector_dim))
+        model_profile=PRODUCTION_MODEL_PROFILE))
     model = ConsensusCoopDiff(expert, fuse, checkpoint_ternary=True,
                              expert_coordinate_grad=args.expert_coordinate_grad).to(args.device)
     flow = SDPIFlow(inference_steps=20)
@@ -75,7 +74,7 @@ def main():
     ligand, poi, body, _ = initializer.initialize(ed['coords'][0], pd['coords'][0], ld, seed=73)
     fixed = {**batch, 'coupling_override': {'initial_state':
         dict(ligand=ligand, poi=poi, body_frame=body)}}
-    report = {'case': args.case, 'model_profile': CONSTRAINT_MODEL_PROFILE, 'seed': 73,
+    report = {'case': args.case, 'model_profile': PRODUCTION_MODEL_PROFILE, 'seed': 73,
               'expert_coordinate_grad': args.expert_coordinate_grad, 'quality_claim': False,
               'config': vars(args), 'training': []}
     for step in range(args.updates):
@@ -95,7 +94,7 @@ def main():
                                    device=args.device, return_trace=True)
     for name in ('ligand', 'poi'):
         assert np.allclose(prediction[name + '_coords'], expected['predicted_' + name][0].cpu().numpy(), atol=2e-4), \
-            'training and sampling must execute the same constraint velocities'
+            'training and sampling must execute the same local compatibility velocities'
     poi_final = torch.as_tensor(prediction['poi_coords'], device=pd['coords'].device)
     # Direct pair vectors avoid float32 cdist cancellation on translated bodies.
     before = torch.linalg.vector_norm(pd['coords'][0, :, None] - pd['coords'][0, None], dim=-1)

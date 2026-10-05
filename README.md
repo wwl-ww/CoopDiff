@@ -1,10 +1,12 @@
 # TriCoopDiff / BiTSeed
 
-`model-4.5` 分支以 `ternary_constraints_v1` 替换旧运动输出路径（checkpoint v38）：保留 v9 的冻结条件专家、三元编码、蛋白刚体和20步流更新，用单个观测结构监督终态界面距离，再以可微加权最小二乘联合求解刚体／共享 torsion 速度。训练默认使用新架构；须使用按原始聚类＋PDB合并后的无重叠索引，旧默认索引会被训练入口拒绝；旧模型对照与旧权重运行使用 `model-v4` worktree。实现与实验门槛见[模型与坐标契约](doc/TriCoopDiff%20模型架构图.md)。这是一版架构原型，不代表 DockQ 改善；尚未实现多模态接触模式生成或协同性自由能预测。
+`model-4.5`当前使用`ternary_local_compatibility_v1`（checkpoint v41）：未调制冻结二元专家提供固定基线，三元网络只学习共享装配状态上的局部兼容性代价，其梯度产生有界刚体／torsion修正。已删除FiLM、全局软锚点距离求解与双阶段控制主路径。训练保留聚类＋PDB无重叠划分、真实终点监督与EMA；旧权重需在历史worktree运行。见[模型与坐标契约](doc/TriCoopDiff%20模型架构图.md)。当前完成情况属于架构与执行验收，不代表验证集泛化提升。
 
-TriCoopDiff 研究蛋白–配体–蛋白三元装配：两个冻结 DiffDock 专家提供二元建议，残差共识模型协调双界面运动。BiTSeed 是在线初始化模块，不是精修模型或排序器。
+TriCoopDiff 研究蛋白–配体–蛋白三元装配：两个冻结 DiffDock 专家提供二元建议，局部兼容性修正协调双界面运动。BiTSeed 是在线初始化模块，不是精修模型或排序器。
 
 ## 当前研究状态
+
+以下候选池、ranking与PROTAC结果属于历史生产路线，不是v41的质量结果。
 
 候选池工作配置为 **192 BiTSeed + 64 SDPI**，从中选择 64 个初态交给 TriCoopDiff。该配置是对照基线，不是已证明的全局最优配置；selector 尚未冻结。候选生成、失败补位和 MGD94 审计见[初始化与实验协议](doc/BiTSeed-Hybrid在线初始化规格.md)。
 

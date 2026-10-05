@@ -230,9 +230,6 @@ def _sample_trajectory(
         else:
             step0_probe = None
         predicted = diffusion.normalized_predictions(out, t_tr)
-        if 'operator_update' in out and (freeze_poi or velocity_transform is not None
-                or translation_velocity_scale != 1. or rotation_velocity_scale != 1.):
-            raise ValueError('operator flow cannot apply post-hoc overrides to diagnostic mean velocities')
         velocities = diffusion.velocities(predicted, e3_data['coords'], poi_data['coords'])
         for branch in ('e3_ligand', 'poi_ligand'):
             velocities[branch]['tr'] = (
@@ -311,8 +308,7 @@ def _sample_trajectory(
                 "poi_e3_dist": float(torch.linalg.vector_norm(poi_com - e3_center[0]).item()),
                 # Flow records use physical velocity units, not DSM scores.
                 "prediction_units": "angstrom/time, radians/time",
-                "velocity_semantics": ("diagnostic_mean_of_executed_substeps"
-                                       if "operator_update" in out else "executed_velocity"),
+                "velocity_semantics": "executed_velocity",
                 # Keep the historical key for report compatibility; the value
                 # is the determinant of the inverse/body-frame rotation.
                 "r_cum_det": float(torch.det(r_e3_to_poi[0]).item()),
