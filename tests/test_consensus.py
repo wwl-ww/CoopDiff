@@ -742,8 +742,7 @@ def test_joint_point_jacobian_matches_actual_symmetric_update():
 
 def test_constraint_model_equivariance_backward_and_no_torsion():
     fuse, graph, proposals, state = fixture()
-    for head in (fuse.constraint_head.contact_head[-1], fuse.constraint_head.torsion_precision[-1],
-                 fuse.constraint_head.expert_precision):
+    for head in (fuse.constraint_head.contact_head[-1],):
         torch.nn.init.normal_(head.weight, std=.03)
     graph['node_coords'].requires_grad_()
     base = fuse(graph, proposals, state)
@@ -761,8 +760,7 @@ def test_constraint_model_equivariance_backward_and_no_torsion():
     loss = sum(values[name][key].square().sum() for name in ('e3_ligand', 'poi_ligand') for key in ('tr', 'rot'))
     (loss + values['torsion'].square().sum()).backward()
     assert torch.isfinite(graph['node_coords'].grad).all()
-    for module in (fuse.constraint_head.contact_head[-1], fuse.constraint_head.torsion_precision[-1],
-                   fuse.constraint_head.expert_precision, fuse.pooling.pair_updates[0][-1]):
+    for module in (fuse.constraint_head.contact_head[-1], fuse.pooling.pair_updates[0][-1]):
         assert module.weight.grad is not None and torch.isfinite(module.weight.grad).all()
         assert module.weight.grad.abs().sum() > 0, 'joint solver must train both constraints and their encoder'
     for branch in proposals.values():
@@ -783,14 +781,18 @@ def test_constraint_checkpoint_is_explicit_and_cannot_load_as_v9():
     # Validator-only payload: use the real profile and solver identity. Normal
     # training/inference save/load with native experts is checked by the smoke.
     payload = trainer.checkpoint_payload()
-    assert payload['runtime_config']['constraint_solver_contract'] == 'supervised_terminal_distance_v2'
+    assert payload['runtime_config']['constraint_solver_contract'] == 'terminal_geometry_repair_v3'
     validate_consensus_checkpoint(payload)
-    for mutation in ('version', 'contract'):
+    for mutation in ('version', 'contract', 'operator', 'probe'):
         invalid = copy.deepcopy(payload)
         if mutation == 'version':
-            invalid['checkpoint_version'] = 37
-        else:
+            invalid['checkpoint_version'] = 38
+        elif mutation == 'contract':
             invalid['runtime_config']['constraint_solver_contract'] = 'unknown'
+        elif mutation == 'operator':
+            invalid['runtime_config']['operator_flow_contract'] = 'unknown'
+        else:
+            invalid['runtime_config']['operator_probe_step'] = .05
         try:
             validate_consensus_checkpoint(invalid)
         except ValueError as error:
@@ -886,8 +888,8 @@ def test_target_geometry_does_not_consume_native_labels_and_has_no_free_torsion_
     loss = terminal_geometry_loss(baseline['target_geometry'], native[0], native[1], native[2][None])
     loss.backward()
     assert fuse.constraint_head.contact_head[-1].weight.grad.abs().sum() > 0
-    assert fuse.constraint_head.expert_precision.weight.grad is None, \
-        'reliability must not be able to reduce the terminal geometry supervision'
+    assert not hasattr(fuse.constraint_head, 'expert_precision')
+    assert not hasattr(fuse.constraint_head, 'torsion_precision')
 
 
 def test_uniform_reliability_changes_do_not_control_speed():
@@ -897,13 +899,158 @@ def test_uniform_reliability_changes_do_not_control_speed():
     # scale without changing the terminal distances or binary suggestions.
     with torch.no_grad():
         fuse.constraint_head.contact_head[-1].bias[1].fill_(2.)
-        fuse.constraint_head.expert_precision.bias.fill_(2.)
-        fuse.constraint_head.torsion_precision[-1].bias.fill_(2.)
     after = fuse(graph, proposals, state)['normalized_velocity']
     for branch in BRANCHES:
         for component in ('tr', 'rot'):
             assert torch.allclose(before[branch][component], after[branch][component], atol=1e-6)
     assert torch.allclose(before['torsion'], after['torsion'], atol=1e-6)
+
+
+
+def _operator_model_fixture(no_torsion=False):
+    from types import SimpleNamespace, MethodType
+    from tricoopdiff.models.consensus import ConsensusCoopDiff
+    fuse, graph, _, _ = fixture()
+    class Expert(torch.nn.Module):
+        node_scalar_dim, ns, node_vector_dim = 58, 48, 20
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(.1))
+            self.model = SimpleNamespace(no_torsion=no_torsion, dynamic_max_cross=False)
+        def forward_features(self, *args, **kwargs):
+            raise AssertionError('this fixture uses analytic packed expert reads')
+    model = ConsensusCoopDiff(Expert(), fuse)
+    records = []
+    def read_state(self, e3_data, poi_data, ligand_data, t_e3l, r_e3_to_poi=None,
+                   film_override=None, **kwargs):
+        coordinates = torch.cat((e3_data['coords'][0], poi_data['coords'][0], ligand_data['coords'][0]))
+        current = {**graph, 'node_coords': coordinates}
+        requests = [(receptor['coords'][0], ligand_data['coords'][0], film_override)
+                    for receptor in (e3_data, poi_data)]
+        metadata = [(name, torch.eye(3)) for name in BRANCHES]
+        outputs = yield requests, metadata, 'held_condition'
+        raw = {name: dict(zip(('tr', 'rot', 'tor'), values)) for name, values in zip(BRANCHES, outputs)}
+        proposals = self._conditioning.normalized_predictions(
+            {'interface_scores': raw, 'torsion_score': raw[BRANCHES[0]]['tor']}, t_e3l)
+        return current, proposals
+    def reads(self, requests):
+        records.append(requests)
+        outputs = []
+        for receptor, ligand, film in requests:
+            delta = ligand.mean(0) - receptor.mean(0)
+            tr = self.expert.scale * delta[None]
+            rot = torch.linalg.cross(delta, receptor[0] - receptor[-1])[None] * .01
+            tor = ligand.new_empty(1, 0) if no_torsion else (ligand[-1] - ligand[0]).square().sum().reshape(1, 1) * .03
+            outputs.append((tr, rot, tor))
+        return outputs
+    model._read_state = MethodType(read_state, model)
+    model._read_experts = MethodType(reads, model)
+    if no_torsion:
+        graph['lig_edge_mask'] = torch.zeros_like(graph['lig_edge_mask'])
+        graph['lig_mask_rotate'] = torch.empty(0, 4, dtype=torch.bool)
+    ed = {'coords': graph['node_coords'][None, :5]}
+    pd = {'coords': graph['node_coords'][None, 5:11]}
+    ld = {'coords': graph['node_coords'][None, 11:], 'edge_index': graph['lig_edge_index'],
+          'edge_mask': graph['lig_edge_mask'], 'mask_rotate': graph['lig_mask_rotate']}
+    return model, records, ed, pd, ld
+
+
+def test_operator_execution_rereads_actual_state_and_trains_controller():
+    model, records, ed, pd, ld = _operator_model_fixture()
+    flow = SDPIFlow()
+    body, time, dt = torch.eye(3)[None], torch.ones(1), torch.tensor([.1])
+    output = flow.forward_state(model, ed, pd, ld, ld['coords'], pd['coords'], body, time, dt)
+    assert len(records) == 3 and all(len(read) == 2 for read in records), 'six evaluations in three packed rounds'
+    assert all(request[2] == 'held_condition' for request in records[1]), 'probe conditioning must be held fixed'
+    middle_ligand = records[2][0][1]
+    assert not torch.allclose(middle_ligand, records[1][0][1])
+    assert not torch.allclose(middle_ligand, records[1][1][1]), 'second stage must reread the executed state, not a probe'
+    velocities = flow.velocities(output['normalized_velocity'], ed['coords'], pd['coords'])
+    actual = flow.apply_output(ld['coords'], pd['coords'], body, velocities, dt, ld, output)
+    collapsed = flow.differentiable_step(ld['coords'], pd['coords'], body, velocities, dt, ld)
+    assert any(not torch.allclose(x, y, atol=1e-6) for x, y in zip(actual, collapsed)), \
+        'ordered substeps were silently collapsed into one Euler step'
+    before = torch.cdist(pd['coords'][0], pd['coords'][0])
+    after = torch.cdist(actual[1][0], actual[1][0])
+    assert torch.allclose(before, after, atol=1e-5), 'operator composition broke protein rigidity'
+    loss = actual[0].square().mean() + actual[1].square().mean()
+    loss.backward()
+    for name, p in model.trifuse.operator_controller.named_parameters():
+        assert p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0, name
+    assert model.expert.scale.grad is None and not model.expert.scale.requires_grad
+    for wrong_dt, frozen in ((dt / 2, False), (dt, True)):
+        try:
+            flow.apply_output(ld['coords'], pd['coords'], body, velocities, wrong_dt, ld, output, frozen)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('operator execution silently changed its duration or freeze contract')
+
+
+def test_operator_flow_is_equivariant_and_supports_rigid_ligands():
+    for no_torsion in (False, True):
+        model, records, ed, pd, ld = _operator_model_fixture(no_torsion=no_torsion)
+        flow = SDPIFlow()
+        time, dt = torch.ones(1), torch.tensor([.05])
+        first = flow.forward_state(model, ed, pd, ld, ld['coords'], pd['coords'], torch.eye(3)[None], time, dt)
+        rotation = rotation_exp(torch.tensor([[.3, -.2, .4]]))[0]
+        moved = [{**data, 'coords': data['coords'] @ rotation.T + 7.} for data in (ed, pd, ld)]
+        second = flow.forward_state(model, *moved, moved[2]['coords'], moved[1]['coords'], torch.eye(3)[None], time, dt)
+        for a, b in zip(first['operator_update']['state'][:2], second['operator_update']['state'][:2]):
+            assert torch.allclose(a @ rotation.T + 7., b, atol=2e-4)
+        assert first['normalized_velocity']['torsion'].shape == (1, int(ld['edge_mask'].sum()))
+        for key in ('order', 'split', 'repair_first', 'repair_second'):
+            assert torch.allclose(first['consensus_diagnostics'][key], second['consensus_diagnostics'][key], atol=1e-5)
+
+
+def test_operator_policy_responds_to_cross_queries_and_has_smooth_gradients():
+    from tricoopdiff.models.operator_flow import OperatorController, response_invariants
+    torch.manual_seed(2)
+    base = [torch.randn(14, dtype=torch.double) for _ in range(2)]
+    cross = [value.clone().requires_grad_() for value in base]
+    assert torch.autograd.gradcheck(lambda a, b: response_invariants(base, [a, b]), tuple(cross))
+    policy = OperatorController(8).double()
+    inputs = torch.randn(1, 47, dtype=torch.double, requires_grad=True)
+    outputs = policy.policy(inputs)
+    gradient = torch.autograd.grad(outputs.square().sum(), inputs)[0]
+    assert gradient[:, 8:38].abs().sum() > 0, 'policy ignores cross-expert responses'
+    assert gradient[:, 38:].abs().sum() > 0, 'policy ignores predicted goal changes'
+
+
+def test_operator_durations_and_composition_match_finite_difference_gradients():
+    from test_sdpi_flow import fixture as flow_fixture
+    from tricoopdiff.models.operator_flow import advance, OperatorController
+    flow, ld, ed, pd, _ = flow_fixture()
+    state = (ld['coords'], pd, torch.eye(3, dtype=torch.double)[None])
+    scales = flow.scales(ed, pd)
+    torch.manual_seed(9)
+    fields = [torch.randn(12 + int(ld['edge_mask'].sum()), dtype=torch.double) * .1 for _ in range(2)]
+    repair = torch.randn_like(fields[0]) * .1
+    def execute(raw):
+        order, split, g1, g2 = raw.sigmoid()
+        split = .25 + .5 * split
+        first = OperatorController.blend(fields, repair, order, g1)
+        middle = advance(state, first, .05 * split, scales, ld)
+        # Smooth analytic response at the actual intermediate geometry.
+        refreshed = [v * (1 + .01 * middle[0].square().mean()) for v in fields]
+        second = OperatorController.blend(refreshed, repair, 1 - order, g2)
+        final = advance(middle, second, .05 * (1 - split), scales, ld)
+        return torch.cat([value.flatten() for value in final])
+    assert torch.autograd.gradcheck(execute, (torch.zeros(4, dtype=torch.double, requires_grad=True),), atol=1e-5)
+
+
+def test_operator_packed_trajectories_match_separate_execution():
+    model, records, ed, pd, ld = _operator_model_fixture()
+    flow = SDPIFlow()
+    q = (ed, pd, ld, ld['coords'], pd['coords'], torch.eye(3)[None], torch.ones(1), torch.tensor([.05]), 0, None)
+    other = (*q[:3], q[3] + 1.4, q[4] - .2, q[5], q[6] * .7, torch.tensor([.03]), *q[8:])
+    separate = [flow.forward_states(model, [value])[0] for value in (q, other)]
+    records.clear()
+    together = flow.forward_states(model, [q, other])
+    assert len(records) == 3 and all(len(round_) == 4 for round_ in records)
+    for actual, expected in zip(together, separate):
+        for a, b in zip(actual['operator_update']['state'], expected['operator_update']['state']):
+            assert torch.equal(a, b), 'packing mixed the base/probe/intermediate states of different trajectories'
 
 
 if __name__ == '__main__':

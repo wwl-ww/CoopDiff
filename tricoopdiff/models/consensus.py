@@ -1181,7 +1181,7 @@ class TorsionCoordinator(nn.Module):
 
 ARCHITECTURE = 'residual_consensus_v2'
 DIRECT_ARCHITECTURE = 'ternary_geometry_independent_v1'
-CONSENSUS_CHECKPOINT_VERSION = 38
+CONSENSUS_CHECKPOINT_VERSION = 39
 INTERFACE_OBJECTIVE_CHECKPOINT_VERSION = 22
 OBJECTIVE_CONTRACT_CHECKPOINT_VERSION = 21
 ENDPOINT_PROTOCOL_CHECKPOINT_VERSION = 20
@@ -1256,7 +1256,7 @@ def candidate_source_tensor(source, reference):
 
 
 class ConsensusFuse(nn.Module):
-    """One production architecture: frozen evidence and joint constraint motion.
+    """One production architecture: expert operators with geometry repair.
 
     Historical motion heads live on model-v4, not behind runtime switches here.
     Feature capability flags are consumed by the shared expert/flow executor.
@@ -1266,7 +1266,7 @@ class ConsensusFuse(nn.Module):
     direct_ternary_motion = True
     endpoint_v2 = continuous_torsion = symmetric_torsion = True
     mutual_experts = enhanced_conditions = refined_conditions = True
-    joint_conditions = integrated_conditions = constraint_motion = True
+    joint_conditions = integrated_conditions = constraint_motion = operator_flow = True
 
     def __init__(self, node_dim=128, input_dim=None, num_transformer_layers=3,
                  dropout=0., source_conditioning=False,
@@ -1305,10 +1305,10 @@ class ConsensusFuse(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 torch.random.default_generator.manual_seed(0)
                 self.source_embedding = nn.Embedding(len(SOURCE_NAMES), node_dim)
-        self.bond_context_encoder = BondContextEncoder(node_dim, chemical_context=True,
-                                                       phase_harmonics=3, symmetric=True)
         from tricoopdiff.models.constraint_motion import ConstraintMotionHead
         self.constraint_head = ConstraintMotionHead(node_dim)
+        from tricoopdiff.models.operator_flow import OperatorController
+        self.operator_controller = OperatorController(node_dim)
 
     @staticmethod
     def proposal_evidence(graph, proposals):
@@ -1417,11 +1417,7 @@ class ConsensusFuse(nn.Module):
                               pooled['ligand_tokens'][0].mean(0, keepdim=True), evidence,
                               pooled['protein_pair']), dim=1)
         context = self.transformer(tokens).mean(1)
-        bonds = self.bond_context_encoder(pooled['ligand_tokens'][0], coords[types == 2],
-            graph['lig_edge_index'], graph['lig_edge_mask'], graph['lig_mask_rotate'], context,
-            edge_attr=graph.get('lig_edge_attr'))
-        return self.constraint_head(pooled['joint_geometry'], graph, proposals, context,
-                                    opinions, bonds, diffusion_state)
+        return self.constraint_head(pooled['joint_geometry'], graph, proposals, context, diffusion_state)
 
 
 
@@ -1554,9 +1550,9 @@ class ConsensusCoopDiff(nn.Module):
                     results[index] = finished.value
         return results
 
-    def _forward_one(self, e3_data, poi_data, ligand_data, t_e3l, t_pol=None,
+    def _read_state(self, e3_data, poi_data, ligand_data, t_e3l, t_pol=None,
                 r_e3_to_poi=None, receptor_crop_cutoff=None, diffusion_state=None,
-                source=0, *, conditions=None):
+                source=0, *, conditions=None, film_override=None):
         if conditions is not None and not self.trifuse.supports_conditions:
             raise ValueError('legacy model cannot consume PROTAC conditions')
         if t_e3l.shape != (1,):
@@ -1586,7 +1582,9 @@ class ConsensusCoopDiff(nn.Module):
                 geometry.append(value[0].to(graph['node_features']))
             graph['protein_local_geometry'] = torch.cat(geometry)
         film_conditions = None
-        if getattr(self.trifuse, 'mutual_experts', False):
+        if film_override is not None:
+            film_conditions = film_override
+        elif getattr(self.trifuse, 'mutual_experts', False):
             # Do not retain all protein-pair attention/geometry intermediates
             # at every rollout time. Recompute the entire conditioning branch.
             film_conditions = (checkpoint(self.trifuse.expert_conditions, graph, diffusion_state,
@@ -1622,7 +1620,7 @@ class ConsensusCoopDiff(nn.Module):
             requests.append((graph, film))
             metadata.append((branch, rotation, crop, len(rec_pos), len(lig_pos)))
         integrated = getattr(self.trifuse, 'integrated_conditions', False)
-        packed_outputs = (yield requests) if integrated else None
+        packed_outputs = (yield (requests, metadata, film_conditions)) if integrated else None
         for index, (branch, rotation, crop, n_rec, n_lig) in enumerate(metadata):
             outputs = packed_outputs[index] if integrated else (yield requests[index])
             tr, rot, tor = outputs[:3]
@@ -1665,12 +1663,105 @@ class ConsensusCoopDiff(nn.Module):
             graph['expert_node_vectors'] = torch.cat((
                 torch.cat((a[1], torch.zeros_like(a[1])), 1),
                 torch.cat((torch.zeros_like(b[1]), b[1]), 1), torch.cat((a[0], b[0]), 1)), 0)
+        return graph, proposals
+
+    def _fuse_state(self, graph, proposals, diffusion_state, source, conditions):
         condition_kwargs = {'conditions': conditions} if conditions is not None else {}
         if self.checkpoint_ternary and self.training and torch.is_grad_enabled():
-            result = checkpoint(self.trifuse, graph, proposals, diffusion_state,
-                                source=source, use_reentrant=False, **condition_kwargs)
+            return checkpoint(self.trifuse, graph, proposals, diffusion_state,
+                              source=source, use_reentrant=False, **condition_kwargs)
+        return self.trifuse(graph, proposals, diffusion_state, source=source, **condition_kwargs)
+
+    def _forward_one(self, **request):
+        reader = self._read_state(**request)
+        prepared = next(reader)
+        integrated = getattr(self.trifuse, 'integrated_conditions', False)
+        if integrated:
+            reads, metadata, film = prepared
+            outputs = yield reads
+            try:
+                reader.send(outputs)
+            except StopIteration as finished:
+                graph, proposals = finished.value
         else:
-            result = self.trifuse(graph, proposals, diffusion_state, source=source, **condition_kwargs)
-        # Kept explicitly as diagnostic evidence, never consumed as another update.
+            # Historical mock/prototype executors retain their sequential reads.
+            while True:
+                outputs = yield prepared
+                try:
+                    prepared = reader.send(outputs)
+                except StopIteration as finished:
+                    graph, proposals = finished.value
+                    break
+        result = self._fuse_state(graph, proposals, request['diffusion_state'],
+                                  request.get('source', 0), request.get('conditions'))
         result['binary_proposals'] = proposals
+        if not getattr(self.trifuse, 'operator_flow', False):
+            return result
+        from tricoopdiff.models.operator_flow import (
+            OPERATOR_FLOW_CONTRACT, PROBE_STEP, EXPERT_EVALUATIONS_PER_STEP,
+            advance, lift_binary, pack_velocity, unpack_velocity,
+        )
+        e3 = request['e3_data']['coords']
+        ld = request['ligand_data']
+        state = (ld['coords'], request['poi_data']['coords'], request.get('r_e3_to_poi'))
+        if state[2] is None:
+            state = (*state[:2], torch.eye(3, device=e3.device, dtype=e3.dtype)[None])
+        clock = request['diffusion_state']
+        scales, dt = clock[0, [0, 3]].exp(), clock[0, 5].reshape(1)
+        base = [lift_binary(proposals[name], i, state, e3, scales) for i, name in enumerate(BRANCHES)]
+        probe_states = [advance(state, vector, dt.new_tensor([PROBE_STEP]), scales, ld) for vector in base]
+
+        def at_state(value):
+            ligand, poi, body = value
+            return {**request, 'ligand_data': {**ld, 'coords': ligand},
+                    'poi_data': {**request['poi_data'], 'coords': poi}, 'r_e3_to_poi': body}
+
+        # Hold FiLM and the expert noise clock fixed for the cross probes. Only
+        # geometry changes; cropped full-receptor node order is preserved.
+        probes = [self._read_state(**at_state(value), film_override=film) for value in probe_states]
+        prepared_probes = [next(probe) for probe in probes]
+        cross_outputs = yield [prepared_probes[0][0][1], prepared_probes[1][0][0]]
+        cross = [None, None]
+        for probe_index, branch in ((0, 1), (1, 0)):
+            rotation = prepared_probes[probe_index][1][branch][1]
+            tr, rot, tor = cross_outputs[probe_index][:3]
+            raw = {'tr': tr @ rotation.T, 'rot': rot @ rotation.T, 'tor': tor.reshape(1, -1)}
+            normalized = self._conditioning.normalized_predictions(
+                {'interface_scores': {name: raw for name in BRANCHES}, 'torsion_score': raw['tor']},
+                request['t_e3l'])[BRANCHES[branch]]
+            cross[branch] = lift_binary(normalized, branch, probe_states[probe_index], e3, scales)
+            probes[probe_index].close()
+        controls, evidence = self.trifuse.operator_controller(
+            result['rank_features'], base, cross, result['target_geometry'], (state, *probe_states), e3)
+        first = self.trifuse.operator_controller.blend(
+            base, unpack_velocity(result['normalized_velocity']), controls['order'], controls['repair_first'])
+        middle = advance(state, first, dt * controls['split'], scales, ld)
+        middle_request = at_state(middle)
+        middle_clock = clock.clone()
+        middle_clock[:, 5:8] = dt * (1 - controls['split'])
+        middle_request['diffusion_state'] = middle_clock
+        second_reader = self._read_state(**middle_request)
+        second_reads, _, _ = next(second_reader)
+        second_outputs = yield second_reads
+        try:
+            second_reader.send(second_outputs)
+        except StopIteration as finished:
+            middle_graph, middle_proposals = finished.value
+        middle_result = self._fuse_state(middle_graph, middle_proposals, middle_clock,
+                                         request.get('source', 0), request.get('conditions'))
+        refreshed = [lift_binary(middle_proposals[name], i, middle, e3, scales)
+                     for i, name in enumerate(BRANCHES)]
+        second = self.trifuse.operator_controller.blend(
+            refreshed, unpack_velocity(middle_result['normalized_velocity']),
+            1 - controls['order'], controls['repair_second'])
+        final = advance(middle, second, dt * (1 - controls['split']), scales, ld)
+        # Mean substep velocities are diagnostics only. Applying them as a
+        # single Euler update would discard the actual ordered composition.
+        result['normalized_velocity'] = pack_velocity(controls['split'] * first + (1 - controls['split']) * second)
+        result['operator_update'] = {'state': final, 'dt': dt, 'contract': OPERATOR_FLOW_CONTRACT}
+        result['geometry_stages'] = [result['target_geometry'], middle_result['target_geometry']]
+        result['consensus_diagnostics'].update(
+            operator_contract=OPERATOR_FLOW_CONTRACT, expert_evaluations=EXPERT_EVALUATIONS_PER_STEP,
+            probe_step=PROBE_STEP, response_feature_norm=evidence.norm().detach(),
+            **{key: value.detach() for key, value in controls.items()})
         return result

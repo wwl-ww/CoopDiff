@@ -1,4 +1,4 @@
-"""Joint binary-evidence / ternary-constraint velocity solve (model-4.5).
+"""Terminal-geometry repair velocity solve for the two-stage expert flow.
 
 All unknowns are normalized *forward-clock* velocities. The existing reverse
 integrator applies -dt. Proteins remain rigid; shared ligand torsions use the
@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 
-CONSTRAINT_SOLVER_CONTRACT = 'supervised_terminal_distance_v2'
+CONSTRAINT_SOLVER_CONTRACT = 'terminal_geometry_repair_v3'
 TARGET_GEOMETRY_LOSS_WEIGHT = 0.1
 DISTANCE_SCALE = 10.0  # Angstrom: distance-rate residual normalization.
 SOLVER_RIDGE = 0.01    # Isotropic in the normalized rigid/torsion coordinates.
@@ -147,7 +147,7 @@ def terminal_geometry_loss(predictions, e3, poi, ligand_candidates):
 
 
 class ConstraintMotionHead(nn.Module):
-    """Predict terminal distances and relative weights, then solve all DOFs.
+    """Predict terminal geometry and solve a repair field, without expert fusion.
 
     All three interfaces have equal total potential precision, independent of
     residue counts. Geometry-selected hard contacts are deliberately avoided.
@@ -158,18 +158,12 @@ class ConstraintMotionHead(nn.Module):
         self.contact_head = nn.Sequential(
             nn.LayerNorm(4 * hidden_dim + 4), nn.Linear(4 * hidden_dim + 4, hidden_dim),
             nn.SiLU(), nn.Linear(hidden_dim, 2))
-        self.expert_precision = nn.Linear(hidden_dim + 14, 4)
-        self.torsion_precision = nn.Sequential(nn.Linear(hidden_dim + 2, hidden_dim),
-                                               nn.SiLU(), nn.Linear(hidden_dim, 2))
-        for head in (self.contact_head[-1], self.expert_precision, self.torsion_precision[-1]):
-            nn.init.zeros_(head.weight)
-            nn.init.zeros_(head.bias)
+        nn.init.zeros_(self.contact_head[-1].weight)
+        nn.init.zeros_(self.contact_head[-1].bias)
         with torch.no_grad():
             self.contact_head[-1].bias[1] = -2.
-            self.expert_precision.bias.fill_(-2.)
-            self.torsion_precision[-1].bias.fill_(-2.)
 
-    def forward(self, joint, graph, proposals, context, evidence, bonds, diffusion_state):
+    def forward(self, joint, graph, proposals, context, diffusion_state):
         coords, types = graph['node_coords'], graph['node_types']
         centers = torch.stack([coords[types == i].mean(0) for i in range(3)])
         scales = diffusion_state[0, [0, 3]].exp()
@@ -215,21 +209,6 @@ class ConstraintMotionHead(nn.Module):
             targets.append(terminal_distance_rate(distance, predicted_distance,
                                                   diffusion_state[0, -1]).reshape(-1))
             weights.append((.001 + values[..., 1].sigmoid()).reshape(-1) / (len(left) * len(right)))
-        a_map, b_map = binary_rigid_maps(centers, scales, width)
-        precision = .001 + self.expert_precision(torch.cat((context, evidence), -1))[0].sigmoid()
-        from tricoopdiff.models.consensus import bounded_vector
-        for index, (name, mapping) in enumerate(zip(('e3_ligand', 'poi_ligand'), (a_map, b_map))):
-            matrices.append(mapping)
-            targets.append(torch.cat([bounded_vector(proposals[name][key])[0] for key in ('tr', 'rot')]))
-            weights.append(precision[index * 2:index * 2 + 2].repeat_interleave(3) / 3.)
-        if count:
-            values = self.torsion_precision(torch.cat((bonds[0], torch.stack((tor_a.tanh(), tor_b.tanh()), -1)), -1))
-            mapping = coords.new_zeros(count, width)
-            mapping[:, 12:] = torch.eye(count, device=coords.device, dtype=coords.dtype)
-            for index, target in enumerate((tor_a.tanh(), tor_b.tanh())):
-                matrices.append(mapping)
-                targets.append(target)
-                weights.append((.001 + values[:, index].sigmoid()) / count)
         relative_weights = torch.cat(weights)
         total_weight = relative_weights.sum()
         relative_weights = relative_weights / total_weight
@@ -247,7 +226,6 @@ class ConstraintMotionHead(nn.Module):
                 'target_geometry': geometry_predictions,
                 'residual_penalty': context.new_zeros(()),
                 'consensus_diagnostics': {**diagnostics, 'constraint_solver': CONSTRAINT_SOLVER_CONTRACT,
-                    'binary_precisions': (precision / total_weight).detach(),
                     'interface_precisions': (torch.stack([w.sum() for w in weights[:3]]) / total_weight).detach(),
                     'solved_dofs': width,
                     'constraint_rows': sum(len(value) for value in targets)}}

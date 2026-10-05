@@ -156,6 +156,10 @@ class SDPIFlow:
 
     @staticmethod
     def _validate_output(model, output):
+        if getattr(getattr(model, 'trifuse', None), 'operator_flow', False):
+            from tricoopdiff.models.operator_flow import OPERATOR_FLOW_CONTRACT
+            if output.get('operator_update', {}).get('contract') != OPERATOR_FLOW_CONTRACT:
+                raise ValueError('operator model must return its executed two-stage update')
         if (getattr(getattr(model, 'trifuse', None), 'direct_ternary_motion', False)
                 and output.get('normalized_velocity', {}).get('rigid_output_mode')
                 != INDEPENDENT_RIGID_MODE):
@@ -179,6 +183,23 @@ class SDPIFlow:
         return torch.cat((torch.log(torch.stack((
             scales[0].expand_as(t), rot, tor, scales[1].expand_as(t), rot,
         ), dim=-1)), dt.reshape(-1, 1).expand(-1, 3), t.unsqueeze(-1)), dim=-1)
+
+    @staticmethod
+    def apply_output(ligand, poi, body, velocities, dt, ligand_data, output, freeze_poi=False):
+        """Shared training/sampling execution; never collapse operator substeps."""
+        update = output.get('operator_update')
+        if update is None:
+            return SDPIFlow.differentiable_step(ligand, poi, body, velocities, dt, ligand_data, freeze_poi)
+        from tricoopdiff.models.operator_flow import OPERATOR_FLOW_CONTRACT
+        if freeze_poi or update.get('contract') != OPERATOR_FLOW_CONTRACT:
+            raise ValueError('operator execution requires its rigid-body contract without freeze_poi')
+        if not torch.equal(update['dt'], dt):
+            raise ValueError('operator update was computed for a different step duration')
+        result = update['state']
+        if len(result) != 3 or any(value.shape != reference.shape or not torch.isfinite(value).all()
+                                   for value, reference in zip(result, (ligand, poi, body))):
+            raise ValueError('operator update contains an invalid rigid/torsion state')
+        return result
 
     def normalized_predictions(self, output, t):
         """Convert pretrained score units to dimensionless velocity outputs.
