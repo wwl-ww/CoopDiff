@@ -135,7 +135,7 @@ def test_joint_cluster_intersection_merges_relations_and_excludes_pdbs():
 
 def test_cluster_split_is_deterministic_and_disjoint():
     clusters = [
-        {'representative': [f'case_{i}'], 'items': [f'case_{i}']}
+        {'representative': [f'{i:04d}_A_B_L'], 'items': [f'{i:04d}_A_B_L']}
         for i in range(10)
     ]
     train_a, val_a = make_deepternary_index.split_clusters(clusters, 0.2, 7)
@@ -155,6 +155,34 @@ def test_written_index_preserves_explicit_split_label(tmp_path):
     import json
     payload = json.loads(destination.read_text(encoding='utf-8'))
     assert payload['metadata']['split'] == 'val'
+
+
+def test_pdb_groups_preserve_transitive_source_clusters():
+    clusters = [
+        {'items': ['1ABC_A_B_L', '2ABC_A_B_L'], 'representative': ['2ABC_A_B_L']},
+        {'items': ['1abc_C_D_L', '3ABC_A_B_L'], 'representative': []},
+        {'items': ['4ABC_A_B_L'], 'representative': []},
+    ]
+    train, val = make_deepternary_index.split_clusters(clusters, .5, 0)
+    assert sorted(len(c['items']) for c in train + val) == [1, 4]
+    payloads = [{'entries': [{'case': c} for c in make_deepternary_index.cluster_members(groups)],
+                 'clusters': groups} for groups in (train, val)]
+    report = make_deepternary_index.audit_partition(*payloads, source_clusters=clusters)
+    assert report['pdb_overlap'] == 0 and report['source_clusters_checked'] == 3
+
+
+def test_partition_gate_rejects_pdb_and_source_cluster_leakage():
+    left = {'entries': [{'case': '1ABC_A_B_L'}]}
+    for right_case, sources, expected in (
+            ('1abc_C_D_L', [], 'PDB overlap'),
+            ('2ABC_A_B_L', [{'items': ['1ABC_A_B_L', '2ABC_A_B_L']}], 'published cluster')):
+        try:
+            make_deepternary_index.audit_partition(
+                left, {'entries': [{'case': right_case}]}, source_clusters=sources)
+        except ValueError as error:
+            assert expected in str(error)
+        else:
+            raise AssertionError('leaking partitions were accepted')
 
 
 def test_repository_joint_pool_contract():

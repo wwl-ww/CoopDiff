@@ -1,6 +1,6 @@
 # 数据与指标协议
 
-更新：2026-09-15。区分历史训练池设计、具体 checkpoint 的训练来源和当前开发评估；三者不能互相替代。
+更新：2026-10-05。区分历史训练池设计、具体 checkpoint 的训练来源和当前开发评估；三者不能互相替代。
 
 ## 训练池与内部验证
 
@@ -9,6 +9,17 @@
 这些是原索引设计，不是所有已训练权重的实际数据。历史 train/val 曾发现 **83 个同 PDB 重叠**：cluster-disjoint 不自动保证 PDB-disjoint。生成或接收索引时检查成员、显式 split 标签、PDB 交集、benchmark 排除、输入可解析性及内容哈希；不要仅凭 7,198/653 计数放行。
 
 内部验证用于 checkpoint、时间步、筛选阈值和来源比例选择。固定路径验证不等于未见结构验证；少量 cluster smoke 不代表完整验证集。MGD94 已用于开发消融，PROTAC22 也已用于协议比较，不能再称完全未触碰测试集，更不能用于 selector 监督训练。
+
+## model-4.5 数据修复
+
+当前共享旧索引实测存在83个同PDB交集。新索引在保留两个官方来源聚类关系的基础上，
+传递合并同PDB成员后再划分；不移动或改写共享结构文件。
+复现：`python scripts/make_deepternary_index.py --reuse-index data/ternary_train.json data/ternary_val.json --index-dir results/model45_partition`。
+得到训练6705例、验证382例，总数7087不变，111个已有不支持配体排除不变。
+原始653个合并簇进一步合为491个PDB连接组；材料化后训练441组、验证49组，
+另1组全部成员属于既有配体排除。审计PDB重叠为0，原始两个来源1985个聚类无跨划分成员。
+完整指纹见`results/model45_partition/partition_audit.json`；生产训练启动和resume执行隔离与指纹检查。
+这不代表重新完成全体蛋白序列同源聚类。旧三元权重见过部分新验证成员，不能用作干净验证对照。
 
 ## 联合训练来源
 

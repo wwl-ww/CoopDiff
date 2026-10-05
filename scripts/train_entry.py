@@ -255,6 +255,8 @@ def append_metric(output_dir, payload):
 
 def main():
     args = parse_args()
+    from make_deepternary_index import audit_index_files
+    args.data_partition = audit_index_files(args.train_data, args.val_data)
     args.generative_process = 'sdpi_flow_v1'
     if args.nan_clamp <= 0:
         raise SystemExit("FATAL: --nan-clamp must be positive")
@@ -324,6 +326,7 @@ def main():
     # ----------------------------------------------------------------
     print("[1/6] Building model...")
     model, diffusion, trainer = build_trainer(args, device, input_dim=input_dim)
+    trainer.data_partition = args.data_partition
     print(f"  Model profile: production | "
           f"dropout={args.resolved_model_config['dropout'] if 'dropout' in args.resolved_model_config else .1:g}")
     # Include resolved resume/profile settings, not defaults that were ignored.

@@ -180,7 +180,11 @@ def _endpoint_trainer_fixture(profile=None, inference_steps=3):
 
         def forward(self, *args, **kwargs):
             self.calls.append((float(kwargs['t_e3l']), kwargs['source']))
-            return {'normalized_velocity': {
+            return {'target_geometry': [{
+                'distance': torch.cdist(ligand['coords'][0], e3[0]) / 10.,
+                'receiver_type': 2, 'anchor_type': 0,
+                'anchor_weights': torch.eye(len(e3[0]), dtype=e3.dtype)}],
+                'normalized_velocity': {
                 'rigid_output_mode': 'independent_centroids_v1',
                 **({'torsion_update_mode': 'continuous_horizontal_v1'}
                    if profile == 'ternary_endpoint_v4' else {}),
@@ -622,6 +626,22 @@ def test_resume_builder_uses_saved_model_and_loss_recipe_not_current_defaults():
     assert args.resolved_model_config['dropout'] == 0
 
 
+def test_resume_rejects_changed_data_partition_before_loading_weights():
+    trainer, _, _ = _endpoint_trainer_fixture()
+    trainer.data_partition = {'train_sha256': 'original', 'validation_sha256': 'held_out'}
+    payload = trainer.checkpoint_payload()
+    trainer.data_partition = {'train_sha256': 'changed', 'validation_sha256': 'held_out'}
+    before = trainer.model.trifuse.motion.detach().clone()
+    with patch('tricoopdiff.train.torch.load', return_value=payload):
+        try:
+            trainer.load_checkpoint('unused.pt')
+        except ValueError as error:
+            assert 'data partition differs' in str(error)
+        else:
+            raise AssertionError('resume silently changed its dataset')
+    assert torch.equal(before, trainer.model.trifuse.motion)
+
+
 def test_terminal_interface_supervision_is_zero_at_native_and_penalizes_errors():
     from tricoopdiff.train import terminal_interface_losses
 
@@ -1048,6 +1068,7 @@ def test_training_entry_keeps_dockq_best_separate_from_loss_best():
         args.resolved_model_config = {'dropout': 0.}
         with patch.dict(os.environ, {}, clear=False), \
                 patch('train_entry.parse_args', return_value=args), \
+                patch('make_deepternary_index.audit_index_files', return_value={}), \
                 patch('train_entry._load_entries', return_value=[entry]), \
                 patch('train_entry._load_score_model_args', return_value=SimpleNamespace()), \
                 patch('train_entry.featurize_complex', return_value=(None, None, None, 16)), \
@@ -1253,7 +1274,7 @@ def test_v2_checkpoint_records_recipe_and_resumes_warmup_and_entry_parity():
     trainer, batch, coupling = _endpoint_trainer_fixture('ternary_endpoint_v2')
     trainer.train_step(**batch, coupling_override=coupling)
     payload = copy.deepcopy(trainer.checkpoint_payload())
-    assert payload['checkpoint_version'] == 37
+    assert payload['checkpoint_version'] == 38
     payload['checkpoint_version'] = 25  # Historical v2 weights retain their old recipe.
     assert payload['runtime_config']['ema_update_contract'] == 'optimizer_step_warmup_v1'
     assert payload['runtime_config']['near_target_supervision']['weight'] == .25

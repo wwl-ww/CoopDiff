@@ -742,7 +742,7 @@ def test_joint_point_jacobian_matches_actual_symmetric_update():
 
 def test_constraint_model_equivariance_backward_and_no_torsion():
     fuse, graph, proposals, state = fixture()
-    for head in (fuse.constraint_head.contact_head[-1], fuse.constraint_head.torsion_head[-1],
+    for head in (fuse.constraint_head.contact_head[-1], fuse.constraint_head.torsion_precision[-1],
                  fuse.constraint_head.expert_precision):
         torch.nn.init.normal_(head.weight, std=.03)
     graph['node_coords'].requires_grad_()
@@ -761,7 +761,7 @@ def test_constraint_model_equivariance_backward_and_no_torsion():
     loss = sum(values[name][key].square().sum() for name in ('e3_ligand', 'poi_ligand') for key in ('tr', 'rot'))
     (loss + values['torsion'].square().sum()).backward()
     assert torch.isfinite(graph['node_coords'].grad).all()
-    for module in (fuse.constraint_head.contact_head[-1], fuse.constraint_head.torsion_head[-1],
+    for module in (fuse.constraint_head.contact_head[-1], fuse.constraint_head.torsion_precision[-1],
                    fuse.constraint_head.expert_precision, fuse.pooling.pair_updates[0][-1]):
         assert module.weight.grad is not None and torch.isfinite(module.weight.grad).all()
         assert module.weight.grad.abs().sum() > 0, 'joint solver must train both constraints and their encoder'
@@ -783,12 +783,12 @@ def test_constraint_checkpoint_is_explicit_and_cannot_load_as_v9():
     # Validator-only payload: use the real profile and solver identity. Normal
     # training/inference save/load with native experts is checked by the smoke.
     payload = trainer.checkpoint_payload()
-    assert payload['runtime_config']['constraint_solver_contract'] == 'joint_distance_velocity_v1'
+    assert payload['runtime_config']['constraint_solver_contract'] == 'supervised_terminal_distance_v2'
     validate_consensus_checkpoint(payload)
     for mutation in ('version', 'contract'):
         invalid = copy.deepcopy(payload)
         if mutation == 'version':
-            invalid['checkpoint_version'] = 36
+            invalid['checkpoint_version'] = 37
         else:
             invalid['runtime_config']['constraint_solver_contract'] = 'unknown'
         try:
@@ -831,6 +831,79 @@ def test_constraint_motion_has_no_train_eval_drift():
         for component in ('tr', 'rot'):
             assert torch.equal(a[branch][component], b[branch][component])
     assert torch.equal(a['torsion'], b['torsion'])
+
+
+def test_terminal_distance_controller_corrects_both_signs_and_stops_at_goal():
+    from tricoopdiff.models.constraint_motion import terminal_distance_rate
+    current = torch.tensor([.5, 1., 2.])
+    goal = torch.ones(3)
+    for time in (0., .05, .5, 1.):
+        rate = terminal_distance_rate(current, goal, torch.tensor(time))
+        after = current - .05 * rate
+        assert rate[0] < 0 and rate[1] == 0 and rate[2] > 0
+        assert torch.all((after - goal).abs() <= (current - goal).abs())
+        assert rate.abs().max() <= 2. and torch.isfinite(rate).all()
+
+
+def test_terminal_geometry_supervision_respects_symmetry_and_stops_target_gradients():
+    from tricoopdiff.models.constraint_motion import terminal_geometry_loss
+    e3 = torch.tensor([[0., 0., 0.], [0., 4., 0.]], requires_grad=True)
+    poi = torch.tensor([[4., 0., 0.], [4., 4., 0.]], requires_grad=True)
+    ligand = torch.tensor([[1., 1., 1.], [2., 2., 2.]], requires_grad=True)
+    targets = (e3, poi, ligand)
+    predictions = []
+    for left, right in ((2, 0), (2, 1), (1, 0)):
+        delta = targets[left][:, None] - targets[right][None]
+        distance = (delta.square().sum(-1) + .01).sqrt().detach() / 10.
+        predictions.append({'distance': distance.requires_grad_(), 'receiver_type': left,
+                            'anchor_type': right, 'anchor_weights': torch.eye(2, requires_grad=True)})
+    candidates = torch.stack((ligand.flip(0), ligand))
+    assert terminal_geometry_loss(predictions, e3, poi, candidates) == 0
+    perturbed = [{**p, 'distance': p['distance'] + .3} for p in predictions]
+    loss = terminal_geometry_loss(perturbed, e3, poi, candidates)
+    assert loss > 0
+    loss.backward()
+    assert all(p['distance'].grad is not None and p['distance'].grad.abs().sum() > 0 for p in predictions)
+    assert all(p['anchor_weights'].grad is None for p in predictions)
+    assert all(p.grad is None for p in targets), 'teacher structure must never receive model gradients'
+    rotation = rotation_exp(torch.tensor([[.2, -.4, .1]]))[0]
+    moved_loss = terminal_geometry_loss(perturbed, e3 @ rotation.T + 7.,
+        poi @ rotation.T + 7., candidates @ rotation.T + 7.)
+    assert torch.allclose(loss, moved_loss, atol=1e-7)
+
+
+def test_target_geometry_does_not_consume_native_labels_and_has_no_free_torsion_head():
+    from tricoopdiff.models.constraint_motion import terminal_geometry_loss
+    fuse, graph, proposals, state = fixture()
+    assert not hasattr(fuse.constraint_head, 'torsion_head')
+    baseline = fuse(graph, proposals, state)
+    poisoned = fuse({**graph, 'native_coords': torch.full_like(graph['node_coords'], float('nan'))},
+                    proposals, state)
+    for left, right in zip(baseline['target_geometry'], poisoned['target_geometry']):
+        assert torch.equal(left['distance'], right['distance'])
+        assert not left['anchor_weights'].requires_grad
+    native = [graph['node_coords'][graph['node_types'] == kind] for kind in range(3)]
+    loss = terminal_geometry_loss(baseline['target_geometry'], native[0], native[1], native[2][None])
+    loss.backward()
+    assert fuse.constraint_head.contact_head[-1].weight.grad.abs().sum() > 0
+    assert fuse.constraint_head.expert_precision.weight.grad is None, \
+        'reliability must not be able to reduce the terminal geometry supervision'
+
+
+def test_uniform_reliability_changes_do_not_control_speed():
+    fuse, graph, proposals, state = fixture()
+    before = fuse(graph, proposals, state)['normalized_velocity']
+    # All reliability logits are initialized identically. Change their common
+    # scale without changing the terminal distances or binary suggestions.
+    with torch.no_grad():
+        fuse.constraint_head.contact_head[-1].bias[1].fill_(2.)
+        fuse.constraint_head.expert_precision.bias.fill_(2.)
+        fuse.constraint_head.torsion_precision[-1].bias.fill_(2.)
+    after = fuse(graph, proposals, state)['normalized_velocity']
+    for branch in BRANCHES:
+        for component in ('tr', 'rot'):
+            assert torch.allclose(before[branch][component], after[branch][component], atol=1e-6)
+    assert torch.allclose(before['torsion'], after['torsion'], atol=1e-6)
 
 
 if __name__ == '__main__':

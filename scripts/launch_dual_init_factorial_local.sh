@@ -9,6 +9,7 @@ if [[ $# -lt 3 || $# -gt 4 ]]; then
 fi
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ASSET_ROOT="${4:-$PROJECT_ROOT}"
+PARTITION_DIR="${PARTITION_DIR:-$PROJECT_ROOT/results/model45_partition}"
 PYTHON_BIN="${PYTHON_BIN:-/home/wl/micromamba/envs/tricoopdiff/bin/python}"
 ARMS=(A1 B C)
 GPUS=("$1" "$2" "$3")
@@ -18,8 +19,10 @@ if [[ "${GPUS[0]}" == "${GPUS[1]}" || "${GPUS[0]}" == "${GPUS[2]}" \
     echo "FATAL: A1/B/C require three distinct GPU IDs" >&2
     exit 2
 fi
-mkdir -p "$PROJECT_ROOT/logs" "$PROJECT_ROOT/results/dual_init"
 cd "$PROJECT_ROOT"
+"$PYTHON_BIN" -c 'import sys; sys.path.insert(0, "scripts"); from make_deepternary_index import audit_index_files; print(audit_index_files(sys.argv[1], sys.argv[2]))' \
+    "$PARTITION_DIR/ternary_train.json" "$PARTITION_DIR/ternary_val.json"
+mkdir -p "$PROJECT_ROOT/logs" "$PROJECT_ROOT/results/dual_init"
 
 for INDEX in 0 1 2; do
     ARM="${ARMS[$INDEX]}"
@@ -32,8 +35,8 @@ for INDEX in 0 1 2; do
         exit 2
     fi
     nohup env CUDA_VISIBLE_DEVICES="$GPU_ID" "$PYTHON_BIN" scripts/train_entry.py \
-        --train_data "$ASSET_ROOT/data/ternary_train.json" \
-        --val_data "$ASSET_ROOT/data/ternary_val.json" \
+        --train_data "$PARTITION_DIR/ternary_train.json" \
+        --val_data "$PARTITION_DIR/ternary_val.json" \
         --output_dir "$OUTPUT" \
         --training-arm "$ARM" \
         --no-random-flip-proteins \

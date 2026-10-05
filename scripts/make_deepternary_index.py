@@ -10,6 +10,7 @@ are merged, then a deterministic cluster-level train/validation split is made.
 """
 
 import argparse
+import hashlib
 import json
 import random
 from pathlib import Path
@@ -84,18 +85,106 @@ def merge_cluster_intersection(cluster_sets, excluded_pdb_ids=()):
 
 
 def split_clusters(clusters, validation_fraction=0.1, seed=0):
-    """Make a deterministic cluster-level split without member leakage."""
+    """Split connected published-cluster/PDB groups, never individual cases."""
     if not 0 < validation_fraction < 1:
         raise ValueError('validation_fraction must be between 0 and 1')
+    clusters = merge_pdb_groups(clusters)
+    if len(clusters) < 2:
+        raise ValueError('at least two independent groups are required for a split')
     order = list(range(len(clusters)))
     random.Random(seed).shuffle(order)
-    n_validation = max(1, round(len(clusters) * validation_fraction))
+    n_validation = min(len(clusters) - 1, max(1, round(len(clusters) * validation_fraction)))
     validation_ids = set(order[:n_validation])
     train = [cluster for index, cluster in enumerate(clusters)
              if index not in validation_ids]
     validation = [cluster for index, cluster in enumerate(clusters)
                   if index in validation_ids]
     return train, validation
+
+
+def merge_pdb_groups(clusters):
+    """Transitively preserve source clusters and unite cases from the same PDB."""
+    members = sorted(cluster_members(clusters))
+    groups = UnionFind(members)
+    by_pdb, representatives = {}, set()
+    for cluster in clusters:
+        items = cluster['items']
+        representatives.update(cluster.get('representative', []))
+        for case in items:
+            groups.union(items[0], case)
+            previous = by_pdb.setdefault(case_pdb_id(case), case)
+            groups.union(previous, case)
+    components = {}
+    for case in members:
+        components.setdefault(groups.find(case), []).append(case)
+    return sorted([{'items': items,
+                    'representative': sorted(set(items) & representatives) or items[:1]}
+                   for items in components.values()], key=lambda c: c['items'][0])
+
+
+def audit_partition(train, validation, source_clusters=()):
+    """Fail closed on duplicate cases, PDB overlap or split source clusters."""
+    case_sets = []
+    for split, payload in zip(('train', 'val'), (train, validation)):
+        if payload.get('metadata', {}).get('split', split) != split:
+            raise ValueError('index split label disagrees with its training/validation role')
+        entries = payload['entries']
+        cases = {entry['case'] for entry in entries}
+        if not cases or len(cases) != len(entries):
+            raise ValueError('index is empty or contains duplicate case IDs')
+        excluded = set(payload.get('metadata', {}).get('excluded_benchmark_pdb_ids', []))
+        if {case_pdb_id(case) for case in cases} & excluded:
+            raise ValueError('benchmark PDB found in training/validation pool')
+        case_sets.append(cases)
+    left, right = case_sets
+    overlap = {case_pdb_id(c) for c in left} & {case_pdb_id(c) for c in right}
+    if overlap:
+        raise ValueError(f'train/validation PDB overlap: {len(overlap)} IDs; {sorted(overlap)[:8]}')
+    clusters = list(source_clusters) + train.get('clusters', []) + validation.get('clusters', [])
+    for cluster in clusters:
+        members = set(cluster['items'])
+        if members & left and members & right:
+            raise ValueError('a published cluster crosses train/validation')
+    return {'train_cases': len(left), 'validation_cases': len(right),
+            'pdb_overlap': 0, 'source_clusters_checked': len(source_clusters)}
+
+
+def reuse_entries(paths):
+    """Read existing materialized structures without changing shared data files."""
+    entries, rejected, hashes = {}, [], {}
+    for path in paths:
+        raw = Path(path).read_bytes()
+        hashes[str(Path(path).resolve())] = hashlib.sha256(raw).hexdigest()
+        payload = json.loads(raw)
+        rejected.extend(payload.get('rejected', []))
+        for entry in payload['entries']:
+            if entry['case'] in entries:
+                raise ValueError('duplicate case in reused indexes')
+            entry = dict(entry)
+            for key in ('protein1', 'protein2', 'ligand'):
+                resolved = Path(entry[key]).resolve()
+                if not resolved.is_file():
+                    raise FileNotFoundError(resolved)
+                entry[key] = str(resolved)
+            entries[entry['case']] = entry
+    return entries, rejected, hashes
+
+
+def audit_index_files(train_path, validation_path, source_cluster_paths=None):
+    """Audit published cluster isolation and fingerprint the actual run inputs."""
+    if source_cluster_paths is None:
+        source_cluster_paths = [
+            _PROJECT_ROOT / 'DeepTernary/data/PROTAC/train_clusters_poc6.json',
+            _PROJECT_ROOT / 'DeepTernary/data/MolecularGlue/train_clusters_poc3_exUNL.json']
+    payloads, hashes = [], []
+    for path in (train_path, validation_path, *source_cluster_paths):
+        raw = Path(path).read_bytes()
+        payloads.append(json.loads(raw))
+        hashes.append(hashlib.sha256(raw).hexdigest())
+    sources = [cluster for clusters in payloads[2:] for cluster in clusters]
+    report = audit_partition(*payloads[:2], source_clusters=sources)
+    return {**report, 'train_sha256': hashes[0], 'validation_sha256': hashes[1],
+            'source_cluster_sha256': hashes[2:]}
 
 
 def select_cluster_cases(clusters, mode='representative', excluded=None):
@@ -350,12 +439,19 @@ def main():
                              'ligands excluded by the CoopDiff graph contract')
     parser.add_argument('--output-root', default='data/ternary_deepternary')
     parser.add_argument('--index-dir', default='data')
+    parser.add_argument('--reuse-index', nargs=2, metavar=('TRAIN', 'VAL'),
+                        help='Reuse materialized entries; write new indexes without exporting structures')
     parser.add_argument('--limit', type=int, default=None)
     parser.add_argument('--min-ligand-heavy-atoms', '--min-ligand-atoms',
                         dest='min_ligand_heavy_atoms', type=int, default=1,
                         help='Structural sanity threshold; official cluster '
                              'membership is otherwise preserved')
     args = parser.parse_args()
+    reused, rejected_pool, input_hashes = reuse_entries(args.reuse_index) if args.reuse_index else (None, [], {})
+    if args.reuse_index and any(
+            (Path(args.index_dir) / f'ternary_{split}.json').resolve() == Path(path).resolve()
+            for split in ('train', 'val') for path in args.reuse_index):
+        raise ValueError('repartition must write to a new index directory')
 
     release = Path(args.release_root)
     protac_clusters = json.loads(Path(args.protac_clusters).read_text())
@@ -375,6 +471,8 @@ def main():
     train_clusters, validation_clusters = split_clusters(
         clusters, args.validation_fraction, args.split_seed,
     )
+    if reused is not None and set(reused) - cluster_members(clusters):
+        raise ValueError('reused entries contain cases outside the official pool')
     splits = {'train': train_clusters, 'val': validation_clusters}
     all_rejected = []
     for split, split_cluster_list in splits.items():
@@ -382,14 +480,22 @@ def main():
                         for case in cluster['items']})
         if args.limit is not None:
             cases = cases[:args.limit]
-        entries, rejected = build_index(
-            cases, release / 'pdbs', Path(args.output_root) / split,
-            min_ligand_heavy_atoms=args.min_ligand_heavy_atoms,
-        )
+        if reused is None:
+            entries, rejected = build_index(
+                cases, release / 'pdbs', Path(args.output_root) / split,
+                min_ligand_heavy_atoms=args.min_ligand_heavy_atoms)
+        else:
+            case_set = set(cases)
+            entries = [reused[case] for case in cases if case in reused]
+            rejected = [item for item in rejected_pool if item['case'] in case_set]
+            if case_set != {e['case'] for e in entries} | {e['case'] for e in rejected}:
+                raise ValueError('reused indexes do not account for every requested case')
         all_rejected.extend(rejected)
         destination = Path(args.index_dir) / f'ternary_{split}.json'
         write_index(destination, entries, rejected, {
-            'protocol': 'joint_train_intersection_v1',
+            'protocol': 'joint_train_intersection_pdb_groups_v2',
+            'input_index_sha256': input_hashes,
+            'pdb_connected_groups': len(train_clusters) + len(validation_clusters),
             'split': split,
             'sampling': ('cluster_80pct_any_20pct_representative'
                          if split == 'train' else 'fixed_representative'),
@@ -410,6 +516,10 @@ def main():
             },
         }, clusters=split_cluster_list)
         print(f'{split}: {len(entries)} accepted, {len(rejected)} rejected -> {destination}')
+    audit = audit_index_files(Path(args.index_dir) / 'ternary_train.json',
+                              Path(args.index_dir) / 'ternary_val.json',
+                              [args.protac_clusters, args.mgd_clusters])
+    (Path(args.index_dir) / 'partition_audit.json').write_text(json.dumps(audit, indent=2))
     unexpected = [item for item in all_rejected
                   if item['code'] != 'unsupported_ligand_graph']
     unsupported = [item for item in all_rejected

@@ -955,7 +955,7 @@ class TernaryRelationEncoder(nn.Module):
                     message = torch.zeros_like(features[chunk]).index_add(0, row, weight[:, None] * values)
                     updates = updates.index_copy(0, chunk, message / normalizer[:, None])
             features = features + updates
-        latent, positions, assignments = [], [], []
+        latent, positions, assignments, material_weights = [], [], [], []
         for component in (0, 1):
             nodes = features[types == component]
             logits = self.anchor_queries[component] @ nodes.T / math.sqrt(self.hidden_dim)
@@ -963,6 +963,7 @@ class TernaryRelationEncoder(nn.Module):
                 logits = logits + self.anchor_geometry(coords[types == component], content=logits,
                                                        stable=self.stable_anchors)
             weights = logits.softmax(-1)
+            material_weights.append(weights)
             latent.append(weights @ nodes)
             positions.append(weights @ coords[types == component])
             assignments.append(logits.T.softmax(-1))
@@ -1008,6 +1009,7 @@ class TernaryRelationEncoder(nn.Module):
                 'ligand_tokens': [features[ligand]],
                 'joint_geometry': {'features': features, 'relation': relation, 'geometry': geometry,
                                    'read': read, 'points': points, 'latent_types': latent_types,
+                                   'material_weights': material_weights,
                                    'latent_features': tokens, 'pair': pair}}
 
 
@@ -1179,7 +1181,7 @@ class TorsionCoordinator(nn.Module):
 
 ARCHITECTURE = 'residual_consensus_v2'
 DIRECT_ARCHITECTURE = 'ternary_geometry_independent_v1'
-CONSENSUS_CHECKPOINT_VERSION = 37
+CONSENSUS_CHECKPOINT_VERSION = 38
 INTERFACE_OBJECTIVE_CHECKPOINT_VERSION = 22
 OBJECTIVE_CONTRACT_CHECKPOINT_VERSION = 21
 ENDPOINT_PROTOCOL_CHECKPOINT_VERSION = 20

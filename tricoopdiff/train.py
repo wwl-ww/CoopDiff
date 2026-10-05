@@ -28,6 +28,9 @@ from tricoopdiff.models.consensus import (
 )
 from tricoopdiff.models.expert import (expert_base_identity, validate_expert_base_identity,
                                     configure_expert_policy, expert_runtime_identity)
+from tricoopdiff.models.constraint_motion import (
+    CONSTRAINT_SOLVER_CONTRACT, TARGET_GEOMETRY_LOSS_WEIGHT, terminal_geometry_loss,
+)
 from tricoopdiff.runtime import (atomic_torch_save, capture_rng_state, evaluation_context,
                                 preserve_rng, restore_rng_state)
 from tricoopdiff.sdpi_flow import (
@@ -531,9 +534,9 @@ def validate_consensus_checkpoint(payload):
     if model_config.get('model_profile') == 'ternary_endpoint_v9' and version < 33:
         raise ValueError('integrated conditional expert v9 requires checkpoint version 33')
     if model_config.get('model_profile') == 'ternary_constraints_v1':
-        from tricoopdiff.models.constraint_motion import CONSTRAINT_SOLVER_CONTRACT
-        if version < 37 or config.get('constraint_solver_contract') != CONSTRAINT_SOLVER_CONTRACT:
-            raise ValueError('constraint motion requires checkpoint v37 and its recorded solver contract')
+        if (version < 38 or config.get('constraint_solver_contract') != CONSTRAINT_SOLVER_CONTRACT
+                or config.get('target_geometry_loss_weight') != TARGET_GEOMETRY_LOSS_WEIGHT):
+            raise ValueError('constraint motion requires checkpoint v38 and its target-geometry contract')
     if version >= 25:
         profile = model_config.get('model_profile')
         new_recipe = profile in MODEL_PROFILES[1:]
@@ -858,10 +861,15 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                                target_candidates=None, fullatom_targets=None):
         """One geometric objective for both full starts and reachable short starts."""
         captured = {}
+        geometry_losses = []
         for index, (t, dt) in enumerate(self.diffusion.reverse_times(ld['coords'], steps=steps, t_start=t_start)):
             if index == capture_index:
                 captured['recovery_state'] = tuple(value.detach() for value in (ligand, poi, body))
             output = yield ed, pd, ld, ligand, poi, body, t, dt, source, conditions
+            if getattr(self.model.trifuse, 'constraint_motion', False):
+                geometry_losses.append(terminal_geometry_loss(
+                    output['target_geometry'], ed['coords'][0], pd['coords'][0],
+                    target_candidates if target_candidates is not None else target_ligand))
             normalized = self.diffusion.normalized_predictions(output, t)
             velocities = self.diffusion.velocities(normalized, ed['coords'], pd['coords'])
             ligand, poi, body = self.diffusion.differentiable_step(
@@ -899,6 +907,9 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             losses['loss_clash_geometry'] = steric
             total = total + self.steric_loss_weight * steric
         total = self.endpoint_loss_weight * total
+        if geometry_losses:
+            losses['loss_target_geometry'] = torch.stack(geometry_losses).mean()
+            total = total + TARGET_GEOMETRY_LOSS_WEIGHT * losses['loss_target_geometry']
         return {'loss_total': total, 'components': losses, 'native_interface_pairs': interface_pairs,
                 'predicted_ligand': ligand, 'predicted_poi': poi, **captured}
 
@@ -1117,7 +1128,9 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 'structural_supervision': self.structural_supervision,
                 'structure_loss_contract': 'dual_contacts025_vdw08_exclude123_v1' if self.structural_supervision else 'legacy',
                 'step_contract': 'fixed_training_steps_v1',
-                **({'constraint_solver_contract': 'joint_distance_velocity_v1'}
+                'data_partition': getattr(self, 'data_partition', None),
+                **({'constraint_solver_contract': CONSTRAINT_SOLVER_CONTRACT,
+                    'target_geometry_loss_weight': TARGET_GEOMETRY_LOSS_WEIGHT}
                    if getattr(self.model.trifuse, 'constraint_motion', False) else {}),
                 'training_objective': self.training_objective,
                 'endpoint_loss_weight': self.endpoint_loss_weight,
@@ -1153,6 +1166,8 @@ class ConsensusTrainer(TriCoopDiffTrainer):
     def load_checkpoint(self, path):
         payload = torch.load(path, map_location=self.device, weights_only=False)
         validate_consensus_checkpoint(payload)
+        if payload['runtime_config'].get('data_partition') != getattr(self, 'data_partition', None):
+            raise ValueError('checkpoint data partition differs; start a new run on the audited split')
         if payload.get('checkpoint_kind') == 'inference_only':
             raise ValueError('inference-only weights cannot resume the production training objective')
         if (payload['checkpoint_version'] not in (24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, CONSENSUS_CHECKPOINT_VERSION)
