@@ -277,6 +277,23 @@ def test_matcha_checkpoint_uses_backend_specific_identity_not_diffdock_edges():
             raise AssertionError('Matcha checkpoint accepted a different expert execution contract')
 
 
+def test_cached_only_loader_preserves_clusters_and_restricts_choices(tmp_path):
+    import json
+    from train_entry import TernaryDataLoader
+
+    entries = [{'case': name, 'protein1': 'missing.pdb', 'protein2': 'missing.pdb',
+                'ligand': 'missing.pdb'} for name in ('cached', 'uncached')]
+    index = tmp_path / 'index.json'
+    index.write_text(json.dumps({'entries': entries, 'clusters': [
+        {'items': ['cached', 'uncached'], 'representative': ['uncached']}]}))
+    (tmp_path / 'cached.pt').touch()
+    loader = TernaryDataLoader(index, None, cache_dir=tmp_path, cached_only=True, shuffle=False)
+    assert len(loader) == 1
+    assert [entry['case'] for entry in loader._epoch_entries()] == ['cached']
+    loader.shuffle = True
+    assert all(loader._epoch_entries()[0]['case'] == 'cached' for _ in range(20))
+
+
 def test_both_ligand_interfaces_preserve_physical_units_and_pose_gradients():
     from tricoopdiff.train import terminal_ligand_interface_losses
 

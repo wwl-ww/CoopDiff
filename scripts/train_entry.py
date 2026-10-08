@@ -43,7 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 from featurize_common import featurize_complex  # noqa: E402
-from tricoopdiff.runtime import evaluation_context, preserve_rng
+from tricoopdiff.runtime import atomic_torch_save, evaluation_context, preserve_rng, sha256_file
 from tricoopdiff.initialization.endpoints import case_seed
 
 
@@ -115,6 +115,8 @@ def parse_args(argv=None):
     # Featurization
     p.add_argument("--cache_dir", default="results/featurize_cache",
                    help="Dir for on-disk featurization cache (per-case .pt)")
+    p.add_argument('--cached-only', action='store_true',
+                   help='Restrict each original cluster to existing feature-cache entries')
 
     # Hardware
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -263,6 +265,9 @@ def main():
     #    (TriFuse's input_dim must match the featurized ternary nodes).
     # ----------------------------------------------------------------
     entries = _load_entries(args.train_data)
+    if args.cached_only:
+        entries = [entry for entry in entries
+                   if (Path(args.cache_dir) / (entry['case'] + '.pt')).is_file()]
     if not entries:
         raise SystemExit(f"FATAL: no entries in {args.train_data}")
 
@@ -302,14 +307,14 @@ def main():
         shuffle=True, device=str(device), cache_dir=args.cache_dir,
         skip_on_error=False, max_clusters=args.max_train_clusters,
         random_flip_proteins=args.random_flip_proteins,
+        expert=getattr(model, 'expert', None), cached_only=args.cached_only,
     )
     val_loader = TernaryDataLoader(
         args.val_data, score_model_args,
         shuffle=False, device=str(device), cache_dir=args.cache_dir,
         skip_on_error=False, max_clusters=args.max_val_clusters,
+        expert=getattr(model, 'expert', None), cached_only=args.cached_only,
     )
-    if args.expert_backend == 'fabind':
-        train_loader.prepare_expert = val_loader.prepare_expert = model.expert.prepare_cached_case
     # Check scoring dependencies before spending an epoch on training.
     for entry in val_loader._epoch_entries():
         validation_metric_context(entry, args.native_root)
@@ -735,8 +740,22 @@ class TernaryDataLoader:
     def __init__(self, data_json, score_model_args, shuffle=True, device="cuda",
                  cache_dir=None, skip_on_error=False, max_clusters=None,
                  random_flip_proteins=False, cache_read_only=False,
-                 cache_wait_seconds=3600.):
+                 cache_wait_seconds=3600., expert=None, cached_only=False):
         self.entries, self.clusters, self.entries_by_case = _load_index(data_json)
+        if cached_only:
+            if cache_dir is None:
+                raise ValueError('cached-only loading requires a cache directory')
+            original = len(self.entries), len(self.clusters or [])
+            self.entries = [entry for entry in self.entries
+                            if (Path(cache_dir) / (entry['case'] + '.pt')).is_file()]
+            self.entries_by_case = {entry['case']: entry for entry in self.entries}
+            if self.clusters:
+                self.clusters = [cluster for cluster in self.clusters
+                                 if any(case in self.entries_by_case for case in cluster['items'])]
+            print(f'[data] cached-only entries {len(self.entries)}/{original[0]}, '
+                  f'clusters {len(self.clusters or [])}/{original[1]}', flush=True)
+            if not self.entries:
+                raise ValueError('cached-only index has no available entries')
         if max_clusters is not None:
             if max_clusters <= 0:
                 raise ValueError('max_clusters must be positive')
@@ -757,6 +776,7 @@ class TernaryDataLoader:
         self.cache_wait_seconds = float(cache_wait_seconds)
         self.skipped = []
         self.prepare_expert = None
+        self.expert = expert
 
     def __iter__(self):
         entries = self._epoch_entries()
@@ -813,6 +833,9 @@ class TernaryDataLoader:
             cache_read_only=self.cache_read_only,
             cache_wait_seconds=self.cache_wait_seconds,
         )
+        if getattr(getattr(self, 'expert', None), 'backend', None) == 'fabind':
+            e3_data, poi_data, ligand_data = self._prepare_fabind(
+                entry, (e3_data, poi_data, ligand_data))
         if self.random_flip_proteins and np.random.random() < 0.5:
             # Re-express the entire ternary state in the old POI-centered frame,
             # then exchange branch identities. This matches DeepTernary's
@@ -829,6 +852,28 @@ class TernaryDataLoader:
             'poi_data': poi_data,
             'ligand_data': ligand_data,
         }
+
+    def _prepare_fabind(self, entry, data):
+        """Cache immutable indexed sequence/chemistry, never label coordinates."""
+        from tricoopdiff.models.expert import expert_base_identity
+
+        feature_path = Path(self.cache_dir) / (entry['case'] + '.pt') if self.cache_dir else None
+        identity = {'expert': expert_base_identity(self.expert),
+                    'inputs': [sha256_file(entry[key]) for key in ('protein1', 'protein2', 'ligand')],
+                    'features': sha256_file(feature_path) if feature_path and feature_path.exists() else None}
+        metadata_path = _PROJECT_ROOT / 'results/fabind_metadata' / (entry['case'] + '.pt')
+        cached = torch.load(metadata_path, map_location='cpu', weights_only=False) if metadata_path.exists() else None
+        if cached is None or cached.get('identity') != identity:
+            prepared = self.expert.prepare_cached_case(*data)
+            metadata = [{key: value.detach().cpu() if torch.is_tensor(value) else value
+                         for key, value in part['fabind'].items()} for part in prepared]
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_torch_save({'identity': identity, 'metadata': metadata}, metadata_path)
+        else:
+            metadata = cached['metadata']
+        return tuple({**part, 'fabind': {
+            key: value.to(self.device) if torch.is_tensor(value) else value
+            for key, value in meta.items()}} for part, meta in zip(data, metadata))
 
 
 if __name__ == "__main__":

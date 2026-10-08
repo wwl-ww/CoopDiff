@@ -465,6 +465,8 @@ def validate_assembly_checkpoint(payload):
     if model_config.get('model_profile') == VECTOR_EXPERT_MODEL_PROFILE:
         if config.get('pose_output_contract') != POSE_OUTPUT_CONTRACT:
             raise ValueError('legal pose output contract differs')
+        if config.get('ligand_interface_contract') != LIGAND_INTERFACE_CONTRACT:
+            raise ValueError('ligand interface supervision contract differs')
         expert_identity = config.get('expert_runtime_identity', {})
         if model_config.get('expert_backend', 'diffdock') == 'matcha':
             if (expert_identity.get('backend') != 'matcha'
