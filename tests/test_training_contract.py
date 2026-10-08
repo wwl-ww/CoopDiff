@@ -177,6 +177,7 @@ def test_consensus_builder_passes_only_active_model_dimensions():
             source_conditioning=False,
             model_profile='ternary_endpoint_v14', expert_scalar_dim=58, expert_vector_dim=20,
             information_contract='geometric_message_values_v1',
+            motion_contract='node_evidence_direct_velocity_without_time_gain_v1',
         )
         assert model.call_args.kwargs['expert_input_grad'] is True
         assert result is model.return_value
@@ -274,6 +275,27 @@ def test_matcha_checkpoint_uses_backend_specific_identity_not_diffdock_edges():
             pass
         else:
             raise AssertionError('Matcha checkpoint accepted a different expert execution contract')
+
+
+def test_both_ligand_interfaces_preserve_physical_units_and_pose_gradients():
+    from tricoopdiff.train import terminal_ligand_interface_losses
+
+    e3 = torch.tensor([[[0., 0., 0.]]])
+    poi_target = torch.tensor([[[4., 0., 0.]]])
+    ligand_target = torch.tensor([[[2., 0., 0.]]])
+    ligand = (ligand_target + torch.tensor([[[0., 1., 0.]]])).requires_grad_()
+    poi = poi_target.clone().requires_grad_()
+    losses, counts = terminal_ligand_interface_losses(e3, poi_target, ligand_target, poi, ligand)
+    assert counts == {'e3': 1, 'poi': 1}
+    for side in ('e3', 'poi'):
+        assert torch.allclose(losses[f'loss_interface_{side}_ligand'], torch.tensor(1. / 3.))
+    sum(losses.values()).backward()
+    assert ligand.grad is not None and ligand.grad.norm() > 0
+    assert poi.grad is not None and poi.grad.norm() > 0
+    far = torch.full_like(poi_target, 100.)
+    empty, counts = terminal_ligand_interface_losses(far, far, ligand_target, poi, ligand)
+    assert counts == {'e3': 0, 'poi': 0}
+    assert all(value.item() == 0 and value.requires_grad for value in empty.values())
 
 
 def test_direct_trainer_supervises_executed_endpoint_not_teacher_velocities():
@@ -1181,7 +1203,7 @@ def test_v2_checkpoint_records_recipe_and_resumes_warmup_and_entry_parity():
     trainer, batch, coupling = _endpoint_trainer_fixture('ternary_endpoint_v2')
     trainer.train_step(**batch, coupling_override=coupling)
     payload = copy.deepcopy(trainer.checkpoint_payload())
-    assert payload['checkpoint_version'] == 49
+    assert payload['checkpoint_version'] == 50
     payload['checkpoint_version'] = 25  # Historical v2 weights retain their old recipe.
     assert payload['runtime_config']['ema_update_contract'] == 'optimizer_step_warmup_v1'
     assert payload['runtime_config']['near_target_supervision']['weight'] == .25
@@ -1323,7 +1345,7 @@ def test_v8_unified_architecture_has_distinct_checkpoint_contract():
     trainer, batch, coupling = _endpoint_trainer_fixture(VECTOR_EXPERT_MODEL_PROFILE)
     trainer.train_step(**batch, coupling_override=coupling)
     payload = trainer.checkpoint_payload()
-    assert payload['checkpoint_version'] == 49
+    assert payload['checkpoint_version'] == 50
     assert payload['architecture'] == DIRECT_ARCHITECTURE
     assert payload['model_config']['expert_vector_dim'] == 20
     validate_assembly_checkpoint(payload)
@@ -1332,7 +1354,7 @@ def test_v8_unified_architecture_has_distinct_checkpoint_contract():
     try:
         validate_assembly_checkpoint(old)
     except ValueError as error:
-        assert 'checkpoint version 49' in str(error)
+        assert 'checkpoint version 50' in str(error)
     else:
         raise AssertionError('pre unified-controller weights were accepted under v8 semantics')
 

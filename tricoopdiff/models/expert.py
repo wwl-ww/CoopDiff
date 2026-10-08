@@ -441,9 +441,9 @@ class FrozenFABind(nn.Module):
             torch.ones(p.shape[:2], device=p.device, dtype=torch.bool),
             torch.ones(c.shape[:2], device=c.device, dtype=torch.bool))
         pair = pair * pair_mask[..., None]
-        for _ in range(module.n_iter):
-            ctx, inter, reduced = module.extract_edges(coords, batch, segment, global_nodes)
-            ctx = torch.cat((edges, ctx), 1)
+        def fixed_topology_step(coords, features, pair, ctx, inter, reduced):
+            # Recompute only continuous tensor operations. Re-extracting hard
+            # edges after CUDA scatter roundoff can select a different graph.
             gnn = module.gnn
             h, x = gnn.dropout(gnn.linear_in(features)), coords
             current_pair = pair
@@ -468,7 +468,18 @@ class FrozenFABind(nn.Module):
             if gnn.dense:
                 raise ValueError('unsupported FABind dense configuration')
             output = gnn.linear_out(gnn.dropout(h))
-            coords = torch.where(mask[:, None, None], x, coords)
+            return torch.where(mask[:, None, None], x, coords), output, current_pair
+
+        from torch.utils.checkpoint import checkpoint
+        for _ in range(module.n_iter):
+            ctx, inter, reduced = module.extract_edges(coords, batch, segment, global_nodes)
+            ctx = torch.cat((edges, ctx), 1)
+            args = (coords, features, pair, ctx, inter, reduced)
+            if torch.is_grad_enabled():
+                coords, output, current_pair = checkpoint(
+                    fixed_topology_step, *args, use_reentrant=False)
+            else:
+                coords, output, current_pair = fixed_topology_step(*args)
         return coords, output, current_pair
 
     @staticmethod

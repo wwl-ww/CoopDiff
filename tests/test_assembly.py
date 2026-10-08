@@ -529,7 +529,7 @@ def test_global_chemical_read_and_explicit_dof_overlap():
         'subset/superset action overlap must retain its direction')
 
 
-def test_pose_increment_uses_actual_remaining_time_below_twenty_step_grid():
+def test_pose_velocity_has_no_explicit_inverse_time_gain():
     from tricoopdiff.models.assembly import LegalPoseDecoder
 
     _, graph, _, state = fixture()
@@ -545,8 +545,8 @@ def test_pose_increment_uses_actual_remaining_time_below_twenty_step_grid():
     scaled = decoder(*args, short, opinions)
     for branch in BRANCHES:
         for field in ('tr', 'rot'):
-            assert torch.allclose(scaled[branch][field] * .01, full[branch][field], atol=1e-6)
-    assert torch.allclose(scaled['torsion'] * .01, full['torsion'], atol=1e-6)
+            assert torch.allclose(scaled[branch][field], full[branch][field], atol=1e-6)
+    assert torch.allclose(scaled['torsion'], full['torsion'], atol=1e-6)
     short[:, -1], short[:, 5:8] = 0., 0.
     terminal = decoder(*args, short, opinions)
     assert all(torch.isfinite(terminal[b][f]).all() for b in BRANCHES for f in ('tr', 'rot', 'tor'))

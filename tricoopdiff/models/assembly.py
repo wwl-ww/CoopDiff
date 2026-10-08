@@ -66,7 +66,7 @@ def bounded_vector(value):
 ARCHITECTURE = 'residual_evidence_v3'
 DIRECT_ARCHITECTURE = 'ternary_topological_joint_pose_v14'
 PREVIOUS_DIRECT_ARCHITECTURE = 'ternary_nodefield_independent_v4'
-ASSEMBLY_CHECKPOINT_VERSION = 49
+ASSEMBLY_CHECKPOINT_VERSION = 50
 EXPERT_CROP_POLICY = 'full_receptor_cross_taper_v1'
 LEGACY_RANK_FEATURE_STATE = 'final_pose_t0_dt0_v1'
 DIRECT_RANK_FEATURE_STATE = 'final_pose_evidence_t0_dt0_v2'
@@ -84,13 +84,14 @@ PRODUCTION_MODEL_PROFILE = 'ternary_endpoint_v4'
 VECTOR_EXPERT_MODEL_PROFILE = 'ternary_endpoint_v14'
 MATCHA_CONDITIONING_CONTRACT = 'nodewise_distance_values_v2'
 INFORMATION_CONTRACT = 'geometric_message_values_v1'
+MOTION_CONTRACT = 'node_evidence_direct_velocity_without_time_gain_v1'
 
 
 def production_model_config(node_dim, input_dim, source_conditioning=False, *,
                             model_profile=VECTOR_EXPERT_MODEL_PROFILE,
                             expert_scalar_dim=58, expert_vector_dim=20,
                             expert_backend='diffdock', conditioning_contract=MATCHA_CONDITIONING_CONTRACT,
-                            information_contract=INFORMATION_CONTRACT):
+                            information_contract=INFORMATION_CONTRACT, motion_contract=MOTION_CONTRACT):
     """One explicit new-model recipe; older weights retain their own config."""
     if model_profile not in (LEGACY_PRODUCTION_MODEL_PROFILE, FEATURE_PRODUCTION_MODEL_PROFILE,
                             PREVIOUS_PRODUCTION_MODEL_PROFILE, PRODUCTION_MODEL_PROFILE,
@@ -98,6 +99,8 @@ def production_model_config(node_dim, input_dim, source_conditioning=False, *,
         raise ValueError(f'unknown model profile: {model_profile}')
     if information_contract != INFORMATION_CONTRACT:
         raise ValueError('retired geometric attention: geometry must enter message values')
+    if motion_contract != MOTION_CONTRACT:
+        raise ValueError('retired broadcast/time-amplified motion contract')
     config = dict(node_dim=node_dim, input_dim=input_dim, information_contract=information_contract,
                 source_conditioning=bool(source_conditioning),
                 direct_ternary_motion=True, global_node_context=True,
@@ -110,6 +113,7 @@ def production_model_config(node_dim, input_dim, source_conditioning=False, *,
             raise ValueError('expert scalar dimension must be positive')
         config['expert_scalar_dim'] = expert_scalar_dim
     if model_profile == VECTOR_EXPERT_MODEL_PROFILE:
+        config['motion_contract'] = motion_contract
         if isinstance(expert_vector_dim, bool) or not isinstance(expert_vector_dim, int) or expert_vector_dim <= 0:
             raise ValueError('expert vector dimension must be a positive integer')
         config['expert_vector_dim'] = expert_vector_dim
@@ -353,7 +357,6 @@ class LegalPoseDecoder(nn.Module):
         # Preserve dt=t semantics even below the historical 20-step grid.
         # A t=0 read is diagnostic only: keep finite outputs without pretending
         # that it has a positive remaining integration budget.
-        remaining = torch.where(time > 0, time, torch.ones_like(time))
         components = (2, 1)  # Physical ligand and POI DOFs, not learned global tokens.
         queries = [h[types == component].mean(0) for component in components]
         positions = [coords[types == component].mean(0) for component in components]
@@ -424,9 +427,9 @@ class LegalPoseDecoder(nn.Module):
             shift = displacement[None] * 10.
             angular = math.pi * bounded_vector(rotation[None])
             motion[branch] = {
-                'tr': -shift / remaining / state[:, column:column + 1].exp(),
-                'rot': -angular / remaining / math.pi}
-        torsion = (-self.bond(decisions[2:]).squeeze(-1).tanh()[None] / remaining
+                'tr': -shift / state[:, column:column + 1].exp(),
+                'rot': -angular / math.pi}
+        torsion = (-self.bond(decisions[2:]).squeeze(-1).tanh()[None]
                    if bonds.shape[1] else h.new_empty(1, 0))
         for branch in BRANCHES:
             motion[branch]['tor'] = torsion
@@ -459,7 +462,7 @@ class UnifiedTernaryController(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 torch.random.default_generator.manual_seed(0)
                 self.source = nn.Embedding(len(SOURCE_NAMES), width)
-        self.vector_input = nn.Linear(2 * vector_dim + 7, channels, bias=False)
+        self.vector_input = nn.Linear(2 * vector_dim + 3, channels, bias=False)
         self.layers = nn.ModuleList([EquivariantInteraction(width, channels) for _ in range(3)])
         self.assembly = LegalPoseDecoder(width, channels)
 
@@ -484,9 +487,7 @@ class UnifiedTernaryController(nn.Module):
             h = h + self.source(candidate_source_tensor(source, h))
         centers = torch.stack([coords[types == i].mean(0) for i in range(3)])
         offsets = bounded_vector((coords[:, None] - centers[None]) / 10.)
-        advice = torch.cat([proposals[b][key] for b in BRANCHES for key in ('tr', 'rot')], 0)
-        vectors = torch.cat((bounded_vector(raw_vectors), offsets,
-                             bounded_vector(advice)[None].expand(len(h), -1, -1)), 1)
+        vectors = torch.cat((bounded_vector(raw_vectors), offsets), 1)
         vectors = self.vector_input(vectors.transpose(1, 2)).transpose(1, 2)
         ligand_ids = ligand.nonzero(as_tuple=False).flatten()
         local_edges = graph['lig_edge_index']
@@ -549,7 +550,7 @@ class TernaryAssembly(nn.Module):
                  direct_ternary_motion=True, model_profile=VECTOR_EXPERT_MODEL_PROFILE,
                  expert_scalar_dim=58, expert_vector_dim=20, expert_backend='diffdock',
                  conditioning_contract=MATCHA_CONDITIONING_CONTRACT,
-                 information_contract=INFORMATION_CONTRACT):
+                 information_contract=INFORMATION_CONTRACT, motion_contract=MOTION_CONTRACT):
         super().__init__()
         if model_profile != VECTOR_EXPERT_MODEL_PROFILE or not direct_ternary_motion:
             raise ValueError('retired architecture: construct a fresh ternary_endpoint_v14 model')
@@ -557,7 +558,8 @@ class TernaryAssembly(nn.Module):
             node_dim, input_dim or node_dim, source_conditioning,
             model_profile=model_profile, expert_scalar_dim=expert_scalar_dim,
             expert_vector_dim=expert_vector_dim, expert_backend=expert_backend,
-            conditioning_contract=conditioning_contract, information_contract=information_contract)
+            conditioning_contract=conditioning_contract, information_contract=information_contract,
+            motion_contract=motion_contract)
         self.controller = UnifiedTernaryController(
             self.config['input_dim'], node_dim, expert_scalar_dim,
             expert_vector_dim, source_conditioning)
@@ -704,8 +706,9 @@ class TernaryAssemblyModel(nn.Module):
                     modulation = self.trifuse.binary_condition(receptor, opposite)
                     def read_pair(rec, lig, time, film):
                         return self.expert.read_pair(rec, lig, time, film)
-                    if torch.is_grad_enabled() and (self.expert_input_grad
-                                                    or any(value.requires_grad for value in modulation)):
+                    if (getattr(self.expert, 'backend', 'diffdock') != 'fabind'
+                            and torch.is_grad_enabled() and (self.expert_input_grad
+                                                    or any(value.requires_grad for value in modulation))):
                         outputs = checkpoint(read_pair, receptor, expert_ligand, t_e3l,
                                              modulation, use_reentrant=False)
                     else:

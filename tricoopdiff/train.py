@@ -317,6 +317,12 @@ VELOCITY_OBJECTIVE = 'sdpi_velocity_mse_v1'
 
 ENDPOINT_OBJECTIVE = 'executed_endpoint_geometry_v1'
 REAL_ENDPOINT_OBJECTIVE = 'real_initialization_reachable_endpoint_v2'
+LIGAND_INTERFACE_CONTRACT = {
+    'version': 'reachable_ca_ligand_contacts_v1', 'cutoff_angstrom': 8.,
+    'error_scale_angstrom': 1., 'per_interface_weight': .5,
+    'geometry': 'relative_pair_vectors_and_distances',
+    'normalization': 'mean_per_interface_empty_is_zero',
+}
 POSE_OUTPUT_CONTRACT = {'version': 'topological_joint_legal_pose_v5',
                         'translation_unit_angstrom': 10.,
                         'rotation': 'bounded_axis_angle', 'torsion': 'bounded_periodic_increment',
@@ -357,6 +363,23 @@ def terminal_interface_losses(e3, native_poi, predicted_poi, cutoff):
                                     - native_poi[0, poi_interface]) / cutoff).square().mean(),
         'loss_contact_geometry': ((predicted_distances - target_distances) / cutoff).square().mean(),
     }, count
+
+
+def terminal_ligand_interface_losses(e3, target_poi, target_ligand, poi, ligand):
+    """Independently normalized CA/ligand vector and distance supervision."""
+    losses, counts = {}, {}
+    for side, target, predicted in (('e3', e3, e3), ('poi', target_poi, poi)):
+        with torch.no_grad():
+            pairs = (torch.cdist(target[0], target_ligand[0],
+                compute_mode='donot_use_mm_for_euclid_dist') <= LIGAND_INTERFACE_CONTRACT['cutoff_angstrom']).nonzero(as_tuple=True)
+            reference = target_ligand[0, pairs[1]] - target[0, pairs[0]]
+        counts[side] = len(pairs[0])
+        delta = ligand[0, pairs[1]] - predicted[0, pairs[0]]
+        zero = (ligand.sum() + predicted.sum()) * 0
+        scale = LIGAND_INTERFACE_CONTRACT['error_scale_angstrom']
+        losses[f'loss_interface_{side}_ligand'] = ((delta-reference)/scale).square().mean() if counts[side] else zero
+        losses[f'loss_contact_{side}_ligand'] = ((delta.norm(dim=-1)-reference.norm(dim=-1))/scale).square().mean() if counts[side] else zero
+    return losses, counts
 
 
 def coarse_intercomponent_repulsion(e3, native_poi, native_ligand, poi, ligand, cutoff=2.):
@@ -707,6 +730,11 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         losses = {'loss_ligand_geometry': ((ligand - target_ligand) / LIGAND_GEOMETRY_SCALE_ANGSTROM).square().mean(),
                   'loss_protein_geometry': ((poi - pd['coords']) / PROTEIN_GEOMETRY_SCALE_ANGSTROM).square().mean()}
         total = sum(losses.values())
+        if self.model.trifuse.config.get('model_profile') == VECTOR_EXPERT_MODEL_PROFILE:
+            interfaces, _ = terminal_ligand_interface_losses(
+                ed['coords'], pd['coords'], target_ligand, poi, ligand)
+            losses.update(interfaces)
+            total = total + LIGAND_INTERFACE_CONTRACT['per_interface_weight'] * sum(interfaces.values())
         interface_pairs = 0
         if self.interface_loss_weight:
             interface, interface_pairs = terminal_interface_losses(
@@ -934,6 +962,7 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                 'endpoint_loss_weight': self.endpoint_loss_weight,
                 'ligand_geometry_scale_angstrom': LIGAND_GEOMETRY_SCALE_ANGSTROM,
                 'protein_geometry_scale_angstrom': PROTEIN_GEOMETRY_SCALE_ANGSTROM,
+                'ligand_interface_contract': dict(LIGAND_INTERFACE_CONTRACT),
                 'inference_steps': self.diffusion.inference_steps,
                 'interface_loss_weight': self.interface_loss_weight,
                 'interface_cutoff': self.interface_cutoff,

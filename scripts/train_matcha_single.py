@@ -5,6 +5,7 @@ training checkpoint. Only the ternary module is optimized; Matcha stays frozen.
 """
 import argparse
 import copy
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -24,7 +25,7 @@ from tricoopdiff.initialization.endpoints import reachable_ligand_target
 from tricoopdiff.metrics.dockq import compute_fullatom_dockq
 from tricoopdiff.models.assembly import TernaryAssembly, TernaryAssemblyModel, production_model_config
 from tricoopdiff.sdpi_flow import SDPIFlow
-from tricoopdiff.train import AssemblyTrainer, clip_grad_norm_finite, NonFiniteTrainingError
+from tricoopdiff.train import AssemblyTrainer, clip_grad_norm_finite, NonFiniteTrainingError, LIGAND_INTERFACE_CONTRACT
 from tricoopdiff.runtime import (atomic_torch_save, sha256_file, evaluation_context,
                                 capture_rng_state, restore_rng_state)
 
@@ -55,6 +56,10 @@ def main():
     parser.add_argument('--steric-weight', type=float, default=.05)
     parser.add_argument('--goal-dockq', type=float, default=.90)
     parser.add_argument('--goal-loss', type=float, default=.01)
+    parser.add_argument('--goal-ligand-rmsd', type=float)
+    parser.add_argument('--expert-backend', choices=('matcha','fabind'), default='matcha')
+    parser.add_argument('--data-root', default=str(ROOT))
+    parser.add_argument('--fixed-from', help='Read only fixed coupling from a same-case checkpoint; not weights')
     parser.add_argument('--source-dir', default='results/matcha_qualification_source')
     parser.add_argument('--weights-dir', default='results/matcha_qualification_weights')
     args = parser.parse_args()
@@ -78,6 +83,7 @@ def main():
     np.random.seed(73)
     random.seed(73)
     device = 'cuda'
+    data_root = Path(args.data_root).resolve()
     checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False) if args.resume else None
     transfer = torch.load(args.weights_from, map_location='cpu', weights_only=False) if args.weights_from else None
     if transfer is not None and (transfer.get('case') != CASE or transfer.get('seed') != 73):
@@ -85,10 +91,10 @@ def main():
     if checkpoint is not None:
         if checkpoint.get('format') != FORMAT or checkpoint['case'] != CASE or checkpoint['seed'] != 73:
             raise ValueError('checkpoint does not match the fixed research experiment')
-    case_dir = ROOT / f'data/ternary_deepternary/train/{CASE}'
+    case_dir = data_root / f'data/ternary_deepternary/train/{CASE}'
     p1, p2 = case_dir/'protein1.pdb', case_dir/'protein2.pdb'
-    cache_path = ROOT/f'results/featurize_cache/{CASE}.pt'
-    input_manifest = {str(path.relative_to(ROOT)): sha256_file(path)
+    cache_path = data_root/f'results/featurize_cache/{CASE}.pt'
+    input_manifest = {str(path.relative_to(data_root)): sha256_file(path)
                       for path in (p1, p2, case_dir/'ligand.pdb', cache_path)}
     if checkpoint is not None and checkpoint['input_manifest'] != input_manifest:
         raise ValueError('resume indexed structures or feature cache changed')
@@ -103,6 +109,10 @@ def main():
     if isinstance(ld['mol'], bytes):
         ld['mol'] = Chem.Mol(ld['mol'])
     fixed = checkpoint if checkpoint is not None else transfer
+    if fixed is None and args.fixed_from:
+        fixed = torch.load(args.fixed_from, map_location='cpu', weights_only=False)
+        if fixed.get('case') != CASE or fixed.get('seed') != 73 or fixed.get('input_manifest') != input_manifest:
+            raise ValueError('fixed coupling source must match exact indexed structures, cache and seed73')
     if fixed is None:
         ligand, poi, body, provenance = TernaryInitializer(no_torsion=False).initialize(
             ed['coords'][0], pd['coords'][0], ld, seed=73)
@@ -114,6 +124,11 @@ def main():
         coupling = fixed['fixed_coupling']
         provenance = fixed['initialization_provenance']
         projection = fixed['target_projection']
+    coupling_hash = hashlib.sha256()
+    for value in [coupling['initial_state'][key] for key in ('ligand','poi','body_frame')] + [coupling['target_ligand']]:
+        value = torch.as_tensor(value).detach().cpu().contiguous()
+        coupling_hash.update(str((tuple(value.shape),value.dtype)).encode())
+        coupling_hash.update(value.numpy().tobytes())
     # Native structure is used only by loss / evaluation, not as an expert input.
     native_path = out/'native_proteins.pdb'
     records = []
@@ -123,15 +138,19 @@ def main():
     native_path.write_text('\n'.join(records)+'\n')
     metric_context = dict(protein1_pdb=str(p1), protein2_pdb=str(p2),
         ligand_pdb=str(case_dir/'ligand.pdb'), native_complex_pdb=str(native_path),
-        deepternary_root=str(ROOT/'DeepTernary'))
+        deepternary_root=str(data_root/'DeepTernary'))
 
-    from tricoopdiff.models.expert import FrozenMatcha, expert_runtime_identity
-    expert = FrozenMatcha(source_dir=str(ROOT/args.source_dir), weights_dir=str(ROOT/args.weights_dir))
+    from tricoopdiff.models.expert import FrozenMatcha, FrozenFABind, expert_runtime_identity
+    expert_type = FrozenFABind if args.expert_backend == 'fabind' else FrozenMatcha
+    expert = expert_type(source_dir=str(ROOT/args.source_dir), weights_dir=str(ROOT/args.weights_dir))
     expert = expert.to(device)
-    ed, pd, ld = expert.prepare_case(ed, pd, ld, (str(p1), str(p2)))
+    if args.expert_backend == 'fabind':
+        ed, pd, ld = expert.prepare_cached_case(ed,pd,ld)
+    else:
+        ed, pd, ld = expert.prepare_case(ed, pd, ld, (str(p1), str(p2)))
     config = production_model_config(args.node_dim, int(ed['features'].shape[-1]),
         expert_scalar_dim=expert.node_scalar_dim, expert_vector_dim=expert.node_vector_dim,
-        expert_backend='matcha')
+        expert_backend=args.expert_backend)
     model = TernaryAssemblyModel(expert, TernaryAssembly(**config), expert_input_grad=True,
                                 checkpoint_ternary=True).to(device)
     trainer = AssemblyTrainer(model, SDPIFlow(inference_steps=20), lr=args.lr,
@@ -143,6 +162,9 @@ def main():
                    source='sdpi', endpoint_weight=.1, interface_weight=1., near_target_aux=False,
                    ligand_geometry_scale_angstrom=1.,
                    protein_geometry_scale_angstrom=1.,
+                   ligand_interface_contract=LIGAND_INTERFACE_CONTRACT,
+                   goal_dockq=args.goal_dockq, goal_ligand_rmsd=args.goal_ligand_rmsd,
+                   fixed_state_sha256=coupling_hash.hexdigest(),
                    gradient_clip=10., expert_input_grad=True,
                    code_identity={str(path.relative_to(ROOT)): sha256_file(path) for path in (
                        Path(__file__).resolve(), ROOT/'tricoopdiff/models/assembly.py',
@@ -156,8 +178,7 @@ def main():
             saved_config['conditioning_contract'] = config['conditioning_contract']
         if legacy_geometry:
             saved_config['information_contract'] = config['information_contract']
-        if (saved_config != config or transfer['backend_manifest']['stage_weights_sha256']
-                != manifest['stage_weights_sha256']):
+        if saved_config != config or transfer['backend_manifest'] != manifest:
             raise ValueError('weights-only transfer requires matching architecture and pretrained stages')
         weights = dict(transfer['trainable_weights'])
         if legacy_conditioning:
@@ -194,7 +215,7 @@ def main():
             weights_source=args.weights_from if checkpoint is None else checkpoint.get('weights_source'),
             trainable_weights=model.trifuse.state_dict(), optimizer=trainer.optimizer.state_dict(),
             rng=capture_rng_state(), fixed_coupling=coupling, initialization_provenance=provenance,
-            target_projection=projection)
+            target_projection=projection, fixed_source=args.fixed_from if checkpoint is None else checkpoint.get('fixed_source'))
         atomic_torch_save(payload, out/filename)
 
     def evaluate():
@@ -212,9 +233,17 @@ def main():
                    out/'latest_prediction.pt')
         return values
 
+    initial_metric = compute_fullatom_dockq(torch.as_tensor(coupling['initial_state']['ligand']).reshape(-1,3).numpy(),
+        torch.as_tensor(coupling['initial_state']['poi']).reshape(-1,3).numpy(), ed['coords'][0].cpu().numpy(), **metric_context)
+    print(json.dumps(dict(kind='fixed_initialization',fixed_state_sha256=runtime['fixed_state_sha256'],
+                         fixed_source=args.fixed_from,**initial_metric)),flush=True)
     before = evaluate()
     save()
-    reached_goal = before['dockq'] >= args.goal_dockq and before['loss'] <= args.goal_loss
+    def meets_goal(values):
+        return values['dockq'] >= args.goal_dockq and (
+            values['ligand_target_rmsd_angstrom'] <= args.goal_ligand_rmsd
+            if args.goal_ligand_rmsd is not None else values['loss'] <= args.goal_loss)
+    reached_goal = meets_goal(before)
     if reached_goal:
         save('goal.pt')
     start = time.time()
@@ -239,7 +268,7 @@ def main():
             save()
         if step % args.eval_every == 0 or step == args.updates:
             current = evaluate()
-            if current['dockq'] >= args.goal_dockq and current['loss'] <= args.goal_loss:
+            if meets_goal(current):
                 reached_goal = True
                 save('goal.pt')
                 break
