@@ -250,9 +250,8 @@ def test_direct_trainer_supervises_executed_endpoint_not_teacher_velocities():
     assert np.allclose([clock for clock, _ in trainer.model.calls], [1., 2/3, 1/3])
     assert set(result['components']) == {'loss_ligand_geometry', 'loss_protein_geometry',
                                          'loss_interface_geometry', 'loss_contact_geometry'}
-    scales = trainer.diffusion.scales(batch['e3_data']['coords'], batch['poi_data']['coords'])
     expected = .1 * ((result['predicted_ligand'] - batch['ligand_data']['coords']).square().mean()
-                     + ((result['predicted_poi'] - batch['poi_data']['coords']) / scales[1]).square().mean()
+                     + (result['predicted_poi'] - batch['poi_data']['coords']).square().mean()
                      + sum(result['components'][key] for key in ('loss_interface_geometry', 'loss_contact_geometry')))
     assert torch.allclose(result['loss_total'], expected)
     assert torch.allclose(result['components']['loss_ligand_geometry'],

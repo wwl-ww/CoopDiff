@@ -142,6 +142,7 @@ def main():
     runtime = dict(lr=args.lr, steric_weight=args.steric_weight, steps=20,
                    source='sdpi', endpoint_weight=.1, interface_weight=1., near_target_aux=False,
                    ligand_geometry_scale_angstrom=1.,
+                   protein_geometry_scale_angstrom=1.,
                    gradient_clip=10., expert_input_grad=True,
                    code_identity={str(path.relative_to(ROOT)): sha256_file(path) for path in (
                        Path(__file__).resolve(), ROOT/'tricoopdiff/models/assembly.py',

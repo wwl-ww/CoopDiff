@@ -41,6 +41,7 @@ class NonFiniteTrainingError(FloatingPointError):
 
 
 LIGAND_GEOMETRY_SCALE_ANGSTROM = 1.0
+PROTEIN_GEOMETRY_SCALE_ANGSTROM = 1.0
 
 
 def clip_grad_norm_finite(parameters, max_norm=1.0):
@@ -417,6 +418,9 @@ def validate_assembly_checkpoint(payload):
     if ('ligand_geometry_scale_angstrom' in config
             and config['ligand_geometry_scale_angstrom'] != LIGAND_GEOMETRY_SCALE_ANGSTROM):
         raise ValueError('unsupported ligand endpoint supervision units')
+    if ('protein_geometry_scale_angstrom' in config
+            and config['protein_geometry_scale_angstrom'] != PROTEIN_GEOMETRY_SCALE_ANGSTROM):
+        raise ValueError('unsupported protein endpoint supervision units')
     if model_config.get('model_profile') == 'ternary_endpoint_v2' and version < 25:
         raise ValueError('ternary endpoint v2 requires checkpoint version 25')
     if model_config.get('model_profile') == 'ternary_endpoint_v3' and version < 26:
@@ -681,12 +685,11 @@ class AssemblyTrainer(TriCoopDiffTrainer):
             velocities = self.diffusion.velocities(normalized, ed['coords'], pd['coords'])
             ligand, poi, body = self.diffusion.differentiable_step(
                 ligand, poi, body, velocities, dt, ld)
-        scales = self.diffusion.scales(ed['coords'], pd['coords'])
         # A protein-radius denominator can hide a >10 Å ligand error behind a
         # tiny total loss. Ligand accuracy has a fixed physical scale, independent
         # of receptor size; target projection already ensures it is reachable.
         losses = {'loss_ligand_geometry': ((ligand - target_ligand) / LIGAND_GEOMETRY_SCALE_ANGSTROM).square().mean(),
-                  'loss_protein_geometry': ((poi - pd['coords']) / scales[1]).square().mean()}
+                  'loss_protein_geometry': ((poi - pd['coords']) / PROTEIN_GEOMETRY_SCALE_ANGSTROM).square().mean()}
         total = sum(losses.values())
         interface_pairs = 0
         if self.interface_loss_weight:
@@ -913,6 +916,7 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                 'training_objective': self.training_objective,
                 'endpoint_loss_weight': self.endpoint_loss_weight,
                 'ligand_geometry_scale_angstrom': LIGAND_GEOMETRY_SCALE_ANGSTROM,
+                'protein_geometry_scale_angstrom': PROTEIN_GEOMETRY_SCALE_ANGSTROM,
                 'inference_steps': self.diffusion.inference_steps,
                 'interface_loss_weight': self.interface_loss_weight,
                 'interface_cutoff': self.interface_cutoff,
@@ -950,6 +954,8 @@ class AssemblyTrainer(TriCoopDiffTrainer):
             raise ValueError('inference-only weights cannot resume the production training objective')
         if payload['runtime_config'].get('ligand_geometry_scale_angstrom') != LIGAND_GEOMETRY_SCALE_ANGSTROM:
             raise ValueError('historical ligand loss used protein-radius units; load weights only, not resume')
+        if payload['runtime_config'].get('protein_geometry_scale_angstrom') != PROTEIN_GEOMETRY_SCALE_ANGSTROM:
+            raise ValueError('historical protein loss used protein-radius units; load weights only, not resume')
         if (payload['checkpoint_version'] not in (24, 25, 26, 27, 39, ASSEMBLY_CHECKPOINT_VERSION)
                 or payload['runtime_config'].get('training_objective') != REAL_ENDPOINT_OBJECTIVE):
             raise ValueError('training objective differs or checkpoint is historical; load weights only')
