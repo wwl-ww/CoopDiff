@@ -44,6 +44,17 @@ LIGAND_GEOMETRY_SCALE_ANGSTROM = 1.0
 PROTEIN_GEOMETRY_SCALE_ANGSTROM = 1.0
 
 
+def _detached_result(value):
+    """Export nested diagnostics without retaining graphs or GPU storage."""
+    if torch.is_tensor(value):
+        return value.item() if value.numel() == 1 else value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _detached_result(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return type(value)(_detached_result(item) for item in value)
+    return value
+
+
 def clip_grad_norm_finite(parameters, max_norm=1.0):
     """Clip in float64 so large *finite* float32 gradients do not overflow."""
     gradients = [p.grad for p in parameters if p.grad is not None]
@@ -243,8 +254,7 @@ class TriCoopDiffTrainer:
                 if not torch.isfinite(total):
                     raise NonFiniteTrainingError('non-finite total loss')
                 (total / len(batches)).backward()
-                results.append({k: v.item() if torch.is_tensor(v) else v
-                                for k, v in loss_dict.items()})
+                results.append(_detached_result(loss_dict))
                 del loss_dict, total
         except Exception:
             self.optimizer.zero_grad(set_to_none=True)
@@ -275,7 +285,7 @@ class TriCoopDiffTrainer:
         """Forward + loss only, no backward."""
         with evaluation_context(self.model):
             loss_dict = self.compute_loss(**batch)
-            return {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
+            return _detached_result(loss_dict)
 
 
     def scheduler_step(self, validation_loss: float):
@@ -757,7 +767,8 @@ class AssemblyTrainer(TriCoopDiffTrainer):
             self._ema_active = False
             self.model.trifuse.load_state_dict(raw)
 
-    def validate_step(self, dockq_context=None, weights='ema', **batch):
+    def validate_step(self, dockq_context=None, weights='ema', diagnostics=False, **batch):
+        """Return scalar metrics or explicitly requested detached endpoint data."""
         if any(batch.get(key) is not None for key in ('near_target_zero', 'near_target_start_t')):
             raise ValueError('validation evaluates the main endpoint only, not training-only auxiliary entries')
         if weights not in ('raw', 'ema'):
@@ -765,7 +776,7 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         if weights == 'raw' and getattr(self, '_ema_active', False):
             raise RuntimeError('raw validation cannot run while temporary EMA weights are active')
         with (self.ema_parameters() if weights == 'ema' else nullcontext()), evaluation_context(self.model):
-            output = self.compute_loss(**batch, diagnostics=dockq_context is not None)
+            output = self.compute_loss(**batch, diagnostics=diagnostics or dockq_context is not None)
             if dockq_context is not None:
                 from tricoopdiff.metrics.dockq import compute_fullatom_dockq
 
@@ -776,10 +787,10 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                     **dockq_context)
                 if not math.isfinite(metric['dockq']) or not 0 <= metric['dockq'] <= 1:
                     raise NonFiniteTrainingError('invalid full-atom validation DockQ')
-                output = {'loss_total': output['loss_total'],
+                output = ({**output, **metric} if diagnostics else {'loss_total': output['loss_total'],
                           'ligand_target_rmsd_angstrom': output['ligand_target_rmsd_angstrom'],
-                          'loss_endpoint_main': output['loss_endpoint_main'], **output['components'], **metric}
-            return {key: value.item() if torch.is_tensor(value) else value for key, value in output.items()}
+                          'loss_endpoint_main': output['loss_endpoint_main'], **output['components'], **metric})
+            return _detached_result(output)
 
     def _optimization_payload(self, training_state):
         """Shared trainable state; subclasses own their supervision contracts."""

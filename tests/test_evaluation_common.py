@@ -11,6 +11,29 @@ evaluation_common = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(evaluation_common)
 
 
+def test_fabind_initializer_uses_expert_not_featurizer_torsion_contract(tmp_path):
+    import sys
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    sys.path.insert(0, str(_SCRIPT.parent))
+    import evaluation_runner as runtime
+    (tmp_path/'model_parameters.yml').write_text('no_torsion: true\n')
+    checkpoint = dict(runtime_config={'activation_clamp': 100.},
+                      model_config={'expert_backend': 'fabind'})
+    expert = SimpleNamespace(backend='fabind', model=SimpleNamespace(no_torsion=False))
+    with patch.object(runtime, 'configure_inference_reproducibility', return_value={}), \
+            patch.object(runtime, 'sha256_file', return_value='test'), \
+            patch.object(runtime.torch, 'load', return_value=checkpoint), \
+            patch.object(runtime, 'validate_checkpoint_payload'), \
+            patch.object(runtime, 'validate_score_norm_version'), \
+            patch.object(runtime, 'validate_expert_base_identity'), \
+            patch.object(runtime, 'FrozenFABind', return_value=expert), \
+            patch.object(runtime, 'TernaryInitializer') as initializer:
+        runtime.EvaluationRunner(tmp_path, 'checkpoint.pt', device='cpu',
+                                 expert_source_dir='source', featurizer_model_dir=tmp_path)
+    initializer.assert_called_once_with(no_torsion=False, conformer_policy='etkdgv3_random')
+
+
 def test_runtime_rejects_overflowing_ema_without_publishing_model():
     import sys
     from types import SimpleNamespace

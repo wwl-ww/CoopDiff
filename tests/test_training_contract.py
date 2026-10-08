@@ -141,6 +141,25 @@ def test_fabind_entry_builds_explicit_backend_without_diffdock_weights():
         assert fuse.call_args.kwargs['expert_scalar_dim'] == 512
 
 
+def test_training_diagnostics_preserve_coordinates_without_retaining_graphs():
+    trainer, batch, coupling = _endpoint_trainer_fixture()
+    result = trainer.train_step(**batch, coupling_override=coupling, diagnostics=True)
+    assert torch.is_tensor(result['predicted_ligand'])
+    assert result['predicted_ligand'].shape == batch['ligand_data']['coords'].shape
+    assert result['predicted_ligand'].device.type == 'cpu'
+    assert result['predicted_ligand'].grad_fn is None
+    assert all(not torch.is_tensor(value) for value in result['components'].values())
+    assert trainer.global_step == 1
+    result = trainer.validate_step(**batch, coupling_override=coupling, diagnostics=True)
+    assert result['predicted_poi'].grad_fn is None
+    assert trainer.global_step == 1
+    with patch('tricoopdiff.metrics.dockq.compute_fullatom_dockq', return_value={'dockq': .5}):
+        result = trainer.validate_step(**batch, coupling_override=coupling,
+                                       diagnostics=True, dockq_context={})
+    assert result['dockq'] == .5 and result['predicted_ligand'].grad_fn is None
+    assert trainer.global_step == 1
+
+
 def test_consensus_builder_passes_only_active_model_dimensions():
     args = parse_args([
         '--train_data', 'unused.json', '--val_data', 'unused.json',

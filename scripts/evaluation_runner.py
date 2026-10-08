@@ -125,7 +125,7 @@ class EvaluationRunner:
         self.input_dim = None
         self.diffusion = SDPIFlow(inference_steps=self.checkpoint['runtime_config'].get('inference_steps', 20))
         self.initializer = TernaryInitializer(
-            no_torsion=getattr(self.score_model_args, "no_torsion", False),
+            no_torsion=bool(getattr(self.expert.model, 'no_torsion', False)),
             conformer_policy=conformer_policy,
         )
 
