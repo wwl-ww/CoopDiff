@@ -17,8 +17,8 @@ from evaluation_common import sha256_file
 from tricoopdiff.conditioning.condition_augmentation import ConditionAugmentation, augment_conditions
 from tricoopdiff.conditioning.condition_features import SideCondition, build_condition_features
 from tricoopdiff.conditioning.conditioned_consensus_train import ConditionedConsensusFuse
-from tricoopdiff.models.consensus import ConsensusFuse
-from tricoopdiff.train import validate_consensus_checkpoint
+from tricoopdiff.models.assembly import TernaryAssembly
+from tricoopdiff.train import validate_assembly_checkpoint
 
 
 def main():
@@ -30,8 +30,8 @@ def main():
     if args.out.exists():
         raise FileExistsError('use a new condition stress output')
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-    validate_consensus_checkpoint(checkpoint)
-    base = ConsensusFuse(**checkpoint['model_config']).eval()
+    validate_assembly_checkpoint(checkpoint)
+    base = TernaryAssembly(**checkpoint['model_config']).eval()
     base.load_state_dict(checkpoint['ema_trifuse_state_dict'], strict=True)
     model = ConditionedConsensusFuse.from_base(base).eval()
     graph, proposals, state, molecule = synthetic_case(base.config['input_dim'])
@@ -94,8 +94,8 @@ def main():
               'code_sha256': {str(p.relative_to(ROOT)): sha256_file(p) for p in (
                   Path(__file__), ROOT / 'scripts/smoke_conditioned_fuse.py',
                   ROOT / 'tricoopdiff/conditioning/condition_augmentation.py', ROOT / 'tricoopdiff/conditioning/condition_features.py',
-                  ROOT / 'tricoopdiff/conditioning/conditioned_consensus_train.py', ROOT / 'tricoopdiff/models/consensus.py',
-                  ROOT / 'tricoopdiff/models/consensus.py')}}
+                  ROOT / 'tricoopdiff/conditioning/conditioned_consensus_train.py', ROOT / 'tricoopdiff/models/assembly.py',
+                  ROOT / 'tricoopdiff/models/assembly.py')}}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open('x') as handle:
         json.dump(report, handle, indent=2, allow_nan=False)

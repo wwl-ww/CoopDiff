@@ -34,8 +34,8 @@ def test_runtime_rejects_overflowing_ema_without_publishing_model():
     runner.checkpoint = {'model_config': {'input_dim': 3},
                          'ema_trifuse_state_dict': {'weight': torch.full((1, 3), 1e300,
                                                                        dtype=torch.float64)}}
-    with patch('evaluation_runner.ConsensusFuse', side_effect=lambda **kwargs:
-               torch.nn.Linear(3, 1, bias=False)), patch('evaluation_runner.ConsensusCoopDiff', Model):
+    with patch('evaluation_runner.TernaryAssembly', side_effect=lambda **kwargs:
+               torch.nn.Linear(3, 1, bias=False)), patch('evaluation_runner.TernaryAssemblyModel', Model):
         try:
             runner._ensure_model(3)
         except ValueError as error:

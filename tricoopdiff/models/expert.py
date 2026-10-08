@@ -14,6 +14,8 @@ import math
 import os
 import json
 import hashlib
+from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -36,6 +38,8 @@ def configure_expert_policy(expert, limit, mode):
     if not math.isfinite(limit) or limit <= 0:
         raise ValueError('expert activation clamp must be finite and positive')
     mode = validate_clamp_mode(mode)
+    if getattr(expert, 'backend', None) == 'matcha':
+        return  # Transformer expert has no DiffDock activation-clamp contract.
     model = getattr(expert, 'model', expert)
     model.activation_clamp = float(limit)
     model.activation_clamp_mode = mode
@@ -43,13 +47,22 @@ def configure_expert_policy(expert, limit, mode):
 
 def expert_runtime_identity(expert):
     """Generation identity includes configuration and actual numerical policy."""
+    if getattr(expert, 'backend', None) == 'matcha':
+        return dict(expert.provenance)
     model = getattr(expert, 'model', None)
-    return {**expert_base_identity(expert),
-            'model_parameters_sha256': getattr(expert, 'provenance', {}).get('model_parameters_sha256'),
-            'effective_model_config_sha256': getattr(expert, 'provenance', {}).get('effective_model_config_sha256'),
-            'activation_clamp': getattr(model, 'activation_clamp', None),
-            'activation_clamp_mode': getattr(model, 'activation_clamp_mode', 'componentwise'),
-            'sigma_bounds': [list(pair) for pair in EXPERT_SIGMA_BOUNDS]}
+    identity = {**expert_base_identity(expert),
+                'model_parameters_sha256': getattr(expert, 'provenance', {}).get('model_parameters_sha256'),
+                'effective_model_config_sha256': getattr(expert, 'provenance', {}).get('effective_model_config_sha256'),
+                'activation_clamp': getattr(model, 'activation_clamp', None),
+                'activation_clamp_mode': getattr(model, 'activation_clamp_mode', 'componentwise'),
+                'sigma_bounds': [list(pair) for pair in EXPERT_SIGMA_BOUNDS]}
+    # Preserve the historical identity schema for the pretrained hard-edge
+    # policy; record the opt-in runtime policy only when it is active.
+    if getattr(model, 'smooth_edges', False):
+        identity['smooth_edges'] = True
+    if getattr(model, 'smooth_cross_edges', False):
+        identity['smooth_cross_edges'] = True
+    return identity
 
 
 def validate_expert_sigma_args(args):
@@ -82,6 +95,210 @@ def torus_score_norm(sigma):
     high noise during diffusion, where tor_sigma reaches 1.55 rad).
     """
     return torus.score_norm(np.asarray(sigma))
+
+
+class FrozenMatcha(nn.Module):
+    """Frozen staged binary flow in a protein-defined, differentiable rigid frame.
+
+    Stages supply evidence to the ternary controller, not a second sampler.
+    No angular reinitialization or DiffDock score preconditioner is applied.
+    """
+
+    backend = 'matcha'
+    crop_policy = 'full_protein_anchor_frame_v1'
+    node_scalar_dim = 320
+    node_vector_dim = 3
+    no_torsion = False
+
+    def __init__(self, source_dir, weights_dir, device='cuda'):
+        super().__init__()
+        import inspect
+        import sys
+        source_dir, weights_dir = Path(source_dir).resolve(), Path(weights_dir).resolve()
+        sys.path.insert(0, str(source_dir))
+        from matcha.models import MatchaModel
+        from safetensors.torch import load_file
+        if Path(inspect.getfile(MatchaModel)).resolve() != source_dir / 'matcha/models/models.py':
+            raise ValueError('imported Matcha source differs from the requested frozen-prior source')
+        conf = SimpleNamespace(num_heads=8, feature_dim=320, num_transformer_blocks=12,
+            llm_emb_dim=480, use_time=True, dropout_rate=0., num_kernel_pos_encoder=128,
+            predict_torsion_angles=True)
+        self.weights_dir = weights_dir
+        self.stages = nn.ModuleList()
+        hashes = []
+        for stage in (1, 2, 3):
+            model = MatchaModel(conf, use_qk_bias=stage != 2)
+            path = weights_dir / f'matcha_pipeline/stage{stage}/model.safetensors'
+            model.load_state_dict(load_file(str(path)), strict=True)
+            self.stages.append(model)
+            hashes.append(sha256_file(path))
+        self.provenance = {'backend': 'matcha', 'stage_weights_sha256': hashes,
+            'coordinate_contract': 'protein_fixed_anchor_frame_v1',
+            'time_contract': 'reverse_global_to_three_equal_local_forward_phases_v1',
+            'advice_contract': 'forward_velocity_negative_reverse_clock_tr_div10_v1',
+            'torsion_contract': 'canonical_executor_bonds_and_fragments_v2',
+            'source_model_sha256': sha256_file(source_dir / 'matcha/models/models.py')}
+        # Node evidence depends on all imported model/preprocessing code and on
+        # the sequence encoder, not only on the three motion-head checkpoints.
+        source_files = sorted((source_dir / 'matcha').rglob('*.py'))
+        self.provenance['source_tree_sha256'] = hashlib.sha256(json.dumps([
+            (str(path.relative_to(source_dir)), sha256_file(path)) for path in source_files
+        ]).encode()).hexdigest()
+        esm_files = sorted(path for path in (weights_dir / 'esm2_t12_35M').iterdir()
+                           if path.suffix in ('.json', '.txt', '.safetensors', '.bin'))
+        self.provenance['sequence_encoder_sha256'] = hashlib.sha256(json.dumps([
+            (path.name, sha256_file(path)) for path in esm_files
+        ]).encode()).hexdigest()
+        self.provenance['adapter_sha256'] = sha256_file(__file__)
+        self.requires_grad_(False).to(device).eval()
+
+    @property
+    def model(self):
+        # Compatibility for existing trainer's no_torsion inspection only.
+        return self
+
+    def train(self, mode=True):
+        super().train(False)
+        return self
+
+    def prepare_case(self, e3_data, poi_data, ligand_data, protein_paths):
+        """Add immutable chemical/sequence features; never store target positions."""
+        import numpy as np
+        from Bio.PDB import PDBParser
+        from Bio.SeqUtils import seq1
+        from rdkit import Chem
+        from transformers import AutoModelForMaskedLM, AutoTokenizer
+        from matcha.utils.preprocessing import allowable_features, lig_feature_dims
+
+        if len(protein_paths) != 2:
+            raise ValueError('Matcha requires exactly two indexed protein paths')
+
+        device = next(self.parameters()).device
+        esm_path = str(self.weights_dir / 'esm2_t12_35M')
+        tokenizer = AutoTokenizer.from_pretrained(esm_path, local_files_only=True)
+        esm = AutoModelForMaskedLM.from_pretrained(esm_path, local_files_only=True).to(device).eval()
+        aa = ['-', 'A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L', 'M',
+              'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y']
+        proteins = []
+        for data, path in zip((e3_data, poi_data), protein_paths):
+            structure = PDBParser(QUIET=True).get_structure('p', str(path))
+            ca, embeddings, sequence = [], [], ''
+            for chain in structure[0]:
+                residues = [r for r in chain if r.id[0] == ' ' and 'CA' in r]
+                if not residues:
+                    continue
+                seq = ''.join(seq1(r.resname, custom_map={'MSE': 'M'}) for r in residues)
+                with torch.no_grad():
+                    tokens = tokenizer(seq, return_tensors='pt').to(device)
+                    embeddings.append(esm(**tokens, output_hidden_states=True).hidden_states[-1][0, 1:-1])
+                sequence += seq
+                ca.extend(r['CA'].coord for r in residues)
+            positions = data['coords'].reshape(-1, 3).to(device)
+            reference = torch.as_tensor(np.asarray(ca), device=device)
+            if reference.shape != positions.shape:
+                raise ValueError('Matcha protein sequence/coordinate correspondence failed')
+            difference = reference - positions
+            if (difference - difference.mean(0)).abs().max() > 1e-3:
+                raise ValueError('Matcha preparation requires the indexed protein reference frame')
+            centered = positions - positions.mean(0)
+            first = int(centered.square().sum(-1).argmax())
+            axis = centered[first] / centered[first].norm()
+            perpendicular = centered - (centered @ axis)[:, None] * axis
+            second = int(perpendicular.square().sum(-1).argmax())
+            if perpendicular[second].norm() < 1e-3:
+                raise ValueError('protein cannot define a nondegenerate rigid reference frame')
+            proteins.append({**data, 'matcha': {
+                'features': torch.cat(embeddings).unsqueeze(0).detach(),
+                'sequence': torch.tensor([[aa.index(a) if a in aa else 0 for a in sequence]],
+                                         device=device).unsqueeze(-1),
+                'anchors': (first, second)}})
+        del esm
+        mol = ligand_data['mol']
+        mol = Chem.Mol(mol) if isinstance(mol, bytes) else Chem.Mol(mol)
+        keys = ('possible_atomic_num_list', 'possible_chirality_list', 'possible_degree_list',
+                'possible_formal_charge_list', 'possible_implicit_valence_list', 'possible_numH_list',
+                'possible_number_radical_e_list', 'possible_hybridization_list', 'possible_is_aromatic_list',
+                'possible_numring_list', *[f'possible_is_in_ring{i}_list' for i in range(3, 9)])
+        features = []
+        for atom in mol.GetAtoms():
+            ring = mol.GetRingInfo()
+            values = (atom.GetAtomicNum(), str(atom.GetChiralTag()), atom.GetTotalDegree(),
+                atom.GetFormalCharge(), atom.GetImplicitValence(), atom.GetTotalNumHs(),
+                atom.GetNumRadicalElectrons(), str(atom.GetHybridization()), atom.GetIsAromatic(),
+                ring.NumAtomRings(atom.GetIdx()), *[ring.IsAtomInRingOfSize(atom.GetIdx(), i) for i in range(3, 9)])
+            features.append([allowable_features[k].index(v) + 1 if v in allowable_features[k]
+                             else len(allowable_features[k]) for k, v in zip(keys, values)])
+        assert len(features[0]) == len(lig_feature_dims[0])
+        bonds, masks = self.canonical_torsions(mol, ligand_data, device)
+        ligand = {**ligand_data, 'matcha': {
+            'features': torch.tensor(features, device=device).unsqueeze(0),
+            'bonds': bonds, 'masks': masks}}
+        return *proteins, ligand
+
+    @staticmethod
+    def canonical_torsions(mol, ligand_data, device):
+        """Query the learned head on the executor's actual directed fragments.
+
+        This is a prior read, not the official Matcha sampler. Its filtered or
+        collinearity-adjusted rotor masks are not interchangeable with ours;
+        neither bond reversal alone nor zero padding is a valid conversion.
+        The head accepts arbitrary counts, including zero canonical rotors.
+        """
+        from tricoopdiff.initialization import validate_ligand_graph
+
+        bonds, masks = validate_ligand_graph(mol, ligand_data['edge_index'],
+            ligand_data['edge_mask'], ligand_data['mask_rotate'])
+        return (bonds.to(device=device, dtype=torch.long),
+                torch.as_tensor(masks, device=device, dtype=torch.bool))
+
+    def read_pair(self, receptor, ligand, reverse_t, modulation=None):
+        """Return world-frame motion and invariant tokens, ligand then protein."""
+        rp, lp = receptor['coords'][0], ligand['coords'][0]
+        data, chem = receptor['matcha'], ligand['matcha']
+        origin = rp.mean(0)
+        centered = rp - origin
+        first, second = data['anchors']
+        e1 = centered[first] / centered[first].norm()
+        e2 = centered[second] - (centered[second] @ e1) * e1
+        e2 = e2 / e2.norm()
+        frame = torch.stack((e1, e2, torch.linalg.cross(e1, e2)), -1)
+        progress = (1 - reverse_t).clamp(0, 1) * 3
+        index = min(2, int(progress.detach().item()))
+        local_time = (progress - index).clamp(0, 1)
+        batch = SimpleNamespace(protein=SimpleNamespace(
+            pos=((rp - origin) @ frame).unsqueeze(0), x=data['features'], seq=data['sequence'],
+            is_padded_mask=torch.zeros(1, len(rp), device=rp.device, dtype=torch.bool)),
+            ligand=SimpleNamespace(pos=((lp - origin) @ frame).unsqueeze(0), x=chem['features'],
+                t=local_time, num_atoms=torch.tensor([len(lp)], device=rp.device),
+                is_padded_mask=torch.zeros(1, len(lp), device=rp.device, dtype=torch.bool),
+                num_rotatable_bonds=torch.tensor([len(chem['bonds'])], device=rp.device),
+                rotatable_bonds=chem['bonds'], mask_rotate=[chem['masks']],
+                tor_ptr=torch.tensor([0, len(chem['bonds'])], device=rp.device)))
+        model = self.stages[index]
+        hook = None
+        if modulation is not None:
+            gamma, beta = modulation
+            def film(module, args, output):
+                return output * (1 + gamma) + beta
+            hook = model.protein_embedder.register_forward_hook(film)
+        try:
+            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+                lig_tokens, prot_tokens, tor = model.encode_complex(batch, predict_torsion=True)
+                tr, rot = model.tr_head(lig_tokens[:, 0]), model.rot_head(lig_tokens[:, 1])
+        finally:
+            if hook is not None:
+                hook.remove()
+        scalar = torch.cat((lig_tokens[0, 2:], prot_tokens[0]), 0)
+        # Tokens are invariant in the protein frame. Preserve direction through
+        # physical atom offsets rather than inventing vector irreps from scalars.
+        nodes = torch.cat((lp, rp), 0)
+        vectors = torch.stack(((nodes - origin) / 10.,
+                               (nodes - lp.mean(0)) / 10.,
+                               frame[:, 0].expand(len(nodes), -1)), 1)
+        tr, rot = tr @ frame.T, rot @ frame.T
+        tor = tor if tor is not None else lp.new_empty(0)
+        # Evidence convention matches the reverse-clock controller, not scores.
+        return -tr / 10., -rot, -tor.reshape(1, -1), scalar, vectors
 
 
 class FrozenDiffDock(nn.Module):
@@ -301,12 +518,21 @@ class FrozenDiffDock(nn.Module):
         irreps = o3.Irreps(self.model.conv_layers[-1].out_irreps)
         return sum(multiplicity for multiplicity, irrep in irreps if irrep.l == 0)
 
-    def forward_features(self, data):
+    @property
+    def node_vector_dim(self) -> int:
+        """Number of final-layer l=1 channels available at each expert node."""
+        irreps = o3.Irreps(self.model.conv_layers[-1].out_irreps)
+        return sum(multiplicity for multiplicity, irrep in irreps if irrep.l == 1)
+
+    def forward_features(self, data, *, include_vectors=False):
         """Return native scores and scalar nodes in ligand/cropped-receptor order.
 
         Coordinates retain autograd through the frozen expert. The temporary
         read-only hook does not replace native forward or alter checkpoint keys.
         Odd scalars are SO(3) invariant, not invariant under reflections.
+        When requested, the final-layer l=1 irreps are returned as [N, V, 3].
+        A componentwise clamp is rejected for this path because it breaks
+        rotational equivariance; the legacy scalar-only API keeps that mode.
         """
         layer = self.model.conv_layers[-1]
         irreps = o3.Irreps(layer.out_irreps)
@@ -322,16 +548,35 @@ class FrozenDiffDock(nn.Module):
             hook.remove()
         if len(captured) != 1 or captured[0].ndim != 2 or captured[0].shape[1] != irreps.dim:
             raise ValueError('expert final-layer node output does not match its irreps')
+        limit = self.model.activation_clamp
+        clamp_mode = self.model.activation_clamp_mode
+        if include_vectors and limit and clamp_mode == 'componentwise':
+            raise ValueError('equivariant vector features require irrep_norm expert activation clamping')
         scalars = torch.cat([captured[0][:, section] for section in sections], dim=-1)
+        vector_blocks = []
+        for (multiplicity, irrep), section in zip(irreps, irreps.slices()):
+            if include_vectors and irrep.l == 1:
+                block = captured[0][:, section].reshape(-1, multiplicity, 3)
+                vector_blocks.append((multiplicity, irrep, block))
         # Native CGModel applies its clamp after the hook. Scalar norm clipping
         # is mathematically equivalent to component clipping, but its floating
         # point arithmetic and non-finite propagation must also match native.
-        limit = self.model.activation_clamp
         if limit:
-            if self.model.activation_clamp_mode == 'irrep_norm':
+            if clamp_mode == 'irrep_norm':
                 scalars = clamp_irrep_features(scalars, f'{scalars.shape[-1]}x0e', float(limit))
             else:
                 scalars = scalars.clamp(min=-float(limit), max=float(limit))
+            if include_vectors:
+                vector_blocks = [
+                    (multiplicity, irrep,
+                     clamp_irrep_features(block.reshape(len(block), -1),
+                                           f"{multiplicity}x1{'o' if irrep.p == -1 else 'e'}", float(limit)
+                                           ).reshape_as(block))
+                    for multiplicity, irrep, block in vector_blocks]
+        if include_vectors:
+            vectors = (torch.cat([block for _, _, block in vector_blocks], dim=1)
+                       if vector_blocks else scalars.new_zeros(len(scalars), 0, 3))
+            return tr, rot, tor, scalars, vectors
         return tr, rot, tor, scalars
 
 
@@ -459,6 +704,8 @@ _EXPERT_IDENTITY_KEYS = ('diffdock_commit', 'score_checkpoint_sha256', 'no_torsi
 def expert_base_identity(expert):
     """Return the stable identity fields for the external frozen expert."""
     provenance = getattr(expert, 'provenance', {})
+    if getattr(expert, 'backend', None) == 'matcha':
+        return dict(provenance)
     missing = [key for key in _EXPERT_IDENTITY_KEYS if key not in provenance]
     if missing:
         raise ValueError(f'frozen expert has incomplete provenance: {missing}')

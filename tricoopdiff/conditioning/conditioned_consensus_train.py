@@ -11,11 +11,11 @@ from tricoopdiff.conditioning.condition_features import (
     ProtacConditionEncoder, condition_feature_shapes, build_supervised_contact_features,
 )
 from tricoopdiff.diffdock.utils.torus import SCORE_NORM_VERSION, validate_score_norm_version
-from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse
+from tricoopdiff.models.assembly import TernaryAssemblyModel, TernaryAssembly
 from tricoopdiff.models.expert import validate_expert_base_identity
 from tricoopdiff.sdpi_flow import FLOW_VERSION
 from tricoopdiff.runtime import atomic_torch_save, sha256_file as checkpoint_sha256
-from tricoopdiff.train import ConsensusTrainer, TriCoopDiffTrainer, validate_consensus_checkpoint
+from tricoopdiff.train import AssemblyTrainer, TriCoopDiffTrainer, validate_assembly_checkpoint
 
 
 ARCHITECTURE = 'conditioned_residual_consensus_v3_prototype'
@@ -24,7 +24,7 @@ ARCHITECTURE = 'conditioned_residual_consensus_v3_prototype'
 CONDITION_CONTRACT = 'protac_condition_features_v2_no_learned_provenance'
 
 
-class ConditionedConsensusFuse(ConsensusFuse):
+class ConditionedConsensusFuse(TernaryAssembly):
     """Condition residuals affect consensus only, never frozen expert proposals."""
 
     supports_conditions = True
@@ -48,8 +48,8 @@ class ConditionedConsensusFuse(ConsensusFuse):
 
     @classmethod
     def from_base(cls, base):
-        if type(base) is not ConsensusFuse:
-            raise ValueError('migration requires an unmodified base ConsensusFuse')
+        if type(base) is not TernaryAssembly:
+            raise ValueError('migration requires an unmodified base TernaryAssembly')
         with torch.random.fork_rng(devices=[]):
             model = cls(**base.config).to(next(base.parameters()).device)
         state = model.state_dict()
@@ -106,7 +106,7 @@ def load_prototype_checkpoint(payload):
     return model
 
 
-class ConditionedConsensusCoopDiff(ConsensusCoopDiff):
+class ConditionedConsensusCoopDiff(TernaryAssemblyModel):
     """Explicit experimental wrapper; legacy evaluators cannot silently enable it."""
 
     architecture = ARCHITECTURE
@@ -129,12 +129,12 @@ def _sha256(value):
 
 def build_conditioned_model(parent_payload, frozen_expert):
     """Migrate the exact EMA C checkpoint into the isolated architecture."""
-    validate_consensus_checkpoint(parent_payload)
+    validate_assembly_checkpoint(parent_payload)
     validate_expert_base_identity(parent_payload, frozen_expert)
     config = dict(parent_payload['model_config'])
     if not config.get('source_conditioning'):
         raise ValueError('conditioned protocol requires the C parent with source conditioning')
-    base = ConsensusFuse(**config)
+    base = TernaryAssembly(**config)
     base.load_state_dict(parent_payload['ema_trifuse_state_dict'], strict=True)
     conditioned = ConditionedConsensusFuse.from_base(base)
     return ConditionedConsensusCoopDiff(frozen_expert, conditioned)
@@ -194,7 +194,7 @@ def validate_conditioned_checkpoint(payload):
         raise ValueError('conditioned checkpoint cannot store native condition coordinates')
 
 
-class ConditionedConsensusTrainer(ConsensusTrainer):
+class ConditionedConsensusTrainer(AssemblyTrainer):
     """EMA trainer whose checkpoint cannot be loaded as an old C40/v20 model."""
 
     training_objective = 'sdpi_velocity_mse_v1'

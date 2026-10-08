@@ -102,7 +102,6 @@ def parse_args(argv=None):
     p.add_argument("--resume", default=None, help="Resume from checkpoint")
 
     # Model config
-    p.add_argument("--num_transformer_layers", type=int, default=3)
     p.add_argument("--node_dim", type=int, default=128)
     # Frozen DiffDock-L expert (ns=48, nv=10, num_conv_layers=11). These are read
     # from the checkpoint's model_parameters.yml, not hand-written here.
@@ -121,6 +120,9 @@ def parse_args(argv=None):
     )
     p.add_argument("--log_interval", type=int, default=10)
     p.add_argument("--save_interval", type=int, default=10)
+    p.add_argument('--save-steps', type=int, default=100,
+                   help='Save progress every N optimizer updates; 0 disables. '
+                        'Resume retains optimization state and restarts the incomplete epoch.')
     p.add_argument("--seed", type=int, default=0,
                    help="Random seed for model initialization, shuffling, and diffusion noise")
     p.add_argument(
@@ -276,8 +278,7 @@ def main():
     # ----------------------------------------------------------------
     print("[1/6] Building model...")
     model, diffusion, trainer = build_trainer(args, device, input_dim=input_dim)
-    print(f"  Model profile: production | "
-          f"dropout={args.resolved_model_config['dropout'] if 'dropout' in args.resolved_model_config else .1:g}")
+    print(f"  Model profile: {args.resolved_model_config.get('model_profile', 'custom')}")
     # Include resolved resume/profile settings, not defaults that were ignored.
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as handle:
         json.dump(vars(args), handle, indent=2)
@@ -339,6 +340,10 @@ def main():
             ) for offset, batch in enumerate(microbatches)]
             group_losses = _guarded_train_batch(trainer, microbatches)
             train_losses.extend(group_losses)
+            if args.save_steps > 0 and trainer.global_step % args.save_steps == 0:
+                trainer.save_checkpoint(
+                    os.path.join(args.output_dir, 'progress_model.pt'), epoch=epoch - 1,
+                    best_val_loss=best_val_loss, best_val_dockq=best_val_dockq)
             for batch, loss_dict in zip(microbatches, group_losses):
                 append_metric(args.output_dir, {
                     'event': 'train_step', 'epoch': epoch,
@@ -427,6 +432,9 @@ def main():
                 os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt"),
                 epoch=epoch, best_val_loss=best_val_loss, best_val_dockq=best_val_dockq,
             )
+        trainer.save_checkpoint(
+            os.path.join(args.output_dir, 'progress_model.pt'), epoch=epoch,
+            best_val_loss=best_val_loss, best_val_dockq=best_val_dockq)
 
     # ----------------------------------------------------------------
     # 5. Final save
@@ -441,10 +449,12 @@ def main():
 
 def build_trainer(args, device, input_dim=None):
     """Build model, diffusion, and trainer."""
-    from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse, production_model_config
+    from tricoopdiff.models.assembly import (TernaryAssemblyModel, TernaryAssembly,
+                                             VECTOR_EXPERT_MODEL_PROFILE,
+                                             production_model_config)
     from tricoopdiff.models.expert import build_diffdock_expert
     from tricoopdiff.sdpi_flow import SDPIFlow
-    from tricoopdiff.train import ConsensusTrainer
+    from tricoopdiff.train import AssemblyTrainer
 
     # Build frozen DiffDock-L expert from pretrained weights (self-contained
     # vendored core — no ../DiffDock dependency). num_conv_layers (11) and the
@@ -462,16 +472,17 @@ def build_trainer(args, device, input_dim=None):
         print(f"[warn] input_dim not provided; defaulting to node_dim={input_dim}")
 
     model_config = production_model_config(args.node_dim, input_dim,
-                                           args.num_transformer_layers,
                                            args.training_arm == 'C',
-                                           expert_scalar_dim=frozen_expert.node_scalar_dim)
+                                           model_profile=VECTOR_EXPERT_MODEL_PROFILE,
+                                           expert_scalar_dim=frozen_expert.node_scalar_dim,
+                                           expert_vector_dim=getattr(frozen_expert, 'node_vector_dim', 20))
     if args.resume:
         # Resume means reconstruct the saved architecture, not reinterpret it
         # using today's defaults. The trainer subsequently checks every runtime
         # loss/source/optimizer contract before loading trainable state.
-        from tricoopdiff.train import validate_consensus_checkpoint
+        from tricoopdiff.train import validate_assembly_checkpoint
         saved = torch.load(args.resume, map_location='cpu', weights_only=False)
-        validate_consensus_checkpoint(saved)
+        validate_assembly_checkpoint(saved)
         if saved['runtime_config'].get('training_objective') != 'real_initialization_reachable_endpoint_v2':
             raise ValueError('historical checkpoints are inference/weight sources, not production resumes')
         model_config = dict(saved['model_config'])
@@ -494,9 +505,9 @@ def build_trainer(args, device, input_dim=None):
     if getattr(args, 'training_arm', 'A1') in ('B', 'C'):
         from tricoopdiff.initialization.endpoints import RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
         args.training_endpoint_protocol = RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
-    trifuse = ConsensusFuse(**model_config)
+    trifuse = TernaryAssembly(**model_config)
 
-    model = ConsensusCoopDiff(frozen_expert, trifuse,
+    model = TernaryAssemblyModel(frozen_expert, trifuse,
                              expert_input_grad=True,
                              checkpoint_ternary=getattr(args, 'checkpoint_ternary', True))
 
@@ -504,7 +515,7 @@ def build_trainer(args, device, input_dim=None):
     diffusion = SDPIFlow(inference_steps=20)
 
     # Build trainer
-    trainer = ConsensusTrainer(
+    trainer = AssemblyTrainer(
         model=model,
         diffusion=diffusion,
         lr=args.lr,

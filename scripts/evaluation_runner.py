@@ -14,7 +14,10 @@ from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
 from tricoopdiff.models.expert import build_diffdock_expert
-from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse
+from tricoopdiff.models.assembly import (
+    DIRECT_RANK_FEATURE_STATE, LEGACY_RANK_FEATURE_STATE,
+    TernaryAssemblyModel, TernaryAssembly,
+)
 from tricoopdiff.runtime import configure_inference_reproducibility, atomic_json as write_report_atomic
 from tricoopdiff.models.expert import validate_expert_base_identity
 from tricoopdiff.diffdock.utils.torus import (
@@ -99,6 +102,8 @@ class EvaluationRunner:
         )
         from tricoopdiff.models.expert import configure_expert_policy
         configure_expert_policy(self.expert, self.activation_clamp, self.activation_clamp_mode)
+        if self.checkpoint.get('model_config', {}).get('model_profile') == 'ternary_endpoint_v14':
+            self.expert.model.smooth_cross_edges = True
         if self.checkpoint.get('checkpoint_version', 0) >= 24:
             from tricoopdiff.models.expert import expert_runtime_identity
             if self.checkpoint['runtime_config'].get('expert_runtime_identity') != expert_runtime_identity(self.expert):
@@ -130,13 +135,13 @@ class EvaluationRunner:
             trifuse = ConditionedConsensusFuse(**self.checkpoint['model_config'])
             model = ConditionedConsensusCoopDiff(self.expert, trifuse).to(self.device)
         else:
-            trifuse = ConsensusFuse(**self.checkpoint['model_config'])
+            trifuse = TernaryAssembly(**self.checkpoint['model_config'])
         if self.experimental_checkpoint:
             from tricoopdiff.experiments.consensus_experiment import ExperimentalConsensus
 
             model = ExperimentalConsensus(self.expert, trifuse).to(self.device)
         elif not self.conditioned_checkpoint:
-            model = ConsensusCoopDiff(
+            model = TernaryAssemblyModel(
                 frozen_expert=self.expert,
                 trifuse=trifuse,
             ).to(self.device)
@@ -263,7 +268,11 @@ class EvaluationRunner:
             "condition_manifest_sha256": (sha256_file(condition_path) if condition_path else None),
             "condition_audit": condition_audit,
             "rank_features_saved": bool(return_rank_features),
-            "rank_feature_state": ('final_pose_t0_dt0_v1' if return_rank_features else None),
+            "rank_feature_state": (
+                DIRECT_RANK_FEATURE_STATE
+                if return_rank_features and self.checkpoint['model_config'].get('direct_ternary_motion', False)
+                else LEGACY_RANK_FEATURE_STATE if return_rank_features else None
+            ),
             "checkpoint_sha256": self.checkpoint_sha256,
             "expert_checkpoint_sha256": self.expert.provenance["score_checkpoint_sha256"],
             "expert_config_sha256": self.expert_config_sha256,

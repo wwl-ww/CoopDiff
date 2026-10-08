@@ -28,7 +28,7 @@ from tricoopdiff.conditioning.conditioned_consensus_train import (
     ConditionedConsensusTrainer, build_conditioned_model, checkpoint_sha256,
     supervised_condition_batch,
 )
-from tricoopdiff.train import validate_consensus_checkpoint
+from tricoopdiff.train import validate_assembly_checkpoint
 from tricoopdiff.models.expert import build_diffdock_expert
 from tricoopdiff.initialization.endpoints import CachedEndpointStore, ONLINE_TRAINING_ENDPOINT_PROTOCOL
 from tricoopdiff.sdpi_flow import SDPIFlow
@@ -97,7 +97,7 @@ def condition_dropout(args):
 
 def build_trainer(args, device):
     parent = torch.load(args.parent, map_location='cpu', weights_only=False)
-    validate_consensus_checkpoint(parent)
+    validate_assembly_checkpoint(parent)
     expert = build_diffdock_expert(args.expert_model_dir, device=str(device))
     model = build_conditioned_model(parent, expert)
     trainer = ConditionedConsensusTrainer(

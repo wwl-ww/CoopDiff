@@ -51,6 +51,9 @@ class CGModel(torch.nn.Module):
         self.device = device
         self.no_torsion = no_torsion
         self.smooth_edges = smooth_edges
+        # Optional cross-interface taper used by ternary integration. Keep
+        # ligand/receptor internal pretrained message weights unchanged.
+        self.smooth_cross_edges = False
         self.odd_parity = odd_parity
         self.timestep_emb_func = timestep_emb_func
         self.separate_noise_schedule = separate_noise_schedule
@@ -525,10 +528,11 @@ class CGModel(torch.nn.Module):
                                              .to(data['ligand'].x.device))
         return 0, 0, tor_pred, 0
 
-    def get_edge_weight(self, edge_vec, max_norm):
+    def get_edge_weight(self, edge_vec, max_norm, *, smooth=None):
         # computes weights for edges that are decreasing with the distance
         # it has an effect only if smooth edges is true
-        if self.smooth_edges:
+        use_smooth = self.smooth_edges if smooth is None else smooth
+        if use_smooth:
             normalised_norm = torch.clip(edge_vec.norm(dim=-1) * np.pi / max_norm, max=np.pi)
             return 0.5 * (torch.cos(normalised_norm) + 1.0).unsqueeze(-1)
         return 1.0
@@ -626,7 +630,8 @@ class CGModel(torch.nn.Module):
         rev_edge_sh = o3.spherical_harmonics(self.sh_irreps, -edge_vec, normalize=True, normalization='component')
 
         cutoff_d = cross_distance_cutoff[data['ligand'].batch[src]].squeeze() if torch.is_tensor(cross_distance_cutoff) else cross_distance_cutoff
-        edge_weight = self.get_edge_weight(edge_vec, cutoff_d)
+        edge_weight = self.get_edge_weight(
+            edge_vec, cutoff_d, smooth=self.smooth_edges or self.smooth_cross_edges)
 
         return edge_index, edge_attr, edge_sh, rev_edge_sh, edge_weight
 
@@ -651,7 +656,8 @@ class CGModel(torch.nn.Module):
 
         cutoff_d = lr_cross_distance_cutoff[data['ligand'].batch[lr_edge_index[0]]].squeeze() \
             if torch.is_tensor(lr_cross_distance_cutoff) else lr_cross_distance_cutoff
-        lr_edge_weight = self.get_edge_weight(lr_edge_vec, cutoff_d)
+        lr_edge_weight = self.get_edge_weight(
+            lr_edge_vec, cutoff_d, smooth=self.smooth_edges or self.smooth_cross_edges)
 
         # LIGAND to ATOM
         la_edge_index = radius(data['misc_atom'].pos, data['ligand'].pos, self.lig_max_radius,

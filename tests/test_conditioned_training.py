@@ -20,8 +20,8 @@ from tricoopdiff.conditioning.conditioned_consensus_train import (
     validate_conditioned_checkpoint,
 )
 from tricoopdiff.conditioning.conditioned_consensus_train import ConditionedConsensusCoopDiff, ConditionedConsensusFuse
-from tricoopdiff.models.consensus import ConsensusFuse
-from tricoopdiff.train import validate_consensus_checkpoint
+from tricoopdiff.models.assembly import TernaryAssembly
+from tricoopdiff.train import validate_assembly_checkpoint
 from tricoopdiff.sdpi_flow import SDPIFlow
 from evaluation_runner import EvaluationRunner
 
@@ -39,8 +39,7 @@ class FrozenExpert(nn.Module):
 
 
 def trainer(parent='a' * 64, dropout=ConditionFeatureDropout()):
-    base = ConsensusFuse(node_dim=16, input_dim=8, num_transformer_layers=1,
-                         dropout=0., source_conditioning=True)
+    base = TernaryAssembly(node_dim=16, input_dim=8, source_conditioning=True)
     fuse = ConditionedConsensusFuse.from_base(base)
     model = ConditionedConsensusCoopDiff(FrozenExpert(), fuse)
     return ConditionedConsensusTrainer(
@@ -91,7 +90,7 @@ def test_conditioned_checkpoint_roundtrip_and_legacy_rejection():
         assert payload['format'] == CHECKPOINT_FORMAT
         assert payload['runtime_config']['native_coordinates_stored_in_conditions'] is False
         try:
-            validate_consensus_checkpoint(payload)
+            validate_assembly_checkpoint(payload)
         except ValueError:
             pass
         else:

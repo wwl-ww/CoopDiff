@@ -63,7 +63,7 @@ def main():
     input_dim = int(first['e3_data']['features'].shape[-1])
     model_args = argparse.Namespace(
         expert_model_dir=args.expert_model_dir, node_dim=128, ns=32, nv=4,
-        num_transformer_layers=3, lr=1e-3, weight_decay=1e-4,
+        lr=1e-3, weight_decay=1e-4,
         nan_clamp=100., activation_clamp_mode='irrep_norm',
         torsion_expert_aux_weight=.25, residual_weight=1e-3, ema_decay=.999,
         training_arm='A1', training_endpoint_protocol='none', phase=1,

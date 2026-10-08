@@ -16,8 +16,8 @@ from test_consensus import fixture
 from tricoopdiff.conditioning.condition_features import SideCondition, build_condition_features
 from tricoopdiff.conditioning.conditioned_consensus_train import (ConditionedConsensusFuse, ConditionedConsensusCoopDiff,
                                               load_prototype_checkpoint)
-from tricoopdiff.models.consensus import BRANCHES, ConsensusCoopDiff, ConsensusFuse
-from tricoopdiff.train import validate_consensus_checkpoint
+from tricoopdiff.models.assembly import BRANCHES, TernaryAssemblyModel, TernaryAssembly
+from tricoopdiff.train import validate_assembly_checkpoint
 from tricoopdiff.geometry.rigid import rotation_exp as so3_exp
 
 
@@ -107,7 +107,7 @@ def test_prototype_roundtrip_and_legacy_rejection():
         velocities(model(graph, proposals, state, conditions=conditions())),
         velocities(restored(graph, proposals, state, conditions=conditions()))))
     try:
-        validate_consensus_checkpoint(checkpoint)
+        validate_assembly_checkpoint(checkpoint)
     except ValueError:
         pass
     else:
@@ -122,7 +122,7 @@ def test_prototype_roundtrip_and_legacy_rejection():
 
 def test_condition_node_alignment_rejected_and_source_stays_independent():
     _, graph, proposals, state = fixture()
-    base = ConsensusFuse(node_dim=32, input_dim=16, num_transformer_layers=1, dropout=0, source_conditioning=True).eval()
+    base = TernaryAssembly(node_dim=32, input_dim=16, source_conditioning=True).eval()
     model = ConditionedConsensusFuse.from_base(base)
     features = conditions()
     first = model(graph, proposals, state, source=0, conditions=features)
@@ -172,7 +172,7 @@ def test_wrapper_never_exposes_condition_channels_or_gradients_to_experts():
     sum(v.square().sum() for v in velocities(after)).backward()
     assert expert.weight.grad is None and not expert.weight.requires_grad
     try:
-        ConsensusCoopDiff(Expert(), fuse)
+        TernaryAssemblyModel(Expert(), fuse)
     except ValueError:
         pass
     else:

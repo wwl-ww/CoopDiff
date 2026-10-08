@@ -22,7 +22,9 @@ import torch
 
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.sdpi_flow import SDPIFlow, FLOW_VERSION
-from tricoopdiff.models.consensus import SOURCE_NAMES
+from tricoopdiff.models.assembly import (
+    DIRECT_RANK_FEATURE_STATE, LEGACY_RANK_FEATURE_STATE, SOURCE_NAMES,
+)
 from tricoopdiff.runtime import evaluation_context
 
 
@@ -357,7 +359,10 @@ def sample_single(
             raise ValueError('model did not return finite final rank_features [1,D]')
         final_rank_features = features[0].detach().cpu().numpy().copy()
         result['rank_features'] = final_rank_features
-        result['rank_feature_state'] = 'final_pose_t0_dt0_v1'
+        trifuse = getattr(model, 'trifuse', None)
+        state = (DIRECT_RANK_FEATURE_STATE if getattr(trifuse, 'direct_ternary_motion', False)
+                 else LEGACY_RANK_FEATURE_STATE)
+        result['rank_feature_state'] = state
     return result
 
 

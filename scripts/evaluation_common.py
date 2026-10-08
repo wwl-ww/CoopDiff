@@ -37,8 +37,8 @@ def validate_checkpoint_payload(payload, expected_lora_tensors=None):
     """The model-v2 production evaluator accepts only consensus checkpoints."""
     if not isinstance(payload, dict):
         raise ValueError('checkpoint must contain a mapping')
-    from tricoopdiff.train import validate_consensus_checkpoint
-    validate_consensus_checkpoint(payload)
+    from tricoopdiff.train import validate_assembly_checkpoint
+    validate_assembly_checkpoint(payload)
 
 
 def validate_legacy_checkpoint_payload(payload, expected_lora_tensors=336):

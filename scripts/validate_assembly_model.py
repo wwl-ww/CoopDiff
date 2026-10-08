@@ -1,4 +1,4 @@
-"""Bounded real-data gate: frozen experts, optimization, EMA and one trajectory.
+"""Bounded assembly gate: frozen experts, optimization, EMA and one trajectory.
 
 Use a previously recorded TRAINING fixed_pair.pt, never benchmark inputs for
 optimization. This writes smoke-only weights, not a quality-selected model.
@@ -18,8 +18,10 @@ import tricoopdiff.diffdock_compat  # noqa: E402,F401
 import numpy as np
 import torch
 
-from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse, production_model_config
-from tricoopdiff.train import ConsensusTrainer
+from tricoopdiff.models.assembly import (TernaryAssemblyModel, TernaryAssembly,
+                                         VECTOR_EXPERT_MODEL_PROFILE,
+                                         production_model_config)
+from tricoopdiff.train import AssemblyTrainer
 from tricoopdiff.models.expert import build_diffdock_expert
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.initialization.endpoints import reachable_ligand_target
@@ -50,10 +52,14 @@ def main():
     native_snapshot = {k: batch[k]['coords'].clone() for k in ('e3_data', 'poi_data', 'ligand_data')}
     expert = build_diffdock_expert(args.expert_model_dir, args.device)
     expert_snapshot = {n: p.detach().cpu().clone() for n, p in expert.named_parameters()}
-    fuse = ConsensusFuse(**production_model_config(128, batch['e3_data']['features'].shape[-1], 3))
-    model = ConsensusCoopDiff(expert, fuse).to(args.device)
+    fuse = TernaryAssembly(**production_model_config(
+        128, batch['e3_data']['features'].shape[-1],
+        model_profile=VECTOR_EXPERT_MODEL_PROFILE,
+        expert_scalar_dim=expert.node_scalar_dim,
+        expert_vector_dim=expert.node_vector_dim))
+    model = TernaryAssemblyModel(expert, fuse).to(args.device)
     flow = SDPIFlow()
-    trainer = ConsensusTrainer(model, flow, device=args.device, lr=1e-4, ema_decay=0.9)
+    trainer = AssemblyTrainer(model, flow, device=args.device, lr=1e-4, ema_decay=0.9)
     ligand, poi, body, _ = TernaryInitializer(no_torsion=expert.model.no_torsion).initialize(
         batch['e3_data']['coords'][0], batch['poi_data']['coords'][0], batch['ligand_data'], seed=17)
     target, _ = reachable_ligand_target(batch['ligand_data'], ligand, poi,
@@ -76,7 +82,7 @@ def main():
     trainer.save_checkpoint(output / 'smoke_only.pt', epoch=1,
                             best_val_loss=validation['loss_total'])
     before = trainer.validate_step(**copy.deepcopy(fixed))
-    restored = ConsensusTrainer(model, flow, device=args.device, lr=1e-4, ema_decay=0.9)
+    restored = AssemblyTrainer(model, flow, device=args.device, lr=1e-4, ema_decay=0.9)
     restored.load_checkpoint(output / 'smoke_only.pt')
     after = restored.validate_step(**copy.deepcopy(fixed))
     assert before == after, 'EMA validation differs after resume'
