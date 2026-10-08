@@ -66,7 +66,7 @@ def bounded_vector(value):
 ARCHITECTURE = 'residual_evidence_v3'
 DIRECT_ARCHITECTURE = 'ternary_topological_joint_pose_v14'
 PREVIOUS_DIRECT_ARCHITECTURE = 'ternary_nodefield_independent_v4'
-ASSEMBLY_CHECKPOINT_VERSION = 48
+ASSEMBLY_CHECKPOINT_VERSION = 49
 EXPERT_CROP_POLICY = 'full_receptor_cross_taper_v1'
 LEGACY_RANK_FEATURE_STATE = 'final_pose_t0_dt0_v1'
 DIRECT_RANK_FEATURE_STATE = 'final_pose_evidence_t0_dt0_v2'
@@ -83,18 +83,22 @@ PREVIOUS_PRODUCTION_MODEL_PROFILE = 'ternary_endpoint_v3'
 PRODUCTION_MODEL_PROFILE = 'ternary_endpoint_v4'
 VECTOR_EXPERT_MODEL_PROFILE = 'ternary_endpoint_v14'
 MATCHA_CONDITIONING_CONTRACT = 'nodewise_distance_values_v2'
+INFORMATION_CONTRACT = 'geometric_message_values_v1'
 
 
 def production_model_config(node_dim, input_dim, source_conditioning=False, *,
                             model_profile=VECTOR_EXPERT_MODEL_PROFILE,
                             expert_scalar_dim=58, expert_vector_dim=20,
-                            expert_backend='diffdock', conditioning_contract=MATCHA_CONDITIONING_CONTRACT):
+                            expert_backend='diffdock', conditioning_contract=MATCHA_CONDITIONING_CONTRACT,
+                            information_contract=INFORMATION_CONTRACT):
     """One explicit new-model recipe; older weights retain their own config."""
     if model_profile not in (LEGACY_PRODUCTION_MODEL_PROFILE, FEATURE_PRODUCTION_MODEL_PROFILE,
                             PREVIOUS_PRODUCTION_MODEL_PROFILE, PRODUCTION_MODEL_PROFILE,
                             VECTOR_EXPERT_MODEL_PROFILE):
         raise ValueError(f'unknown model profile: {model_profile}')
-    config = dict(node_dim=node_dim, input_dim=input_dim,
+    if information_contract != INFORMATION_CONTRACT:
+        raise ValueError('retired geometric attention: geometry must enter message values')
+    config = dict(node_dim=node_dim, input_dim=input_dim, information_contract=information_contract,
                 source_conditioning=bool(source_conditioning),
                 direct_ternary_motion=True, global_node_context=True,
                 spatial_geometry=True, motion_attention=True,
@@ -112,9 +116,9 @@ def production_model_config(node_dim, input_dim, source_conditioning=False, *,
         for obsolete in ('global_node_context', 'spatial_geometry', 'motion_attention',
                          'global_node_attention', 'rotation_scale_normalization'):
             config.pop(obsolete)
-    if expert_backend not in ('diffdock', 'matcha'):
+    if expert_backend not in ('diffdock', 'matcha', 'fabind'):
         raise ValueError('unknown binary expert backend')
-    if expert_backend == 'matcha':
+    if expert_backend in ('matcha', 'fabind'):
         if conditioning_contract != MATCHA_CONDITIONING_CONTRACT:
             raise ValueError('retired Matcha conditioning: distance must enter nodewise values')
         config['expert_backend'] = expert_backend
@@ -148,7 +152,7 @@ class ComponentStructureEncoder(nn.Module):
         self.query = nn.Linear(width, width, bias=False)
         self.key = nn.Linear(width, width, bias=False)
         self.value = nn.Linear(width, width)
-        self.geometry = nn.Sequential(nn.Linear(1, width), nn.SiLU(), nn.Linear(width, 1))
+        self.geometry = nn.Sequential(nn.Linear(1, width), nn.SiLU(), nn.Linear(width, width + 1))
         self.chemistry = nn.Sequential(nn.Linear(6, width), nn.SiLU(), nn.Linear(width, width + 1))
         self.norm = nn.LayerNorm(width)
 
@@ -192,8 +196,9 @@ class ComponentStructureEncoder(nn.Module):
                     messages = values[None] + relation[..., :-1]
                 else:
                     distance = torch.linalg.vector_norm(xyz[start:stop, None] - xyz[None], dim=-1) / 10.
-                    logits = logits + self.geometry(torch.log1p(distance)[..., None]).squeeze(-1)
-                    messages = values[None]
+                    relation = self.geometry(torch.log1p(distance)[..., None])
+                    logits = logits + relation[..., -1]
+                    messages = values[None] + relation[..., :-1]
                 pieces.append((logits.softmax(-1)[..., None] * messages).sum(1))
             encoded[ids] = self.norm(h + torch.cat(pieces))
         return encoded
@@ -210,7 +215,7 @@ class EquivariantInteraction(nn.Module):
         self.key = nn.Linear(width, width, bias=False)
         self.value = nn.Linear(width, width)
         self.geometry = nn.Sequential(nn.Linear(5 + 2 * channels, width), nn.SiLU(),
-                                      nn.Linear(width, self.heads))
+                                      nn.Linear(width, width + self.heads))
         self.direction = nn.Linear(width, channels)
         self.vector_mix = nn.Linear(3 * channels, channels, bias=False)
         self.scalar_mix = nn.Sequential(nn.Linear(4 * width + channels + 3, width), nn.SiLU(),
@@ -229,13 +234,16 @@ class EquivariantInteraction(nn.Module):
         query = q.reshape(len(q), self.heads, -1)
         keys = keys.reshape(len(keys), self.heads, -1)
         logits = torch.einsum('ihd,jhd->ijh', query, keys) / math.sqrt(self.width // self.heads)
-        logits = logits + self.geometry(geometry)
+        relation = self.geometry(geometry)
+        logits = logits + relation[..., -self.heads:]
+        pair_values = relation[..., :-self.heads].reshape(len(q), len(keys), self.heads, -1)
         scalar_messages, vector_messages, densities = [], [], []
         for component in range(3):
             selected = types == component
             weights = logits[:, selected].softmax(1)
-            scalar_messages.append(torch.einsum('ijh,jhd->ihd', weights,
-                values[selected].reshape(-1, self.heads, self.width // self.heads)).flatten(1))
+            messages = (values[selected].reshape(1, -1, self.heads, self.width // self.heads)
+                        + pair_values[:, selected])
+            scalar_messages.append(torch.einsum('ijh,ijhd->ihd', weights, messages).flatten(1))
             direct = torch.einsum('ijh,jhvc->ihvc', weights,
                 vectors[selected].reshape(-1, self.heads, vectors.shape[1] // self.heads, 3))
             radial = torch.einsum('ijh,jhv,ijc->ihvc', weights,
@@ -281,7 +289,7 @@ class LegalPoseDecoder(nn.Module):
         self.width = width
         self.key = nn.Linear(width, width, bias=False)
         self.value = nn.Linear(width, width)
-        self.distance = nn.Sequential(nn.Linear(1, width), nn.SiLU(), nn.Linear(width, 1))
+        self.distance = nn.Sequential(nn.Linear(1, width), nn.SiLU(), nn.Linear(width, width + 1))
         self.bond_query = nn.Linear(2 * width + 2 * channels + 2, width)
         self.bond_geometry = nn.Sequential(nn.Linear(2 * channels + 3, width), nn.SiLU(),
                                            nn.Linear(width, width + 1))
@@ -298,10 +306,11 @@ class LegalPoseDecoder(nn.Module):
             nn.init.normal_(head[-1].weight, std=.01)
             nn.init.zeros_(head[-1].bias)
 
-    def _logits(self, queries, positions, h, coords):
+    def _relations(self, queries, positions, h, coords):
         distance = torch.linalg.vector_norm(positions[:, None] - coords[None], dim=-1) / 10.
-        return (queries @ self.key(h).T / math.sqrt(self.width)
-                + self.distance(torch.log1p(distance)[..., None]).squeeze(-1))
+        relation = self.distance(torch.log1p(distance)[..., None])
+        logits = queries @ self.key(h).T / math.sqrt(self.width) + relation[..., -1]
+        return logits, relation[..., :-1]
 
     @staticmethod
     def joint_relations(positions, affected):
@@ -364,7 +373,8 @@ class LegalPoseDecoder(nn.Module):
             bond_queries = self.bond_query(features)
             midpoint = (xyz[u] + xyz[v]) / 2.
             geometry = self.bond_geometry(self.action_geometry(coords, vectors, ligand, bonds, masks))
-            logits = self._logits(bond_queries, midpoint, lh, xyz) + geometry[:, ligand, -1]
+            logits, distance_values = self._relations(bond_queries, midpoint, lh, xyz)
+            logits = logits + geometry[:, ligand, -1]
             # Keep atom identity and geometry until bond-specific selection;
             # no unconditional fragment average before control.
             fragments = []
@@ -373,7 +383,7 @@ class LegalPoseDecoder(nn.Module):
                     raise ValueError('each rotating bond requires two nonempty fragments')
                 weights = logits.masked_fill(~selected, -torch.inf).softmax(-1)
                 fragments.append((weights[..., None] * (
-                    self.value(lh)[None] + geometry[:, ligand, :-1])).sum(1))
+                    self.value(lh)[None] + distance_values + geometry[:, ligand, :-1])).sum(1))
             bond_queries = bond_queries + self.fragment(torch.cat(fragments, -1))
             queries.extend(bond_queries.unbind(0))
             positions.extend(midpoint.unbind(0))
@@ -383,7 +393,7 @@ class LegalPoseDecoder(nn.Module):
             bond_affected = h.new_zeros(len(masks), len(h))
             bond_affected[:, types == 2] = masks.to(h.dtype)
             affected = torch.cat((affected, bond_affected), 0)
-        logits = self._logits(queries, positions, h, coords)
+        logits, distance_values = self._relations(queries, positions, h, coords)
         if bonds.shape[1]:
             logits = torch.cat((logits[:2], logits[2:] + geometry[..., -1]), 0)
         # Each physical DOF reads each component separately; large proteins
@@ -391,7 +401,7 @@ class LegalPoseDecoder(nn.Module):
         context = []
         for component in range(3):
             selected = types == component
-            values = self.value(h[selected])[None].expand(len(queries), -1, -1)
+            values = self.value(h[selected])[None] + distance_values[:, selected]
             if bonds.shape[1]:
                 values = torch.cat((values[:2], values[2:] + geometry[:, selected, :-1]), 0)
             context.append((logits[:, selected].softmax(-1)[..., None] * values).sum(1))
@@ -513,10 +523,33 @@ class TernaryAssembly(nn.Module):
     supports_conditions = False
     direct_ternary_motion = True
 
+    def migrate_logit_only_geometry(self, weights):
+        """Explicit weights-only upgrade; zero new values, preserve old logits.
+
+        Optimizer state must not be restored across this parameter-shape change.
+        No unrelated missing keys or shape mismatches are accepted.
+        """
+        weights = dict(weights)
+        template = self.state_dict()
+        heads = [('controller.structure.geometry.2', 1),
+                 ('controller.assembly.distance.2', 1)]
+        heads.extend((f'controller.layers.{i}.geometry.2', layer.heads)
+                     for i, layer in enumerate(self.controller.layers))
+        for prefix, count in heads:
+            for suffix in ('weight', 'bias'):
+                key = f'{prefix}.{suffix}'
+                old, new = weights[key], torch.zeros_like(template[key])
+                if old.shape != (count, *new.shape[1:]):
+                    raise ValueError(f'{key}: not a legacy logit-only geometric head')
+                new[-count:] = old.to(new)
+                weights[key] = new
+        return weights
+
     def __init__(self, node_dim=128, input_dim=None, source_conditioning=False, *,
                  direct_ternary_motion=True, model_profile=VECTOR_EXPERT_MODEL_PROFILE,
                  expert_scalar_dim=58, expert_vector_dim=20, expert_backend='diffdock',
-                 conditioning_contract=MATCHA_CONDITIONING_CONTRACT):
+                 conditioning_contract=MATCHA_CONDITIONING_CONTRACT,
+                 information_contract=INFORMATION_CONTRACT):
         super().__init__()
         if model_profile != VECTOR_EXPERT_MODEL_PROFILE or not direct_ternary_motion:
             raise ValueError('retired architecture: construct a fresh ternary_endpoint_v14 model')
@@ -524,11 +557,11 @@ class TernaryAssembly(nn.Module):
             node_dim, input_dim or node_dim, source_conditioning,
             model_profile=model_profile, expert_scalar_dim=expert_scalar_dim,
             expert_vector_dim=expert_vector_dim, expert_backend=expert_backend,
-            conditioning_contract=conditioning_contract)
+            conditioning_contract=conditioning_contract, information_contract=information_contract)
         self.controller = UnifiedTernaryController(
             self.config['input_dim'], node_dim, expert_scalar_dim,
             expert_vector_dim, source_conditioning)
-        if expert_backend == 'matcha':
+        if expert_backend in ('matcha', 'fabind'):
             self.condition_query = nn.Linear(self.config['input_dim'], node_dim)
             self.condition_key = nn.Linear(self.config['input_dim'], node_dim)
             self.condition_value = nn.Linear(self.config['input_dim'], node_dim)
@@ -580,7 +613,7 @@ class TernaryAssemblyModel(nn.Module):
         backend = getattr(frozen_expert, 'backend', 'diffdock')
         if backend != trifuse.config.get('expert_backend', 'diffdock'):
             raise ValueError('expert backend and controller configuration disagree')
-        reader = 'read_pair' if backend == 'matcha' else 'forward_features'
+        reader = 'read_pair' if backend in ('matcha', 'fabind') else 'forward_features'
         if (not callable(getattr(frozen_expert, reader, None))
                 or frozen_expert.node_scalar_dim != trifuse.config['expert_scalar_dim']
                 or frozen_expert.node_vector_dim != trifuse.config['expert_vector_dim']):
@@ -597,7 +630,7 @@ class TernaryAssemblyModel(nn.Module):
         # caller's no_grad during inference; never force enable_grad here.
         # Matcha FiLM belongs to the trainable controller, not the frozen prior.
         # Its gradient must survive even when expert coordinate VJPs are disabled.
-        if self.expert_input_grad or getattr(self.expert, 'backend', None) == 'matcha':
+        if self.expert_input_grad or getattr(self.expert, 'backend', None) in ('matcha', 'fabind'):
             return nullcontext()
         return torch.no_grad()
 
@@ -661,7 +694,7 @@ class TernaryAssemblyModel(nn.Module):
         # mutate the shared state or the other branch's input.
         with self._expert_context():
             for index, (branch, receptor) in enumerate(zip(BRANCHES, (e3_data, poi_data))):
-                if getattr(self.expert, 'backend', 'diffdock') == 'matcha':
+                if getattr(self.expert, 'backend', 'diffdock') in ('matcha', 'fabind'):
                     opposite = poi_data if index == 0 else e3_data
                     expert_ligand = ligand_data
                     if not self.expert_input_grad:
@@ -706,7 +739,7 @@ class TernaryAssemblyModel(nn.Module):
                                    vectors[:n_lig] @ rotation.T, vectors[n_lig:] @ rotation.T))
                 raw[branch] = {'tr': tr @ rotation.T, 'rot': rot @ rotation.T,
                                'tor': tor.reshape(1, -1)}
-            if getattr(self.expert, 'backend', 'diffdock') == 'matcha':
+            if getattr(self.expert, 'backend', 'diffdock') in ('matcha', 'fabind'):
                 proposals = {**raw, 'torsion': raw[BRANCHES[0]]['tor']}
             else:
                 proposals = self._conditioning.normalized_predictions(

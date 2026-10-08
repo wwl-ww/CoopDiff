@@ -30,6 +30,71 @@ def fixture():
     return fuse, graph, proposals, state
 
 
+def test_fabind_legal_tangent_projection_is_equivariant_and_differentiable():
+    from tricoopdiff.models.expert import FrozenFABind
+
+    torch.manual_seed(19)
+    coords = torch.randn(7, 3, requires_grad=True)
+    displacement = torch.randn(7, 3, requires_grad=True)
+    bonds = torch.tensor([[1, 2], [3, 4]])
+    masks = torch.tensor([[False, False, True, True, True, True, True],
+                          [False, False, False, False, True, True, True]])
+    action = FrozenFABind.project_motion(coords, displacement, bonds, masks)
+    rotation = so3_exp(torch.tensor([[.2, -.5, .7]]))[0]
+    transformed = FrozenFABind.project_motion(
+        coords @ rotation.T + 8, displacement @ rotation.T, bonds, masks)
+    assert torch.allclose(transformed[0], action[0] @ rotation.T, atol=2e-5)
+    assert torch.allclose(transformed[1], action[1] @ rotation.T, atol=2e-5)
+    assert torch.allclose(transformed[2], action[2], atol=2e-5)
+    gradients = torch.autograd.grad(sum(x.square().sum() for x in action),
+                                    (coords, displacement))
+    assert all(torch.isfinite(g).all() and g.norm() > 0 for g in gradients)
+    empty = FrozenFABind.project_motion(coords, displacement,
+                                         bonds[:0], masks[:0])
+    assert empty[2].shape == (1, 0)
+
+
+def test_fabind_crop_keeps_contacts_at_both_ends_of_long_ligand():
+    from tricoopdiff.models.expert import FrozenFABind
+
+    protein = torch.tensor([[0., 0., 0.], [45., 0., 0.], [90., 0., 0.]])
+    ligand = torch.tensor([[1., 0., 0.], [46., 0., 0.]])
+    keep = FrozenFABind.pocket_membership(protein, ligand, protein[0], 20., 10.)
+    assert torch.equal(keep, torch.tensor([True, True, False])), (
+        'predicted pocket must not erase current contacts at a long ligand distal end')
+
+
+def test_fabind_motion_projection_matches_executor_sign_units_and_gauge():
+    from tricoopdiff.models.expert import FrozenFABind
+    from tricoopdiff.sdpi_flow import SDPIFlow, CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
+
+    torch.manual_seed(29)
+    coords = torch.randn(1, 8, 3, dtype=torch.float64)
+    bonds = torch.tensor([[2, 3]])
+    masks = torch.tensor([[False, False, False, True, True, True, True, True]])
+    data = {'edge_index': bonds.T, 'edge_mask': torch.tensor([True]), 'mask_rotate': masks}
+    h = torch.tensor([1e-5], dtype=coords.dtype)
+    zeros = coords.new_zeros(1, 3)
+    def execute(tr, rot, tor):
+        return SDPIFlow.differentiable_step(coords, coords.clone(),
+            torch.eye(3, dtype=coords.dtype)[None],
+            {'e3_ligand': {'tr': -tr, 'rot': -rot},
+             'poi_ligand': {'tr': zeros, 'rot': zeros}, 'torsion': -tor,
+             'rigid_output_mode': INDEPENDENT_RIGID_MODE,
+             'torsion_update_mode': CONTINUOUS_TORSION_MODE}, h, data, freeze_poi=True)[0]
+    actual = execute(coords.new_tensor([[.2, -.3, .1]]),
+                     coords.new_tensor([[.05, .07, -.08]]), coords.new_tensor([[.12]]))
+    delta = (actual - coords)[0] / h
+    fitted = FrozenFABind.project_motion(coords[0], delta, bonds, masks)
+    reconstructed = (execute(*fitted) - coords)[0] / h
+    assert torch.allclose(reconstructed, delta, atol=2e-4, rtol=2e-3), (
+        'FABind projection must match actual reverse-clock rigid/torsion execution')
+    line = coords.new_zeros(8, 3)
+    line[:, 0] = torch.arange(8)
+    singular = FrozenFABind.project_motion(line, delta, bonds, masks)
+    assert all(torch.isfinite(value).all() for value in singular)
+
+
 def test_v8_unified_controller_equivariance_and_gradient_paths():
     from tricoopdiff.models.assembly import VECTOR_EXPERT_MODEL_PROFILE, production_model_config
 

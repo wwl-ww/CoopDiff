@@ -1,7 +1,7 @@
 """Production model API, isolated from historical and experimental models."""
 
 __all__ = ['TernaryAssemblyModel', 'TernaryAssembly', 'production_model_config',
-           'FrozenDiffDock', 'build_diffdock_expert']
+           'FrozenDiffDock', 'FrozenFABind', 'build_diffdock_expert']
 
 
 def __getattr__(name):
@@ -9,7 +9,7 @@ def __getattr__(name):
     if name in ('TernaryAssemblyModel', 'TernaryAssembly', 'production_model_config'):
         from . import assembly
         return getattr(assembly, name)
-    if name in ('FrozenDiffDock', 'build_diffdock_expert'):
+    if name in ('FrozenDiffDock', 'FrozenFABind', 'build_diffdock_expert'):
         from . import expert
         return getattr(expert, name)
     raise AttributeError(f'module {__name__!r} has no attribute {name!r}')

@@ -22,7 +22,7 @@ from tricoopdiff.models.assembly import (TernaryAssemblyModel, TernaryAssembly,
                                          VECTOR_EXPERT_MODEL_PROFILE,
                                          production_model_config)
 from tricoopdiff.train import AssemblyTrainer
-from tricoopdiff.models.expert import build_diffdock_expert
+from tricoopdiff.models.expert import FrozenFABind, build_diffdock_expert
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.initialization.endpoints import reachable_ligand_target
 from tricoopdiff.sampler import sample_single
@@ -35,6 +35,8 @@ def main():
     parser.add_argument('--pair', required=True)
     parser.add_argument('--out', required=True)
     parser.add_argument('--expert-model-dir', required=True)
+    parser.add_argument('--expert-backend', choices=('diffdock', 'fabind'), default='diffdock')
+    parser.add_argument('--expert-source-dir')
     parser.add_argument('--device', default='cuda', choices=('cuda', 'cpu'))
     args = parser.parse_args()
     if args.device == 'cuda' and (
@@ -50,13 +52,27 @@ def main():
     payload = torch.load(args.pair, map_location=args.device, weights_only=False)
     batch = payload['batch']
     native_snapshot = {k: batch[k]['coords'].clone() for k in ('e3_data', 'poi_data', 'ligand_data')}
-    expert = build_diffdock_expert(args.expert_model_dir, args.device)
+    if args.expert_backend == 'fabind':
+        if not args.expert_source_dir:
+            parser.error('FABind requires --expert-source-dir')
+        expert = FrozenFABind(args.expert_source_dir, args.expert_model_dir, args.device)
+        # This entrypoint consumes the repository DiffDock featurization schema:
+        # one amino-acid categorical column followed by ESM2-650M layer 33.
+        for key in ('e3_data', 'poi_data'):
+            features = batch[key]['features']
+            if features.shape[-1] != 1281:
+                raise ValueError('FABind gate requires indexed DiffDock AA+ESM650M features')
+            batch[key] = {**batch[key], 'esm_features': features[0, :, 1:]}
+        batch['e3_data'], batch['poi_data'], batch['ligand_data'] = expert.prepare_case(
+            batch['e3_data'], batch['poi_data'], batch['ligand_data'])
+    else:
+        expert = build_diffdock_expert(args.expert_model_dir, args.device)
     expert_snapshot = {n: p.detach().cpu().clone() for n, p in expert.named_parameters()}
     fuse = TernaryAssembly(**production_model_config(
         128, batch['e3_data']['features'].shape[-1],
         model_profile=VECTOR_EXPERT_MODEL_PROFILE,
         expert_scalar_dim=expert.node_scalar_dim,
-        expert_vector_dim=expert.node_vector_dim))
+        expert_vector_dim=expert.node_vector_dim, expert_backend=args.expert_backend))
     model = TernaryAssemblyModel(expert, fuse).to(args.device)
     flow = SDPIFlow()
     trainer = AssemblyTrainer(model, flow, device=args.device, lr=1e-4, ema_decay=0.9)

@@ -38,7 +38,7 @@ def configure_expert_policy(expert, limit, mode):
     if not math.isfinite(limit) or limit <= 0:
         raise ValueError('expert activation clamp must be finite and positive')
     mode = validate_clamp_mode(mode)
-    if getattr(expert, 'backend', None) == 'matcha':
+    if getattr(expert, 'backend', None) in ('matcha', 'fabind'):
         return  # Transformer expert has no DiffDock activation-clamp contract.
     model = getattr(expert, 'model', expert)
     model.activation_clamp = float(limit)
@@ -47,7 +47,7 @@ def configure_expert_policy(expert, limit, mode):
 
 def expert_runtime_identity(expert):
     """Generation identity includes configuration and actual numerical policy."""
-    if getattr(expert, 'backend', None) == 'matcha':
+    if getattr(expert, 'backend', None) in ('matcha', 'fabind'):
         return dict(expert.provenance)
     model = getattr(expert, 'model', None)
     identity = {**expert_base_identity(expert),
@@ -299,6 +299,276 @@ class FrozenMatcha(nn.Module):
         tor = tor if tor is not None else lp.new_empty(0)
         # Evidence convention matches the reverse-clock controller, not scores.
         return -tr / 10., -rot, -tor.reshape(1, -1), scalar, vectors
+
+
+class FrozenFABind(nn.Module):
+    """FABind+ node/pair prior read at the actual pose, not its docking sampler.
+
+    Predict a pocket without target coordinates, then evaluate the pretrained
+    refinement network on the current ligand. Atom suggestions are projected
+    onto rigid/torsion tangents; only SDPI executes motions. Hard edge/pocket
+    membership is piecewise constant, not a globally smooth expert contract.
+    """
+
+    backend = 'fabind'
+    crop_policy = 'predicted_pocket_union_current_contacts_full_protein_evidence_v1'
+    node_scalar_dim = 512
+    node_vector_dim = 3
+    no_torsion = False
+
+    def __init__(self, source_dir, weights_dir, device='cpu'):
+        super().__init__()
+        import inspect
+        import sys
+        source_dir, weights_dir = Path(source_dir).resolve(), Path(weights_dir).resolve()
+        root = source_dir / 'FABind_plus/fabind'
+        sys.path.insert(0, str(root))
+        from models.model import FABindPlus
+        from utils.parsing import parse_train_args
+        if Path(inspect.getfile(FABindPlus)).resolve() != root / 'models/model.py':
+            raise ValueError('FABind import does not match requested source')
+        _, parser = parse_train_args(test=True)
+        flags = ('--n-iter 8 --mean-layers 5 --hidden-size 512 --pocket-pred-hidden-size 128 '
+                 '--rm-layernorm --add-attn-pair-bias --explicit-pair-embed '
+                 '--add-cross-attn-layer --random-n-iter --use-ln-mlp '
+                 '--mlp-hidden-scale 1 --permutation-invariant --use-for-radius-pred ligand '
+                 '--dropout 0.1 --use-esm2-feat --dis-map-thres 15 '
+                 '--pocket-radius-buffer 5 --min-pocket-radius 20')
+        args = parser.parse_args(flags.split())
+        self.prior = FABindPlus(args, embedding_channels=512, pocket_pred_embedding_channels=128)
+        path = weights_dir / 'fabind_plus_best_ckpt.bin'
+        self.prior.load_state_dict(torch.load(path, map_location='cpu', weights_only=True), strict=True)
+        self.provenance = {
+            'backend': self.backend, 'weights_sha256': sha256_file(path),
+            'source_tree_sha256': hashlib.sha256(json.dumps([
+                (str(p.relative_to(root)), sha256_file(p)) for p in sorted(root.rglob('*.py'))
+            ]).encode()).hexdigest(),
+            'coordinate_contract': 'protein_fixed_anchor_frame_current_pose_functional_refinement_v2',
+            'advice_contract': 'ridge_horizontal_rigid_torsion_tangent_reverse_clock_v1',
+            'topology_contract': 'native_hard_radius_and_predicted_pocket_piecewise_constant',
+            'sequence_contract': 'caller_cached_esm2_t33_650M_last_hidden_1280',
+            'time_contract': 'time_independent_regression_advice_not_a_flow_velocity',
+            'adapter_sha256': sha256_file(__file__),
+        }
+        self.requires_grad_(False).to(device).eval()
+
+    @property
+    def model(self):
+        return self
+
+    def train(self, mode=True):
+        super().train(False)
+        return self
+
+    def prepare_case(self, e3_data, poi_data, ligand_data, protein_paths=None):
+        """Prepare indexed chemistry; ESM must be supplied, never downloaded."""
+        from rdkit import Chem
+        from tricoopdiff.initialization import validate_ligand_graph
+        device = next(self.parameters()).device
+        proteins = []
+        for data in (e3_data, poi_data):
+            features = data.get('esm_features')
+            if features is None:
+                raise ValueError('FABind requires explicit esm_features [N,1280]; do not guess feature slices')
+            features = torch.as_tensor(features, device=device)
+            if features.shape != (data['coords'].shape[1], 1280) or not torch.isfinite(features).all():
+                raise ValueError('FABind ESM rows/dimension differ from protein coordinates')
+            coords = data['coords'][0]
+            centered = coords - coords.mean(0)
+            first = int(centered.square().sum(-1).argmax())
+            axis = centered[first] / centered[first].norm().clamp_min(1e-10)
+            perpendicular = centered - (centered @ axis)[:, None] * axis
+            second = int(perpendicular.square().sum(-1).argmax())
+            if perpendicular[second].norm() < 1e-3:
+                raise ValueError('FABind protein cannot define a nondegenerate rigid frame')
+            proteins.append({**data, 'fabind': {'features': features.detach(),
+                                              'anchors': (first, second)}})
+        mol = Chem.Mol(ligand_data['mol'])
+        bonds, masks = validate_ligand_graph(mol, ligand_data['edge_index'],
+            ligand_data['edge_mask'], ligand_data['mask_rotate'])
+        vocabularies = (['H', 'B', 'C', 'N', 'O', 'F', 'Mg', 'Si', 'P', 'S',
+                         'Cl', 'Cu', 'Zn', 'Se', 'Br', 'Sn', 'I'],
+                        list(range(7)), list(range(7)), list(range(8)), list(range(-5, 6)))
+        features = []
+        for atom in mol.GetAtoms():
+            values = (atom.GetSymbol(), atom.GetDegree(), atom.GetTotalNumHs(),
+                      atom.GetTotalValence(), atom.GetFormalCharge())
+            row = []
+            for value, vocabulary in zip(values, vocabularies):
+                encoded = [0.] * (len(vocabulary) + 1)
+                encoded[vocabulary.index(value) if value in vocabulary else -1] = 1.
+                row.extend(encoded)
+            features.append(row + [float(atom.GetIsAromatic())])
+        adjacency = torch.as_tensor(Chem.GetAdjacencyMatrix(mol), device=device, dtype=torch.float32)
+        las = (adjacency + adjacency @ adjacency) > 0
+        for ring in Chem.GetSymmSSSR(mol):
+            ids = torch.tensor(list(ring), device=device)
+            las[ids[:, None], ids[None]] = True
+        las.fill_diagonal_(False)
+        ligand = {**ligand_data, 'fabind': {
+            'features': torch.tensor(features, device=device),
+            'edges': torch.tensor([(a, b) for bond in mol.GetBonds()
+                for a, b in ((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()),
+                             (bond.GetEndAtomIdx(), bond.GetBeginAtomIdx()))],
+                device=device, dtype=torch.long).reshape(-1, 2).T + 1,
+            'las': las.nonzero().T + 1,
+            'bonds': bonds.to(device), 'masks': torch.as_tensor(masks, device=device),
+        }}
+        return *proteins, ligand
+
+    @staticmethod
+    def _refine(module, coords, features, segment, mask, global_nodes, edges, las, reference):
+        """Official refine_coord equations with functional, fully tracked updates.
+
+        Native first iterations intentionally use no_grad; invoking that sampler
+        would silently truncate our endpoint derivative. Its weights and formulas
+        are retained here, but not its inference autograd policy.
+        """
+        from torch_scatter import scatter_add
+        batch = segment.new_zeros(len(segment), dtype=torch.long)
+        p, c = features[segment == 1][None], features[segment == 0][None]
+        pair, pair_mask = module.inter_layer(p, c,
+            torch.ones(p.shape[:2], device=p.device, dtype=torch.bool),
+            torch.ones(c.shape[:2], device=c.device, dtype=torch.bool))
+        pair = pair * pair_mask[..., None]
+        for _ in range(module.n_iter):
+            ctx, inter, reduced = module.extract_edges(coords, batch, segment, global_nodes)
+            ctx = torch.cat((edges, ctx), 1)
+            gnn = module.gnn
+            h, x = gnn.dropout(gnn.linear_in(features)), coords
+            current_pair = pair
+            for index in range(gnn.n_layers):
+                h, moved = gnn._modules[f'gcl_{index}'](h, ctx, x, batch_id=batch)
+                x = torch.where(mask[:, None, None], moved, x) if gnn.args.fix_pocket else moved
+                h, moved, _, current_pair = gnn._modules[f'att_{index}'](
+                    h, inter, x, segment_id=segment, batch_id=batch, reduced_tuple=reduced,
+                    pair_embed_batched=current_pair, pair_mask=pair_mask,
+                    LAS_mask=None, p_p_dist_embed=None, c_c_dist_embed=None)
+                x = torch.where(mask[:, None, None], moved, x) if gnn.args.fix_pocket else moved
+                if not gnn.args.rm_LAS_constrained_optim and not gnn.args.only_last_LAS:
+                    for _ in range(gnn.geom_reg_steps):
+                        delta = x[las[0], 0] - x[las[1], 0]
+                        target = reference[las[0], 0] - reference[las[1], 0]
+                        force = 4 * (delta.square().sum(-1) - target.square().sum(-1))[:, None] * delta
+                        update = scatter_add(force, las[1], dim=0, dim_size=len(x))
+                        x = x + (update * gnn.geometry_reg_step_size).clamp(
+                            min=gnn.normalize_coord(-15), max=gnn.normalize_coord(15))[:, None]
+            h, moved = gnn.out_layer(h, ctx, x, batch_id=batch)
+            x = torch.where(mask[:, None, None], moved, x) if gnn.args.fix_pocket else moved
+            if gnn.dense:
+                raise ValueError('unsupported FABind dense configuration')
+            output = gnn.linear_out(gnn.dropout(h))
+            coords = torch.where(mask[:, None, None], x, coords)
+        return coords, output, current_pair
+
+    @staticmethod
+    def project_motion(coords, displacement, bonds, masks):
+        """Regularized joint fit in the executor's horizontal torsion gauge."""
+        x = coords.double()
+        centered = x - x.mean(0)
+        eye = torch.eye(3, device=x.device, dtype=x.dtype)
+        spin_basis = torch.linalg.cross(eye[:, None].expand(3, len(x), 3),
+                                         centered[None].expand(3, -1, -1), dim=-1)
+        columns = [eye[:, None].expand(3, len(x), 3), spin_basis]
+        inertia = centered.square().sum() * eye - centered.T @ centered
+        ridge = inertia.trace().clamp_min(torch.finfo(x.dtype).tiny) * 1e-6
+        torsions = []
+        for (u, v), mask in zip(bonds, masks):
+            axis = x[u] - x[v]
+            length = torch.linalg.vector_norm(axis)
+            if bool(length <= 1e-10):
+                raise ValueError('degenerate FABind executor torsion axis')
+            axis = axis / length
+            tangent = torch.linalg.cross(axis.expand_as(x), x - x[v], dim=-1) * mask[:, None]
+            torque = torch.linalg.cross(centered, tangent, dim=-1).sum(0)
+            spin = torch.linalg.solve(inertia + ridge * eye, torque + .5 * ridge * axis)
+            tangent = tangent - tangent.mean(0) - torch.linalg.cross(spin.expand_as(x), centered, dim=-1)
+            torsions.append(tangent)
+        if torsions:
+            columns.append(torch.stack(torsions))
+        jacobian = torch.cat(columns).flatten(1).T
+        gram = jacobian.T @ jacobian
+        damping = gram.diagonal().mean().clamp_min(1e-8) * 1e-4
+        action = torch.linalg.solve(gram + damping * torch.eye(len(gram), device=x.device, dtype=x.dtype),
+                                    jacobian.T @ displacement.double().flatten()).to(coords.dtype)
+        return action[:3][None], action[3:6][None], action[6:][None]
+
+    def read_pair(self, receptor, ligand, reverse_t, modulation=None):
+        rp, lp = receptor['coords'][0], ligand['coords'][0]
+        # Official xyz-wise clamps break rotation equivariance. Keep the exact
+        # frozen equations in a protein-defined frame, not an arbitrary world
+        # frame. Anchor indices are chosen once, without ligand/target input.
+        origin = rp.mean(0)
+        centered = rp - origin
+        first, second = receptor['fabind']['anchors']
+        e1 = centered[first] / centered[first].norm()
+        e2 = centered[second] - (centered[second] @ e1) * e1
+        e2 = e2 / e2.norm()
+        frame = torch.stack((e1, e2, torch.linalg.cross(e1, e2)), -1)
+        rp, lp = (rp - origin) @ frame, (lp - origin) @ frame
+        chem, model = ligand['fabind'], self.prior
+        lig_h = model.compound_linear_whole_protein(chem['features'].to(lp))
+        prot_h = model.protein_linear_whole_protein(receptor['fabind']['features'].to(rp))
+        if modulation is not None:
+            gamma, beta = modulation
+            if gamma.ndim == 3 and gamma.shape[0] == 1:
+                gamma, beta = gamma[0], beta[0]
+            if gamma.shape != prot_h.shape or beta.shape != prot_h.shape:
+                raise ValueError('FABind requires node-aligned protein FiLM, not broadcast context')
+            prot_h = prot_h * (1 + gamma) + beta
+        n = len(lp)
+        def run(module, prot_coords, ligand_coords, protein_h, ligand_h):
+            origin = prot_coords.mean(0, keepdim=True)
+            coords = torch.cat((origin, ligand_coords,
+                                origin, prot_coords)) / model.coordinate_scale
+            reference = torch.cat((lp.new_zeros(1, 3), lp - lp.mean(0),
+                                    lp.new_zeros(1 + len(prot_coords), 3))) / model.coordinate_scale
+            h = torch.cat((model.glb_c, ligand_h, model.glb_p, protein_h))
+            if module is model.pocket_pred_model:
+                h = model.embedding_shrink(h)
+            segment = torch.zeros(len(h), dtype=torch.long, device=lp.device)
+            segment[n + 1:] = 1
+            global_nodes = torch.zeros(len(h), dtype=torch.bool, device=lp.device)
+            global_nodes[0] = global_nodes[n + 1] = True
+            mask = segment == 0
+            mask[n + 1] = True
+            return self._refine(module, coords[:, None], h, segment, mask,
+                                global_nodes, chem['edges'], chem['las'], reference[:, None])
+        _, whole, _ = run(model.pocket_pred_model, rp, lp - lp.mean(0) + rp.mean(0), prot_h, lig_h)
+        whole = model.embedding_enlarge(whole)
+        proteins, ligands = whole[n + 2:], whole[1:n + 1]
+        probability = model.protein_to_pocket(proteins).sigmoid().squeeze(-1)
+        # Official inference defaults gs_hard=False, gs_tau=1: deterministic
+        # two-class softmax(log probabilities) gives these soft weights.
+        probability = probability.clamp(1e-6, 1 - 1e-6)
+        center = (probability[:, None] * rp).sum(0) / probability.sum().clamp_min(1e-6)
+        radius = (model.pocket_radius_head(ligands.sum(0, keepdim=True)).relu().squeeze() + 5).clamp_min(20)
+        keep = self.pocket_membership(rp, lp, center, radius, model.args.inter_cutoff)
+        if int(keep.sum()) < 5:
+            keep = torch.ones_like(keep)
+        predicted, local, _ = run(model.complex_model, rp[keep], lp, proteins[keep], ligands)
+        displacement = predicted[1:n + 1, 0] * model.coordinate_scale - lp
+        tr, rot, tor = self.project_motion(lp, displacement, chem['bonds'], chem['masks'])
+        proteins = proteins.index_copy(0, keep.nonzero().flatten(), local[n + 2:])
+        scalar = torch.cat((local[1:n + 1], proteins))
+        nodes = torch.cat((lp, rp))
+        suggestion = torch.cat((displacement, torch.zeros_like(rp)))
+        vectors = torch.stack(((nodes - rp.mean(0)) / 10,
+                               (nodes - lp.mean(0)) / 10, suggestion / 10), 1)
+        return -tr @ frame.T / 10, -rot @ frame.T, -tor, scalar, vectors @ frame.T
+
+    @staticmethod
+    def pocket_membership(protein, ligand, center, radius, contact_cutoff):
+        """A long ligand must retain every currently nearby protein residue.
+
+        Predicted pocket alone can omit the far end of a PROTAC. Full-protein
+        evidence is retained regardless, and local refinement additionally sees
+        the union of predicted pocket and actual native-cutoff contacts.
+        """
+        predicted = (protein - center).norm(dim=-1) <= radius
+        nearby = torch.cdist(protein, ligand,
+                             compute_mode='donot_use_mm_for_euclid_dist').amin(-1) <= contact_cutoff
+        return (predicted | nearby).detach()
 
 
 class FrozenDiffDock(nn.Module):
@@ -704,7 +974,7 @@ _EXPERT_IDENTITY_KEYS = ('diffdock_commit', 'score_checkpoint_sha256', 'no_torsi
 def expert_base_identity(expert):
     """Return the stable identity fields for the external frozen expert."""
     provenance = getattr(expert, 'provenance', {})
-    if getattr(expert, 'backend', None) == 'matcha':
+    if getattr(expert, 'backend', None) in ('matcha', 'fabind'):
         return dict(provenance)
     missing = [key for key in _EXPERT_IDENTITY_KEYS if key not in provenance]
     if missing:

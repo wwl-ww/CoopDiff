@@ -28,7 +28,7 @@ from tricoopdiff.models.assembly import (
     candidate_source_tensor,
 )
 from tricoopdiff.models.expert import (expert_base_identity, validate_expert_base_identity,
-                                    configure_expert_policy, expert_runtime_identity, FrozenMatcha)
+                                    configure_expert_policy, expert_runtime_identity, FrozenMatcha, FrozenFABind)
 from tricoopdiff.runtime import (atomic_torch_save, capture_rng_state, evaluation_context,
                                 preserve_rng, restore_rng_state)
 from tricoopdiff.sdpi_flow import (
@@ -439,6 +439,12 @@ def validate_assembly_checkpoint(payload):
                     or config.get('expert_crop_policy') != FrozenMatcha.crop_policy
                     or expert_identity.get('torsion_contract') != 'canonical_executor_bonds_and_fragments_v2'):
                 raise ValueError('Matcha checkpoint requires its own canonical input and frozen-prior identity')
+        elif model_config.get('expert_backend') == 'fabind':
+            if (expert_identity.get('backend') != 'fabind'
+                    or expert_identity != payload['expert_base_identity']
+                    or config.get('expert_crop_policy') != FrozenFABind.crop_policy
+                    or expert_identity.get('advice_contract') != 'ridge_horizontal_rigid_torsion_tangent_reverse_clock_v1'):
+                raise ValueError('FABind checkpoint requires its current-pose frozen-prior identity')
         elif (config.get('expert_crop_policy') != EXPERT_CROP_POLICY
                 or expert_identity.get('smooth_cross_edges') is not True
                 or expert_identity.get('smooth_edges', False)):

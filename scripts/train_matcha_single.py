@@ -151,8 +151,11 @@ def main():
     if transfer is not None:
         saved_config = dict(transfer['model_config'])
         legacy_conditioning = 'conditioning_contract' not in saved_config
+        legacy_geometry = 'information_contract' not in saved_config
         if legacy_conditioning:
             saved_config['conditioning_contract'] = config['conditioning_contract']
+        if legacy_geometry:
+            saved_config['information_contract'] = config['information_contract']
         if (saved_config != config or transfer['backend_manifest']['stage_weights_sha256']
                 != manifest['stage_weights_sha256']):
             raise ValueError('weights-only transfer requires matching architecture and pretrained stages')
@@ -160,10 +163,13 @@ def main():
         if legacy_conditioning:
             # Explicit, function-preserving migration, not a partial state load.
             weights['condition_geometry.weight'] = torch.zeros_like(model.trifuse.condition_geometry.weight)
+        if legacy_geometry:
+            weights = model.trifuse.migrate_logit_only_geometry(weights)
         model.trifuse.load_state_dict(weights, strict=True)
         trainer.ema = {name: value.detach().clone() for name, value in model.trifuse.state_dict().items()}
         print(json.dumps(dict(kind='weights_only_transfer', source=args.weights_from,
                               source_step=transfer['step'], optimizer_reset=True,
+                              zero_initialized_message_values=legacy_geometry,
                               zero_initialized_geometry=legacy_conditioning)), flush=True)
     if checkpoint is not None:
         if checkpoint['model_config'] != config or checkpoint['runtime'] != runtime:
