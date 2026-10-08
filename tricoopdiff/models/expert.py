@@ -416,6 +416,16 @@ class FrozenFABind(nn.Module):
         }}
         return *proteins, ligand
 
+    def prepare_cached_case(self, e3_data, poi_data, ligand_data):
+        """Consume the repository's indexed AA + ESM2-650M schema explicitly."""
+        proteins = []
+        for data in (e3_data, poi_data):
+            features = data['features']
+            if features.ndim != 3 or features.shape[0] != 1 or features.shape[-1] != 1281:
+                raise ValueError('FABind cached inputs require B=1 AA+ESM650M features')
+            proteins.append({**data, 'esm_features': features[0, :, 1:]})
+        return self.prepare_case(*proteins, ligand_data)
+
     @staticmethod
     def _refine(module, coords, features, segment, mask, global_nodes, edges, las, reference):
         """Official refine_coord equations with functional, fully tracked updates.

@@ -13,7 +13,7 @@ from featurize_common import featurize_complex
 from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
-from tricoopdiff.models.expert import build_diffdock_expert
+from tricoopdiff.models.expert import FrozenFABind, build_diffdock_expert
 from tricoopdiff.models.assembly import (
     DIRECT_RANK_FEATURE_STATE, LEGACY_RANK_FEATURE_STATE,
     TernaryAssemblyModel, TernaryAssembly,
@@ -34,7 +34,8 @@ class EvaluationRunner:
                  deepternary_root=None, deterministic=True,
                  conformer_policy="etkdgv3_random",
                  allow_experimental_checkpoint=False,
-                 allow_conditioned_checkpoint=False):
+                 allow_conditioned_checkpoint=False, expert_source_dir=None,
+                 featurizer_model_dir='checkpoints/score_model'):
         self.reproducibility = configure_inference_reproducibility(deterministic)
         self.reproducibility['torus_score_norm_version'] = SCORE_NORM_VERSION
         self.root = Path(project_root).resolve()
@@ -92,17 +93,26 @@ class EvaluationRunner:
         self.model_dir = Path(model_dir)
         if not self.model_dir.is_absolute():
             self.model_dir = self.root / self.model_dir
-        with (self.model_dir / "model_parameters.yml").open() as handle:
+        backend = self.checkpoint.get('model_config', {}).get('expert_backend', 'diffdock')
+        feature_dir = self.model_dir if backend == 'diffdock' else Path(featurizer_model_dir)
+        if not feature_dir.is_absolute():
+            feature_dir = self.root / feature_dir
+        with (feature_dir / "model_parameters.yml").open() as handle:
             self.score_model_args = Namespace(**yaml.full_load(handle))
-        self.expert_config_sha256 = sha256_file(self.model_dir / "model_parameters.yml")
-        self.expert = build_diffdock_expert(
-            model_dir=str(self.model_dir), device=str(self.device),
-            ckpt=expert_checkpoint,
-            num_conv_layers=self.score_model_args.num_conv_layers,
-        )
+        self.expert_config_sha256 = sha256_file(feature_dir / "model_parameters.yml")
+        if backend == 'fabind':
+            if not expert_source_dir:
+                raise ValueError('FABind evaluation requires its explicit official source directory')
+            self.expert = FrozenFABind(expert_source_dir, self.model_dir, str(self.device))
+        elif backend == 'diffdock':
+            self.expert = build_diffdock_expert(
+                model_dir=str(self.model_dir), device=str(self.device),
+                ckpt=expert_checkpoint, num_conv_layers=self.score_model_args.num_conv_layers)
+        else:
+            raise ValueError(f'evaluation backend {backend!r} is not supported by this entrypoint')
         from tricoopdiff.models.expert import configure_expert_policy
         configure_expert_policy(self.expert, self.activation_clamp, self.activation_clamp_mode)
-        if self.checkpoint.get('model_config', {}).get('model_profile') == 'ternary_endpoint_v14':
+        if backend == 'diffdock' and self.checkpoint.get('model_config', {}).get('model_profile') == 'ternary_endpoint_v14':
             self.expert.model.smooth_cross_edges = True
         if self.checkpoint.get('checkpoint_version', 0) >= 24:
             from tricoopdiff.models.expert import expert_runtime_identity
@@ -166,6 +176,8 @@ class EvaluationRunner:
                       return_rank_features=False,
                       condition_manifest=None):
         """Featurize and evaluate one case with the resident model."""
+        if getattr(self.expert, 'backend', 'diffdock') == 'fabind' and init_mode != 'sdpi':
+            raise ValueError('FABind evaluation currently supports SDPI initialization, not DiffDock binary sampling')
         torch.manual_seed(seed)
         if self.device.type == "cuda":
             torch.cuda.manual_seed_all(seed)
@@ -174,6 +186,8 @@ class EvaluationRunner:
             str(paths["ligand"]), self.score_model_args, str(self.device),
             cache_dir=str(cache_dir),
         )
+        if getattr(self.expert, 'backend', 'diffdock') == 'fabind':
+            e3_data, poi_data, ligand_data = self.expert.prepare_cached_case(e3_data, poi_data, ligand_data)
         self._ensure_model(input_dim)
         conditions, condition_audit, condition_path = None, None, None
         if self.conditioned_checkpoint:

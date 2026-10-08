@@ -30,6 +30,9 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--index", default="data/ternary_test.json")
     parser.add_argument("--trifuse-ckpt", required=True)
+    parser.add_argument('--model-dir', default='checkpoints/score_model')
+    parser.add_argument('--expert-source-dir')
+    parser.add_argument('--featurizer-model-dir', default='checkpoints/score_model')
     parser.add_argument("--out-dir", default="results/deepternary_test")
     parser.add_argument("--native-root", default="data/TernaryDB_release/pdbs")
     parser.add_argument("--metric-template-root",
@@ -117,6 +120,8 @@ def main():
         deterministic=not args.allow_nondeterministic,
         conformer_policy=args.conformer_policy,
         allow_experimental_checkpoint=args.allow_experimental_checkpoint,
+        model_dir=args.model_dir, expert_source_dir=args.expert_source_dir,
+        featurizer_model_dir=args.featurizer_model_dir,
     )
     failures = []
     for position, entry in enumerate(entries, start=1):

@@ -53,6 +53,8 @@ def build_parser():
     p.add_argument("--native-root", default="data/TernaryDB_release/pdbs",
                    help="Root containing <case>/gt_complex.pdb for indexed data")
     p.add_argument("--model-dir", default="checkpoints/score_model")
+    p.add_argument('--expert-source-dir', help='Official source directory for an alternative expert checkpoint')
+    p.add_argument('--featurizer-model-dir', default='checkpoints/score_model')
     p.add_argument("--ckpt", default="best_ema_inference_epoch_model.pt")
     p.add_argument("--case", default="5T35_D_A_759",
                    help="Ternary complex case name (directory under --protac-dir)")
@@ -173,6 +175,8 @@ def main():
                 device=args.device, model_dir=args.model_dir,
                 expert_checkpoint=args.ckpt,
                 conformer_policy=args.conformer_policy,
+                expert_source_dir=args.expert_source_dir,
+                featurizer_model_dir=args.featurizer_model_dir,
             )
             report = runner.evaluate_case(
                 args.case, paths, cache_dir=_PROJECT_ROOT / args.cache_dir,

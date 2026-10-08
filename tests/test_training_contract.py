@@ -124,6 +124,23 @@ def test_trainer_owns_recorded_activation_clamp_runtime():
         assert 'NAN_CLAMP' not in os.environ
 
 
+def test_fabind_entry_builds_explicit_backend_without_diffdock_weights():
+    args = parse_args(['--train_data', 'unused', '--val_data', 'unused', '--output_dir', 'unused',
+                       '--expert-backend', 'fabind', '--expert-source-dir', '/official',
+                       '--expert_model_dir', '/weights'])
+    expert = SimpleNamespace(node_scalar_dim=512, node_vector_dim=3)
+    with patch('tricoopdiff.models.expert.FrozenFABind', return_value=expert) as prior, \
+            patch('tricoopdiff.models.expert.build_diffdock_expert') as old_prior, \
+            patch('tricoopdiff.models.assembly.TernaryAssembly') as fuse, \
+            patch('tricoopdiff.models.assembly.TernaryAssemblyModel'), \
+            patch('tricoopdiff.train.AssemblyTrainer'):
+        build_trainer(args, 'cpu', input_dim=1281)
+        prior.assert_called_once_with('/official', '/weights', 'cpu')
+        old_prior.assert_not_called()
+        assert fuse.call_args.kwargs['expert_backend'] == 'fabind'
+        assert fuse.call_args.kwargs['expert_scalar_dim'] == 512
+
+
 def test_consensus_builder_passes_only_active_model_dimensions():
     args = parse_args([
         '--train_data', 'unused.json', '--val_data', 'unused.json',

@@ -107,6 +107,10 @@ def parse_args(argv=None):
     # from the checkpoint's model_parameters.yml, not hand-written here.
     p.add_argument("--expert_model_dir", default="checkpoints/score_model",
                    help="Dir with model_parameters.yml + best_ema_inference_epoch_model.pt")
+    p.add_argument('--expert-backend', choices=('diffdock', 'fabind'), default='diffdock')
+    p.add_argument('--expert-source-dir', help='Official FABind source checkout')
+    p.add_argument('--featurizer-model-dir', default='checkpoints/score_model',
+                   help='DiffDock featurization configuration, not alternative expert weights')
 
     # Featurization
     p.add_argument("--cache_dir", default="results/featurize_cache",
@@ -135,6 +139,8 @@ def parse_args(argv=None):
     )
 
     args = p.parse_args(argv)
+    if args.expert_backend == 'fabind' and args.training_arm != 'A1':
+        p.error('FABind currently supports SDPI arm A1; BiTSeed requires a binary sampling API')
     tokens = sys.argv[1:] if argv is None else argv
     args.explicit_loss_options = [token.split('=')[0] for token in tokens
                                  if token.split('=')[0] in ('--interface-loss-weight',
@@ -261,7 +267,8 @@ def main():
         raise SystemExit(f"FATAL: no entries in {args.train_data}")
 
     print("[0/6] Determining receptor feature dim from first sample...")
-    score_model_args = _load_score_model_args(args.expert_model_dir)
+    score_model_args = _load_score_model_args(
+        args.expert_model_dir if args.expert_backend == 'diffdock' else args.featurizer_model_dir)
     first = entries[0]
     _, _, _, input_dim = featurize_complex(
         first["case"], first["protein1"], first["protein2"], first["ligand"],
@@ -301,6 +308,8 @@ def main():
         shuffle=False, device=str(device), cache_dir=args.cache_dir,
         skip_on_error=False, max_clusters=args.max_val_clusters,
     )
+    if args.expert_backend == 'fabind':
+        train_loader.prepare_expert = val_loader.prepare_expert = model.expert.prepare_cached_case
     # Check scoring dependencies before spending an epoch on training.
     for entry in val_loader._epoch_entries():
         validation_metric_context(entry, args.native_root)
@@ -452,17 +461,20 @@ def build_trainer(args, device, input_dim=None):
     from tricoopdiff.models.assembly import (TernaryAssemblyModel, TernaryAssembly,
                                              VECTOR_EXPERT_MODEL_PROFILE,
                                              production_model_config)
-    from tricoopdiff.models.expert import build_diffdock_expert
+    from tricoopdiff.models.expert import FrozenFABind, build_diffdock_expert
     from tricoopdiff.sdpi_flow import SDPIFlow
     from tricoopdiff.train import AssemblyTrainer
 
     # Build frozen DiffDock-L expert from pretrained weights (self-contained
     # vendored core — no ../DiffDock dependency). num_conv_layers (11) and the
     # full CGModel architecture come from model_parameters.yml.
-    frozen_expert = build_diffdock_expert(
-        model_dir=args.expert_model_dir,
-        device=str(device),
-    )
+    backend = getattr(args, 'expert_backend', 'diffdock')
+    if backend == 'fabind':
+        if not args.expert_source_dir:
+            raise ValueError('FABind requires --expert-source-dir')
+        frozen_expert = FrozenFABind(args.expert_source_dir, args.expert_model_dir, str(device))
+    else:
+        frozen_expert = build_diffdock_expert(model_dir=args.expert_model_dir, device=str(device))
 
     # input_dim must match the ternary node feature dim, which is the receptor
     # feature dim (1281 = 1 amino-acid index + 1280 ESM2 for DiffDock-L). It is
@@ -476,6 +488,8 @@ def build_trainer(args, device, input_dim=None):
                                            model_profile=VECTOR_EXPERT_MODEL_PROFILE,
                                            expert_scalar_dim=frozen_expert.node_scalar_dim,
                                            expert_vector_dim=getattr(frozen_expert, 'node_vector_dim', 20))
+    if backend != 'diffdock':
+        model_config['expert_backend'] = backend
     if args.resume:
         # Resume means reconstruct the saved architecture, not reinterpret it
         # using today's defaults. The trainer subsequently checks every runtime
@@ -486,6 +500,8 @@ def build_trainer(args, device, input_dim=None):
         if saved['runtime_config'].get('training_objective') != 'real_initialization_reachable_endpoint_v2':
             raise ValueError('historical checkpoints are inference/weight sources, not production resumes')
         model_config = dict(saved['model_config'])
+        if model_config.get('expert_backend', 'diffdock') != backend:
+            raise ValueError('resume checkpoint expert backend differs from requested backend')
         if model_config.get('model_profile') == 'ternary_endpoint_v2':
             raise ValueError('v2 used the historical coupled near-target recipe; load weights only, not a production resume')
         if model_config.get('model_profile') == 'ternary_endpoint_v3':
@@ -740,6 +756,7 @@ class TernaryDataLoader:
         self.cache_read_only = bool(cache_read_only)
         self.cache_wait_seconds = float(cache_wait_seconds)
         self.skipped = []
+        self.prepare_expert = None
 
     def __iter__(self):
         entries = self._epoch_entries()
@@ -804,6 +821,8 @@ class TernaryDataLoader:
             e3_data, poi_data, ligand_data = swap_protein_reference(
                 e3_data, poi_data, ligand_data,
             )
+        if getattr(self, 'prepare_expert', None) is not None:
+            e3_data, poi_data, ligand_data = self.prepare_expert(e3_data, poi_data, ligand_data)
         return {
             'case': entry['case'],
             'e3_data': e3_data,
