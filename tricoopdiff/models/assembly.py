@@ -14,7 +14,7 @@ from torch.utils.checkpoint import checkpoint
 
 from tricoopdiff.inputs.graphs import build_binary_graph, build_trifuse_graph, crop_receptor_to_ligand
 from tricoopdiff.models.expert import _set_time_embeddings
-from tricoopdiff.sdpi_flow import SDPIFlow
+from tricoopdiff.sdpi_flow import SDPIFlow, horizontal_torsion_spin
 from tricoopdiff.diffdock.constants import lig_feature_dims
 
 
@@ -66,7 +66,7 @@ def bounded_vector(value):
 ARCHITECTURE = 'residual_evidence_v3'
 DIRECT_ARCHITECTURE = 'ternary_topological_joint_pose_v14'
 PREVIOUS_DIRECT_ARCHITECTURE = 'ternary_nodefield_independent_v4'
-ASSEMBLY_CHECKPOINT_VERSION = 50
+ASSEMBLY_CHECKPOINT_VERSION = 51
 EXPERT_CROP_POLICY = 'full_receptor_cross_taper_v1'
 LEGACY_RANK_FEATURE_STATE = 'final_pose_t0_dt0_v1'
 DIRECT_RANK_FEATURE_STATE = 'final_pose_evidence_t0_dt0_v2'
@@ -184,6 +184,8 @@ class ComponentStructureEncoder(nn.Module):
         encoded = torch.zeros_like(identity)
         for component in range(3):
             ids = (types == component).nonzero(as_tuple=False).flatten()
+            if not len(ids):
+                continue
             h, xyz = identity[ids], coords[ids]
             keys, values = self.key(h), self.value(h)
             if component == 2:
@@ -301,7 +303,7 @@ class LegalPoseDecoder(nn.Module):
         self.readout = nn.Linear(3 * width, width)
         self.joint = nn.MultiheadAttention(width, 4 if width % 4 == 0 else 1,
                                           dropout=0., batch_first=True)
-        self.joint_relation = nn.Linear(3, self.joint.num_heads, bias=False)
+        self.joint_relation = nn.Linear(5, self.joint.num_heads, bias=False)
         self.norm = nn.LayerNorm(width)
         self.rigid = nn.Sequential(nn.Linear(2 * width, width), nn.SiLU(),
                                    nn.Linear(width, 2 * channels))
@@ -317,35 +319,52 @@ class LegalPoseDecoder(nn.Module):
         return logits, relation[..., :-1]
 
     @staticmethod
-    def joint_relations(positions, affected):
+    def joint_relations(positions, affected, axes=None, tangents=None):
         """Physical DOF coupling: separation, shared atoms and directed overlap."""
         distance = torch.linalg.vector_norm(positions[:, None] - positions[None], dim=-1) / 10.
         count = affected.sum(-1)
         shared = affected @ affected.T
         union = count[:, None] + count[None] - shared
+        shape = distance.shape
+        axis_gram = positions.new_zeros(shape)
+        tangent_gram = positions.new_zeros(shape)
+        if axes is not None:
+            axis_gram[2:, 2:] = axes @ axes.T
+            flat = tangents.flatten(1)
+            flat = flat / flat.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            tangent_gram[2:, 2:] = flat @ flat.T
         return torch.stack((torch.log1p(distance), shared / union.clamp_min(1.),
-                            shared / count[:, None].clamp_min(1.)), -1)
+                            shared / count[:, None].clamp_min(1.), axis_gram, tangent_gram), -1)
 
     @staticmethod
-    def action_geometry(coords, vectors, ligand, bonds, masks):
-        """Invariant bond/atom geometry; tangent is the raw legal rotor action.
-
-        No inverse solve or target enters here. The executor retains its
-        existing horizontal gauge; this is not its complete Jacobian.
-        """
-        xyz = coords[ligand]
+    def rotor_tangents(xyz, bonds, masks):
+        """Unit-angle derivatives in the actual horizontal execution gauge."""
         u, v = bonds
         axis = xyz[u] - xyz[v]
         length = torch.linalg.vector_norm(axis, dim=-1, keepdim=True)
         if bool((length <= 1e-10).any()):
             raise ValueError('degenerate torsion axis')
         axis = axis / length
+        raw = torch.cross(axis[:, None].expand(-1, len(xyz), -1),
+                          xyz[None] - xyz[v, None], dim=-1) * masks[..., None]
+        spin = horizontal_torsion_spin(xyz[None], raw, .5 * axis).to(xyz.dtype)
+        tangent = raw - raw.mean(1, keepdim=True) - torch.cross(
+            spin[:, None].expand_as(raw), (xyz - xyz.mean(0))[None].expand_as(raw), dim=-1)
+        return axis, tangent
+
+    @staticmethod
+    def action_geometry(coords, vectors, ligand, bonds, masks):
+        """Invariant bond/atom geometry in the actual execution gauge."""
+        xyz = coords[ligand]
+        u, v = bonds
+        axis, horizontal = LegalPoseDecoder.rotor_tangents(xyz, bonds, masks)
         lever = (coords[None] - xyz[v, None]) / 10.
         axial = (lever * axis[:, None]).sum(-1, keepdim=True)
         radial = lever - axial * axis[:, None]
         affected = coords.new_zeros(len(u), len(coords))
         affected[:, ligand] = masks.to(coords.dtype)
-        tangent = torch.cross(axis[:, None].expand_as(lever), lever, dim=-1) * affected[..., None]
+        tangent = coords.new_zeros(len(u), len(coords), 3)
+        tangent[:, ligand] = horizontal / 10.
         return torch.cat((axial, torch.linalg.vector_norm(radial, dim=-1, keepdim=True),
                           affected[..., None], (vectors[None] * axis[:, None, None]).sum(-1),
                           (vectors[None] * tangent[:, :, None]).sum(-1)), -1)
@@ -409,7 +428,10 @@ class LegalPoseDecoder(nn.Module):
                 values = torch.cat((values[:2], values[2:] + geometry[:, selected, :-1]), 0)
             context.append((logits[:, selected].softmax(-1)[..., None] * values).sum(1))
         decisions = queries + self.readout(torch.cat(context, -1))
-        relation = self.joint_relation(self.joint_relations(positions, affected)).permute(2, 0, 1)
+        axes, tangents = (self.rotor_tangents(coords[types == 2], bonds, masks)
+                          if bonds.shape[1] else (None, None))
+        relation = self.joint_relation(self.joint_relations(
+            positions, affected, axes, tangents)).permute(2, 0, 1)
         coupled, _ = self.joint(decisions[None], decisions[None], decisions[None],
                                 attn_mask=relation, need_weights=False)
         decisions = self.norm(decisions + coupled[0])
@@ -425,11 +447,11 @@ class LegalPoseDecoder(nn.Module):
                 weights[:, None, None] * (coefficients[..., None]
                                          * vectors[selected, None]).sum(2)).sum(0)
             shift = displacement[None] * 10.
-            angular = math.pi * bounded_vector(rotation[None])
+            angular = rotation[None]
             motion[branch] = {
                 'tr': -shift / state[:, column:column + 1].exp(),
                 'rot': -angular / math.pi}
-        torsion = (-self.bond(decisions[2:]).squeeze(-1).tanh()[None]
+        torsion = (-self.bond(decisions[2:]).squeeze(-1)[None] / math.pi
                    if bonds.shape[1] else h.new_empty(1, 0))
         for branch in BRANCHES:
             motion[branch]['tor'] = torsion
@@ -572,8 +594,12 @@ class TernaryAssembly(nn.Module):
             self.binary_film = nn.Linear(node_dim, 2 * expert_scalar_dim)
             nn.init.zeros_(self.binary_film.weight)
             nn.init.zeros_(self.binary_film.bias)
+            if expert_backend == 'fabind':
+                self.condition_ligand = LigandFeatureEncoder(node_dim)
+                self.condition_chemistry = ComponentStructureEncoder(node_dim)
+                self.condition_interface = nn.Linear(2 * node_dim + 6, node_dim)
 
-    def binary_condition(self, receptor, opposite):
+    def binary_condition(self, receptor, opposite, ligand=None):
         """Nodewise opposite-protein context; no target or pooled condition token."""
         q = self.condition_query(receptor['features'][0])
         k = self.condition_key(opposite['features'][0])
@@ -589,6 +615,26 @@ class TernaryAssembly(nn.Module):
                                 (weights * log_distance.square()).sum(-1),
                                 torch.log1p(torch.exp(-distance.square()).sum(-1))), -1)
         context = weights @ value + self.condition_geometry(geometry)
+        if self.config.get('expert_backend') == 'fabind':
+            if ligand is None:
+                raise ValueError('FABind mutual condition requires current ligand chemistry and geometry')
+            identity = self.condition_ligand(ligand['features'][0])
+            identity = self.condition_chemistry(identity, ligand['coords'][0],
+                torch.full((len(identity),), 2, dtype=torch.long, device=q.device),
+                ligand['edge_index'], ligand['edge_attr'])
+            separation = torch.cdist(opposite['coords'][0], ligand['coords'][0],
+                                     compute_mode='donot_use_mm_for_euclid_dist') / 10.
+            support = weights @ (-separation).softmax(-1)
+            interface_weights = (-separation).softmax(-1)
+            interface_log = torch.log1p(separation)
+            interface_geometry = torch.stack(((interface_weights * interface_log).sum(-1),
+                (interface_weights * interface_log.square()).sum(-1),
+                torch.log1p(torch.exp(-separation.square()).sum(-1))), -1)
+            receiver_distance = torch.cdist(receptor['coords'][0], ligand['coords'][0],
+                compute_mode='donot_use_mm_for_euclid_dist') / 10.
+            atoms = (torch.log(support.clamp_min(1e-30)) - receiver_distance).softmax(-1)
+            context = self.condition_interface(torch.cat((weights @ value,
+                atoms @ identity, geometry, weights @ interface_geometry), -1)) + self.condition_geometry(geometry)
         gamma, beta = self.binary_film(context).chunk(2, -1)
         return .1 * gamma.tanh().unsqueeze(0), .1 * beta.tanh().unsqueeze(0)
 
@@ -703,7 +749,7 @@ class TernaryAssemblyModel(nn.Module):
                         receptor = {**receptor, 'coords': receptor['coords'].detach()}
                         opposite = {**opposite, 'coords': opposite['coords'].detach()}
                         expert_ligand = {**ligand_data, 'coords': ligand_data['coords'].detach()}
-                    modulation = self.trifuse.binary_condition(receptor, opposite)
+                    modulation = self.trifuse.binary_condition(receptor, opposite, expert_ligand)
                     def read_pair(rec, lig, time, film):
                         return self.expert.read_pair(rec, lig, time, film)
                     if (getattr(self.expert, 'backend', 'diffdock') != 'fabind'

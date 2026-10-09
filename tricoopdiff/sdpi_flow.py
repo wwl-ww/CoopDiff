@@ -41,6 +41,18 @@ def _raw_torsions(coords, bonds, masks, angles):
     )
 
 
+def horizontal_torsion_spin(coords, displacement, gauge_prior):
+    """Differentiable executor gauge, including batched candidate rotors."""
+    centered = (coords - coords.mean(-2, keepdim=True)).double()
+    identity = torch.eye(3, dtype=torch.float64, device=coords.device)
+    inertia = centered.square().sum((-2, -1))[..., None, None] * identity
+    inertia = inertia - centered.transpose(-1, -2) @ centered
+    torque = torch.linalg.cross(centered, displacement.double(), dim=-1).sum(-2)
+    ridge = inertia.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(torch.finfo(torch.float64).tiny) * 1e-6
+    return torch.linalg.solve(inertia + ridge[..., None, None] * identity,
+        (torque + ridge[..., None] * gauge_prior.double())[..., None]).squeeze(-1)
+
+
 def _horizontal_torsion_velocity(coords, bonds, masks, angular_velocity):
     """Horizontal torsion velocity and the removed rigid angular velocity."""
     velocity = np.zeros_like(coords)
@@ -299,18 +311,11 @@ class SDPIFlow:
                 # Instead retract the local horizontal torsion tangent: remove
                 # its mean motion and rigid spin, without changing shape DOFs.
                 center = rigid.mean(1, keepdim=True)
-                centered = (rigid - center).double()
-                identity = torch.eye(3, dtype=torch.float64, device=rigid.device)[None]
-                inertia = centered.square().sum((1, 2))[:, None, None] * identity
-                inertia = inertia - centered.transpose(1, 2) @ centered
-                torque = torch.linalg.cross(centered, displacement.double(), dim=-1).sum(1)
                 # Symmetric half-side gauge keeps the ridge prior covariant
                 # under bond reversal plus complementary rotation fragments.
                 # A zero-spin prior would leave an orientation-dependent
                 # first-order residual, even though the ideal projection does not.
-                ridge = inertia.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(torch.finfo(torch.float64).tiny) * 1e-6
-                spin = torch.linalg.solve(inertia + ridge[:, None, None] * identity,
-                                          (torque + ridge[:, None] * gauge_prior.double())[:, :, None]).squeeze(-1)
+                spin = horizontal_torsion_spin(rigid, displacement, gauge_prior)
                 rotation = rotation_exp(-spin).to(rigid.dtype)
                 rigid = (raw - raw.mean(1, keepdim=True)) @ rotation.transpose(-1, -2) + center
         _check_coords(rigid)

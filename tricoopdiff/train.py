@@ -323,10 +323,10 @@ LIGAND_INTERFACE_CONTRACT = {
     'geometry': 'relative_pair_vectors_and_distances',
     'normalization': 'mean_per_interface_empty_is_zero',
 }
-POSE_OUTPUT_CONTRACT = {'version': 'topological_joint_legal_pose_v5',
+POSE_OUTPUT_CONTRACT = {'version': 'horizontal_joint_legal_velocity_v6',
                         'translation_unit_angstrom': 10.,
-                        'rotation': 'bounded_axis_angle', 'torsion': 'bounded_periodic_increment',
-                        'execution': 'remaining_time_reverse_velocity'}
+                        'rotation': 'unbounded_axis_angle_velocity', 'torsion': 'unbounded_angular_velocity',
+                        'execution': 'direct_reverse_velocity_without_inverse_time_gain'}
 ENDPOINT_OBJECTIVES = (ENDPOINT_OBJECTIVE, REAL_ENDPOINT_OBJECTIVE)
 
 

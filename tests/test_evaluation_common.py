@@ -34,6 +34,24 @@ def test_fabind_initializer_uses_expert_not_featurizer_torsion_contract(tmp_path
     initializer.assert_called_once_with(no_torsion=False, conformer_policy='etkdgv3_random')
 
 
+def test_retired_condition_checkpoint_rejected_even_with_opt_in():
+    import sys
+    from unittest.mock import patch
+
+    sys.path.insert(0, str(_SCRIPT.parent))
+    from evaluation_runner import EvaluationRunner
+    for opt_in in (False, True):
+        with patch('evaluation_runner.sha256_file', return_value='a' * 64), \
+                patch('evaluation_runner.torch.load', return_value={'format': 'conditioned_consensus_training_v1'}):
+            try:
+                EvaluationRunner(_SCRIPT.parent.parent, 'retired.pt', device='cpu',
+                                 allow_conditioned_checkpoint=opt_in)
+            except ValueError as error:
+                assert 'retired condition-token' in str(error)
+            else:
+                raise AssertionError('retired prototype weights must never enter nodewise assembly')
+
+
 def test_runtime_rejects_overflowing_ema_without_publishing_model():
     import sys
     from types import SimpleNamespace

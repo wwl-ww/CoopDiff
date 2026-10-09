@@ -1244,7 +1244,7 @@ def test_v2_checkpoint_records_recipe_and_resumes_warmup_and_entry_parity():
     trainer, batch, coupling = _endpoint_trainer_fixture('ternary_endpoint_v2')
     trainer.train_step(**batch, coupling_override=coupling)
     payload = copy.deepcopy(trainer.checkpoint_payload())
-    assert payload['checkpoint_version'] == 50
+    assert payload['checkpoint_version'] == 51
     payload['checkpoint_version'] = 25  # Historical v2 weights retain their old recipe.
     assert payload['runtime_config']['ema_update_contract'] == 'optimizer_step_warmup_v1'
     assert payload['runtime_config']['near_target_supervision']['weight'] == .25
@@ -1386,7 +1386,7 @@ def test_v8_unified_architecture_has_distinct_checkpoint_contract():
     trainer, batch, coupling = _endpoint_trainer_fixture(VECTOR_EXPERT_MODEL_PROFILE)
     trainer.train_step(**batch, coupling_override=coupling)
     payload = trainer.checkpoint_payload()
-    assert payload['checkpoint_version'] == 50
+    assert payload['checkpoint_version'] == 51
     assert payload['architecture'] == DIRECT_ARCHITECTURE
     assert payload['model_config']['expert_vector_dim'] == 20
     validate_assembly_checkpoint(payload)
@@ -1395,7 +1395,7 @@ def test_v8_unified_architecture_has_distinct_checkpoint_contract():
     try:
         validate_assembly_checkpoint(old)
     except ValueError as error:
-        assert 'checkpoint version 50' in str(error)
+        assert 'checkpoint version 51' in str(error)
     else:
         raise AssertionError('pre unified-controller weights were accepted under v8 semantics')
 

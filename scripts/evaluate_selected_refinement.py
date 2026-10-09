@@ -350,9 +350,7 @@ def main():
                 "tricoopdiff/sdpi_flow.py", "tricoopdiff/initialization/candidates.py",
                 "scripts/evaluation_runner.py", "scripts/featurize_common.py",
                 "scripts/evaluation_common.py", "tricoopdiff/metrics/dockq.py",
-            ) + (("tricoopdiff/conditioning/conditioned_consensus_train.py",
-                  "tricoopdiff/conditioning/condition_features.py")
-                 if args.allow_conditioned_checkpoint else ())
+            )
         },
         "smoke_one_per_source": args.smoke_one_per_source,
         "allow_experimental_checkpoint": args.allow_experimental_checkpoint,

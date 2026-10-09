@@ -84,6 +84,11 @@ def test_fabind_motion_projection_matches_executor_sign_units_and_gauge():
              'torsion_update_mode': CONTINUOUS_TORSION_MODE}, h, data, freeze_poi=True)[0]
     actual = execute(coords.new_tensor([[.2, -.3, .1]]),
                      coords.new_tensor([[.05, .07, -.08]]), coords.new_tensor([[.12]]))
+    from tricoopdiff.models.assembly import LegalPoseDecoder
+    _, tangent = LegalPoseDecoder.rotor_tangents(coords[0], bonds.T, masks)
+    pure_torsion = (execute(zeros, zeros, coords.new_tensor([[.12]])) - coords)[0] / h
+    assert torch.allclose(pure_torsion, .12 * tangent[0], atol=2e-5, rtol=2e-4), (
+        'decoder torsion geometry must describe actual horizontal atom derivatives')
     delta = (actual - coords)[0] / h
     fitted = FrozenFABind.project_motion(coords[0], delta, bonds, masks)
     reconstructed = (execute(*fitted) - coords)[0] / h
@@ -495,8 +500,11 @@ def test_chemical_multihop_and_rotor_geometry_match_physical_action():
     moved = torch.where(masks[0, :, None], moved, xyz)
     tangent = (moved - xyz) / (10. * step)
     projection = (vectors[ligand] * tangent[:, None]).sum(-1)
-    assert torch.allclose(geometry[0, ligand, -4:], projection, atol=1e-6), (
-        'action features must encode the legal raw rotor derivative, with the correct axis sign')
+    assert not torch.allclose(geometry[0, ligand, -4:], projection, atol=1e-6), (
+        'raw fragment motion incorrectly omits executor recentering and spin removal')
+    _, horizontal = LegalPoseDecoder.rotor_tangents(xyz, bonds, masks)
+    projection = (vectors[ligand] * horizontal[0, :, None] / 10.).sum(-1)
+    assert torch.allclose(geometry[0, ligand, -4:], projection, atol=1e-10)
     rotation = so3_exp(torch.tensor([[.7, -.4, .9]], dtype=torch.float64))[0]
     transformed = LegalPoseDecoder.action_geometry(coords @ rotation.T + 30.,
                                                    vectors @ rotation.T, ligand, bonds, masks)
@@ -527,6 +535,34 @@ def test_global_chemical_read_and_explicit_dof_overlap():
     assert relation[1, 2, 1] == 0 and relation[0, 1, 1] == .5
     assert relation[0, 1, 2] == .5 and relation[1, 0, 2] == 1., (
         'subset/superset action overlap must retain its direction')
+    positions = torch.zeros(4, 3)
+    affected = torch.ones(4, 4)
+    axes = torch.tensor([[1., 0., 0.], [0., 1., 0.]])
+    tangent = axes[:, None].expand(2, 4, 3)
+    orthogonal = LegalPoseDecoder.joint_relations(positions, affected, axes, tangent)
+    parallel = LegalPoseDecoder.joint_relations(positions, affected,
+        axes[:1].expand(2, 3), tangent[:1].expand(2, 4, 3))
+    assert torch.equal(orthogonal[..., :3], parallel[..., :3])
+    assert orthogonal[2, 3, 3] == orthogonal[2, 3, 4] == 0
+    assert parallel[2, 3, 3] == parallel[2, 3, 4] == 1
+
+
+def test_pose_velocity_is_not_limited_to_pi_total_angular_budget():
+    from tricoopdiff.models.assembly import LegalPoseDecoder
+    _, graph, _, state = fixture()
+    decoder = LegalPoseDecoder(32, 4).eval()
+    for module in (decoder.rigid, decoder.bond):
+        for parameter in module.parameters():
+            torch.nn.init.zeros_(parameter)
+    decoder.rigid[-1].bias.data[4] = 10.
+    decoder.bond[-1].bias.data.fill_(10.)
+    vectors = torch.zeros(15, 4, 3)
+    vectors[:, 0, 0] = 1.
+    output = decoder(torch.zeros(15, 32), vectors, graph['node_coords'], graph['node_types'],
+        graph['lig_edge_index'][:, graph['lig_edge_mask']], graph['lig_mask_rotate'],
+        state, [torch.zeros(1) for _ in BRANCHES])
+    assert output['torsion'].abs().min() > 1.
+    assert all(output[branch]['rot'].norm() > 1. for branch in BRANCHES)
 
 
 def test_pose_velocity_has_no_explicit_inverse_time_gain():
@@ -550,6 +586,51 @@ def test_pose_velocity_has_no_explicit_inverse_time_gain():
     short[:, -1], short[:, 5:8] = 0., 0.
     terminal = decoder(*args, short, opinions)
     assert all(torch.isfinite(terminal[b][f]).all() for b in BRANCHES for f in ('tr', 'rot', 'tor'))
+
+
+def test_fabind_mutual_condition_routes_current_ligand_chemistry():
+    torch.manual_seed(37)
+    model = TernaryAssembly(node_dim=32, input_dim=16, expert_backend='fabind',
+        expert_scalar_dim=512, expert_vector_dim=3).double()
+    receptor = {'features': torch.randn(1, 5, 16, dtype=torch.float64),
+        'coords': torch.randn(1, 5, 3, dtype=torch.float64, requires_grad=True)}
+    opposite = {'features': torch.randn(1, 7, 16, dtype=torch.float64),
+        'coords': torch.randn(1, 7, 3, dtype=torch.float64, requires_grad=True)}
+    ligand = {'features': torch.zeros(1, 4, 16, dtype=torch.float64),
+        'coords': torch.randn(1, 4, 3, dtype=torch.float64, requires_grad=True),
+        'edge_index': torch.tensor([[0, 1, 1, 2, 2, 3], [1, 0, 2, 1, 3, 2]]),
+        'edge_attr': torch.nn.functional.one_hot(torch.zeros(6, dtype=torch.long), 4).double()}
+    zero = model.binary_condition(receptor, opposite, ligand)
+    assert all(value.count_nonzero() == 0 for value in zero), 'retain original frozen prior at initialization'
+    torch.nn.init.normal_(model.binary_film.weight, std=.1)
+    original = model.binary_condition(receptor, opposite, ligand)
+    changed = {**ligand, 'features': ligand['features'].clone()}
+    changed['features'][0, 0, 0] = 1
+    alternate = model.binary_condition(receptor, opposite, changed)
+    assert any(not torch.allclose(a, b) for a, b in zip(original, alternate)), (
+        'same protein pair must retain atom-specific ligand chemical differences in its FiLM')
+    gradient = torch.autograd.grad(sum(value.square().sum() for value in original),
+        (receptor['coords'], opposite['coords'], ligand['coords']))
+    assert all(torch.isfinite(value).all() and value.norm() > 0 for value in gradient)
+    rotation = so3_exp(torch.tensor([[.3, -.2, .5]], dtype=torch.float64))[0]
+    moved = lambda part: {**part, 'coords': part['coords'] @ rotation.T + 27.}
+    transformed = model.binary_condition(moved(receptor), moved(opposite), moved(ligand))
+    assert all(torch.allclose(a, b, atol=1e-10) for a, b in zip(original, transformed))
+    # Keep receptor-opposite and receptor-ligand distances fixed. A single
+    # ligand atom makes softmax support exactly one, so only absolute interface
+    # value channels can distinguish the two opposite-ligand separations.
+    rec = {key: value[:, :1].detach() for key, value in receptor.items()}
+    opp = {key: value[:, :1].detach() for key, value in opposite.items()}
+    rec['coords'] = torch.zeros(1, 1, 3, dtype=torch.float64)
+    opp['coords'] = torch.tensor([[[3., 0., 0.]]], dtype=torch.float64)
+    atom = {'features': ligand['features'][:, :1],
+        'coords': torch.tensor([[[5., 0., 0.]]], dtype=torch.float64),
+        'edge_index': torch.empty(2, 0, dtype=torch.long),
+        'edge_attr': torch.empty(0, 4, dtype=torch.float64)}
+    near = model.binary_condition(rec, opp, atom)
+    far = model.binary_condition(rec, {**opp, 'coords': -opp['coords']}, atom)
+    assert any(not torch.allclose(a, b) for a, b in zip(near, far)), (
+        'single-atom softmax must not erase absolute opposite-ligand separation')
 
 
 def test_matcha_mutual_condition_preserves_prior_and_live_geometry():
