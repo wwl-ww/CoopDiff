@@ -655,15 +655,19 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         projection = None
         source = int(candidate_source_tensor(source, dt).item())
         from tricoopdiff.initialization import TernaryInitializer
-        from tricoopdiff.initialization.endpoints import reachable_ligand_target
+        from tricoopdiff.initialization.endpoints import reachable_ligand_target, EndpointProjectionError
         if coupling_override is None:
             if int(source) != 0:
                 raise ValueError('BiTSeed training requires its actual sampled state')
             seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
             ligand, poi, body, _ = TernaryInitializer(no_torsion=no_torsion).initialize(
                 ed['coords'][0], pd['coords'][0], ld, seed=seed)
-            target, projection = reachable_ligand_target(
-                ld, ligand, poi, pd['coords'], no_torsion=no_torsion)
+            try:
+                target, projection = reachable_ligand_target(
+                    ld, ligand, poi, pd['coords'], no_torsion=no_torsion)
+            except EndpointProjectionError as error:
+                error.diagnostics.update(case=case, seed=seed, no_torsion=no_torsion)
+                raise
         else:
             if 'initial_state' not in coupling_override:
                 raise ValueError('real initialization training rejects crystal-projected couplings')
@@ -683,6 +687,9 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         result = self._endpoint_rollout_loss(
             ed, pd, ld, ligand, poi, body, target_ligand, source, conditions)
         result['loss_endpoint_main'] = result['loss_total']
+        if projection is not None:
+            result['target_projection_rmsd_angstrom'] = projection['ligand_projection_rmsd_angstrom']
+            result['target_projection_nfev'] = projection['torsion_optimization']['nfev']
         if near_target_zero is not None:
             near_ligand, near_poi = target_ligand.detach(), pd['coords'].detach()
             near_body = torch.eye(3, device=self.device, dtype=near_ligand.dtype).unsqueeze(0)
@@ -715,6 +722,8 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         return {'loss_total': result['loss_total'], 'loss_score': result['loss_total'].detach().item(),
                 'loss_endpoint_main': result['loss_endpoint_main'].detach().item(),
                 'native_interface_pairs': result['native_interface_pairs'],
+                **{key: result[key] for key in ('target_projection_rmsd_angstrom', 'target_projection_nfev')
+                   if key in result},
                 **{name: value.detach().item() for name, value in result['components'].items()}}
 
     def _endpoint_rollout_loss(self, ed, pd, ld, ligand, poi, body, target_ligand,
@@ -945,6 +954,7 @@ class AssemblyTrainer(TriCoopDiffTrainer):
 
     def checkpoint_payload(self, epoch=0, best_val_loss=float('inf'), best_val_dockq=None):
         """Build the shared training/inference payload without writing files."""
+        from tricoopdiff.initialization.endpoints import PROJECTION_SOLVER_VERSION
         payload = {
             'checkpoint_version': ASSEMBLY_CHECKPOINT_VERSION,
             'architecture': self.model.architecture, 'generative_process': FLOW_VERSION,
@@ -961,6 +971,7 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                 'training_endpoint_protocol': self.training_endpoint_protocol,
                 'expert_input_grad': getattr(self.model, 'expert_input_grad', True),
                 'training_objective': self.training_objective,
+                'target_projection_solver': PROJECTION_SOLVER_VERSION,
                 'endpoint_loss_weight': self.endpoint_loss_weight,
                 'ligand_geometry_scale_angstrom': LIGAND_GEOMETRY_SCALE_ANGSTROM,
                 'protein_geometry_scale_angstrom': PROTEIN_GEOMETRY_SCALE_ANGSTROM,
@@ -996,8 +1007,17 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         atomic_torch_save(self.checkpoint_payload(epoch, best_val_loss, best_val_dockq), path)
 
     def load_checkpoint(self, path):
+        from tricoopdiff.initialization.endpoints import PROJECTION_SOLVER_VERSION
         payload = torch.load(path, map_location=self.device, weights_only=False)
         validate_assembly_checkpoint(payload)
+        saved_solver = payload['runtime_config'].get('target_projection_solver')
+        if saved_solver is None:
+            import warnings
+            warnings.warn('resuming optimization state with upgraded target projection solver; '
+                          'future sampled labels are recomputed with ' + PROJECTION_SOLVER_VERSION,
+                          RuntimeWarning, stacklevel=2)
+        elif saved_solver != PROJECTION_SOLVER_VERSION:
+            raise ValueError('unsupported checkpoint target projection solver')
         if payload.get('checkpoint_kind') == 'inference_only':
             raise ValueError('inference-only weights cannot resume the production training objective')
         if payload['runtime_config'].get('ligand_geometry_scale_angstrom') != LIGAND_GEOMETRY_SCALE_ANGSTROM:

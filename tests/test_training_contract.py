@@ -277,6 +277,30 @@ def test_matcha_checkpoint_uses_backend_specific_identity_not_diffdock_edges():
             raise AssertionError('Matcha checkpoint accepted a different expert execution contract')
 
 
+def test_projection_failure_is_saved_without_accepting_partial_update(tmp_path):
+    from train_entry import _guarded_train_batch
+    from tricoopdiff.initialization.endpoints import EndpointProjectionError
+
+    ligand = {'coords': torch.zeros(1, 2, 3), 'edge_index': torch.tensor([[0], [1]]),
+              'edge_mask': torch.tensor([False]), 'mask_rotate': np.empty((0, 2), dtype=bool)}
+    error = EndpointProjectionError({'torsion_optimization': {'success': False}},
+        ligand, ligand['coords'], ligand['coords'], ligand['coords'])
+    error.diagnostics.update(case='failure_case', seed=73)
+    class FailingTrainer:
+        def train_batch(self, batches):
+            raise error
+    destination = tmp_path / 'projection_failure.pt'
+    try:
+        _guarded_train_batch(FailingTrainer(), [{}], failure_path=destination)
+    except EndpointProjectionError as caught:
+        assert caught is error
+    else:
+        raise AssertionError('projection failure was silently accepted')
+    payload = torch.load(destination, weights_only=False)
+    assert payload['case'] == 'failure_case' and payload['seed'] == 73
+    assert np.array_equal(payload['initial_ligand'], np.zeros((2, 3)))
+
+
 def test_cached_only_loader_preserves_clusters_and_restricts_choices(tmp_path):
     import json
     from train_entry import TernaryDataLoader

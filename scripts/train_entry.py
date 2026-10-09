@@ -352,7 +352,8 @@ def main():
             microbatches = [prepare_source_batch(
                 batch, trainer.samples_seen + offset, args.training_arm, endpoint_store,
             ) for offset, batch in enumerate(microbatches)]
-            group_losses = _guarded_train_batch(trainer, microbatches)
+            group_losses = _guarded_train_batch(trainer, microbatches,
+                failure_path=Path(args.output_dir) / 'projection_failure.pt')
             train_losses.extend(group_losses)
             if args.save_steps > 0 and trainer.global_step % args.save_steps == 0:
                 trainer.save_checkpoint(
@@ -565,13 +566,18 @@ def build_trainer(args, device, input_dim=None):
     return model, diffusion, trainer
 
 
-def _guarded_train_batch(trainer, batches):
+def _guarded_train_batch(trainer, batches, failure_path=None):
     from tricoopdiff.train import NonFiniteTrainingError
+    from tricoopdiff.initialization.endpoints import EndpointProjectionError
 
     try:
         return trainer.train_batch(batches)
     except NonFiniteTrainingError as error:
         raise RuntimeError(f'training aborted without updating the partial microbatch group: {error}') from error
+    except EndpointProjectionError as error:
+        if failure_path is not None:
+            atomic_torch_save(error.diagnostics, failure_path)
+        raise
 
 
 def iter_training_batches(loader, size):
