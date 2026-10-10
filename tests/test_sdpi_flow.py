@@ -1,34 +1,75 @@
-"""Endpoint, coordinate-tangent, integration and train/inference flow gates."""
+"""Sdpi flow regression checks. Run with pytest or execute this file directly."""
 
-import sys
-from pathlib import Path
+if __name__ == "__main__":
+    from helpers import run_tests
+
+    run_tests(__file__)
+
+import math
 from types import SimpleNamespace
 
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import tricoopdiff.diffdock_compat  # noqa: F401
-from test_initialization import ligand_input
+from helpers import flow_example
+from tricoopdiff.experiments.joint_endpoint_experiment import (
+    joint_rigid_endpoint_targets,
+    stable_so3_log,
+)
+from tricoopdiff.experiments.offpath_experiments import (
+    BodyFrameTransportRolloutTrainer,
+    BoundedJointEndpointRolloutTrainer,
+    GAUGE_CORRECT_CONTRACT_MODE,
+    GAUGE_CORRECT_TORSION_CONTRACT,
+    GaugeCorrectBodyFrameTransportRolloutTrainer,
+    JOINT_ENDPOINT_CONTRACT_MODE,
+    JOINT_ENDPOINT_TORSION_CONTRACT,
+    OFFPATH_CONTRACT_MODE,
+    TORSION_GAUGE_CONTRACT,
+    _state_torsion_gauge,
+    transport_poi_body_frame_targets,
+    transport_targets_with_recomputed_gauge,
+)
+from tricoopdiff.experiments.trajectory_experiment import (
+    DISTANCE_STAGED_POI_CONTRACT_MODE,
+    DeterministicPriorReplayTrajectoryTrainer,
+    PRIOR_REPLAY_CONTRACT_MODE,
+    PRIOR_REPLAY_EVAL_CONTRACT_MODE,
+    PRIOR_REPLAY_TRANSLATION_AGREEMENT_CONTRACT_MODE,
+    PRIOR_REPLAY_TRANSLATION_CONTRACT_MODE,
+    PRIOR_REPLAY_TRANSLATION_DIRECTION_CONTRACT_MODE,
+    PRIOR_REPLAY_TRANSLATION_REPLACE_CONTRACT_MODE,
+    PRIOR_REPLAY_TRANSLATION_SOFT_TIME_CONTRACT_MODE,
+    PRIOR_REPLAY_TRANSLATION_WINDOW_REPLACE_CONTRACT_MODE,
+    PriorReplayJointTranslationAgreementTrainer,
+    PriorReplayJointTranslationDirectionTrainer,
+    PriorReplayJointTranslationReplaceTrainer,
+    PriorReplayJointTranslationSoftTimeTrainer,
+    PriorReplayJointTranslationTrainer,
+    PriorReplayJointTranslationWindowReplaceTrainer,
+    PriorReplayTrajectoryTrainer,
+    STAGED_POI_CONTRACT_MODE,
+    StagedPOITrajectoryTrainer,
+    TRAJECTORY_CONTRACT_MODE,
+    TrajectoryConsistencyTrainer,
+    differentiable_sdpi_step,
+    joint_endpoint_translation_loss,
+    prior_replay_schedule,
+    remaining_centroid_loss,
+    staged_poi_state_loss,
+)
+from tricoopdiff.geometry.rigid import (
+    apply_rigid,
+    assemble_interface_pair,
+    rotation_exp as _rotation_exp,
+)
 from tricoopdiff.sdpi_flow import SDPIFlow
 
 
-def fixture(smiles='CCCOCC', seed=12):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    data = ligand_input(smiles)
-    data['coords'] = data['coords'].double()
-    a = torch.randn(1, 20, 3, dtype=torch.float64) * 10
-    b = torch.randn(1, 17, 3, dtype=torch.float64) * 8 + 7
-    flow = SDPIFlow()
-    coupling = flow.sample_coupling(a, b, data)
-    return flow, data, a, b, coupling
-
+# Sdpi flow
 
 def test_flow_clean_and_prior_endpoints():
-    flow, data, a, b, coupling = fixture()
+    flow, data, a, b, coupling = flow_example()
     ligand, poi, body, _ = flow.path(data, b, coupling, torch.tensor([0.], dtype=torch.float64))
     assert torch.allclose(ligand, data['coords'], atol=1e-10)
     assert torch.allclose(poi, b, atol=1e-10)
@@ -115,7 +156,7 @@ def test_reverse_clock_integrates_to_zero_with_identical_branch_times():
 
 
 def test_shared_model_read_preserves_geometry_gradient_and_conditioning():
-    flow, ligand_data, e3, poi, _ = fixture()
+    flow, ligand_data, e3, poi, _ = flow_example()
     ligand = ligand_data['coords'].detach().clone().requires_grad_()
     moved_poi = (poi + 3).detach().requires_grad_()
     body = torch.eye(3, dtype=e3.dtype).unsqueeze(0)
@@ -145,7 +186,7 @@ def test_shared_model_read_preserves_geometry_gradient_and_conditioning():
 def test_flow_complete_cartesian_tangent_and_step_convergence():
     # Both interfaces, mixed torsions, and nontrivial body frames must agree.
     for smiles in ('CCCOCC', 'CC1CCCCC1', 'c1ccccc1'):
-        flow, data, a, b, coupling = fixture(smiles)
+        flow, data, a, b, coupling = flow_example(smiles)
         for value in (0.1, 0.47, 0.9):
             time = torch.tensor([value], dtype=torch.float64)
             ligand, poi, body, velocities = flow.path(data, b, coupling, time)
@@ -161,7 +202,7 @@ def test_flow_complete_cartesian_tangent_and_step_convergence():
 
 
 def test_flow_oracle_roundtrip_refines_with_steps():
-    flow, data, a, b, coupling = fixture()
+    flow, data, a, b, coupling = flow_example()
     errors = []
     for steps in (50, 100):
         ligand, poi, body, _ = flow.path(data, b, coupling, torch.tensor([1.], dtype=torch.float64))
@@ -179,7 +220,7 @@ def test_independent_targets_match_actual_path_and_both_decoders():
     from tricoopdiff.experiments.trajectory_experiment import differentiable_sdpi_step
 
     for smiles in ('CCCOCC', 'c1ccccc1'):
-        flow, data, _, b, coupling = fixture(smiles)
+        flow, data, _, b, coupling = flow_example(smiles)
         for value in (.1, .47, .9):
             time = torch.tensor([value], dtype=torch.float64)
             ligand, poi, body, teacher = flow.path(data, b, coupling, time)
@@ -198,7 +239,7 @@ def test_independent_targets_match_actual_path_and_both_decoders():
 
 
 def test_flow_normalization_and_conditioning_agree():
-    flow, data, a, b, _ = fixture()
+    flow, data, a, b, _ = flow_example()
     t = torch.tensor([0.6], dtype=torch.float64)
     branches = {name: {'tr': torch.randn(1, 3, dtype=torch.float64),
                        'rot': torch.randn(1, 3, dtype=torch.float64),
@@ -219,7 +260,7 @@ def test_flow_normalization_and_conditioning_agree():
 def test_flow_loss_backward_and_shared_clock_guard():
     from tricoopdiff.train import TriCoopDiffTrainer
 
-    flow, data, a, b, _ = fixture()
+    flow, data, a, b, _ = flow_example()
     n_tor = int(data['edge_mask'].sum())
 
     class Predictor(torch.nn.Module):
@@ -275,7 +316,7 @@ def test_flow_loss_backward_and_shared_clock_guard():
 
 def test_flow_is_equivariant_under_global_rigid_transform():
     from scipy.spatial.transform import Rotation
-    flow, data, a, b, coupling = fixture()
+    flow, data, a, b, coupling = flow_example()
     q = torch.tensor(Rotation.from_rotvec([.3, -.7, .4]).as_matrix())
     offset = torch.tensor([7., -2., 13.], dtype=torch.float64)
     transformed_data = {**data, 'coords': data['coords'] @ q.T + offset}
@@ -293,7 +334,7 @@ def test_flow_is_equivariant_under_global_rigid_transform():
 
 
 def test_flow_rejects_invalid_batch_time_and_velocity():
-    flow, data, a, b, coupling = fixture()
+    flow, data, a, b, coupling = flow_example()
     for invalid in (torch.tensor([float('nan')]), torch.tensor([-.1]), torch.tensor([1.1])):
         try:
             flow.path(data, b, coupling, invalid)
@@ -318,7 +359,6 @@ def test_flow_rejects_invalid_batch_time_and_velocity():
 
 
 def test_flow_checkpoint_rejects_old_or_wrong_process():
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
     from evaluation_common import validate_checkpoint_payload
     for payload in ({'checkpoint_version': 16},
                     {'checkpoint_version': 17, 'generative_process': 'native_dsm'},
@@ -356,7 +396,7 @@ def test_exact_rigid_fit_rmsd_has_finite_zero_gradient():
 def test_candidates_and_decoder_reject_nonrotation_frames():
     from tricoopdiff.initialization.candidates import FixedCandidateInitializer, _valid_candidate
 
-    flow, data, _, native_poi, coupling = fixture()
+    flow, data, _, native_poi, coupling = flow_example()
     ligand, poi, body, velocities = flow.path(data, native_poi, coupling, torch.tensor([.5]))
     candidate = {'ligand': ligand, 'poi': poi, 'rotation': body}
     assert _valid_candidate(candidate)
@@ -380,7 +420,7 @@ def test_sampler_restores_training_mode_and_rng_on_success_and_failure():
     from tricoopdiff.sampler import sample_single
     from tricoopdiff.initialization import TernaryInitializer
 
-    flow, data, e3, poi, _ = fixture()
+    flow, data, e3, poi, _ = flow_example()
 
     class Predictor(torch.nn.Module):
         def __init__(self):
@@ -418,7 +458,7 @@ def test_sampler_restores_training_mode_and_rng_on_success_and_failure():
             assert torch.equal(torch.get_rng_state(), rng), 'sampling changed training RNG'
 
 
-def _folded_torsion_decoder_fixture(dtype=torch.float64):
+def sdpi_flow_folded_torsion_decoder_fixture(dtype=torch.float64):
     ligand = torch.tensor([[[-1., 1., 0.], [0., 0., 0.], [1., 0., 0.], [2., 1., 0.]]], dtype=dtype)
     poi = torch.tensor([[[0., 0., 2.], [1., 1., 2.], [2., 0., 3.]]], dtype=dtype)
     data = {'edge_index': torch.tensor([[0, 1, 1, 2, 2, 3], [1, 0, 2, 1, 3, 2]]),
@@ -430,7 +470,7 @@ def _folded_torsion_decoder_fixture(dtype=torch.float64):
 def test_continuous_horizontal_torsion_preserves_tags_and_rejects_unknown_decoder():
     from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
 
-    ligand, poi, body, data = _folded_torsion_decoder_fixture()
+    ligand, poi, body, data = sdpi_flow_folded_torsion_decoder_fixture()
     normalized = {'rigid_output_mode': INDEPENDENT_RIGID_MODE, 'torsion_update_mode': CONTINUOUS_TORSION_MODE,
                   'e3_ligand': {'tr': ligand.new_zeros(1, 3), 'rot': ligand.new_zeros(1, 3)},
                   'poi_ligand': {'tr': ligand.new_zeros(1, 3), 'rot': ligand.new_zeros(1, 3)},
@@ -450,7 +490,7 @@ def test_continuous_horizontal_torsion_crosses_folded_rank_deficient_fit_without
     from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
 
     for dtype in (torch.float32, torch.float64):
-        ligand, poi, body, data = _folded_torsion_decoder_fixture(dtype)
+        ligand, poi, body, data = sdpi_flow_folded_torsion_decoder_fixture(dtype)
         assert torch.linalg.matrix_rank(ligand[0] - ligand.mean(1)[0]) == 2
         results = []
         for offset in (-1e-3, 0., 1e-3):
@@ -485,7 +525,7 @@ def test_continuous_horizontal_torsion_is_equivariant_differentiable_and_safe_fo
     from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
     from tricoopdiff.geometry.rigid import rotation_exp
 
-    ligand, poi, body, data = _folded_torsion_decoder_fixture()
+    ligand, poi, body, data = sdpi_flow_folded_torsion_decoder_fixture()
     for collinear in (False, True):
         current = ligand.clone()
         if collinear:
@@ -515,7 +555,7 @@ def test_continuous_horizontal_torsion_is_equivariant_differentiable_and_safe_fo
 def test_continuous_horizontal_multitorsion_decoder_matches_teacher_tangent():
     from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE
 
-    flow, data, _, native_poi, coupling = fixture('CCCOCC')
+    flow, data, _, native_poi, coupling = flow_example('CCCOCC')
     for time in (.1, .47, .9):
         t = torch.tensor([time], dtype=torch.float64)
         ligand, poi, body, velocities = flow.path(data, native_poi, coupling, t)
@@ -535,7 +575,7 @@ def test_continuous_torsion_model_and_sampler_callback_cannot_drop_update_tag():
     from tricoopdiff.sampler import sample_single
     from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
 
-    ligand, poi, body, data = _folded_torsion_decoder_fixture()
+    ligand, poi, body, data = sdpi_flow_folded_torsion_decoder_fixture()
     data = {**data, 'coords': ligand}
 
     class Predictor(torch.nn.Module):
@@ -613,7 +653,7 @@ def test_large_angle_rigid_decoder_preserves_distance_and_valid_body_over_repeat
     from tricoopdiff.geometry.rigid import is_proper_rotation
     from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
 
-    ligand, poi, body, data = _folded_torsion_decoder_fixture(torch.float32)
+    ligand, poi, body, data = sdpi_flow_folded_torsion_decoder_fixture(torch.float32)
     original_distances = torch.cdist(poi, poi, compute_mode='donot_use_mm_for_euclid_dist')
     velocities = {'rigid_output_mode': INDEPENDENT_RIGID_MODE, 'torsion_update_mode': CONTINUOUS_TORSION_MODE,
                   'e3_ligand': {'tr': ligand.new_zeros(1, 3), 'rot': ligand.new_tensor([[1e4, 3e3, -7e3]])},
@@ -631,7 +671,7 @@ def test_large_angle_rigid_decoder_preserves_distance_and_valid_body_over_repeat
 def test_continuous_horizontal_multitorsion_large_angles_have_correct_coordinate_gradients():
     from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
 
-    _, data, _, poi, _ = fixture('CCCOCC')
+    _, data, _, poi, _ = flow_example('CCCOCC')
     ligand = data['coords'].clone().requires_grad_()
     body = torch.eye(3, dtype=ligand.dtype)[None]
     k = int(data['edge_mask'].sum())
@@ -652,7 +692,7 @@ def test_continuous_horizontal_multitorsion_large_angles_have_correct_coordinate
 def test_continuous_horizontal_spin_prior_preserves_geometric_scale_and_torsion_gradient():
     from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
 
-    ligand, poi, body, data = _folded_torsion_decoder_fixture()
+    ligand, poi, body, data = sdpi_flow_folded_torsion_decoder_fixture()
     reference = reference_gradient = None
     for scale in (1., 1e-5, 1e5):
         coordinates = ligand * scale
@@ -695,7 +735,7 @@ def test_horizontal_ridge_prior_has_no_first_order_rotor_orientation_dependence(
     from tricoopdiff.initialization import validate_ligand_graph
     from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
 
-    flow, data, _, poi, _ = fixture()
+    flow, data, _, poi, _ = flow_example()
     edges = data['edge_index']
     selected = torch.where(data['edge_mask'])[0]
     reversed_indices = [int(torch.where((edges[0] == edges[1, i]) &
@@ -728,7 +768,7 @@ def test_horizontal_ridge_prior_has_no_first_order_rotor_orientation_dependence(
 def test_horizontal_ridge_prior_multistep_near_collinear_gradients_match_finite_difference():
     from tricoopdiff.sdpi_flow import CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE
 
-    flow, data, _, poi, _ = fixture()
+    flow, data, _, poi, _ = flow_example()
     n = data['coords'].shape[1]
     index = torch.arange(n, dtype=torch.float64)
     body = torch.eye(3, dtype=torch.float64)[None]
@@ -761,8 +801,829 @@ def test_horizontal_ridge_prior_multistep_near_collinear_gradients_match_finite_
         assert torch.allclose(difference, exact, atol=2e-6, rtol=1e-5)
 
 
-if __name__ == '__main__':
-    for name, function in list(globals().items()):
-        if name.startswith('test_'):
-            function()
-            print(f'PASS {name}', flush=True)
+# Trajectory experiment
+
+def trajectory_experiment_example(dtype=torch.float64):
+    ligand = torch.tensor(
+        [[[0., 0., 0.], [1., 0., 0.], [1., 1., 0.],
+          [2., 1., .5], [2.5, 1.5, 1.2]]], dtype=dtype)
+    poi = torch.tensor(
+        [[[0., 0., 0.], [0., 1., 0.], [0., 0., 1.], [1., 1., 1.]]],
+        dtype=dtype)
+    body = torch.eye(3, dtype=dtype).reshape(1, 3, 3)
+    ligand_data = {
+        'edge_index': torch.tensor([[0, 1], [1, 0]]),
+        'edge_mask': torch.tensor([True, False]),
+        'mask_rotate': np.array([[False, True, True, True, True]]),
+    }
+    velocities = {
+        'e3_ligand': {
+            'tr': torch.tensor([[.4, -.2, .3]], dtype=dtype),
+            'rot': torch.tensor([[.2, .1, -.3]], dtype=dtype),
+        },
+        'poi_ligand': {
+            'tr': torch.tensor([[-.1, .5, .2]], dtype=dtype),
+            'rot': torch.tensor([[.3, -.2, .1]], dtype=dtype),
+        },
+        'torsion': torch.tensor([[.7]], dtype=dtype),
+    }
+    return ligand, poi, body, ligand_data, velocities
+
+
+def test_differentiable_step_matches_production_solver():
+    ligand, poi, body, ligand_data, velocities = trajectory_experiment_example()
+    dt = torch.tensor([.05], dtype=ligand.dtype)
+    expected = SDPIFlow.step(
+        ligand, poi, body, velocities, dt, ligand_data)
+    actual = differentiable_sdpi_step(
+        ligand, poi, body, velocities, dt, ligand_data)
+    for value, reference in zip(actual, expected):
+        assert torch.allclose(value, reference, atol=2e-7, rtol=2e-7), (
+            value - reference).abs().max()
+
+
+def test_remaining_centroid_loss_uses_exact_independent_motion_and_gradients():
+    from tricoopdiff.sdpi_flow import INDEPENDENT_RIGID_MODE
+
+    ligand, poi, body, data, velocities = trajectory_experiment_example()
+    velocities['rigid_output_mode'] = INDEPENDENT_RIGID_MODE
+    time = ligand.new_tensor([.4])
+    scales = ligand.new_tensor([10., 15.])
+    target_ligand, target_poi, _ = SDPIFlow.step(ligand, poi, body, velocities, time, data)
+    loss = remaining_centroid_loss(ligand, poi, velocities, time, target_ligand, target_poi, scales)
+    assert loss < 1e-20, 'rotation and torsion must not change the supervised centroid'
+    rotation = torch.linalg.matrix_exp(torch.tensor([[0., -.3, .2], [.3, 0., -.1], [-.2, .1, 0.]], dtype=ligand.dtype))
+    moved = {**velocities, **{b: {**velocities[b], 'tr': velocities[b]['tr'] @ rotation.T}
+                            for b in ('e3_ligand', 'poi_ligand')}}
+    reference = remaining_centroid_loss(ligand, poi, velocities, time, ligand, poi, scales)
+    transformed = remaining_centroid_loss(ligand @ rotation.T + 10, poi @ rotation.T + 10,
+                                         moved, time, ligand @ rotation.T + 10,
+                                         poi @ rotation.T + 10, scales)
+    assert torch.allclose(reference, transformed, atol=1e-12)
+    for branch in ('e3_ligand', 'poi_ligand'):
+        velocities[branch]['tr'] = velocities[branch]['tr'].clone().requires_grad_()
+    loss = remaining_centroid_loss(ligand, poi, velocities, time, ligand, poi, scales)
+    loss.backward()
+    for branch in ('e3_ligand', 'poi_ligand'):
+        grad = velocities[branch]['tr'].grad
+        assert torch.isfinite(grad).all() and grad.abs().sum() > 0
+    zero = remaining_centroid_loss(ligand, poi, velocities, time * 0, ligand, poi, scales)
+    assert zero == 0 and torch.isfinite(zero), 'no inverse-time singularity is allowed'
+
+
+def test_remaining_centroid_loss_rejects_legacy_motion():
+    ligand, poi, _, _, velocities = trajectory_experiment_example()
+    try:
+        remaining_centroid_loss(ligand, poi, velocities, ligand.new_tensor([.5]),
+                                ligand, poi, ligand.new_tensor([10., 15.]))
+    except ValueError as error:
+        assert 'independent' in str(error)
+    else:
+        raise AssertionError('dual-interface velocities do not independently move the POI centroid')
+
+
+def test_gradients_cross_two_differentiable_steps():
+    ligand, poi, body, ligand_data, velocities = trajectory_experiment_example()
+    leaves = []
+    for branch in ('e3_ligand', 'poi_ligand'):
+        for component in ('tr', 'rot'):
+            value = velocities[branch][component].clone().requires_grad_()
+            velocities[branch][component] = value
+            leaves.append(value)
+    velocities['torsion'] = velocities['torsion'].clone().requires_grad_()
+    leaves.append(velocities['torsion'])
+    dt = torch.tensor([.05], dtype=ligand.dtype)
+    for _ in range(2):
+        ligand, poi, body = differentiable_sdpi_step(
+            ligand, poi, body, velocities, dt, ligand_data)
+    loss = ligand.square().mean() + poi.square().mean() + body.square().mean()
+    loss.backward()
+    for value in leaves:
+        assert value.grad is not None
+        assert torch.isfinite(value.grad).all()
+        assert float(value.grad.abs().sum()) > 0
+
+
+def test_differentiable_step_supports_no_torsion_graphs():
+    ligand, poi, body, ligand_data, velocities = trajectory_experiment_example()
+    ligand_data = {
+        **ligand_data,
+        'edge_mask': torch.tensor([False, False]),
+        'mask_rotate': np.zeros((0, ligand.shape[1]), dtype=bool),
+    }
+    velocities = {**velocities, 'torsion': ligand.new_empty((1, 0))}
+    dt = torch.tensor([.05], dtype=ligand.dtype)
+    expected = SDPIFlow.step(ligand, poi, body, velocities, dt, ligand_data)
+    actual = differentiable_sdpi_step(
+        ligand, poi, body, velocities, dt, ligand_data)
+    for value, reference in zip(actual, expected):
+        assert torch.allclose(value, reference, atol=1e-12, rtol=1e-12)
+
+
+def test_no_torsion_output_can_disable_existing_rotatable_bonds():
+    ligand, poi, body, ligand_data, velocities = trajectory_experiment_example()
+    assert bool(ligand_data['edge_mask'].any())
+    velocities['torsion'] = ligand.new_empty((1, 0))
+    dt = ligand.new_tensor([.05])
+    actual = SDPIFlow.differentiable_step(ligand, poi, body, velocities, dt, ligand_data)
+    expected = SDPIFlow.step(ligand, poi, body, velocities, dt, ligand_data)
+    assert all(torch.allclose(a, b, atol=1e-12) for a, b in zip(actual, expected))
+
+
+def test_trajectory_contract_has_checkpoint_identity():
+    trainer = TrajectoryConsistencyTrainer.__new__(TrajectoryConsistencyTrainer)
+    trainer.trajectory_contract_mode = TRAJECTORY_CONTRACT_MODE
+    trainer.trajectory_steps = 3
+    trainer.trajectory_weight = .1
+    trainer.trajectory_min_time = .25
+    trainer.activation_clamp = 100.
+    trainer.activation_clamp_mode = 'irrep_norm'
+    trainer.residual_weight = 1e-3
+    trainer.ema_decay = .999
+    trainer.optimizer_config = {'trifuse': {'lr': 5e-5, 'weight_decay': 1e-4}}
+    contract = trainer.runtime_contract()
+    assert contract['trajectory_objective'] == TRAJECTORY_CONTRACT_MODE
+    assert contract['trajectory_steps'] == 3
+    assert contract['trajectory_weight'] == .1
+    assert contract['trajectory_min_time'] == .25
+
+
+def test_staged_poi_loss_jointly_penalizes_center_and_orientation():
+    poi = torch.tensor(
+        [[[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]]],
+        dtype=torch.float64, requires_grad=True)
+    target = poi.detach() + torch.tensor([[[2., -1., 3.]]], dtype=torch.float64)
+    native = target + torch.tensor([[[20., 0., 0.]]], dtype=torch.float64)
+    body = torch.eye(3, dtype=torch.float64).reshape(1, 3, 3).requires_grad_()
+    target_body = body.detach().clone()
+    target_body[:, 0, 0] = 0
+    loss, parts = staged_poi_state_loss(
+        poi, target, native, body, target_body, poi.new_tensor(10.),
+        distance_weighted=True, distance_weight_cap=3.)
+    assert parts['center'] > 0 and parts['orientation'] > 0
+    assert 1 < parts['distance_weight'] <= 3
+    loss.backward()
+    assert float(poi.grad.abs().sum()) > 0
+    assert float(body.grad.abs().sum()) > 0
+
+
+def test_staged_poi_contracts_are_distinct_and_complete():
+    for mode, weighted in (
+            (STAGED_POI_CONTRACT_MODE, False),
+            (DISTANCE_STAGED_POI_CONTRACT_MODE, True)):
+        trainer = StagedPOITrajectoryTrainer.__new__(StagedPOITrajectoryTrainer)
+        trainer.trajectory_contract_mode = mode
+        trainer.trajectory_steps = 5
+        trainer.trajectory_weight = 1.
+        trainer.trajectory_min_time = .25
+        trainer.trajectory_max_time = .65
+        trainer.distance_weighted = weighted
+        trainer.distance_weight_cap = 3.
+        trainer.activation_clamp = 100.
+        trainer.activation_clamp_mode = 'irrep_norm'
+        trainer.residual_weight = 1e-3
+        trainer.ema_decay = .999
+        trainer.optimizer_config = {'trifuse': {'lr': 5e-5, 'weight_decay': 1e-4}}
+        contract = trainer.runtime_contract()
+        assert contract['trajectory_objective'] == mode
+        assert contract['trajectory_max_time'] == .65
+        assert contract['trajectory_distance_weighted'] is weighted
+        assert contract['trajectory_distance_weight_cap'] == 3.
+
+
+def test_prior_replay_schedule_reaches_requested_time():
+    time = torch.tensor([.43], dtype=torch.float64)
+    count, step = prior_replay_schedule(
+        time, inference_steps=20, max_steps=15)
+    assert count == 12
+    assert torch.allclose(torch.ones_like(time) - count * step, time)
+    capped_count, capped_step = prior_replay_schedule(
+        time, inference_steps=20, max_steps=4)
+    assert capped_count == 4
+    assert torch.allclose(torch.ones_like(time) - capped_count * capped_step, time)
+    endpoint_count, endpoint_step = prior_replay_schedule(
+        torch.ones_like(time), inference_steps=20, max_steps=15)
+    assert endpoint_count == 0
+    assert torch.equal(endpoint_step, torch.zeros_like(time))
+
+
+def test_prior_replay_contract_records_exposure_policy():
+    trainer = PriorReplayTrajectoryTrainer.__new__(PriorReplayTrajectoryTrainer)
+    trainer.trajectory_contract_mode = PRIOR_REPLAY_CONTRACT_MODE
+    trainer.trajectory_steps = 3
+    trainer.trajectory_weight = 1.
+    trainer.trajectory_min_time = .25
+    trainer.replay_max_steps = 15
+    trainer.activation_clamp = 100.
+    trainer.activation_clamp_mode = 'irrep_norm'
+    trainer.residual_weight = 1e-3
+    trainer.ema_decay = .999
+    trainer.optimizer_config = {'trifuse': {'lr': 5e-5, 'weight_decay': 1e-4}}
+    contract = trainer.runtime_contract()
+    assert contract['trajectory_objective'] == PRIOR_REPLAY_CONTRACT_MODE
+    assert contract['trajectory_replay_start_time'] == 1.
+    assert contract['trajectory_replay_max_steps'] == 15
+    assert contract['trajectory_replay_gradients'] is False
+
+
+def test_deterministic_prior_replay_uses_eval_and_restores_training():
+    trainer = DeterministicPriorReplayTrajectoryTrainer.__new__(
+        DeterministicPriorReplayTrajectoryTrainer)
+    trainer.model = torch.nn.Sequential(torch.nn.Dropout(.5))
+    trainer.model.train()
+    with trainer._replay_context():
+        assert not trainer.model.training
+    assert trainer.model.training
+
+    trainer.trajectory_contract_mode = PRIOR_REPLAY_EVAL_CONTRACT_MODE
+    trainer.trajectory_steps = 3
+    trainer.trajectory_weight = 1.
+    trainer.trajectory_min_time = .25
+    trainer.replay_max_steps = 15
+    trainer.activation_clamp = 100.
+    trainer.activation_clamp_mode = 'irrep_norm'
+    trainer.residual_weight = 1e-3
+    trainer.ema_decay = .999
+    trainer.optimizer_config = {'trifuse': {'lr': 5e-5, 'weight_decay': 1e-4}}
+    contract = trainer.runtime_contract()
+    assert contract['trajectory_objective'] == PRIOR_REPLAY_EVAL_CONTRACT_MODE
+    assert contract['trajectory_replay_model_mode'] == 'eval'
+
+
+def test_joint_endpoint_translation_loss_only_differentiates_translations():
+    _, _, _, _, velocities = trajectory_experiment_example()
+    targets = {}
+    leaves = []
+    for branch in ('e3_ligand', 'poi_ligand'):
+        targets[branch] = {}
+        for component in ('tr', 'rot'):
+            value = velocities[branch][component].clone().requires_grad_()
+            velocities[branch][component] = value
+            leaves.append((component, value))
+            targets[branch][component] = torch.zeros_like(value)
+    loss = joint_endpoint_translation_loss(
+        velocities, targets,
+        (torch.tensor(2., dtype=torch.float64),
+         torch.tensor(4., dtype=torch.float64)))
+    loss.backward()
+    for component, value in leaves:
+        if component == 'tr':
+            assert value.grad is not None
+            assert float(value.grad.abs().sum()) > 0
+        else:
+            assert value.grad is None
+
+
+def test_prior_replay_translation_contract_is_explicit():
+    trainer = PriorReplayJointTranslationTrainer.__new__(
+        PriorReplayJointTranslationTrainer)
+    trainer.trajectory_contract_mode = PRIOR_REPLAY_TRANSLATION_CONTRACT_MODE
+    trainer.trajectory_steps = 3
+    trainer.trajectory_weight = .1
+    trainer.trajectory_min_time = .3
+    trainer.replay_max_steps = 15
+    trainer.activation_clamp = 100.
+    trainer.activation_clamp_mode = 'irrep_norm'
+    trainer.residual_weight = 1e-3
+    trainer.ema_decay = .999
+    trainer.optimizer_config = {'trifuse': {'lr': 5e-5, 'weight_decay': 1e-4}}
+    contract = trainer.runtime_contract()
+    assert contract['trajectory_objective'] == PRIOR_REPLAY_TRANSLATION_CONTRACT_MODE
+    assert contract['trajectory_min_time'] == .3
+    assert contract['trajectory_auxiliary_branches'] == [
+        'e3_ligand.tr', 'poi_ligand.tr']
+    assert contract['trajectory_auxiliary_state_gradients'] is False
+    assert contract['trajectory_auxiliary_native_reading'] == 'training_only'
+    assert contract['trajectory_rotation_torsion_target'] == 'analytic_teacher_only'
+
+
+def test_prior_replay_translation_replacement_contract_is_explicit():
+    trainer = PriorReplayJointTranslationReplaceTrainer.__new__(
+        PriorReplayJointTranslationReplaceTrainer)
+    trainer.trajectory_contract_mode = PRIOR_REPLAY_TRANSLATION_REPLACE_CONTRACT_MODE
+    trainer.trajectory_steps = 3
+    trainer.trajectory_weight = 1.
+    trainer.trajectory_min_time = .3
+    trainer.replay_max_steps = 15
+    trainer.activation_clamp = 100.
+    trainer.activation_clamp_mode = 'irrep_norm'
+    trainer.residual_weight = 1e-3
+    trainer.ema_decay = .999
+    trainer.optimizer_config = {'trifuse': {'lr': 5e-5, 'weight_decay': 1e-4}}
+    contract = trainer.runtime_contract()
+    assert contract['trajectory_objective'] == (
+        PRIOR_REPLAY_TRANSLATION_REPLACE_CONTRACT_MODE)
+    assert contract['trajectory_translation_teacher_policy'] == (
+        'replace_when_prior_replay_target_available')
+
+
+def test_prior_replay_translation_window_contract_is_explicit():
+    trainer = PriorReplayJointTranslationWindowReplaceTrainer.__new__(
+        PriorReplayJointTranslationWindowReplaceTrainer)
+    trainer.trajectory_contract_mode = (
+        PRIOR_REPLAY_TRANSLATION_WINDOW_REPLACE_CONTRACT_MODE)
+    trainer.trajectory_steps = 3
+    trainer.trajectory_weight = 1.
+    trainer.trajectory_min_time = .3
+    trainer.trajectory_max_time = .65
+    trainer.replay_max_steps = 15
+    trainer.activation_clamp = 100.
+    trainer.activation_clamp_mode = 'irrep_norm'
+    trainer.residual_weight = 1e-3
+    trainer.ema_decay = .999
+    trainer.optimizer_config = {'trifuse': {'lr': 5e-5, 'weight_decay': 1e-4}}
+    contract = trainer.runtime_contract()
+    assert contract['trajectory_objective'] == (
+        PRIOR_REPLAY_TRANSLATION_WINDOW_REPLACE_CONTRACT_MODE)
+    assert contract['trajectory_min_time'] == .3
+    assert contract['trajectory_max_time'] == .65
+    assert contract['trajectory_translation_teacher_policy'] == (
+        'replace_only_inside_prior_replay_time_window')
+
+
+def test_prior_replay_translation_window_keeps_early_teacher_target():
+    trainer = PriorReplayJointTranslationWindowReplaceTrainer.__new__(
+        PriorReplayJointTranslationWindowReplaceTrainer)
+    trainer.trajectory_max_time = .65
+    trainer._translation_auxiliary_applied = True
+    time = torch.tensor([.8])
+    trainer._trajectory_context = (None, None, None, None, time, None, None)
+    loss = trainer._trajectory_loss()
+    assert loss.item() == 0
+    assert not loss.requires_grad
+    assert trainer._translation_auxiliary_applied is False
+
+
+def test_soft_time_translation_mix_has_expected_endpoints():
+    trainer = PriorReplayJointTranslationSoftTimeTrainer.__new__(
+        PriorReplayJointTranslationSoftTimeTrainer)
+    trainer.endpoint_zero_time = .8
+    trainer.endpoint_full_time = .3
+    for time, expected in ((.8, 0.), (.55, .5), (.3, 1.)):
+        trainer._trajectory_context = (
+            None, None, None, None, torch.tensor([time]), None, None)
+        assert torch.allclose(
+            trainer._translation_replacement_mix(), torch.tensor(expected))
+
+
+def test_direction_translation_uses_teacher_magnitude():
+    trainer = PriorReplayJointTranslationDirectionTrainer.__new__(
+        PriorReplayJointTranslationDirectionTrainer)
+    endpoint = torch.tensor([[0., 2., 0.]])
+    analytic = torch.tensor([[3., 0., 0.]])
+    prediction = torch.tensor([[0., 3., 0.]])
+    branches = ('e3_ligand', 'poi_ligand')
+    velocities = {branch: {'tr': prediction} for branch in branches}
+    endpoint_targets = {branch: {'tr': endpoint} for branch in branches}
+    analytic_targets = {branch: {'tr': analytic} for branch in branches}
+    loss = trainer._translation_loss(
+        velocities, endpoint_targets, (torch.ones(1), torch.ones(1)),
+        analytic_targets)
+    assert torch.allclose(loss, torch.zeros(()))
+
+
+def test_agreement_translation_falls_back_for_opposite_target():
+    trainer = PriorReplayJointTranslationAgreementTrainer.__new__(
+        PriorReplayJointTranslationAgreementTrainer)
+    endpoint = torch.tensor([[-2., 0., 0.]])
+    analytic = torch.tensor([[3., 0., 0.]])
+    branches = ('e3_ligand', 'poi_ligand')
+    velocities = {branch: {'tr': analytic} for branch in branches}
+    endpoint_targets = {branch: {'tr': endpoint} for branch in branches}
+    analytic_targets = {branch: {'tr': analytic} for branch in branches}
+    loss = trainer._translation_loss(
+        velocities, endpoint_targets, (torch.ones(1), torch.ones(1)),
+        analytic_targets)
+    assert torch.allclose(loss, torch.zeros(()))
+
+
+def test_new_translation_contract_names_are_distinct():
+    assert len({
+        PRIOR_REPLAY_TRANSLATION_REPLACE_CONTRACT_MODE,
+        PRIOR_REPLAY_TRANSLATION_WINDOW_REPLACE_CONTRACT_MODE,
+        PRIOR_REPLAY_TRANSLATION_SOFT_TIME_CONTRACT_MODE,
+        PRIOR_REPLAY_TRANSLATION_DIRECTION_CONTRACT_MODE,
+        PRIOR_REPLAY_TRANSLATION_AGREEMENT_CONTRACT_MODE,
+    }) == 5
+
+
+# Joint endpoint experiment
+
+ENDPOINT_DTYPE = torch.float64
+
+
+def joint_endpoint_experiment_raises(message, function, *args, **kwargs):
+    try:
+        function(*args, **kwargs)
+    except ValueError as error:
+        assert message in str(error), str(error)
+    else:
+        raise AssertionError(f'expected ValueError containing {message!r}')
+
+
+def joint_endpoint_experiment_random_rotation(generator):
+    axis = torch.randn(3, dtype=ENDPOINT_DTYPE, generator=generator)
+    axis /= axis.norm()
+    angle = (torch.rand((), dtype=ENDPOINT_DTYPE, generator=generator) * 2 - 1) * 2.8
+    return _rotation_exp(axis * angle)
+
+
+def joint_endpoint_experiment_fixture(seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    native_ligand = torch.randn(1, 13, 3, dtype=ENDPOINT_DTYPE, generator=generator) * torch.tensor(
+        [2., 3., 4.], dtype=ENDPOINT_DTYPE)
+    native_poi = torch.randn(1, 19, 3, dtype=ENDPOINT_DTYPE, generator=generator) * torch.tensor(
+        [5., 7., 9.], dtype=ENDPOINT_DTYPE)
+    ra, rb = joint_endpoint_experiment_random_rotation(generator)[None], joint_endpoint_experiment_random_rotation(generator)[None]
+    ta, tb = (torch.randn(1, 3, dtype=ENDPOINT_DTYPE, generator=generator) * 10 for _ in range(2))
+    ligand = apply_rigid(native_ligand, ra, ta)
+    poi, body = assemble_interface_pair(native_poi, ra, ta, rb, tb)
+    data = {
+        'coords': native_ligand,
+        'edge_index': torch.empty((2, 0), dtype=torch.long),
+        'edge_mask': torch.empty(0, dtype=torch.bool),
+        'mask_rotate': torch.empty((0, native_ligand.shape[1]), dtype=torch.bool),
+    }
+    return ligand, poi, body, native_ligand, native_poi, data
+
+
+def test_exact_one_step_recovers_joint_endpoint_across_random_poses():
+    for seed in range(24):
+        ligand, poi, body, native_ligand, native_poi, data = joint_endpoint_experiment_fixture(seed)
+        time = torch.tensor([0.17 + (seed % 7) * 0.1], dtype=ENDPOINT_DTYPE)
+        target, diagnostic = joint_rigid_endpoint_targets(
+            ligand, poi, body, native_ligand, native_poi, time)
+        result = SDPIFlow.step(ligand, poi, body, target, time, data)
+        assert torch.allclose(result[0], native_ligand, atol=2e-9, rtol=0)
+        assert torch.allclose(result[1], native_poi, atol=2e-9, rtol=0)
+        assert torch.allclose(result[2], torch.eye(3, dtype=ENDPOINT_DTYPE)[None], atol=2e-9, rtol=0)
+        assert diagnostic['ligand_fit_rmsd'].max() < 1e-12
+        assert diagnostic['poi_fit_rmsd'].max() < 1e-12
+
+
+def test_target_is_equivariant_under_global_rigid_motion():
+    ligand, poi, body, native_ligand, native_poi, _ = joint_endpoint_experiment_fixture(31)
+    generator = torch.Generator().manual_seed(91)
+    q = joint_endpoint_experiment_random_rotation(generator)[None]
+    shift = torch.tensor([[80., -31., 12.]], dtype=ENDPOINT_DTYPE)
+    original, _ = joint_rigid_endpoint_targets(
+        ligand, poi, body, native_ligand, native_poi, torch.tensor([.6], dtype=ENDPOINT_DTYPE))
+    moved, _ = joint_rigid_endpoint_targets(
+        apply_rigid(ligand, q, shift), apply_rigid(poi, q, shift), q @ body @ q.transpose(-1, -2),
+        apply_rigid(native_ligand, q, shift), apply_rigid(native_poi, q, shift),
+        torch.tensor([.6], dtype=ENDPOINT_DTYPE))
+    for branch in ('e3_ligand', 'poi_ligand'):
+        for component in ('tr', 'rot'):
+            assert torch.allclose(moved[branch][component],
+                                  original[branch][component] @ q.transpose(-1, -2),
+                                  atol=2e-9, rtol=0)
+
+
+def test_local_step_matches_cartesian_finite_difference_tangent():
+    ligand, poi, body, native_ligand, native_poi, data = joint_endpoint_experiment_fixture(8)
+    time = torch.tensor([.7], dtype=ENDPOINT_DTYPE)
+    target, _ = joint_rigid_endpoint_targets(
+        ligand, poi, body, native_ligand, native_poi, time)
+    h = 1e-6
+    plus = SDPIFlow.step(ligand, poi, body, target, torch.tensor([h], dtype=ENDPOINT_DTYPE), data)
+    # Directly evaluate the same smooth one-parameter branch at negative h.
+    center = ligand.mean(1)
+    transforms = []
+    for branch in ('e3_ligand', 'poi_ligand'):
+        rotation = _rotation_exp(torch.tensor([h], dtype=ENDPOINT_DTYPE)[:, None] * target[branch]['rot'])
+        destination = center + h * target[branch]['tr']
+        translation = destination - (rotation @ center[..., None]).squeeze(-1)
+        transforms.append((rotation, translation))
+    minus_ligand = apply_rigid(ligand, *transforms[0])
+    minus_poi, _ = assemble_interface_pair(poi, *transforms[0], *transforms[1])
+    derivative = ((plus[0] - minus_ligand) / (2 * h), (plus[1] - minus_poi) / (2 * h))
+    for step in (2e-4, 1e-4):
+        actual = SDPIFlow.step(ligand, poi, body, target, torch.tensor([step], dtype=ENDPOINT_DTYPE), data)
+        errors = [((value - start) / step - tangent).abs().max()
+                  for value, start, tangent in zip(actual[:2], (ligand, poi), derivative)]
+        if step == 2e-4:
+            coarse = max(errors)
+        else:
+            assert max(errors) < coarse * .51
+
+
+def test_low_time_is_rejected_or_velocity_is_bounded():
+    fixture = joint_endpoint_experiment_fixture(12)
+    args = fixture[:5] + (torch.tensor([1e-5], dtype=ENDPOINT_DTYPE),)
+    joint_endpoint_experiment_raises('minimum', joint_rigid_endpoint_targets, *args, min_time=.1)
+    bounded, diagnostic = joint_rigid_endpoint_targets(*args, min_time=.1, low_time='clamp')
+    reference, _ = joint_rigid_endpoint_targets(
+        *fixture[:5], torch.tensor([.1], dtype=ENDPOINT_DTYPE))
+    for branch in ('e3_ligand', 'poi_ligand'):
+        for component in ('tr', 'rot'):
+            assert torch.allclose(bounded[branch][component], reference[branch][component])
+    assert diagnostic['low_time_clamped'].item()
+    assert diagnostic['effective_time'].item() == .1
+
+
+def test_blend_and_per_component_correction_caps_are_explicit():
+    fixture = joint_endpoint_experiment_fixture(5)
+    time = torch.tensor([.4], dtype=ENDPOINT_DTYPE)
+    oracle, _ = joint_rigid_endpoint_targets(*fixture[:5], time)
+    teacher = {branch: {component: torch.zeros_like(oracle[branch][component])
+                        for component in ('tr', 'rot')}
+               for branch in ('e3_ligand', 'poi_ligand')}
+    bounded, diagnostic = joint_rigid_endpoint_targets(
+        *fixture[:5], time, teacher_targets=teacher, blend=.25,
+        correction_cap={'tr': .5, 'rot': .2})
+    for branch in ('e3_ligand', 'poi_ligand'):
+        assert bounded[branch]['tr'].norm(dim=-1).max() <= .125 + 1e-12
+        assert bounded[branch]['rot'].norm(dim=-1).max() <= .05 + 1e-12
+        for component in ('tr', 'rot'):
+            key = f'correction_norm_{branch}_{component}'
+            assert torch.allclose(diagnostic[key], oracle[branch][component].norm(dim=-1))
+    assert diagnostic['bounded_target'].item()
+
+
+def test_pi_branch_is_rejected_by_default_but_stable_log_is_finite():
+    native_ligand = torch.tensor([[[0., 0., 0.], [1., 0., 0.], [0., 2., 0.],
+                                   [0., 0., 3.]]], dtype=ENDPOINT_DTYPE)
+    native_poi = native_ligand * 2 + 4
+    rotation = _rotation_exp(torch.tensor([[math.pi, 0., 0.]], dtype=ENDPOINT_DTYPE))
+    ligand = apply_rigid(native_ligand, rotation, torch.zeros(1, 3, dtype=ENDPOINT_DTYPE))
+    body = torch.eye(3, dtype=ENDPOINT_DTYPE)[None]
+    joint_endpoint_experiment_raises('branch cut', joint_rigid_endpoint_targets,
+            ligand, native_poi, body, native_ligand, native_poi,
+            torch.tensor([.5], dtype=ENDPOINT_DTYPE))
+    log = stable_so3_log(rotation, reject_near_pi=False)
+    assert torch.isfinite(log).all()
+    assert torch.allclose(log.norm(dim=-1), torch.tensor([math.pi], dtype=ENDPOINT_DTYPE), atol=1e-9)
+    assert torch.allclose(_rotation_exp(log), rotation, atol=1e-9, rtol=0)
+
+
+def test_shape_or_body_inconsistency_is_rejected_in_exact_mode():
+    ligand, poi, body, native_ligand, native_poi, _ = joint_endpoint_experiment_fixture(4)
+    changed = native_ligand.clone()
+    changed[:, 0] += torch.tensor([2., -1., 3.], dtype=ENDPOINT_DTYPE)
+    joint_endpoint_experiment_raises('rigid-equivalent', joint_rigid_endpoint_targets,
+            ligand, poi, body, changed, native_poi, torch.tensor([.5], dtype=ENDPOINT_DTYPE))
+    joint_endpoint_experiment_raises('body frame', joint_rigid_endpoint_targets,
+            ligand, poi, torch.eye(3, dtype=ENDPOINT_DTYPE)[None], native_ligand, native_poi,
+            torch.tensor([.5], dtype=ENDPOINT_DTYPE))
+
+
+# Offpath experiments
+
+def offpath_experiments_rotation(vector):
+    return _rotation_exp(torch.as_tensor(vector, dtype=torch.float64).reshape(1, 3))
+
+
+def offpath_experiments_targets(dtype=torch.float64):
+    return {
+        'e3_ligand': {
+            'tr': torch.tensor([[7., 8., 9.]], dtype=dtype),
+            'rot': torch.tensor([[1., 4., 2.]], dtype=dtype),
+        },
+        'poi_ligand': {
+            'tr': torch.tensor([[2., -3., 5.]], dtype=dtype),
+            'rot': torch.tensor([[-4., 1., 6.]], dtype=dtype),
+        },
+        'torsion': torch.tensor([[.2, -.7]], dtype=dtype),
+    }
+
+
+def test_identity_when_teacher_and_rollout_bodies_equal():
+    body = offpath_experiments_rotation([.3, -.5, .7])
+    original = offpath_experiments_targets()
+    result = transport_poi_body_frame_targets(original, body, body)
+    assert torch.allclose(result['poi_ligand']['tr'], original['poi_ligand']['tr'], atol=1e-12)
+    assert torch.allclose(result['poi_ligand']['rot'], original['poi_ligand']['rot'], atol=1e-12)
+    assert result['e3_ligand'] is original['e3_ligand']
+    assert result['torsion'] is original['torsion']
+
+
+def test_transport_is_globally_rotation_equivariant():
+    teacher_body = offpath_experiments_rotation([.2, -.4, .1])
+    rollout_body = offpath_experiments_rotation([-.7, .3, .5])
+    global_rotation = offpath_experiments_rotation([.6, .1, -.2])
+    original = offpath_experiments_targets()
+    result = transport_poi_body_frame_targets(original, teacher_body, rollout_body)
+    rotated_targets = {
+        **original,
+        'poi_ligand': {
+            **original['poi_ligand'],
+            'tr': torch.einsum('...i,...ij->...j', original['poi_ligand']['tr'],
+                               global_rotation.transpose(-1, -2)),
+            'rot': torch.einsum('...i,...ij->...j', original['poi_ligand']['rot'],
+                                global_rotation.transpose(-1, -2)),
+        },
+    }
+    rotated = transport_poi_body_frame_targets(
+        rotated_targets, global_rotation @ teacher_body, global_rotation @ rollout_body)
+    for component in ('tr', 'rot'):
+        expected = torch.einsum('...i,...ij->...j', result['poi_ligand'][component],
+                                global_rotation.transpose(-1, -2))
+        assert torch.allclose(rotated['poi_ligand'][component], expected, atol=1e-12)
+
+
+def test_transport_preserves_rigid_label_norms():
+    original = offpath_experiments_targets()
+    result = transport_poi_body_frame_targets(
+        original, offpath_experiments_rotation([.8, -.2, .4]), offpath_experiments_rotation([-.1, .9, -.3]))
+    for component in ('tr', 'rot'):
+        before = torch.linalg.vector_norm(original['poi_ligand'][component], dim=-1)
+        after = torch.linalg.vector_norm(result['poi_ligand'][component], dim=-1)
+        assert torch.allclose(after, before, atol=1e-12)
+
+
+def offpath_experiments_torsion_example():
+    teacher = torch.tensor([[[0., 0., 0.], [1., 0., 0.],
+                             [1., 1., 0.], [2., 1., .5]]], dtype=torch.float64)
+    rollout = teacher.clone()
+    rollout[0, 2:] = rollout[0, 2:] @ offpath_experiments_rotation([.6, 0., 0.])[0].T
+    coupling = {
+        'bonds': torch.tensor([[0, 1]]).numpy(),
+        'masks': torch.tensor([[False, False, True, True]]).numpy(),
+    }
+    return teacher, rollout, coupling
+
+
+def test_gauge_correct_transport_removes_and_recomputes_common_spin():
+    teacher_ligand, rollout_ligand, coupling = offpath_experiments_torsion_example()
+    teacher_body, rollout_body = offpath_experiments_rotation([.3, -.2, .1]), offpath_experiments_rotation([-.4, .2, .5])
+    original = offpath_experiments_targets()
+    teacher_gauge = _state_torsion_gauge(
+        teacher_ligand, coupling, original['torsion'][:, :1])
+    rollout_gauge = _state_torsion_gauge(
+        rollout_ligand, coupling, original['torsion'][:, :1])
+    # Match the one active bond in this synthetic graph.
+    one_torsion = {**original, 'torsion': original['torsion'][:, :1]}
+    result = transport_targets_with_recomputed_gauge(
+        one_torsion, teacher_body, rollout_body,
+        teacher_ligand, rollout_ligand, coupling)
+    assert torch.allclose(result['e3_ligand']['rot'],
+                          original['e3_ligand']['rot'] - teacher_gauge + rollout_gauge,
+                          atol=1e-12)
+    old_global = torch.einsum('...i,...ij->...j',
+                              original['poi_ligand']['rot'], teacher_body)
+    new_global = torch.einsum('...i,...ij->...j',
+                              result['poi_ligand']['rot'], rollout_body)
+    assert torch.allclose(new_global, old_global - teacher_gauge + rollout_gauge,
+                          atol=1e-12)
+
+
+def test_gauge_correct_contract_has_distinct_checkpoint_identity():
+    trainer = GaugeCorrectBodyFrameTransportRolloutTrainer.__new__(
+        GaugeCorrectBodyFrameTransportRolloutTrainer)
+    trainer.offpath_contract_mode = GAUGE_CORRECT_CONTRACT_MODE
+    trainer.rollout_probability = .5
+    trainer.rollout_steps = 5
+    trainer.rollout_min_time = .25
+    trainer.activation_clamp = 100.0
+    trainer.activation_clamp_mode = 'irrep_norm'
+    trainer.residual_weight = 1e-3
+    trainer.ema_decay = .999
+    trainer.optimizer_config = {'trifuse': {'lr': 1e-4, 'weight_decay': 1e-4}}
+    contract = trainer.runtime_contract()
+    assert contract['offpath_contract_mode'] == GAUGE_CORRECT_CONTRACT_MODE
+    assert contract['offpath_torsion_gauge'] == GAUGE_CORRECT_TORSION_CONTRACT
+
+
+def test_bounded_joint_endpoint_changes_only_rigid_targets_within_caps():
+    native_ligand, rollout_ligand, coupling = offpath_experiments_torsion_example()
+    native_poi = torch.tensor(
+        [[[0., 0., 0.], [0., 1., 0.], [0., 0., 1.], [1., 1., 1.]]],
+        dtype=torch.float64)
+    poi_rotation = offpath_experiments_rotation([-.2, .3, .1])
+    rollout_poi = native_poi @ poi_rotation.transpose(-1, -2) + torch.tensor(
+        [[[2., -1., .5]]], dtype=torch.float64)
+    teacher_body = offpath_experiments_rotation([.3, -.2, .1])
+    rollout_body = offpath_experiments_rotation([-.4, .2, .5])
+    original = offpath_experiments_targets()
+    original = {**original, 'torsion': original['torsion'][:, :1]}
+    teacher = (native_ligand, native_poi, teacher_body, original)
+
+    trainer = BoundedJointEndpointRolloutTrainer.__new__(
+        BoundedJointEndpointRolloutTrainer)
+    trainer.rollout_min_time = .25
+    trainer.endpoint_blend = .25
+    trainer.endpoint_translation_cap = 2.
+    trainer.endpoint_rotation_cap = .4
+    trainer.joint_endpoint_applied_states = 0
+    result = trainer._map_targets(
+        teacher, rollout_ligand, rollout_poi, rollout_body, coupling,
+        ligand_data={'coords': native_ligand},
+        poi_data={'coords': native_poi},
+        time=torch.tensor([.5], dtype=torch.float64))
+    base = transport_targets_with_recomputed_gauge(
+        original, teacher_body, rollout_body,
+        native_ligand, rollout_ligand, coupling)
+
+    assert trainer.joint_endpoint_applied_states == 1
+    assert result['torsion'] is base['torsion']
+    assert torch.equal(result['torsion'], original['torsion'])
+    for branch in ('e3_ligand', 'poi_ligand'):
+        for component, cap in (('tr', 2.), ('rot', .4)):
+            change = torch.linalg.vector_norm(
+                result[branch][component] - base[branch][component], dim=-1)
+            assert bool((change <= .25 * cap + 1e-12).all()), (
+                branch, component, change)
+
+
+def test_bounded_joint_endpoint_contract_has_distinct_checkpoint_identity():
+    trainer = BoundedJointEndpointRolloutTrainer.__new__(
+        BoundedJointEndpointRolloutTrainer)
+    trainer.offpath_contract_mode = JOINT_ENDPOINT_CONTRACT_MODE
+    trainer.rollout_probability = .5
+    trainer.rollout_steps = 5
+    trainer.rollout_min_time = .25
+    trainer.endpoint_blend = .25
+    trainer.endpoint_translation_cap = 10.
+    trainer.endpoint_rotation_cap = .5
+    trainer.activation_clamp = 100.0
+    trainer.activation_clamp_mode = 'irrep_norm'
+    trainer.residual_weight = 1e-3
+    trainer.ema_decay = .999
+    trainer.optimizer_config = {'trifuse': {'lr': 1e-4, 'weight_decay': 1e-4}}
+    contract = trainer.runtime_contract()
+    assert contract['offpath_target'] == JOINT_ENDPOINT_CONTRACT_MODE
+    assert contract['offpath_contract_mode'] == JOINT_ENDPOINT_CONTRACT_MODE
+    assert contract['offpath_torsion_gauge'] == JOINT_ENDPOINT_TORSION_CONTRACT
+    assert contract['endpoint_blend'] == .25
+    assert contract['endpoint_translation_cap'] == 10.
+    assert contract['endpoint_rotation_cap'] == .5
+
+
+class FakeFlow:
+    def __init__(self, teacher_body, rollout_body, teacher_targets):
+        self.teacher_body = teacher_body
+        self.rollout_body = rollout_body
+        self.teacher_targets = teacher_targets
+        self.path_calls = 0
+
+    def path(self, ligand_data, poi_coords, coupling, time):
+        self.path_calls += 1
+        body = (self.teacher_body if torch.equal(time, torch.tensor([.5], dtype=time.dtype))
+                else offpath_experiments_rotation([-.1, .2, .3]))
+        ligand = ligand_data['coords'] + self.path_calls
+        poi = poi_coords + self.path_calls
+        return ligand, poi, body, self.teacher_targets
+
+    def normalized_predictions(self, output, time):
+        return output
+
+    def velocities(self, normalized, e3_coords, poi_coords):
+        return normalized
+
+    def step(self, ligand, poi, body, velocities, dt, ligand_data):
+        return ligand + 10, poi + 20, self.rollout_body
+
+
+def test_training_state_maps_only_generated_offpath_poi_targets():
+    teacher_body = offpath_experiments_rotation([.4, -.3, .2])
+    rollout_body = offpath_experiments_rotation([-.6, .1, .5])
+    original = offpath_experiments_targets()
+    trainer = BodyFrameTransportRolloutTrainer.__new__(BodyFrameTransportRolloutTrainer)
+    trainer.diffusion = FakeFlow(teacher_body, rollout_body, original)
+    trainer.rollout_probability = 1.0
+    trainer.rollout_steps = 1
+    trainer.rollout_min_time = 0.0
+    trainer.rollout_augmented_states = 41  # Must not be used to identify this state.
+    trainer._forward_state = lambda *args, **kwargs: {'deterministic': True}
+    coords = torch.zeros(1, 2, 3, dtype=torch.float64)
+    state = trainer._training_state(
+        {'coords': coords}, {'coords': coords}, {'coords': coords}, {},
+        torch.tensor([.5], dtype=torch.float64),
+        torch.tensor([.05], dtype=torch.float64))
+    expected = transport_poi_body_frame_targets(original, teacher_body, rollout_body)
+    assert trainer.rollout_augmented_states == 42
+    assert torch.equal(state[2], rollout_body)
+    for component in ('tr', 'rot'):
+        assert torch.allclose(state[3]['poi_ligand'][component],
+                              expected['poi_ligand'][component], atol=1e-12)
+    assert state[3]['e3_ligand'] is original['e3_ligand']
+    assert state[3]['torsion'] is original['torsion']
+
+
+def test_teacher_state_is_not_mapped_and_contract_records_mode():
+    original = offpath_experiments_targets()
+    trainer = BodyFrameTransportRolloutTrainer.__new__(BodyFrameTransportRolloutTrainer)
+    trainer.diffusion = FakeFlow(offpath_experiments_rotation([.1, .2, .3]), offpath_experiments_rotation([.7, -.2, .4]), original)
+    trainer.rollout_probability = 0.0
+    trainer.rollout_steps = 1
+    trainer.rollout_min_time = 0.0
+    trainer.rollout_augmented_states = 99
+    coords = torch.zeros(1, 2, 3, dtype=torch.float64)
+    state = trainer._training_state(
+        {'coords': coords}, {'coords': coords}, {'coords': coords}, {},
+        torch.tensor([.5], dtype=torch.float64),
+        torch.tensor([.05], dtype=torch.float64))
+    assert state[3] is original
+    assert trainer.rollout_augmented_states == 99
+
+    trainer.offpath_contract_mode = OFFPATH_CONTRACT_MODE
+    trainer.activation_clamp = 100.0
+    trainer.activation_clamp_mode = 'irrep_norm'
+    trainer.residual_weight = 1e-3
+    trainer.ema_decay = .999
+    trainer.optimizer_config = {'trifuse': {'lr': 1e-4, 'weight_decay': 1e-4}}
+    contract = trainer.runtime_contract()
+    assert contract['offpath_target'] == OFFPATH_CONTRACT_MODE
+    assert contract['offpath_contract_mode'] == OFFPATH_CONTRACT_MODE
+    assert contract['offpath_torsion_gauge'] == TORSION_GAUGE_CONTRACT
+    assert contract['rollout_probability'] == 0.0

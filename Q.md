@@ -49,14 +49,14 @@ model-v3 已分别测试初态 current-quality/future-value selector 与末态 p
 | 编号 | 状态与边界 | 证据 |
 | --- | --- | --- |
 | Q-001 | 随机 torus 表导致跨进程漂移；改确定性积分。只承诺已验证环境 | `7741b87`；`results/deterministic_production_gate_{1,2,3,4,5,6}/` |
-| Q-002 | 旧训练归一化表未保存，无法恢复；新 checkpoint 记录版本 | `wrapped_normal_quadrature_v1`；`tests/test_torus_score_norm.py` |
+| Q-002 | 旧训练归一化表未保存，无法恢复；新 checkpoint 记录版本 | `wrapped_normal_quadrature_v1`；`tests/test_geometry.py` |
 | Q-005 | 远离口袋后 cross-edge 变稀疏是该失败轨迹的放大机制，非已证起始根因 | `results/epoch20_failure_trajectories_v2/` |
 | Q-006 | 该案例未发现输出头近零归一化爆炸；不推广为全库无风险 | `results/epoch20_head_direction_probe/5T35_D_A_759_seed0.json` |
-| Q-007 | 续跑校验加入数值协议，避免新旧报告混用 | `tests/test_evaluation_common.py` |
+| Q-007 | 续跑校验加入数值协议，避免新旧报告混用 | `tests/test_evaluation.py` |
 | Q-008 | 解析速度/参考系/反向更新经18个真实验证状态互相核对；不支持整体反号修补 | `tests/test_sdpi_flow.py`；方向审计 |
 | Q-009 | 生成器补显式 split 标签，旧索引不回写；PDB 交集仍须另查 | `scripts/make_deepternary_index.py` |
 | Q-010 | Trainer 落实已记录 activation clamp；历史18 probes复核有限 | `tests/test_training_contract.py` |
-| Q-011 | checkpoint 绑定 frozen expert 身份；旧格式未记录信息不可追溯补齐 | `tests/test_checkpoint_contract.py` |
+| Q-011 | checkpoint 绑定 frozen expert 身份；旧格式未记录信息不可追溯补齐 | `tests/test_training_contract.py` |
 
 ## 历史研究结论的使用边界
 

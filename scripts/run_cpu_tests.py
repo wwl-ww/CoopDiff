@@ -1,4 +1,4 @@
-"""Run all assertion-based tests in isolated, offline CPU subprocesses."""
+"""Run all pytest domains in isolated, offline CPU subprocesses."""
 
 import argparse
 import json
@@ -10,29 +10,32 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 CHILD = r'''
-import inspect, runpy, sys, tempfile, traceback
-from pathlib import Path
-sys.path[:0] = [str(Path.cwd()), str(Path.cwd() / 'scripts'), str(Path.cwd() / 'tests')]
-namespace = runpy.run_path(sys.argv[1])
-passed, failed = 0, []
-for name, function in namespace.items():
-    if not name.startswith('test_') or not callable(function):
-        continue
-    try:
-        with tempfile.TemporaryDirectory(prefix='coopdiff-cpu-test-') as directory:
-            kwargs = {}
-            for key, parameter in inspect.signature(function).parameters.items():
-                if key == 'tmp_path':
-                    kwargs[key] = Path(directory)
-                elif parameter.default is inspect.Parameter.empty:
-                    raise ValueError(f'unsupported fixture: {key}')
-            function(**kwargs)
-        passed += 1
-    except Exception:
-        failed.append(name + '\n' + traceback.format_exc())
 import json
-print('CPU_TEST_RESULT=' + json.dumps({'passed': passed, 'failed': failed}))
-sys.exit(bool(failed))
+import sys
+
+import pytest
+
+
+class Results:
+    def __init__(self):
+        self.passed = 0
+        self.failed = []
+
+    def pytest_runtest_logreport(self, report):
+        if report.when == 'call' and report.passed:
+            self.passed += 1
+        elif report.failed:
+            self.failed.append(report.nodeid + '\n' + str(report.longrepr))
+
+    def pytest_collectreport(self, report):
+        if report.failed:
+            self.failed.append(report.nodeid + '\n' + str(report.longrepr))
+
+
+results = Results()
+status = pytest.main([sys.argv[1], '-q', '--tb=short'], plugins=[results])
+print('CPU_TEST_RESULT=' + json.dumps({'passed': results.passed, 'failed': results.failed}))
+sys.exit(status)
 '''
 
 

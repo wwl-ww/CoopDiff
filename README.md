@@ -205,6 +205,21 @@ python scripts/run_cpu_tests.py
 
 `run_cpu_tests.py` 在隔离的离线 CPU 子进程运行保留的测试，需要已存在的 DiffDock 数值缓存。模型入口应先导入 `tricoopdiff.diffdock_compat`。
 
+测试统一使用 `pytest`（需安装在项目 Python 环境中）。运行全部检查可用 `python -m pytest tests -q`；上述直接运行命令也使用同一套配置并支持 `tmp_path`。`tests/` 保留 9 个职责模块和 2 个公共文件；新增检查应加入对应模块，不再互相导入测试文件。
+
+| 文件 | 覆盖职责 |
+| --- | --- |
+| `test_model_build.py` | 模型构建、装配、专家接口与模块边界 |
+| `test_training_contract.py` | 训练、检查点、恢复与可复现性 |
+| `test_prepare_data.py` | 数据索引、特征缓存与配体化学恢复 |
+| `test_geometry.py` | 扭转、数值归一化、邻接搜索与等变裁剪 |
+| `test_initialization.py` | 初始化、候选、锚点与端点投影 |
+| `test_sdpi_flow.py` | 流积分及轨迹、联合端点、离轨实验 |
+| `test_conditioning.py` | 条件特征、增强与 PROTAC manifest |
+| `test_ranking.py` | 初态选择、排名档案与推理 |
+| `test_evaluation.py` | 评估、指标、报告、续跑与精修契约 |
+| `helpers.py` / `conftest.py` | 公共合成输入、运行入口与测试环境设置 |
+
 ## 训练与续跑
 
 以下示例假定本地数据、Matcha 源码／权重和特征缓存已经准备好。GPU编号及输出目录应按实际资源选择。
