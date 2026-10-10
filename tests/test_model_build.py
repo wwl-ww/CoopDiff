@@ -1561,7 +1561,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_package_root_contains_only_production_orchestration():
     expected = {
         '__init__.py', 'train.py', 'sampler.py', 'sdpi_flow.py',
-        'evaluate.py', 'runtime.py', 'diffdock_compat.py',
+        'evaluate.py', 'runtime.py', 'diffdock_compat.py', 'distributed.py',
     }
     actual = {path.name for path in (ROOT / 'tricoopdiff').glob('*.py')}
     assert actual == expected, f'Unexpected root modules: {actual ^ expected}'

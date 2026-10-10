@@ -18,9 +18,10 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 
 import select_best_checkpoint
-from helpers import flow_example
+from helpers import distributed_gloo_worker, flow_example
 from train_entry import (
     TernaryDataLoader,
     build_trainer,
@@ -34,6 +35,7 @@ from tricoopdiff.models.expert import expert_base_identity, validate_expert_base
 from tricoopdiff.runtime import configure_inference_reproducibility
 from tricoopdiff.sampler import actual_candidate_source
 from tricoopdiff.sdpi_flow import SDPIFlow
+from tricoopdiff.distributed import shard_global_batch
 from tricoopdiff.train import TriCoopDiffTrainer
 
 
@@ -1683,3 +1685,90 @@ def test_deterministic_policy_and_explicit_legacy_control():
                 (cuda.enable_flash_sdp, cuda.enable_mem_efficient_sdp,
                  cuda.enable_cudnn_sdp, cuda.enable_math_sdp), attention_state):
             setter(value)
+
+
+# Explicit gradient-allreduce contracts run entirely on CPU/Gloo.
+
+
+def test_gloo_weighted_gradient_and_failure_contract():
+    with tempfile.TemporaryDirectory(prefix='coopdiff_gloo_') as directory:
+        mp.spawn(distributed_gloo_worker, args=(os.path.join(directory, 'rendezvous'), directory),
+                 nprocs=2, join=True)
+        assert all(Path(directory, str(rank)).read_text() == 'ok' for rank in range(2))
+
+
+def test_global_batch_shards_are_disjoint_without_padding():
+    shards = [shard_global_batch(list(range(8)), 8, rank, 2) for rank in range(2)]
+    assert shards == [list(range(4)), list(range(4, 8))]
+    for size, entries in ((3, [1, 2, 3]), (4, [1, 2, 3])):
+        try:
+            shard_global_batch(entries, size, 0, 2)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('unequal shards or incomplete batch must be rejected')
+
+
+def test_distributed_near_target_offsets_follow_global_sample_order():
+    from tricoopdiff.train import AssemblyTrainer
+
+    trainer = AssemblyTrainer.__new__(AssemblyTrainer)
+    trainer.effective_batch_size = 4
+    trainer.near_target_weight = .25
+    trainer.training_recipe = 'endpoint_near_target_v2'
+    trainer.near_target_supervision = {'start_times': [.1, .3]}
+    trainer.samples_seen = 4
+    trainer.distributed_sample_offset = 2
+    trainer.ema_decay = .99
+    trainer.ema_update_contract = 'optimizer_step_fixed_v1'
+    trainer.global_step = 1
+    trainer.model = SimpleNamespace(trifuse=torch.nn.Linear(1, 1))
+    trainer.ema = {key: value.detach().clone() for key, value in trainer.model.trifuse.state_dict().items()}
+    with patch.object(TriCoopDiffTrainer, 'train_batch', lambda self, batches: batches):
+        results = trainer.train_batch([{}, {}])
+    assert [batch['near_target_zero'] for batch in results] == [False, False]
+    assert [batch['near_target_start_t'] for batch in results] == [.3, .3]
+
+
+def test_distributed_resume_restores_optimizer_ema_and_next_update():
+    trainer, batch, override = training_contract_endpoint_trainer_fixture()
+    trainer.train_step(**batch, coupling_override=override)
+    payload = copy.deepcopy(trainer.checkpoint_payload())
+    payload['checkpoint_kind'] = 'inference_only'
+    payload['distributed_state'] = {
+        'contract': 'explicit_sample_weighted_allreduce_v1',
+        'world_size': 1, 'global_batch_size': 1,
+        'rank_rng_states': [payload['rng_state']],
+    }
+    trainer.train_step(**batch, coupling_override=override)
+    expected = copy.deepcopy(trainer.model.trifuse.state_dict())
+    expected_ema = copy.deepcopy(trainer.ema)
+    restored, _, _ = training_contract_endpoint_trainer_fixture()
+    with patch('tricoopdiff.train.torch.load', return_value=payload):
+        restored.load_checkpoint('unused.pt', distributed_context={
+            'world_size': 1, 'global_batch_size': 1})
+    assert restored.global_step == 1 and restored.samples_seen == 1
+    assert restored.optimizer.state, 'resume must restore Adam moments'
+    restored.train_step(**batch, coupling_override=override)
+    assert all(torch.equal(value, expected[name])
+               for name, value in restored.model.trifuse.state_dict().items())
+    assert all(torch.equal(value, expected_ema[name]) for name, value in restored.ema.items())
+
+
+def test_distributed_checkpoint_requires_matching_topology_and_entry():
+    trainer, _, _ = training_contract_endpoint_trainer_fixture()
+    payload = trainer.checkpoint_payload()
+    payload['distributed_state'] = {
+        'contract': 'explicit_sample_weighted_allreduce_v1',
+        'world_size': 1, 'global_batch_size': 1,
+        'rank_rng_states': [payload['rng_state']],
+    }
+    for context in (None, {'world_size': 4, 'global_batch_size': 1},
+                    {'world_size': 2, 'global_batch_size': 4}):
+        with patch('tricoopdiff.train.torch.load', return_value=payload):
+            try:
+                trainer.load_checkpoint('unused.pt', distributed_context=context)
+            except ValueError as error:
+                assert 'distributed' in str(error)
+            else:
+                raise AssertionError('distributed state resumed with incompatible entry/topology')

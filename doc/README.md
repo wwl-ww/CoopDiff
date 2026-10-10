@@ -10,6 +10,7 @@
 | --- | --- |
 | [项目概览](../README.md) | 项目定位、目录与快速检查 |
 | [当前工作](../todo.md) | 当前分支状态与下一步 |
+| [训练吞吐与多卡准备](TRAINING_THROUGHPUT.md) | 重计算配对短测、显式梯度同步入口与当前验收边界 |
 | [联合训练交接](SDPI-BiTSeed联合训练交接.md) | SDPI/BiTSeed 路径、B/C 结果、最终 checkpoint 和 LoRA 结论 |
 | [BiTSeed-Hybrid 协议](BiTSeed-Hybrid在线初始化规格.md) | 候选生成、fallback、selector、当前实验榜单 |
 | [模型与坐标契约](TriCoopDiff%20模型架构图.md) | 当前 Consensus、SDPI flow、source conditioning、版本与不变量 |

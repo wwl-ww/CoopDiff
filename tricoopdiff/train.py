@@ -236,6 +236,7 @@ class TriCoopDiffTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         rng_before = capture_rng_state()
         results = []
+        error_check = getattr(self, 'distributed_error_check', None)
         try:
             for batch in batches:
                 loss_dict = self.compute_loss(**batch)
@@ -246,10 +247,19 @@ class TriCoopDiffTrainer:
                 results.append({k: v.item() if torch.is_tensor(v) else v
                                 for k, v in loss_dict.items()})
                 del loss_dict, total
-        except Exception:
+        except Exception as error:
             self.optimizer.zero_grad(set_to_none=True)
             restore_rng_state(rng_before)
+            if error_check:
+                error_check(error)
             raise
+        if error_check:
+            try:
+                error_check(None)
+            except Exception:
+                self.optimizer.zero_grad(set_to_none=True)
+                restore_rng_state(rng_before)
+                raise
         trainable = [
             parameter
             for group in self.optimizer.param_groups
@@ -257,18 +267,24 @@ class TriCoopDiffTrainer:
             if parameter.requires_grad
         ]
         try:
+            # A distributed entry point may average gradients before clipping.
+            # The default path retains sequential, single-device accumulation.
+            sync = getattr(self, 'gradient_sync', None)
+            sample_count = sync(trainable, len(batches)) if sync else len(batches)
+            if not isinstance(sample_count, int) or sample_count < len(batches):
+                raise ValueError('gradient synchronization returned invalid global sample count')
             grad_norm = clip_grad_norm_finite(trainable, max_norm=1.0)
-        except NonFiniteTrainingError:
+        except Exception:
             self.optimizer.zero_grad(set_to_none=True)
             restore_rng_state(rng_before)
             raise
         self.optimizer.step()
         self.global_step += 1
-        self.samples_seen += len(batches)
+        self.samples_seen += sample_count
         for result in results:
             result['lr'] = self.optimizer.param_groups[0]['lr']
             result['grad_norm'] = float(grad_norm)
-            result['optimizer_batch_size'] = len(batches)
+            result['optimizer_batch_size'] = sample_count
         return results
 
     def validate_step(self, **batch) -> dict:
@@ -765,14 +781,15 @@ class AssemblyTrainer(TriCoopDiffTrainer):
     def train_batch(self, batches):
         if len(batches) > self.effective_batch_size:
             raise ValueError('microbatch group exceeds the recorded effective batch size')
+        sample_offset = getattr(self, 'distributed_sample_offset', 0)
         if self.near_target_weight:
             if self.training_recipe == 'endpoint_near_target_v2':
-                batches = [{**batch, 'near_target_zero': ((self.samples_seen + offset) // 2) % 2 == 0,
+                batches = [{**batch, 'near_target_zero': ((self.samples_seen + sample_offset + offset) // 2) % 2 == 0,
                             'near_target_start_t': self.near_target_supervision['start_times'][
-                                ((self.samples_seen + offset) // 4) % 2]}
+                                ((self.samples_seen + sample_offset + offset) // 4) % 2]}
                            for offset, batch in enumerate(batches)]
             else:
-                batches = [{**batch, 'near_target_zero': (self.samples_seen + offset) % 2 == 0,
+                batches = [{**batch, 'near_target_zero': (self.samples_seen + sample_offset + offset) % 2 == 0,
                             'near_target_start_t': self.near_target_supervision['start_t']}
                            for offset, batch in enumerate(batches)]
         result = super().train_batch(batches)
@@ -1004,9 +1021,27 @@ class AssemblyTrainer(TriCoopDiffTrainer):
     def save_checkpoint(self, path, epoch=0, best_val_loss=float('inf'), best_val_dockq=None):
         atomic_torch_save(self.checkpoint_payload(epoch, best_val_loss, best_val_dockq), path)
 
-    def load_checkpoint(self, path):
+    def load_checkpoint(self, path, *, distributed_context=None):
         from tricoopdiff.initialization.endpoints import PROJECTION_SOLVER_VERSION
         payload = torch.load(path, map_location=self.device, weights_only=False)
+        distributed = payload.get('distributed_state')
+        if distributed is not None:
+            if distributed_context is None:
+                raise ValueError('distributed checkpoint requires the distributed training entry')
+            if distributed.get('contract') != 'explicit_sample_weighted_allreduce_v1':
+                raise ValueError('unsupported distributed checkpoint contract')
+            for key in ('world_size', 'global_batch_size'):
+                if distributed.get(key) != distributed_context.get(key):
+                    raise ValueError(f'distributed checkpoint {key} differs')
+            states = distributed.get('rank_rng_states')
+            if not isinstance(states, list) or len(states) != distributed['world_size']:
+                raise ValueError('distributed checkpoint has incomplete rank RNG states')
+            # Early distributed smoke artifacts were marked inference-only to
+            # prevent single-rank resume. Their full optimizer payload remains
+            # eligible here, subject to every production resume check below.
+            payload = {**payload, 'checkpoint_kind': 'distributed_training'}
+        elif distributed_context is not None:
+            raise ValueError('distributed resume requires a distributed checkpoint')
         validate_assembly_checkpoint(payload)
         saved_solver = payload['runtime_config'].get('target_projection_solver')
         if saved_solver is None:
