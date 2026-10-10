@@ -2,10 +2,14 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path[:0] = [str(ROOT), str(ROOT / "scripts")]
 
 from train_entry import TernaryDataLoader, _load_score_model_args, seed_training
 from tricoopdiff.initialization import TernaryInitializer

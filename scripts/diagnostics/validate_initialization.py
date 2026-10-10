@@ -14,8 +14,8 @@ import torch
 from rdkit import Chem
 from scipy.spatial.transform import Rotation
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path[:0] = [str(ROOT), str(ROOT / "scripts")]
 
 import tricoopdiff.diffdock_compat  # noqa: F401
 from torch_geometric.data import HeteroData

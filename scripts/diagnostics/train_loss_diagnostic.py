@@ -5,10 +5,14 @@ import argparse
 import json
 import os
 import time
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path[:0] = [str(ROOT), str(ROOT / "scripts")]
 
 from train_entry import (
     TernaryDataLoader,

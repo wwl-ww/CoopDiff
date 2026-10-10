@@ -8,7 +8,7 @@ import sys
 import numpy as np
 from rdkit import Chem
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 from evaluation_common import sha256_file
 from tricoopdiff.conditioning.condition_features import (CONDITION_SCHEMA_VERSION, attachment_bonds,

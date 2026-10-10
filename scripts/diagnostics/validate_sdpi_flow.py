@@ -12,10 +12,10 @@ import numpy as np
 import torch
 from rdkit import Chem
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path[:0] = [str(ROOT), str(ROOT / "scripts")]
 
-from validate_initialization import read_case
+from scripts.diagnostics.validate_initialization import read_case
 from tricoopdiff.sdpi_flow import SDPIFlow, FLOW_VERSION
 
 

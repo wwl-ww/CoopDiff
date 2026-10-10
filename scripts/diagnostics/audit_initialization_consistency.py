@@ -11,10 +11,10 @@ from pathlib import Path
 import numpy as np
 from rdkit import Chem
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path[:0] = [str(ROOT), str(ROOT / "scripts")]
 
-from validate_initialization import read_case
+from scripts.diagnostics.validate_initialization import read_case
 from tricoopdiff.legacy.diffusion import InterfaceDiffusion
 from tricoopdiff.initialization import INITIALIZATION_VERSION, TernaryInitializer, receptor_prior
 from tricoopdiff.initialization.audit import (

@@ -38,7 +38,7 @@
 - `tricoopdiff/initialization/`、`geometry/`、`inputs/`、`metrics/`：初始化、合法几何、输入与评分。
 - `tricoopdiff/diffdock/`：vendored DiffDock；`legacy/` 保留历史模型与 BiTSeed 二元扩散实现，生产模型不导入旧模型。
 - `tricoopdiff/ranking/`、`experiments/`、`conditioning/`：保留已有研究库及兼容接口；退役的 ranking 训练与一次性消融脚本已移除。当前二元专家的 FiLM 互条件化仍保留。
-- `scripts/`：数据准备、当前训练、评估及通用分析入口。
+- `scripts/`：数据准备、当前训练与评估入口；诊断工具在 `scripts/diagnostics/`，结果分析在 `scripts/analysis/`。完整分类与迁移路径见[脚本索引](scripts/README.md)。
 - `tests/`：现行模型、训练契约、几何、数据及评估的回归检查。
 - `doc/`：历史研究与协议文档，从 [索引](doc/README.md) 进入；旧架构、版本和结果不代表当前实现。
 - `data/`、`checkpoints/`、`results/`、`logs/`：本地资产与生成产物，不随脚本清理删除。
