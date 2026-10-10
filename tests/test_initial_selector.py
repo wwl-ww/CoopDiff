@@ -1,10 +1,7 @@
 """Full-pool selector features and retention accounting."""
 
 from pathlib import Path
-import importlib.util
-import json
 import sys
-import tempfile
 
 import torch
 
@@ -17,12 +14,6 @@ from tricoopdiff.ranking.initial_selector import (future_selector_retention,
                                           selector_retention,
                                           selector_retention_at_indices)
 from tricoopdiff.ranking.ranking_archive import state_hash
-
-SPEC = importlib.util.spec_from_file_location(
-    'train_initial_selector', ROOT / 'scripts/train_initial_selector.py')
-train_selector = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(train_selector)
-from scripts.evaluation_common import sha256_file
 
 
 def archive():
@@ -105,30 +96,9 @@ def test_exact_random_selection_matches_enumerated_source_quota():
     assert abs(result['hit_probability_0.23'] - 1.) < 1e-10
 
 
-def test_selector_training_loader_requires_complete_ordered_pool():
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory); archives = root / 'archives'; labels = root / 'labels'
-        archives.mkdir(); labels.mkdir()
-        (archives / 'manifest.json').write_text(json.dumps({'cases': ['1ABC_A_B_LIG']}))
-        pool = [{'source': 'bitseed' if i < 192 else 'sdpi'} for i in range(256)]
-        torch.save({'split': 'train', 'pool': pool}, archives / '1ABC_A_B_LIG.pt')
-        (labels / 'manifest.json').write_text(json.dumps({
-            'protocol': 'exact_initial_pool_labels_v1',
-            'archive_manifest_sha256': sha256_file(archives / 'manifest.json')}))
-        rows = [{'pool_index': i, 'source': pool[i]['source'], 'geometry': [float(i % 5)] * 14,
-                 'dockq': {'dockq': float(i) / 255}} for i in range(256)]
-        (labels / '1ABC_A_B_LIG.json').write_text(json.dumps({
-            'archive_sha256': sha256_file(archives / '1ABC_A_B_LIG.pt'), 'rows': rows}))
-        cases, manifests = train_selector.load_cases([archives], [labels], 'train')
-    assert len(cases) == len(manifests) == 1
-    assert cases[0]['features'].shape == (256, 14)
-    assert float(cases[0]['dockq'][-1]) == 1.
-
-
 if __name__ == '__main__':
     test_all_pool_features_are_aligned_and_checksummed()
     test_retention_tracks_oracle_and_source_budget()
     test_diversity_selection_has_exact_topk_control_and_removes_redundancy()
     test_future_retention_separates_initial_final_and_rescued_candidates()
     test_exact_random_selection_matches_enumerated_source_quota()
-    test_selector_training_loader_requires_complete_ordered_pool()

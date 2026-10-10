@@ -27,7 +27,6 @@ import argparse
 import random
 import json
 import os
-import pickle
 import sys
 import time
 from contextlib import nullcontext
@@ -44,7 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 from featurize_common import featurize_complex  # noqa: E402
-from tricoopdiff.runtime import evaluation_context, preserve_rng
+from tricoopdiff.runtime import evaluation_context, preserve_rng, atomic_torch_save, sha256_file
 from tricoopdiff.initialization.endpoints import case_seed
 
 
@@ -97,28 +96,26 @@ def parse_args(argv=None):
     p.add_argument('--native-root', default='DeepTernary/data/TernaryDB/pdbs',
                    help='Native complexes for exact terminal training-validation DockQ; not the MGD benchmark protocol')
     p.add_argument('--ema-decay', type=float, default=0.999)
-    p.add_argument('--expert-coordinate-grad', action=argparse.BooleanOptionalAction, default=None,
-                   help='Explicit full expert geometry Jacobian ablation; new runs default to the stopped-coordinate approximation')
-    p.add_argument('--structural-supervision', action=argparse.BooleanOptionalAction, default=None,
-                   help='Element-aware sterics and independent E3-L/POI-L contacts; defaults on for new runs')
     # Phase
     p.add_argument("--phase", type=int, default=1, choices=[1],
                    help="Frozen experts with trainable ternary motion (the supervised phase)")
     p.add_argument("--resume", default=None, help="Resume from checkpoint")
 
     # Model config
-    p.add_argument("--num_transformer_layers", type=int, default=3)
     p.add_argument("--node_dim", type=int, default=128)
     # Frozen DiffDock-L expert (ns=48, nv=10, num_conv_layers=11). These are read
     # from the checkpoint's model_parameters.yml, not hand-written here.
     p.add_argument("--expert_model_dir", default="checkpoints/score_model",
                    help="Dir with model_parameters.yml + best_ema_inference_epoch_model.pt")
+    p.add_argument('--expert-backend', choices=('diffdock', 'matcha'), default='diffdock')
+    p.add_argument('--matcha-source-dir', default='results/matcha_qualification_source')
+    p.add_argument('--matcha-weights-dir', default='results/matcha_qualification_weights')
 
     # Featurization
     p.add_argument("--cache_dir", default="results/featurize_cache",
                    help="Dir for on-disk featurization cache (per-case .pt)")
-    p.add_argument('--cache-only', action='store_true',
-                   help='Train/validate only source-verified cached cases; never rebuild ESM')
+    p.add_argument('--cached-only', action='store_true',
+                   help='Explicitly restrict the indexed population to existing feature caches')
 
     # Hardware
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -128,6 +125,9 @@ def parse_args(argv=None):
     )
     p.add_argument("--log_interval", type=int, default=10)
     p.add_argument("--save_interval", type=int, default=10)
+    p.add_argument('--save-steps', type=int, default=100,
+                   help='Save progress every N optimizer updates; 0 disables. '
+                        'Resume retains optimization state and restarts the incomplete epoch.')
     p.add_argument("--seed", type=int, default=0,
                    help="Random seed for model initialization, shuffling, and diffusion noise")
     p.add_argument(
@@ -212,39 +212,6 @@ def seed_training(seed, device):
         torch.cuda.manual_seed_all(seed)
 
 
-def summarize_metrics(records):
-    """Means over observed values; absent auxiliary losses are not zeros."""
-    groups = {}
-    for record in records:
-        for key, value in record.items():
-            groups.setdefault(key, []).append(float(value))
-    return ({key: float(np.mean(values)) for key, values in groups.items()},
-            {key: len(values) for key, values in groups.items()})
-
-
-def fullatom_targets(entry, e3_data, poi_data, flipped=False):
-    """Scoring-only heavy atoms in the same fixed frame as the CA templates."""
-    import prody as pr
-    from tricoopdiff.metrics.dockq import _featurized_ca_coords
-
-    paths = (entry['protein2'], entry['protein1']) if flipped else (entry['protein1'], entry['protein2'])
-    result = {}
-    for name, path, data in zip(('e3', 'poi'), paths, (e3_data, poi_data)):
-        reference = data['coords'][0]
-        ca = reference.new_tensor(_featurized_ca_coords(path))
-        if ca.shape != reference.shape or not torch.allclose(
-                ca - ca.mean(0), reference - reference.mean(0), atol=.01, rtol=1e-4):
-            raise ValueError('full-atom target and featurized protein do not share the same rigid template')
-        atoms = pr.parsePDB(str(path)).select('protein and not hydrogen')
-        if atoms is None:
-            raise ValueError('full-atom supervision requires protein heavy atoms')
-        result[name] = reference.new_tensor(atoms.getCoords()) - ca.mean(0) + reference.mean(0)
-        from rdkit import Chem
-        result[name + '_atomic_numbers'] = [Chem.GetPeriodicTable().GetAtomicNumber(str(element).strip().capitalize())
-                                            for element in atoms.getElements()]
-    return result
-
-
 def append_metric(output_dir, payload):
     """Append one flush-safe structured training or validation event."""
     path = Path(output_dir) / 'metrics.jsonl'
@@ -256,6 +223,8 @@ def append_metric(output_dir, payload):
 def main():
     args = parse_args()
     args.generative_process = 'sdpi_flow_v1'
+    if args.expert_backend == 'matcha' and args.training_arm != 'A1':
+        raise SystemExit('Matcha BiTSeed is not implemented; do not reinterpret DiffDock endpoint caches')
     if args.nan_clamp <= 0:
         raise SystemExit("FATAL: --nan-clamp must be positive")
     device = torch.device(args.device)
@@ -295,23 +264,17 @@ def main():
     #    (TriFuse's input_dim must match the featurized ternary nodes).
     # ----------------------------------------------------------------
     entries = _load_entries(args.train_data)
+    if args.cached_only:
+        entries = [entry for entry in entries if (Path(args.cache_dir) / (entry['case'] + '.pt')).is_file()]
     if not entries:
         raise SystemExit(f"FATAL: no entries in {args.train_data}")
 
     print("[0/6] Determining receptor feature dim from first sample...")
     score_model_args = _load_score_model_args(args.expert_model_dir)
-    prepared_loader = None
-    if args.cache_only:
-        prepared_loader = TernaryDataLoader(args.train_data, score_model_args,
-            shuffle=True, device=str(device), cache_dir=args.cache_dir,
-            max_clusters=args.max_train_clusters, random_flip_proteins=args.random_flip_proteins,
-            cache_only=True)
-        entries = prepared_loader.entries
     first = entries[0]
     _, _, _, input_dim = featurize_complex(
         first["case"], first["protein1"], first["protein2"], first["ligand"],
         score_model_args, str(device), cache_dir=args.cache_dir,
-        **({'cache_only': True} if args.cache_only else {}),
     )
     print(f"  receptor_feat_dim={input_dim} (from {first['case']})")
     # A cold ESM/graph cache can consume framework RNG state while a warm cache
@@ -324,8 +287,7 @@ def main():
     # ----------------------------------------------------------------
     print("[1/6] Building model...")
     model, diffusion, trainer = build_trainer(args, device, input_dim=input_dim)
-    print(f"  Model profile: production | "
-          f"dropout={args.resolved_model_config['dropout'] if 'dropout' in args.resolved_model_config else .1:g}")
+    print(f"  Model profile: {args.resolved_model_config.get('model_profile', 'custom')}")
     # Include resolved resume/profile settings, not defaults that were ignored.
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as handle:
         json.dump(vars(args), handle, indent=2)
@@ -337,28 +299,19 @@ def main():
     # 2. Load data
     # ----------------------------------------------------------------
     print("[2/6] Loading data...")
-    train_loader = prepared_loader or TernaryDataLoader(
+    train_loader = TernaryDataLoader(
         args.train_data, score_model_args,
         shuffle=True, device=str(device), cache_dir=args.cache_dir,
         skip_on_error=False, max_clusters=args.max_train_clusters,
         random_flip_proteins=args.random_flip_proteins,
-        fullatom_supervision=bool(trainer.fullatom_interface_weight),
+        expert=model.expert, cached_only=args.cached_only,
     )
-    train_loader.fullatom_supervision = bool(trainer.fullatom_interface_weight)
     val_loader = TernaryDataLoader(
         args.val_data, score_model_args,
         shuffle=False, device=str(device), cache_dir=args.cache_dir,
         skip_on_error=False, max_clusters=args.max_val_clusters,
-        fullatom_supervision=bool(trainer.fullatom_interface_weight),
-        cache_only=args.cache_only,
+        expert=model.expert, cached_only=args.cached_only,
     )
-    if args.cache_only:
-        from tricoopdiff.runtime import atomic_json
-        manifest = {'train': train_loader.cache_selection, 'validation': val_loader.cache_selection}
-        path = Path(args.output_dir) / 'cache_subset.json'
-        if args.resume and (not path.is_file() or json.loads(path.read_text()) != manifest):
-            raise ValueError('cache-only resume requires the identical recorded dataset subset')
-        atomic_json(manifest, path)
     # Check scoring dependencies before spending an epoch on training.
     for entry in val_loader._epoch_entries():
         validation_metric_context(entry, args.native_root)
@@ -390,18 +343,20 @@ def main():
 
     for epoch in range(start_epoch, args.epochs + 1):
         train_losses = []
-        projection_cases = []
         n_skipped = 0
         t0 = time.time()
         for batch_idx, microbatches in enumerate(iter_training_batches(train_loader, args.batch_size)):
             microbatches = [prepare_source_batch(
                 batch, trainer.samples_seen + offset, args.training_arm, endpoint_store,
             ) for offset, batch in enumerate(microbatches)]
-            group_losses = _guarded_train_batch(trainer, microbatches)
+            group_losses = _guarded_train_batch(trainer, microbatches,
+                failure_path=Path(args.output_dir) / 'projection_failure.pt')
             train_losses.extend(group_losses)
+            if args.save_steps > 0 and trainer.global_step % args.save_steps == 0:
+                trainer.save_checkpoint(
+                    os.path.join(args.output_dir, 'progress_model.pt'), epoch=epoch - 1,
+                    best_val_loss=best_val_loss, best_val_dockq=best_val_dockq)
             for batch, loss_dict in zip(microbatches, group_losses):
-                if 'projection_rmsd_angstrom' in loss_dict:
-                    projection_cases.append({'case': batch['case'], 'rmsd_angstrom': loss_dict['projection_rmsd_angstrom']})
                 append_metric(args.output_dir, {
                     'event': 'train_step', 'epoch': epoch,
                     'global_step': trainer.global_step, 'case': batch['case'],
@@ -409,14 +364,14 @@ def main():
                     'training_objective': trainer.training_objective,
                     **loss_dict,
                 })
-            loss_dict, _ = summarize_metrics(group_losses)
+            loss_dict = {key: float(np.mean([loss[key] for loss in group_losses]))
+                         for key in group_losses[0]}
 
             if batch_idx % args.log_interval == 0:
                 print(f"  Epoch {epoch} | Batch {batch_idx} | "
                       f"loss={loss_dict['loss_total']:.4f} | "
                       f"endpoint_main={loss_dict.get('loss_endpoint_main', loss_dict['loss_total']):.4f} | "
-                      f"near_target={loss_dict.get('loss_near_target', 'n/a')} | "
-                      f"recovery={loss_dict.get('loss_state_recovery', 'n/a')} | "
+                      f"near_target={loss_dict.get('loss_near_target', 0.):.4f} | "
                       f"ligand_geometry={loss_dict['loss_ligand_geometry']:.4f} | "
                       f"protein_geometry={loss_dict['loss_protein_geometry']:.4f}")
 
@@ -447,24 +402,15 @@ def main():
         trainer.scheduler_step(val_loss)
 
         # Log
-        train_means, train_counts = summarize_metrics(train_losses)
-        append_metric(args.output_dir, {'event': 'train_epoch', 'epoch': epoch,
-                                       'means': train_means, 'counts': train_counts})
-        if projection_cases:
-            values = [row['rmsd_angstrom'] for row in projection_cases]
-            append_metric(args.output_dir, {'event': 'projection_summary', 'epoch': epoch,
-                'p50_p90_p99_max_angstrom': np.percentile(values, [50, 90, 99, 100]).tolist(),
-                'above_1A': sum(value > 1 for value in values),
-                'worst_cases': sorted(projection_cases, key=lambda row: row['rmsd_angstrom'], reverse=True)[:10]})
-        train_loss_avg = train_means['loss_total']
-        train_main_avg = train_means.get('loss_endpoint_main', train_loss_avg)
-        train_ligand_avg = train_means['loss_ligand_geometry']
-        train_protein_avg = train_means['loss_protein_geometry']
+        train_loss_avg = np.mean([d['loss_total'] for d in train_losses]) if train_losses else float('nan')
+        train_main_avg = np.mean([d.get('loss_endpoint_main', d['loss_total']) for d in train_losses])
+        train_near_avg = np.mean([d.get('loss_near_target', 0.) for d in train_losses])
+        train_ligand_avg = np.mean([d['loss_ligand_geometry'] for d in train_losses])
+        train_protein_avg = np.mean([d['loss_protein_geometry'] for d in train_losses])
         dt = time.time() - t0
         print(f"  Epoch {epoch}/{args.epochs} | "
               f"train_loss={train_loss_avg:.4f} | "
-              f"endpoint_main={train_main_avg:.4f} | near_target={train_means.get('loss_near_target', 'n/a')} | "
-              f"recovery={train_means.get('loss_state_recovery', 'n/a')} | "
+              f"endpoint_main={train_main_avg:.4f} | near_target={train_near_avg:.4f} | "
               f"ligand_geometry={train_ligand_avg:.4f} | "
               f"protein_geometry={train_protein_avg:.4f} | "
               f"val_loss={val_loss:.4f} | "
@@ -498,6 +444,9 @@ def main():
                 os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt"),
                 epoch=epoch, best_val_loss=best_val_loss, best_val_dockq=best_val_dockq,
             )
+        trainer.save_checkpoint(
+            os.path.join(args.output_dir, 'progress_model.pt'), epoch=epoch,
+            best_val_loss=best_val_loss, best_val_dockq=best_val_dockq)
 
     # ----------------------------------------------------------------
     # 5. Final save
@@ -512,18 +461,24 @@ def main():
 
 def build_trainer(args, device, input_dim=None):
     """Build model, diffusion, and trainer."""
-    from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse, production_model_config
-    from tricoopdiff.models.expert import build_diffdock_expert
+    from tricoopdiff.models.assembly import (TernaryAssemblyModel, TernaryAssembly,
+                                             VECTOR_EXPERT_MODEL_PROFILE,
+                                             production_model_config)
+    from tricoopdiff.models.expert import build_diffdock_expert, FrozenMatcha
     from tricoopdiff.sdpi_flow import SDPIFlow
-    from tricoopdiff.train import ConsensusTrainer
+    from tricoopdiff.train import AssemblyTrainer
 
     # Build frozen DiffDock-L expert from pretrained weights (self-contained
     # vendored core — no ../DiffDock dependency). num_conv_layers (11) and the
     # full CGModel architecture come from model_parameters.yml.
-    frozen_expert = build_diffdock_expert(
-        model_dir=args.expert_model_dir,
-        device=str(device),
-    )
+    backend = getattr(args, 'expert_backend', 'diffdock')
+    if backend == 'matcha':
+        if args.training_arm != 'A1':
+            raise ValueError('Matcha currently supports SDPI training, not DiffDock BiTSeed caches')
+        frozen_expert = FrozenMatcha(source_dir=args.matcha_source_dir,
+                                    weights_dir=args.matcha_weights_dir).to(device)
+    else:
+        frozen_expert = build_diffdock_expert(model_dir=args.expert_model_dir, device=str(device))
 
     # input_dim must match the ternary node feature dim, which is the receptor
     # feature dim (1281 = 1 amino-acid index + 1280 ESM2 for DiffDock-L). It is
@@ -533,19 +488,22 @@ def build_trainer(args, device, input_dim=None):
         print(f"[warn] input_dim not provided; defaulting to node_dim={input_dim}")
 
     model_config = production_model_config(args.node_dim, input_dim,
-                                           args.num_transformer_layers,
                                            args.training_arm == 'C',
+                                           model_profile=VECTOR_EXPERT_MODEL_PROFILE,
                                            expert_scalar_dim=frozen_expert.node_scalar_dim,
-                                           expert_film_dim=frozen_expert.ns,
-                                           expert_vector_dim=frozen_expert.node_vector_dim)
+                                           expert_vector_dim=getattr(frozen_expert, 'node_vector_dim', 20))
+    if backend == 'matcha':
+        model_config = production_model_config(args.node_dim, input_dim, False,
+            expert_backend='matcha', expert_scalar_dim=frozen_expert.node_scalar_dim,
+            expert_vector_dim=frozen_expert.node_vector_dim)
     if args.resume:
         # Resume means reconstruct the saved architecture, not reinterpret it
         # using today's defaults. The trainer subsequently checks every runtime
         # loss/source/optimizer contract before loading trainable state.
-        from tricoopdiff.train import validate_consensus_checkpoint
+        from tricoopdiff.train import validate_assembly_checkpoint, REAL_ENDPOINT_OBJECTIVE
         saved = torch.load(args.resume, map_location='cpu', weights_only=False)
-        validate_consensus_checkpoint(saved)
-        if saved['runtime_config'].get('training_objective') != 'real_initialization_reachable_endpoint_v2':
+        validate_assembly_checkpoint(saved)
+        if saved['runtime_config'].get('training_objective') != REAL_ENDPOINT_OBJECTIVE:
             raise ValueError('historical checkpoints are inference/weight sources, not production resumes')
         model_config = dict(saved['model_config'])
         if model_config.get('model_profile') == 'ternary_endpoint_v2':
@@ -567,25 +525,17 @@ def build_trainer(args, device, input_dim=None):
     if getattr(args, 'training_arm', 'A1') in ('B', 'C'):
         from tricoopdiff.initialization.endpoints import RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
         args.training_endpoint_protocol = RESAMPLED_TRAINING_ENDPOINT_PROTOCOL
-    trifuse = ConsensusFuse(**model_config)
-    coordinate_grad = getattr(args, 'expert_coordinate_grad', None)
-    structural = getattr(args, 'structural_supervision', None)
-    if coordinate_grad is None:
-        coordinate_grad = saved['runtime_config'].get('expert_coordinate_grad', True) if args.resume else False
-    if structural is None:
-        structural = saved['runtime_config'].get('structural_supervision', False) if args.resume else True
-    args.expert_coordinate_grad, args.structural_supervision = coordinate_grad, structural
+    trifuse = TernaryAssembly(**model_config)
 
-    model = ConsensusCoopDiff(frozen_expert, trifuse,
+    model = TernaryAssemblyModel(frozen_expert, trifuse,
                              expert_input_grad=True,
-                             expert_coordinate_grad=coordinate_grad,
                              checkpoint_ternary=getattr(args, 'checkpoint_ternary', True))
 
     # Build diffusion
     diffusion = SDPIFlow(inference_steps=20)
 
     # Build trainer
-    trainer = ConsensusTrainer(
+    trainer = AssemblyTrainer(
         model=model,
         diffusion=diffusion,
         lr=args.lr,
@@ -598,7 +548,6 @@ def build_trainer(args, device, input_dim=None):
         interface_cutoff=args.interface_cutoff,
         effective_batch_size=args.batch_size,
         steric_loss_weight=args.steric_loss_weight,
-        structural_supervision=structural,
         training_source_mix=(
             'sdpi_only' if getattr(args, 'training_arm', 'A1') == 'A1'
             else 'sdpi_bitseed_1_1'
@@ -615,13 +564,18 @@ def build_trainer(args, device, input_dim=None):
     return model, diffusion, trainer
 
 
-def _guarded_train_batch(trainer, batches):
+def _guarded_train_batch(trainer, batches, failure_path=None):
     from tricoopdiff.train import NonFiniteTrainingError
+    from tricoopdiff.initialization.endpoints import EndpointProjectionError
 
     try:
         return trainer.train_batch(batches)
     except NonFiniteTrainingError as error:
         raise RuntimeError(f'training aborted without updating the partial microbatch group: {error}') from error
+    except EndpointProjectionError as error:
+        if failure_path is not None:
+            atomic_torch_save(error.diagnostics, failure_path)
+        raise
 
 
 def iter_training_batches(loader, size):
@@ -681,9 +635,7 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
     """Run a deterministic validation pass without perturbing training RNG."""
     from tricoopdiff.train import REAL_ENDPOINT_OBJECTIVE, REAL_VALIDATION_DOCKQ_PROTOCOL
     exact_dockq = getattr(trainer, 'training_objective', None) == REAL_ENDPOINT_OBJECTIVE
-    balanced = bool(getattr(trainer, 'symmetric_supervision', False))
     scores = {'sdpi': [], 'bitseed': []}
-    requested_losses, requested_scores = {'sdpi': [], 'bitseed': []}, {'sdpi': [], 'bitseed': []}
     per_case = []
     if weights not in ('raw', 'ema'):
         raise ValueError('validation weights must be raw or ema')
@@ -708,12 +660,9 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
                     "produced a non-finite loss"
                 )
             losses['sdpi'].append(loss_dict['loss_total'])
-            requested_losses['sdpi'].append(loss_dict['loss_total'])
             if exact_dockq:
                 scores['sdpi'].append(loss_dict['dockq'])
-                requested_scores['sdpi'].append(loss_dict['dockq'])
                 per_case.append({'case': batch['case'], 'source': 'sdpi',
-                                 'requested_source': 'sdpi',
                                  'loss': loss_dict['loss_total'],
                                  'loss_endpoint_main': loss_dict.get('loss_endpoint_main', loss_dict['loss_total']),
                                  **{key: loss_dict[key] for key in ('dockq', 'fnat', 'irms', 'lrms')}})
@@ -742,12 +691,9 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
                         "produced a non-finite BiTSeed loss"
                     )
                 losses[actual_source].append(endpoint_loss['loss_total'])
-                requested_losses['bitseed'].append(endpoint_loss['loss_total'])
                 if exact_dockq:
                     scores[actual_source].append(endpoint_loss['dockq'])
-                    requested_scores['bitseed'].append(endpoint_loss['dockq'])
                     per_case.append({'case': batch['case'], 'source': actual_source,
-                                     'requested_source': 'bitseed',
                                      'loss': endpoint_loss['loss_total'],
                                      'loss_endpoint_main': endpoint_loss.get('loss_endpoint_main', endpoint_loss['loss_total']),
                                      **{key: endpoint_loss[key] for key in ('dockq', 'fnat', 'irms', 'lrms')}})
@@ -757,13 +703,8 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
         for source, values in losses.items() if values
     }
     selection = float(np.mean(list(by_source.values()))) if by_source else float('nan')
-    by_requested_source = {source: float(np.mean(values))
-                           for source, values in requested_losses.items() if values}
-    if balanced and by_requested_source:
-        selection = float(np.mean(list(by_requested_source.values())))
     result = {
         'selection_loss': selection, 'by_source': by_source,
-        'by_requested_source': by_requested_source,
         'selection_loss_component': 'loss_endpoint_main' if exact_dockq else 'loss_total',
         'source_counts': {source: len(values) for source, values in losses.items()},
         'bitseed_fallback_count': fallback_count,
@@ -776,13 +717,9 @@ def validate(trainer, val_loader, device, training_arm='A1', endpoint_store=None
         dockq_by_source = {source: float(np.mean(values)) for source, values in scores.items() if values}
         if not dockq_by_source:
             raise RuntimeError('full-atom validation produced no DockQ measurements')
-        dockq_requested = {source: float(np.mean(values))
-                           for source, values in requested_scores.items() if values}
-        result.update(selection_dockq=float(np.mean(list(
-                          (dockq_requested if balanced else dockq_by_source).values()))),
-                      dockq_by_requested_source=dockq_requested,
+        result.update(selection_dockq=float(np.mean(list(dockq_by_source.values()))),
                       dockq_by_source=dockq_by_source, per_case=per_case,
-                      dockq_protocol=getattr(trainer, 'validation_dockq_protocol', REAL_VALIDATION_DOCKQ_PROTOCOL))
+                      dockq_protocol=REAL_VALIDATION_DOCKQ_PROTOCOL)
     return result
 
 
@@ -807,40 +744,21 @@ class TernaryDataLoader:
     def __init__(self, data_json, score_model_args, shuffle=True, device="cuda",
                  cache_dir=None, skip_on_error=False, max_clusters=None,
                  random_flip_proteins=False, cache_read_only=False,
-                 cache_wait_seconds=3600., fullatom_supervision=False, cache_only=False):
+                 cache_wait_seconds=3600., expert=None, cached_only=False):
         self.entries, self.clusters, self.entries_by_case = _load_index(data_json)
-        self.cache_only = bool(cache_only)
-        if self.cache_only:
-            from featurize_common import _featurize_signature, _FEATURIZE_CACHE_VERSION
-            retained, excluded = [], []
-            for entry in self.entries:
-                try:
-                    path = Path(cache_dir) / (entry['case'].replace('/', '_') + '.pt')
-                    cached = torch.load(path, map_location='cpu', weights_only=False)
-                    version = cached.get('cache_version')
-                    if version not in (7, 8, _FEATURIZE_CACHE_VERSION):
-                        raise ValueError('incompatible cache schema')
-                    signature = _featurize_signature(entry['protein1'], entry['protein2'], entry['ligand'],
-                        score_model_args, cache_version=None if version in (7, 8) else version)
-                    if cached.get('source_signature') != signature:
-                        raise ValueError('cache source signature mismatch')
-                    retained.append(entry)
-                except (OSError, ValueError, RuntimeError, EOFError, pickle.UnpicklingError) as error:
-                    excluded.append({'case': entry['case'], 'reason': type(error).__name__ + ': ' + str(error)})
-            self.entries = retained
-            self.entries_by_case = {entry['case']: entry for entry in retained}
-            original_clusters = len(self.clusters or [])
-            if self.clusters:
-                self.clusters = [{**cluster,
-                    'items': [case for case in cluster['items'] if case in self.entries_by_case],
-                    'representative': [case for case in cluster.get('representative', []) if case in self.entries_by_case]}
-                    for cluster in self.clusters if any(case in self.entries_by_case for case in cluster['items'])]
-            self.cache_selection = {'included': [entry['case'] for entry in retained], 'excluded': excluded,
-                                    'original_clusters': original_clusters, 'retained_clusters': len(self.clusters or [])}
-            print(f'[cache-only] {data_json}: {len(retained)} included, {len(excluded)} excluded; '
-                  f'{len(self.clusters or [])}/{original_clusters} clusters', flush=True)
-            if not retained:
-                raise ValueError(f'{data_json}: no compatible cached cases remain')
+        if cached_only:
+            if cache_dir is None:
+                raise ValueError('cached-only loading requires a cache directory')
+            original = len(self.entries), len(self.clusters)
+            self.entries = [entry for entry in self.entries
+                            if (Path(cache_dir) / (entry['case'] + '.pt')).is_file()]
+            self.entries_by_case = {entry['case']: entry for entry in self.entries}
+            self.clusters = [cluster for cluster in self.clusters
+                             if any(case in self.entries_by_case for case in cluster['items'])]
+            print(f'[data] cached-only entries {len(self.entries)}/{original[0]}, '
+                  f'clusters {len(self.clusters)}/{original[1]}', flush=True)
+            if not self.entries:
+                raise ValueError('cached-only index has no available entries')
         if max_clusters is not None:
             if max_clusters <= 0:
                 raise ValueError('max_clusters must be positive')
@@ -852,17 +770,14 @@ class TernaryDataLoader:
                     entry['case']: entry for entry in self.entries
                 }
         self.score_model_args = score_model_args
-        if self.cache_only:
-            self.cache_selection['selected_clusters'] = self.clusters
-            self.cache_selection['selected_entries'] = [entry['case'] for entry in self.entries]
         self.shuffle = shuffle
         self.device = device
         self.cache_dir = cache_dir
+        self.expert = expert
         self.skip_on_error = skip_on_error
         self.random_flip_proteins = bool(random_flip_proteins)
         self.cache_read_only = bool(cache_read_only)
         self.cache_wait_seconds = float(cache_wait_seconds)
-        self.fullatom_supervision = bool(fullatom_supervision)
         self.skipped = []
 
     def __iter__(self):
@@ -919,10 +834,11 @@ class TernaryDataLoader:
             self.score_model_args, self.device, cache_dir=self.cache_dir,
             cache_read_only=self.cache_read_only,
             cache_wait_seconds=self.cache_wait_seconds,
-            **({'cache_only': True} if getattr(self, 'cache_only', False) else {}),
         )
-        flipped = self.random_flip_proteins and np.random.random() < 0.5
-        if flipped:
+        if getattr(self.expert, 'backend', None) == 'matcha':
+            e3_data, poi_data, ligand_data = preserve_rng(self._prepare_matcha)(
+                entry, (e3_data, poi_data, ligand_data))
+        if self.random_flip_proteins and np.random.random() < 0.5:
             # Re-express the entire ternary state in the old POI-centered frame,
             # then exchange branch identities. This matches DeepTernary's
             # training-only random protein flip while preserving the invariant
@@ -935,9 +851,31 @@ class TernaryDataLoader:
             'e3_data': e3_data,
             'poi_data': poi_data,
             'ligand_data': ligand_data,
-            **({'fullatom_targets': fullatom_targets(entry, e3_data, poi_data, flipped)}
-               if getattr(self, 'fullatom_supervision', False) else {}),
         }
+
+    def _prepare_matcha(self, entry, data):
+        """Cache only immutable sequence/chemical metadata, before protein flips."""
+        from tricoopdiff.models.expert import expert_base_identity
+
+        paths = [entry[key] for key in ('protein1', 'protein2', 'ligand')]
+        cache_path = Path(self.cache_dir) / (entry['case'] + '.pt') if self.cache_dir else None
+        identity = {'expert': expert_base_identity(self.expert),
+                    'inputs': [sha256_file(path) for path in paths],
+                    'features': sha256_file(cache_path) if cache_path and cache_path.exists() else None}
+        metadata_path = Path(self.cache_dir) / 'matcha_metadata' / (entry['case'] + '.pt') if self.cache_dir else None
+        cached = torch.load(metadata_path, map_location='cpu', weights_only=False) if metadata_path and metadata_path.exists() else None
+        if cached is None or cached.get('identity') != identity:
+            prepared = self.expert.prepare_case(*data, paths[:2])
+            metadata = [{key: value.detach().cpu() if torch.is_tensor(value) else value
+                         for key, value in part['matcha'].items()} for part in prepared]
+            if metadata_path:
+                metadata_path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_torch_save({'identity': identity, 'metadata': metadata}, metadata_path)
+        else:
+            metadata = cached['metadata']
+        return tuple({**part, 'matcha': {
+            key: value.to(self.device) if torch.is_tensor(value) else value
+            for key, value in meta.items()}} for part, meta in zip(data, metadata))
 
 
 if __name__ == "__main__":

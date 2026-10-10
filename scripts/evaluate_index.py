@@ -8,6 +8,7 @@ from pathlib import Path
 from evaluation_common import (
     completed_report, evaluation_input_signature, resolve_entry_paths, sha256_file,
 )
+from tricoopdiff.models.assembly import DIRECT_RANK_FEATURE_STATE, LEGACY_RANK_FEATURE_STATE
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -161,7 +162,11 @@ def main():
                 "dockq_source_sha256": sha256_file(runner.deepternary_root / 'DockQ/dockq_util.py'),
                 "dockq_binary_sha256": sha256_file(runner.deepternary_root / 'DockQ/fnat'),
                 "rank_features_saved": args.save_rank_features,
-                "rank_feature_state": ('final_pose_t0_dt0_v1' if args.save_rank_features else None),
+                "rank_feature_state": (
+                    DIRECT_RANK_FEATURE_STATE
+                    if args.save_rank_features and runner.checkpoint['model_config'].get('direct_ternary_motion', False)
+                    else LEGACY_RANK_FEATURE_STATE if args.save_rank_features else None
+                ),
             }
             if not args.no_resume and completed_report(
                     report_path, case, checkpoint, expected_config,

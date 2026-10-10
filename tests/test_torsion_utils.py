@@ -6,7 +6,7 @@ import torch
 import tricoopdiff.diffdock_compat  # noqa: F401
 from tricoopdiff.diffdock.utils.torsion import modify_conformer_torsion_angles
 from tricoopdiff.geometry.rigid import rotation_exp
-from tricoopdiff.models.consensus import BondContextEncoder
+from tricoopdiff.legacy.trifuse import BondContextEncoder
 
 
 def test_modify_conformer_torsion_angles_copies_and_rotates():

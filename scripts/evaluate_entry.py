@@ -35,7 +35,7 @@ from evaluation_common import (
 )
 
 from tricoopdiff.models.expert import build_diffdock_expert
-from tricoopdiff.models.consensus import ConsensusCoopDiff, ConsensusFuse
+from tricoopdiff.models.assembly import TernaryAssemblyModel, TernaryAssembly
 from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
@@ -227,8 +227,8 @@ def main():
           f"rotatable bonds={n_rot}", flush=True)
 
     # --- Build TriFuse + TriCoopDiff + diffusion + initializer --------------
-    trifuse = ConsensusFuse(node_dim=128, input_dim=d_rec)
-    model = ConsensusCoopDiff(
+    trifuse = TernaryAssembly(node_dim=128, input_dim=d_rec)
+    model = TernaryAssemblyModel(
         frozen_expert=expert,
         trifuse=trifuse,
     ).to(device)

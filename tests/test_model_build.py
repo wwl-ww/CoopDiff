@@ -6,6 +6,7 @@ Run with: python tests/test_model_build.py
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
@@ -18,7 +19,6 @@ def test_trifuse_build():
 
     trifuse = TriFuse(
         node_dim=128, ns=32, nv=4,
-        num_transformer_layers=3,
         num_conv_layers_per_expert=6,
     )
 
@@ -68,10 +68,8 @@ def test_trifuse_reads_geometry_and_preserves_rigid_invariance():
     torch.manual_seed(3)
     trifuse = TriFuse(
         node_dim=32, input_dim=16, ns=8, nv=2,
-        num_transformer_layers=1,
         num_conv_layers_per_expert=2,
         film_dim=4,
-        dropout=0.0,
     ).eval()
     features = torch.randn(15, 16)
     coords = torch.randn(15, 3)
@@ -112,9 +110,7 @@ def test_trifuse_links_chemical_features_to_local_contacts():
     torch.manual_seed(7)
     trifuse = TriFuse(
         node_dim=32, input_dim=16, ns=8, nv=2,
-        num_transformer_layers=1,
         num_conv_layers_per_expert=2,
-        dropout=0.0,
     ).eval()
     features = torch.randn(9, 16)
     node_types = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2])
@@ -147,9 +143,7 @@ def test_trifuse_reads_sigma_and_solver_state():
     torch.manual_seed(13)
     trifuse = TriFuse(
         node_dim=32, input_dim=16, ns=8, nv=2,
-        num_transformer_layers=1,
         num_conv_layers_per_expert=2,
-        dropout=0.0,
     ).eval()
     features = torch.randn(12, 16)
     coords = torch.randn(12, 3)
@@ -172,14 +166,26 @@ def test_trifuse_reads_sigma_and_solver_state():
     print("  [OK] TriFuse reads sigma and solver state")
 
 
+def test_trifuse_supports_odd_hidden_dimensions():
+    from tricoopdiff.legacy.trifuse import TriFuse
+
+    model = TriFuse(node_dim=31, input_dim=16, film_dim=4,
+                    num_conv_layers_per_expert=1).eval()
+    features = torch.randn(9, 16)
+    coords = torch.randn(9, 3)
+    node_types = torch.tensor([0] * 3 + [1] * 3 + [2] * 3)
+    output = model(features, coords, node_types, t_e3l=torch.tensor([.4]))
+    assert output['h_e3l'].shape == (1, 31)
+    assert all(gamma.shape[-1] == 4 for gamma, _ in output['film_params'])
+
+
 def test_trifuse_distinguishes_mirrored_interface_handedness():
     """Signed local geometry distinguishes mirror images with equal distances."""
     from tricoopdiff.legacy.trifuse import TriFuse
 
     torch.manual_seed(23)
     trifuse = TriFuse(
-        node_dim=32, input_dim=16, num_transformer_layers=1,
-        num_conv_layers_per_expert=2, dropout=0.0,
+        node_dim=32, input_dim=16, num_conv_layers_per_expert=2,
     ).eval()
     features = torch.randn(9, 16)
     node_types = torch.tensor([0] * 3 + [1] * 3 + [2] * 3)
@@ -224,8 +230,7 @@ def test_trifuse_atom_film_can_select_ligand_regions():
 
     torch.manual_seed(19)
     trifuse = TriFuse(
-        node_dim=32, input_dim=16, num_transformer_layers=1,
-        num_conv_layers_per_expert=2, film_dim=8, dropout=0.0,
+        node_dim=32, input_dim=16, num_conv_layers_per_expert=2, film_dim=8,
     ).eval()
     torch.nn.init.normal_(trifuse.film_heads[0].net.weight, std=0.02)
     features = torch.randn(12, 16)
@@ -346,8 +351,7 @@ def test_expert_telemetry_conditions_bond_context():
 
     torch.manual_seed(17)
     trifuse = TriFuse(
-        node_dim=32, input_dim=16, num_transformer_layers=1,
-        num_conv_layers_per_expert=2, dropout=0.0,
+        node_dim=32, input_dim=16, num_conv_layers_per_expert=2,
     ).eval()
     width = 2 * TELEMETRY_PER_LAYER + TELEMETRY_TAIL
     bonds = torch.randn(1, 3, 32)
@@ -536,7 +540,7 @@ def test_frozen_expert_features_preserve_scores_gradients_and_hook_cleanup():
             return nodes[:, :3], nodes[:, 3:], nodes[:, -1], nodes.new_zeros(1)
 
     expert = FrozenDiffDock(NativeExpert(), num_conv_layers=1)
-    assert expert.node_scalar_dim == 3
+    assert expert.node_scalar_dim == 3 and expert.node_vector_dim == 1
     original_keys = set(expert.state_dict())
     for mode in ('componentwise', 'irrep_norm'):
         configure_expert_policy(expert, .75, mode)
@@ -548,6 +552,21 @@ def test_frozen_expert_features_preserve_scores_gradients_and_hook_cleanup():
         expected = torch.cat((ordinary[0][:, :2], ordinary[2][:, None]), dim=-1)
         assert torch.equal(scalars, expected), '0e/0o extraction must follow irrep sections'
         assert scalars.shape == (2, expert.node_scalar_dim)
+        if mode == 'componentwise':
+            try:
+                expert.forward_features(coords, include_vectors=True)
+            except ValueError as error:
+                assert 'require irrep_norm' in str(error)
+            else:
+                raise AssertionError('componentwise clipping must not enter an equivariant vector bridge')
+            continue
+        _, _, _, _, vectors = expert.forward_features(coords, include_vectors=True)
+        native_nodes = expert.model.conv_layers[0](coords)
+        from tricoopdiff.geometry.equivariant_clamp import clamp_irrep_features
+        expected_vectors = clamp_irrep_features(native_nodes[:, 2:5], '1x1o', .75).reshape(-1, 1, 3)
+        assert vectors.shape == (2, 1, 3)
+        assert torch.equal(vectors, expected_vectors), 'equivariant node bridge must retain and clamp l=1 channels'
+        assert torch.isfinite(vectors).all()
         native_gradient = torch.autograd.grad(expected.sum(), coords)[0]
         scalars.sum().backward()
         assert torch.equal(coords.grad, native_gradient), 'features must preserve native post-clamp Jacobians'
@@ -593,75 +612,6 @@ def test_frozen_expert_features_preserve_scores_gradients_and_hook_cleanup():
     expert.model.fail = False
     assert expert.forward_features(coords)[3].shape == (2, 3)
     print('  [OK] Frozen feature scores, coordinate gradients and hook cleanup')
-
-
-def test_integrated_experts_pack_both_branches_without_losing_ragged_identity():
-    """One 2B call preserves FiLM, scalar/vector rows, torsions and gradients."""
-    from types import MethodType, SimpleNamespace
-    from torch_geometric.data import HeteroData
-    from tricoopdiff.models.consensus import ConsensusCoopDiff
-
-    class Expert(torch.nn.Module):
-        ns, node_scalar_dim, node_vector_dim = 2, 2, 1
-
-        def __init__(self):
-            super().__init__()
-            self.model = SimpleNamespace(no_torsion=False)
-            self.calls = 0
-
-        def forward_features(self, graph, film=None, return_vectors=False):
-            self.calls += 1
-            positions = torch.cat((graph['ligand'].pos, graph['receptor'].pos))
-            scalars = positions[:, :2] * (1 + film[0][0]) + film[0][1]
-            tr = positions.new_zeros(graph.num_graphs, 3).index_add(
-                0, graph['ligand'].batch, graph['ligand'].pos)
-            torsion = graph['ligand'].pos[graph['ligand'].edge_mask, 0]
-            return tr, tr * .1, torsion, scalars, positions[:, None]
-
-    fuse = torch.nn.Module()
-    fuse.endpoint_v2 = fuse.enhanced_conditions = fuse.refined_conditions = True
-    fuse.integrated_conditions = True
-    fuse.config = {'expert_scalar_dim': 2, 'expert_film_dim': 2, 'expert_vector_dim': 1}
-    model = ConsensusCoopDiff(Expert(), fuse)
-    inputs, pairs = [], []
-    torch.manual_seed(91)
-    for case in range(2):
-        pair = []
-        for branch in range(2):
-            graph = HeteroData()
-            for kind, count in (('ligand', 3 + case), ('receptor', 4 + case + branch)):
-                value = torch.randn(count, 3, requires_grad=True)
-                inputs.append(value)
-                graph[kind].pos = value
-                graph[kind].batch = torch.zeros(count, dtype=torch.long)
-            graph['ligand'].edge_mask = torch.arange(3 + case) <= case
-            graph.num_graphs = 1
-            count = len(graph['ligand'].pos) + len(graph['receptor'].pos)
-            film = tuple(torch.randn(count, 2, requires_grad=True) for _ in range(2))
-            inputs.extend(film)
-            pair.append((graph, [film]))
-        pairs.append(pair)
-
-    def trajectory(self, pair):
-        if self.trifuse.integrated_conditions:
-            return (yield pair)
-        return [(yield pair[0]), (yield pair[1])]
-
-    model._forward_one = MethodType(trajectory, model)
-    requests = [{'pair': pair} for pair in pairs]
-    together = model.forward_many(requests)
-    assert model.expert.calls == 1, 'v9 must combine both independent expert branches'
-    fuse.integrated_conditions = False
-    model.expert.calls = 0
-    separate = model.forward_many(requests)
-    assert model.expert.calls == 2, 'older profiles must preserve their two-pass execution'
-    flat = lambda results: [value for case in results for branch in case for value in branch]
-    for actual, expected in zip(flat(together), flat(separate)):
-        assert torch.allclose(actual, expected), 'packed branch/node/FiLM ordering changed'
-    gradients = [torch.autograd.grad(sum(value.square().sum() for value in flat(result)), inputs)
-                 for result in (together, separate)]
-    for actual, expected in zip(*gradients):
-        assert torch.isfinite(actual).all() and torch.allclose(actual, expected, atol=1e-6)
 
 
 def test_failed_expert_policy_configuration_preserves_the_live_policy():
@@ -765,6 +715,19 @@ def test_deepternary_dockq_alignment():
     print("  [OK] DeepTernary DockQ alignment")
 
 
+def test_cross_edge_taper_preserves_internal_weights():
+    from tricoopdiff.diffdock.models.cg_model import CGModel
+
+    expert_policy = SimpleNamespace(smooth_edges=False)
+    edge_vec = torch.tensor([[1., 0., 0.], [2., 0., 0.]])
+    internal = CGModel.get_edge_weight(expert_policy, edge_vec, 4.)
+    cross = CGModel.get_edge_weight(expert_policy, edge_vec, 4., smooth=True)
+    expected = .5 * (torch.cos(edge_vec.norm(dim=-1) * torch.pi / 4.) + 1.)
+    assert internal == 1.0
+    assert torch.allclose(cross[:, 0], expected)
+    print("  [OK] Cross-edge taper preserves internal pretrained weights")
+
+
 if __name__ == "__main__":
     print("=== TriCoopDiff Smoke Tests ===\n")
 
@@ -772,6 +735,7 @@ if __name__ == "__main__":
     test_trifuse_reads_geometry_and_preserves_rigid_invariance()
     test_trifuse_links_chemical_features_to_local_contacts()
     test_trifuse_reads_sigma_and_solver_state()
+    test_trifuse_supports_odd_hidden_dimensions()
     test_trifuse_distinguishes_mirrored_interface_handedness()
     test_film_zero_init()
     test_trifuse_atom_film_can_select_ligand_regions()
@@ -787,11 +751,11 @@ if __name__ == "__main__":
     test_initializer_body_frame()
     test_frozen_expert_stays_eval()
     test_frozen_expert_features_preserve_scores_gradients_and_hook_cleanup()
-    test_integrated_experts_pack_both_branches_without_losing_ragged_identity()
     test_failed_expert_policy_configuration_preserves_the_live_policy()
     test_expert_loader_cannot_mislabel_the_frozen_layer_count()
     test_score_guard_handles_infinity()
     test_reflect_pipeline()
     test_deepternary_dockq_alignment()
+    test_cross_edge_taper_preserves_internal_weights()
 
     print("\n=== All tests passed ===")

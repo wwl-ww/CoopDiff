@@ -23,7 +23,6 @@ CHECKPOINT_VERSION = 17
 INDEPENDENT_RIGID_MODE = 'independent_centroids_v1'
 LEGACY_RIGID_MODE = 'dual_interfaces_v1'
 CONTINUOUS_TORSION_MODE = 'continuous_horizontal_v1'
-SYMMETRIC_TORSION_MODE = 'symmetric_horizontal_v1'
 
 
 def _check_coords(coords):
@@ -40,6 +39,18 @@ def _raw_torsions(coords, bonds, masks, angles):
     return modify_conformer_torsion_angles(
         coords.copy(), torch.as_tensor(bonds), masks, angles, as_numpy=True,
     )
+
+
+def horizontal_torsion_spin(coords, displacement, gauge_prior):
+    """Differentiable executor gauge; supports batched candidate rotor tangents."""
+    centered = (coords - coords.mean(-2, keepdim=True)).double()
+    identity = torch.eye(3, dtype=torch.float64, device=coords.device)
+    inertia = centered.square().sum((-2, -1))[..., None, None] * identity
+    inertia = inertia - centered.transpose(-1, -2) @ centered
+    torque = torch.linalg.cross(centered, displacement.double(), dim=-1).sum(-2)
+    ridge = inertia.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(torch.finfo(torch.float64).tiny) * 1e-6
+    return torch.linalg.solve(inertia + ridge[..., None, None] * identity,
+                              (torque + ridge[..., None] * gauge_prior.double())[..., None]).squeeze(-1)
 
 
 def _horizontal_torsion_velocity(coords, bonds, masks, angular_velocity):
@@ -121,23 +132,6 @@ class SDPIFlow:
 
     def forward_state(self, model, e3_data, poi_data, ligand_data,
                       ligand, poi, body, t, dt, source=0, conditions=None):
-        return self.forward_states(model, [(e3_data, poi_data, ligand_data, ligand,
-                                           poi, body, t, dt, source, conditions)])[0]
-
-    def forward_states(self, model, states):
-        """One shared clock/geometry contract for single and ragged batch execution."""
-        requests = [self._forward_inputs(model, *state) for state in states]
-        outputs = (model.forward_many(requests) if hasattr(model, 'forward_many')
-                   else [model(request['e3_data'], request['poi_data'], request['ligand_data'],
-                               **{key: value for key, value in request.items()
-                                  if key not in ('e3_data', 'poi_data', 'ligand_data')})
-                         for request in requests])
-        for output in outputs:
-            self._validate_output(model, output)
-        return outputs
-
-    def _forward_inputs(self, model, e3_data, poi_data, ligand_data,
-                        ligand, poi, body, t, dt, source=0, conditions=None):
         """Read the same current geometry and expert clock in both execution paths.
 
         Template coordinates supply fixed conditioning scales; moving coordinates
@@ -149,22 +143,19 @@ class SDPIFlow:
             tr_sigma, _, _ = self.t_to_sigma(t, t, t)
             crop = tr_sigma * 3 + 20
         condition_kwargs = {'conditions': conditions} if conditions is not None else {}
-        return dict(e3_data=e3_data, poi_data={**poi_data, 'coords': poi},
-                    ligand_data={**ligand_data, 'coords': ligand}, t_e3l=t, t_pol=t,
-                    r_e3_to_poi=body, diffusion_state=conditioning,
-                    receptor_crop_cutoff=crop, source=source, **condition_kwargs)
-
-    @staticmethod
-    def _validate_output(model, output):
+        output = model(e3_data, {**poi_data, 'coords': poi},
+                       {**ligand_data, 'coords': ligand}, t_e3l=t, t_pol=t,
+                       r_e3_to_poi=body, diffusion_state=conditioning,
+                       receptor_crop_cutoff=crop, source=source, **condition_kwargs)
         if (getattr(getattr(model, 'trifuse', None), 'direct_ternary_motion', False)
                 and output.get('normalized_velocity', {}).get('rigid_output_mode')
                 != INDEPENDENT_RIGID_MODE):
             raise ValueError('direct model must execute independent centroid motion')
-        symmetric = getattr(getattr(model, 'trifuse', None), 'symmetric_torsion', False)
-        if ((symmetric or getattr(getattr(model, 'trifuse', None), 'continuous_torsion', False))
+        if (getattr(getattr(model, 'trifuse', None), 'continuous_torsion', False)
                 and output.get('normalized_velocity', {}).get('torsion_update_mode')
-                != (SYMMETRIC_TORSION_MODE if symmetric else CONTINUOUS_TORSION_MODE)):
+                != CONTINUOUS_TORSION_MODE):
             raise ValueError('continuous torsion model must execute its horizontal update')
+        return output
 
     @staticmethod
     def scales(e3_coords, poi_coords):
@@ -272,7 +263,7 @@ class SDPIFlow:
             raise FloatingPointError('non-finite flow body frame')
         torsion = velocities['torsion']
         torsion_mode = velocities.get('torsion_update_mode')
-        if torsion_mode not in (None, CONTINUOUS_TORSION_MODE, SYMMETRIC_TORSION_MODE):
+        if torsion_mode not in (None, CONTINUOUS_TORSION_MODE):
             raise ValueError(f'unknown torsion update mode: {torsion_mode!r}')
         # A no_torsion expert can disable torsions even when the chemical graph
         # contains rotatable bonds. Match the production empty-output contract.
@@ -291,8 +282,7 @@ class SDPIFlow:
                 or masks.shape != (len(bonds), ligand.shape[1])):
             raise ValueError('finite torsion velocities and ligand graph sizes must agree')
         raw = rigid
-        symmetric = torsion_mode == SYMMETRIC_TORSION_MODE
-        displacement = torch.zeros_like(rigid) if torsion_mode in (CONTINUOUS_TORSION_MODE, SYMMETRIC_TORSION_MODE) else None
+        displacement = torch.zeros_like(rigid) if torsion_mode == CONTINUOUS_TORSION_MODE else None
         gauge_prior = torch.zeros_like(rigid[:, 0]) if displacement is not None else None
         for index, (u, v) in enumerate(bonds):
             axis = raw[:, u] - raw[:, v]
@@ -303,21 +293,14 @@ class SDPIFlow:
                 initial_axis = rigid[:, u] - rigid[:, v]
                 initial_axis = initial_axis / torch.linalg.vector_norm(initial_axis, dim=-1, keepdim=True)
                 angle = initial_axis * (-dt * torsion[:, index])[:, None]
-                if not symmetric:
-                    gauge_prior = gauge_prior + .5 * angle
-                pivot = (rigid[:, u:u + 1] + rigid[:, v:v + 1]) * .5 if symmetric else rigid[:, v:v + 1]
-                side = masks[index].to(rigid.dtype) - (.5 if symmetric else 0.)
+                gauge_prior = gauge_prior + .5 * angle
                 displacement = displacement + torch.linalg.cross(
-                    angle[:, None].expand_as(rigid), rigid - pivot, dim=-1,
-                ) * side[None, :, None]
-            rotation = rotation_exp(axis / norm * (-dt * torsion[:, index])[:, None]
-                                    * (.5 if symmetric else 1.))
-            pivot = (raw[:, u:u + 1] + raw[:, v:v + 1]) * .5 if symmetric else raw[:, v:v + 1]
+                    angle[:, None].expand_as(rigid), rigid - rigid[:, v:v + 1], dim=-1,
+                ) * masks[index][None, :, None]
+            rotation = rotation_exp(axis / norm * (-dt * torsion[:, index])[:, None])
+            pivot = raw[:, v:v + 1]
             moved = (raw - pivot) @ rotation.transpose(-1, -2) + pivot
-            # Reversing the axis and complementing the mask swaps the two
-            # half-rotations exactly, not merely their infinitesimal tangent.
-            stationary = (raw - pivot) @ rotation + pivot if symmetric else raw
-            raw = torch.where(masks[index][None, :, None], moved, stationary)
+            raw = torch.where(masks[index][None, :, None], moved, raw)
         if len(bonds):
             if displacement is None:
                 rotation, translation, _ = proper_rigid_fit(raw, rigid)
@@ -328,20 +311,11 @@ class SDPIFlow:
                 # Instead retract the local horizontal torsion tangent: remove
                 # its mean motion and rigid spin, without changing shape DOFs.
                 center = rigid.mean(1, keepdim=True)
-                centered = (rigid - center).double()
-                identity = torch.eye(3, dtype=torch.float64, device=rigid.device)[None]
-                inertia = centered.square().sum((1, 2))[:, None, None] * identity
-                inertia = inertia - centered.transpose(1, 2) @ centered
-                torque = torch.linalg.cross(centered, displacement.double(), dim=-1).sum(1)
-                # The symmetric finite chart already removes half-side spin;
-                # its zero prior is the same tangent as the historical chart.
-                # Symmetric half-side gauge keeps the legacy ridge prior covariant
+                # Symmetric half-side gauge keeps the ridge prior covariant
                 # under bond reversal plus complementary rotation fragments.
                 # A zero-spin prior would leave an orientation-dependent
                 # first-order residual, even though the ideal projection does not.
-                ridge = inertia.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(torch.finfo(torch.float64).tiny) * 1e-6
-                spin = torch.linalg.solve(inertia + ridge[:, None, None] * identity,
-                                          (torque + ridge[:, None] * gauge_prior.double())[:, :, None]).squeeze(-1)
+                spin = horizontal_torsion_spin(rigid, displacement, gauge_prior)
                 rotation = rotation_exp(-spin).to(rigid.dtype)
                 rigid = (raw - raw.mean(1, keepdim=True)) @ rotation.transpose(-1, -2) + center
         _check_coords(rigid)

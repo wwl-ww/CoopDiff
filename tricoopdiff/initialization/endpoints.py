@@ -102,6 +102,7 @@ def endpoint_internal_geometry(reference, endpoint, edge_index, atol=1e-4):
 
 
 ENDPOINT_PROJECTION_VERSION = "torsion_rigid_endpoint_projection_v1"
+PROJECTION_SOLVER_VERSION = "explicit_rotation_torsion_least_squares_v2"
 
 
 def _mask_array(mask_rotate, bond_count, atom_count):
@@ -144,7 +145,7 @@ def _fit_numpy_rigid(source, target):
 
 def project_endpoint_coupling(ligand_data, native_poi, endpoint_ligand,
                               endpoint_poi, *, no_torsion=False,
-                              max_nfev=4000, exact_atol=1e-3):
+                              max_nfev=400, exact_atol=1e-3):
     """Project an external endpoint into the SDPI torsion-plus-SE(3) chart.
 
     The returned coupling can be passed directly to :meth:`SDPIFlow.path`.
@@ -176,11 +177,15 @@ def project_endpoint_coupling(ligand_data, native_poi, endpoint_ligand,
     bonds = edge_index.T[edge_mask].astype(np.int64, copy=False)
     masks = _mask_array(ligand_data["mask_rotate"], len(bonds), len(native_ligand))
 
-    def residual(angles):
-        shape = _raw_torsions(native_ligand, bonds, masks, angles)
-        rotation, translation, _, _ = _fit_numpy_rigid(shape, endpoint_ligand)
-        fitted = shape @ rotation.T + translation
-        return (fitted - endpoint_ligand).reshape(-1)
+    target_centered = endpoint_ligand - endpoint_ligand.mean(0)
+
+    def residual(parameters):
+        # Optimize rotation explicitly. Re-fitting Kabsch inside every residual
+        # makes finite-difference torsion derivatives depend on an SVD chart
+        # that is non-unique near collinear/symmetric intermediate conformers.
+        shape = _raw_torsions(native_ligand, bonds, masks, parameters[:-3])
+        rotation = Rotation.from_rotvec(parameters[-3:]).as_matrix()
+        return ((shape - shape.mean(0)) @ rotation.T - target_centered).reshape(-1)
 
     if no_torsion or not len(bonds):
         angles = np.zeros(len(bonds), dtype=np.float64)
@@ -219,16 +224,41 @@ def project_endpoint_coupling(ligand_data, native_poi, endpoint_ligand,
                 selected = np.unravel_index(quality.argmax(), quality.shape)
                 if quality[selected] > 1e-20:
                     initial_angles[index] = (phases[0][selected] - phases[1][selected] + np.pi) % (2 * np.pi) - np.pi
-        # Strained conformers can need >400 evaluations to reach the same
-        # strict tolerance. This is a ceiling, not work forced on easy cases.
-        fitted = least_squares(
-            residual, initial_angles, max_nfev=int(max_nfev),
-            ftol=1e-10, xtol=1e-10, gtol=1e-10,
-        )
-        angles = (fitted.x + np.pi) % (2 * np.pi) - np.pi
+        def start(angles):
+            shape = _raw_torsions(native_ligand, bonds, masks, angles)
+            rotation, _, _, _ = _fit_numpy_rigid(shape, endpoint_ligand)
+            return np.concatenate((angles, Rotation.from_matrix(rotation).as_rotvec()))
+
+        attempts = []
+        fitted = None
+        for initial in (initial_angles, np.zeros_like(initial_angles)):
+            candidate = least_squares(
+                residual, start(initial), max_nfev=int(max_nfev), jac='3-point',
+                ftol=1e-8, xtol=1e-10, gtol=1e-8)
+            attempts.append(candidate)
+            # Budget exhaustion is not accepted. Continue from the actual best
+            # state, rather than dropping the sample or inventing a target.
+            if not candidate.success and candidate.status == 0:
+                candidate = least_squares(
+                    residual, candidate.x, max_nfev=3 * int(max_nfev), jac='3-point',
+                    ftol=1e-8, xtol=1e-10, gtol=1e-8)
+                attempts.append(candidate)
+            if candidate.success and np.isfinite(candidate.fun).all():
+                if fitted is None or candidate.cost < fitted.cost:
+                    fitted = candidate
+                if np.sqrt(np.mean(candidate.fun ** 2)) < 1e-8:
+                    break
+        if fitted is None:
+            fitted = min(attempts, key=lambda result: result.cost)
+        angles = (fitted.x[:-3] + np.pi) % (2 * np.pi) - np.pi
         optimization = {
             "success": bool(fitted.success), "status": int(fitted.status),
-            "nfev": int(fitted.nfev),
+            "nfev": sum(int(result.nfev) for result in attempts),
+            "solver": PROJECTION_SOLVER_VERSION,
+            "optimality": float(fitted.optimality), "message": str(fitted.message),
+            "attempts": [{"success": bool(result.success), "status": int(result.status),
+                          "nfev": int(result.nfev), "cost": float(result.cost),
+                          "optimality": float(result.optimality)} for result in attempts],
         }
     shape = _raw_torsions(native_ligand, bonds, masks, angles)
     shape += native_ligand.mean(0) - shape.mean(0)
@@ -375,22 +405,24 @@ ONLINE_TRAINING_ENDPOINT_PROTOCOL = "online_bitseed_training_c1_m1_v1"
 RESAMPLED_TRAINING_ENDPOINT_PROTOCOL = "online_bitseed_raw_resampled_v2"
 
 
-def ligand_symmetries(ligand_data):
-    """Exact graph automorphisms preserving elements, bonds and stereochemistry."""
-    from rdkit import Chem
-    mol = ligand_data.get('mol')
-    if isinstance(mol, bytes):
-        mol = Chem.Mol(mol)
-    if mol is None or mol.GetNumAtoms() != ligand_data['coords'].shape[-2]:
-        raise ValueError('symmetric supervision requires the indexed RDKit molecule')
-    matches = mol.GetSubstructMatches(mol, uniquify=False, useChirality=True, maxMatches=4097)
-    if not matches or len(matches) > 4096:
-        raise ValueError('ligand automorphism enumeration is empty or exceeds 4096; refusing a truncated loss')
-    return np.asarray(sorted(set(matches)), dtype=np.int64)
+class EndpointProjectionError(ValueError):
+    """A reproducible failed target solve, not a reason to skip training data."""
+
+    def __init__(self, report, ligand_data, initial_ligand, initial_poi, native_poi):
+        super().__init__(f'reachable target torsion projection did not converge: {report}')
+        self.diagnostics = {
+            'report': report,
+            'initial_ligand': _coordinates(initial_ligand, 'initial ligand'),
+            'initial_poi': _coordinates(initial_poi, 'initial POI'),
+            'target_ligand': _coordinates(ligand_data['coords'], 'target ligand'),
+            'target_poi': _coordinates(native_poi, 'target POI'),
+            **{key: value.detach().cpu() if torch.is_tensor(value) else value
+               for key, value in ligand_data.items() if key in ('edge_index', 'edge_mask', 'mask_rotate')},
+        }
 
 
 def reachable_ligand_target(ligand_data, initial_ligand, initial_poi, native_poi,
-                            *, no_torsion=False, symmetries=None, return_candidates=False):
+                            *, no_torsion=False):
     """Project only the supervision target, never the inference-like input.
 
     Bond lengths/rigid fragments stay those of the sampled conformer. Protein
@@ -398,30 +430,12 @@ def reachable_ligand_target(ligand_data, initial_ligand, initial_poi, native_poi
     coordinate surrogate, not an assertion of exact native ligand geometry.
     """
     reference = {**ligand_data, 'coords': initial_ligand}
-    native = _coordinates(ligand_data['coords'], 'native ligand')
-    permutations = (np.arange(len(native))[None] if symmetries is None else symmetries)
-    if not len(permutations):
-        raise ValueError('reachable target requires at least one atom correspondence')
-    best = None
-    candidates = []
-    for permutation in permutations:
-        _, projected, report = project_endpoint_coupling(
-            reference, initial_poi, native[permutation], native_poi,
-            no_torsion=no_torsion)
-        if report['torsion_optimization']['success']:
-            candidates.append(projected['ligand'])
-            if best is None or report['ligand_projection_rmsd_angstrom'] < best[1]['ligand_projection_rmsd_angstrom']:
-                best = projected, report
-    if best is None:
-        raise ValueError('reachable target torsion projection did not converge: '
-                         f'last_optimizer={report["torsion_optimization"]}, '
-                         f'last_rmsd={report["ligand_projection_rmsd_angstrom"]:.6g} A')
-    projected, report = best
-    if symmetries is not None:
-        report = {**report, 'symmetry_contract': 'stereo_graph_automorphisms_v1',
-                  'symmetry_count': len(symmetries)}
-    result = projected['ligand'], report
-    return (*result, np.stack(candidates).reshape(-1, len(native), 3)) if return_candidates else result
+    _, projected, report = project_endpoint_coupling(
+        reference, initial_poi, ligand_data['coords'], native_poi,
+        no_torsion=no_torsion)
+    if not report['torsion_optimization']['success']:
+        raise EndpointProjectionError(report, ligand_data, initial_ligand, initial_poi, native_poi)
+    return projected['ligand'], report
 
 
 def validate_raw_endpoint_record(record):
@@ -612,12 +626,9 @@ class LazyTrainingEndpointStore:
             raise AssertionError(f"{case}: C=1/M=1 must produce exactly one endpoint")
         candidate = candidates[0]
         actual_source = candidate["candidate_id"][0]
-        try:
-            target, projection = reachable_ligand_target(
-                ligand, candidate['ligand'], candidate['poi'], poi['coords'],
-                no_torsion=initializer.no_torsion)
-        except ValueError as error:
-            raise ValueError(f'{case}, occurrence={occurrence}: {error}') from error
+        target, projection = reachable_ligand_target(
+            ligand, candidate['ligand'], candidate['poi'], poi['coords'],
+            no_torsion=initializer.no_torsion)
         record = {
             'case': case, 'actual_source': actual_source,
             'candidate_id': candidate['candidate_id'], 'occurrence': occurrence,

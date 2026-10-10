@@ -3,18 +3,18 @@
 import torch
 
 from tricoopdiff.models.expert import validate_expert_base_identity
-from tricoopdiff.models.consensus import ConsensusCoopDiff
-from tricoopdiff.train import ConsensusTrainer, TriCoopDiffTrainer
+from tricoopdiff.models.assembly import TernaryAssemblyModel
+from tricoopdiff.train import AssemblyTrainer, TriCoopDiffTrainer
 from tricoopdiff.runtime import atomic_torch_save
 
 EXPERIMENT_ARCHITECTURE = 'residual_consensus_factorial_v1'
 
 
-class ExperimentalConsensus(ConsensusCoopDiff):
+class ExperimentalConsensus(TernaryAssemblyModel):
     """Factorial consensus model with an immutable pretrained expert."""
     architecture = EXPERIMENT_ARCHITECTURE
 
-class ExperimentalConsensusTrainer(ConsensusTrainer):
+class ExperimentalConsensusTrainer(AssemblyTrainer):
     """Train and serialize a factorial frozen-expert consensus model."""
     training_objective = 'sdpi_velocity_mse_v1'
     mixed_endpoint_protocol = 'online_bitseed_training_c1_m1_v1'

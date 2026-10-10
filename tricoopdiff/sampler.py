@@ -22,7 +22,9 @@ import torch
 
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.sdpi_flow import SDPIFlow, FLOW_VERSION
-from tricoopdiff.models.consensus import SOURCE_NAMES, packed_groups
+from tricoopdiff.models.assembly import (
+    DIRECT_RANK_FEATURE_STATE, LEGACY_RANK_FEATURE_STATE, SOURCE_NAMES,
+)
 from tricoopdiff.runtime import evaluation_context
 
 
@@ -70,7 +72,8 @@ def _sampling_context(function):
     return wrapped
 
 
-def _sample_trajectory(
+@_sampling_context
+def sample_single(
     model,
     diffusion: SDPIFlow,
     initializer: TernaryInitializer,
@@ -91,7 +94,6 @@ def _sample_trajectory(
     return_rank_features: bool = False,
     return_body_frame: bool = False,
     conditions=None,
-    allow_step_change=False,
 ) -> dict:
     """
     Run one reverse-flow trajectory (single walker) from t=1 to t=0.
@@ -129,9 +131,6 @@ def _sample_trajectory(
         steps = diffusion.inference_steps
     if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
         raise ValueError("steps must be a positive integer")
-    trained_steps = getattr(model, 'trained_inference_steps', None)
-    if trained_steps is not None and steps != trained_steps and not allow_step_change:
-        raise ValueError('sampling steps differ from training; use allow_step_change only for an explicit step-consistency experiment')
     for name, value in (("translation_velocity_scale", translation_velocity_scale),
                         ("rotation_velocity_scale", rotation_velocity_scale)):
         if not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
@@ -220,8 +219,9 @@ def _sample_trajectory(
             setattr(model, '_debug_step0_probe', True)
             setattr(model, '_last_step0_probe', None)
         try:
-            out = yield (e3_data, poi_data, ligand_data, ligand_pos, poi_pos,
-                         r_e3_to_poi, t_tr, dt_tr, source_index, conditions)
+            out = diffusion.forward_state(
+                model, e3_data, poi_data, ligand_data, ligand_pos, poi_pos,
+                r_e3_to_poi, t_tr, dt_tr, source_index, conditions)
         finally:
             if return_trace:
                 setattr(model, '_debug_step0_probe', probe_enabled)
@@ -337,25 +337,11 @@ def _sample_trajectory(
         "poi_coords": poi_pos[0].detach().cpu().numpy(),
         "initialization": initialization,
         "valid": not nonfinite_score_steps,
-        "numerically_valid": not nonfinite_score_steps,
-        "physical_valid": None,
-        "physical_check_scope": "not_checked",
         "nonfinite_score_steps": nonfinite_score_steps,
         "termination_reason": (
             "nonfinite_score" if nonfinite_score_steps else "completed"
         ),
     }
-    if not nonfinite_score_steps and ligand_data.get('mol') is not None:
-        from tricoopdiff.geometry.reflect import (atom_vdw_radii, ligand_atomic_numbers,
-                                                 ligand_nonbonded_mask, steric_pair_penalty)
-        radii = atom_vdw_radii(ligand_atomic_numbers(ligand_data), ligand_pos)
-        _, clashes, pairs = steric_pair_penalty(ligand_pos[0], ligand_pos[0], radii, radii,
-                                               mask=ligand_nonbonded_mask(ligand_data, ligand_pos.device))
-        result.update(physical_check_scope='ligand_internal_nonbonded_only',
-                      ligand_internal_clash_pairs=int(clashes), ligand_internal_checked_pairs=pairs,
-                      ligand_internal_valid=bool(clashes == 0))
-        # No protein heavy atoms here: absence of internal clashes is NOT
-        # a certificate of complete ternary physical validity.
     if return_trajectory:
         result["trajectory"] = trajectory
     if return_body_frame:
@@ -363,47 +349,21 @@ def _sample_trajectory(
     if return_trace:
         result["trace"] = trace
     if return_rank_features and not nonfinite_score_steps:
-        final = yield (e3_data, poi_data, ligand_data, ligand_pos, poi_pos,
-                       r_e3_to_poi, ligand_pos.new_zeros(1), ligand_pos.new_zeros(1),
-                       source_index, conditions)
+        final = diffusion.forward_state(
+            model, e3_data, poi_data, ligand_data, ligand_pos, poi_pos,
+            r_e3_to_poi, ligand_pos.new_zeros(1), ligand_pos.new_zeros(1),
+            source_index, conditions)
         features = final.get('rank_features')
         if (features is None or features.ndim != 2 or features.shape[0] != 1
                 or not torch.isfinite(features).all()):
             raise ValueError('model did not return finite final rank_features [1,D]')
         final_rank_features = features[0].detach().cpu().numpy().copy()
         result['rank_features'] = final_rank_features
-        result['rank_feature_state'] = 'final_pose_t0_dt0_v1'
+        trifuse = getattr(model, 'trifuse', None)
+        state = (DIRECT_RANK_FEATURE_STATE if getattr(trifuse, 'direct_ternary_motion', False)
+                 else LEGACY_RANK_FEATURE_STATE)
+        result['rank_feature_state'] = state
     return result
-
-
-def _run_trajectories(model, diffusion, trajectories):
-    pending, results = {}, [None] * len(trajectories)
-    try:
-        for index, trajectory in enumerate(trajectories):
-            pending[index] = next(trajectory)
-        while pending:
-            work = [dict(zip(('e3_data', 'poi_data', 'ligand_data'), state[:3]), index=index)
-                    for index, state in pending.items()]
-            next_pending = {}
-            for group in packed_groups(work):
-                indices = [item['index'] for item in group]
-                outputs = diffusion.forward_states(model, [pending[index] for index in indices])
-                for index, output in zip(indices, outputs):
-                    try:
-                        next_pending[index] = trajectories[index].send(output)
-                    except StopIteration as finished:
-                        results[index] = finished.value
-            pending = next_pending
-    finally:
-        for trajectory in trajectories:
-            trajectory.close()
-    return results
-
-
-@_sampling_context
-def sample_single(model, diffusion, *args, **kwargs):
-    """One walker through the same executor used by packed ensemble inference."""
-    return _run_trajectories(model, diffusion, [_sample_trajectory(model, diffusion, *args, **kwargs)])[0]
 
 
 def sample_ensemble(
@@ -443,13 +403,19 @@ def sample_ensemble(
     if n_walkers < 1:
         raise ValueError("at least one walker is required")
 
-    trajectories = [
-        _sample_trajectory(model, diffusion, initializer, e3_data, poi_data, ligand_data,
-                           steps=steps, device=device, seed=seed, freeze_poi=freeze_poi,
-                           init_mode=init_mode, t_anchor=t_anchor,
-                           translation_velocity_scale=translation_velocity_scale,
-                           rotation_velocity_scale=rotation_velocity_scale,
-                           return_rank_features=return_rank_features, conditions=conditions)
-        for seed in seeds]
-    with evaluation_context(model):
-        return _run_trajectories(model, diffusion, trajectories)
+    results = []
+    for i in range(n_walkers):
+        print(f"[sample] walker {i + 1}/{n_walkers}, seed={seeds[i]}", flush=True)
+        results.append(
+            sample_single(
+                model, diffusion, initializer, e3_data, poi_data, ligand_data,
+                steps=steps, device=device, seed=seeds[i], freeze_poi=freeze_poi,
+                init_mode=init_mode,
+                t_anchor=t_anchor,
+                translation_velocity_scale=translation_velocity_scale,
+                rotation_velocity_scale=rotation_velocity_scale,
+                return_rank_features=return_rank_features,
+                conditions=conditions,
+            )
+        )
+    return results

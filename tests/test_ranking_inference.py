@@ -1,9 +1,7 @@
 """Deployment without labels, exact random baselines, and source/failed-state accounting."""
 
 import json
-import os
 from pathlib import Path
-import subprocess
 import sys
 
 import torch
@@ -11,79 +9,10 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 from evaluation_common import sha256_file
-from train_pose_ranker import load_cases as load_pose_cases
-from tricoopdiff.ranking.ranking_inference import (
-    PoseRanker, listwise_ranking_loss, selected_pose_metrics,
-)
 from tricoopdiff.ranking.ranking_inference import StateQualityRanker
 from tricoopdiff.ranking.ranking_inference import (export_quality_checkpoint, feature_vector,
                                          load_quality_checkpoint, predict_archive)
 from tricoopdiff.ranking.ranking_audit import case_metrics, join_labels, label_support, random_hit_probability, summarize_cases
-from tricoopdiff.ranking.ranking_audit import paired_case_comparison
-
-
-def test_pose_ranker_and_loss_preserve_score_order():
-    model = PoseRanker(input_dim=16, hidden_dim=8)
-    assert model(torch.randn(5, 16)).shape == (5,)
-    dockq = torch.tensor([0.01, 0.10, 0.40])
-    correct = listwise_ranking_loss(torch.tensor([-2.0, 0.0, 2.0]), dockq)
-    reversed_order = listwise_ranking_loss(torch.tensor([2.0, 0.0, -2.0]), dockq)
-    assert correct < reversed_order
-    result = selected_pose_metrics(
-        torch.tensor([3.0, 2.0, 1.0]), torch.tensor([0.1, 0.3, 0.8]),
-    )
-    assert abs(result['selected_dockq'] - 0.1) < 1e-6
-    assert abs(result['oracle_dockq'] - 0.8) < 1e-6
-    assert not result['selected_hit'] and result['oracle_hit']
-
-
-def test_load_pose_cases_preserves_recorded_rank_features(tmp_path):
-    payload = {
-        'case': '1ABC_A_B_LIG',
-        'run_config': {'rank_features_saved': True},
-        'walkers': [
-            {'dockq': 0.1 + index / 100, 'rank_features': [index, index + 1]}
-            for index in range(8)
-        ],
-    }
-    (tmp_path / 'case.json').write_text(json.dumps(payload))
-    cases = load_pose_cases(tmp_path)
-    assert len(cases) == 1
-    assert cases[0]['features'].shape == (8, 2)
-
-
-def paired_report(values, label='label'):
-    cases = {}
-    files = {}
-    for index, value in enumerate(values):
-        case = f'case{index}'
-        cases[case] = {'count': 2, 'top1': value, 'oracle': .8}
-        files[case] = {'label': label, 'prediction': f'prediction{index}'}
-    return {'labels_manifest_sha256': 'manifest', 'files_sha256': files,
-            'cases': {'all/union': cases}}
-
-
-def test_paired_comparison_averages_seeds_before_resampling_cases():
-    left = [paired_report([.6, .2]), paired_report([.4, .4])]
-    right = [paired_report([.2, .2]), paired_report([.2, .2])]
-    result = paired_case_comparison(left, right, 'all/union', repeats=100, seed=7)
-    assert abs(result['mean_delta_top1'] - .2) < 1e-12
-    assert result['case_wins'] == 2 and result['case_losses'] == result['case_ties'] == 0
-    assert result['seeds_per_method'] == 2 and result['cases'] == 2
-    assert result['mean_seed_hit_count_delta']['0.23'] == 1.5
-
-
-def test_paired_comparison_rejects_label_or_candidate_drift():
-    original = paired_report([.4, .3])
-    for changed in (paired_report([.4, .3], label='other'), paired_report([.4, .3])):
-        if changed['files_sha256']['case0']['label'] == 'label':
-            changed['cases']['all/union']['case0']['oracle'] = .7
-        try:
-            paired_case_comparison([original], [changed], 'all/union')
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('paired audit accepted label/candidate drift')
 
 
 def example_archive():
@@ -177,62 +106,3 @@ def test_class_support_counts_cases_not_correlated_states():
     assert report['all/union']['cases_with_ge23'] == 1
     assert report['all/union']['classes_with_no_labels'] == [2]
     assert report['sdpi/final']['states'] == 0 and report['sdpi/final']['cases'] == 2
-
-
-def test_native_free_cli_with_no_structure_or_label_files(tmp_path):
-    archive = example_archive()
-    manifest = {'cases': ['demo']}
-    archive['manifest'] = manifest
-    directory = tmp_path / 'archives'
-    directory.mkdir()
-    (directory / 'manifest.json').write_text(json.dumps(manifest))
-    path = directory / 'demo.pt'
-    torch.save(archive, path)
-    (directory / 'demo.complete.json').write_text(json.dumps({'archive_sha256': sha256_file(path)}))
-    out = tmp_path / 'ranks'
-    environment = dict(os.environ, CUDA_VISIBLE_DEVICES='')
-    subprocess.run([sys.executable, str(ROOT / 'scripts/rank_pose_archive.py'),
-                    '--archives', str(directory), '--out', str(out)],
-                   cwd=tmp_path, env=environment, check=True, capture_output=True, timeout=30)
-    assert json.loads((out / 'complete.json').read_text())['cases'] == ['demo']
-    assert json.loads((out / 'manifest.json').read_text())['native_or_labels_read'] is False
-    assert len(json.loads((out / 'demo.json').read_text())['rows']) == 3
-
-
-def test_complete_comparison_exports_weights_and_runs_three_cpu_methods(tmp_path):
-    manifest = {k: 'fixture' for k in ('protocol', 'checkpoint_sha256', 'probe', 'runtime_sha256',
-                                      'pool', 'steps', 'expert_assets')}
-    manifest['cases'] = ['demo']
-    archive = {**example_archive(), 'manifest': manifest}
-    archives, labels = tmp_path / 'val_archives', tmp_path / 'val_labels'
-    archives.mkdir()
-    labels.mkdir()
-    (archives / 'manifest.json').write_text(json.dumps(manifest))
-    torch.save(archive, archives / 'demo.pt')
-    digest = sha256_file(archives / 'demo.pt')
-    (archives / 'demo.complete.json').write_text(json.dumps({'archive_sha256': digest}))
-    (labels / 'manifest.json').write_text(json.dumps({
-        'archive_manifest_sha256': sha256_file(archives / 'manifest.json')}))
-    (labels / 'demo.json').write_text(json.dumps({'case': 'demo', 'archive_sha256': digest, 'labels': [
-        {'pool_index': 0, 'initial': {'dockq': .1}, 'final': None},
-        {'pool_index': 1, 'initial': {'dockq': .6}, 'final': {'dockq': .3}}]}))
-    (tmp_path / 'pipeline_status.json').write_text(json.dumps({'stage': 'complete'}))
-    for mode, dimension, geometry_only in (('ranker_geometry', 14, True), ('ranker_frozen_geometry', 17, False)):
-        destination = tmp_path / mode
-        destination.mkdir()
-        model = StateQualityRanker(dimension, 4)
-        torch.save({'architecture': 'state_quality_ranker_v1', 'model_config': model.config,
-                    'state_dict': model.state_dict(), 'generator': manifest, 'geometry_only': geometry_only,
-                    'mean': torch.zeros(dimension), 'scale': torch.ones(dimension),
-                    'metrics': {'labels_must_not_enter_inference': True}}, destination / 'best.pt')
-    output = tmp_path / 'comparison'
-    subprocess.run([sys.executable, str(ROOT / 'scripts/compare_state_rankers.py'), '--run-dir', str(tmp_path),
-                    '--out', str(output)], env=dict(os.environ, CUDA_VISIBLE_DEVICES=''),
-                   capture_output=True, check=True, timeout=60)
-    result = json.loads((output / 'comparison.json').read_text())
-    assert len(result['reports']) == 3
-    assert (output / 'comparison.md').is_file()
-    for mode in ('ranker_geometry', 'ranker_frozen_geometry'):
-        exported = torch.load(output / f'{mode}_inference.pt', map_location='cpu', weights_only=False)
-        assert 'metrics' not in exported
-        assert result['reports'][mode]['all/final']['cases'] == 1

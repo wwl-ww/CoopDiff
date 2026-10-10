@@ -218,6 +218,36 @@ def test_sampler_rejects_empty_ensemble():
             raise AssertionError('empty ensemble must not be reported as completed')
 
 
+def test_coupled_anchor_perturbation_preserves_local_geometry():
+    from tricoopdiff.initialization.candidates import coupled_anchor_perturbation
+
+    data = ligand_input('CCCCCCCC')
+    ligand = data['coords']
+    poi = ligand + torch.tensor([0., 0., 2.])
+    center = {'ligand': ligand, 'poi': poi, 'rotation': torch.eye(3)[None]}
+    e3 = ligand[0] - torch.tensor([0., 0., 2.])
+    before = ligand.clone()
+    result, meta = coupled_anchor_perturbation(
+        center, e3, data, seed=73, translation_std=0., rotation_std=0.)
+    assert meta['mode'] == 'two_anchor_coupled_torsion', 'separable anchors must use coupled motion'
+    a, b = meta['e3_anchor_atoms'], meta['poi_anchor_atoms']
+    assert torch.allclose(result['ligand'][0, a], ligand[0, a], atol=1e-4)
+    assert torch.allclose(torch.cdist(result['ligand'][0, b], result['poi'][0]),
+                          torch.cdist(ligand[0, b], poi[0]), atol=1e-4)
+    edges = data['edge_index'].T
+    def lengths(coords):
+        return (coords[0, edges[:, 0]] - coords[0, edges[:, 1]]).norm(dim=-1)
+    assert torch.allclose(lengths(result['ligand']), lengths(ligand), atol=1e-4)
+    again, _ = coupled_anchor_perturbation(
+        center, e3, data, seed=73, translation_std=0., rotation_std=0.)
+    assert torch.equal(result['ligand'], again['ligand'])
+    assert torch.equal(ligand, before), 'initialization must not mutate its center'
+    rigid_data = ligand_input('c1ccccc1')
+    rigid_center = {'ligand': rigid_data['coords'], 'poi': poi, 'rotation': torch.eye(3)[None]}
+    _, rigid_meta = coupled_anchor_perturbation(rigid_center, e3, rigid_data, seed=73)
+    assert rigid_meta['mode'] == 'rigid_only_no_separable_anchors'
+
+
 if __name__ == '__main__':
     for name, fn in list(globals().items()):
         if name.startswith('test_'):

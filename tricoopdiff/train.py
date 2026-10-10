@@ -16,27 +16,32 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from tricoopdiff.diffdock.utils.torus import SCORE_NORM_VERSION, validate_score_norm_version
 from tricoopdiff.geometry.equivariant_clamp import validate_clamp_mode
-from tricoopdiff.models.consensus import (
-    ARCHITECTURE, DIRECT_ARCHITECTURE, CONSENSUS_CHECKPOINT_VERSION,
+from tricoopdiff.models.assembly import (
+    ARCHITECTURE, DIRECT_ARCHITECTURE, PREVIOUS_DIRECT_ARCHITECTURE,
+    ASSEMBLY_CHECKPOINT_VERSION, EXPERT_CROP_POLICY,
     ENDPOINT_PROTOCOL_CHECKPOINT_VERSION,
     OBJECTIVE_CONTRACT_CHECKPOINT_VERSION,
-    INTERFACE_OBJECTIVE_CHECKPOINT_VERSION, MODEL_PROFILES,
-    production_model_config, packed_groups, PACKED_BATCH_LIMITS,
+    INTERFACE_OBJECTIVE_CHECKPOINT_VERSION, PRODUCTION_MODEL_PROFILE, VECTOR_EXPERT_MODEL_PROFILE,
+    production_model_config,
     LEGACY_CONSENSUS_CHECKPOINT_VERSION, PREVIOUS_CONSENSUS_CHECKPOINT_VERSION,
     SOURCE_CONTRACT_VERSION,
     candidate_source_tensor,
 )
 from tricoopdiff.models.expert import (expert_base_identity, validate_expert_base_identity,
-                                    configure_expert_policy, expert_runtime_identity)
+                                    configure_expert_policy, expert_runtime_identity, FrozenMatcha)
 from tricoopdiff.runtime import (atomic_torch_save, capture_rng_state, evaluation_context,
                                 preserve_rng, restore_rng_state)
 from tricoopdiff.sdpi_flow import (
-    CONTINUOUS_TORSION_MODE, SYMMETRIC_TORSION_MODE, FLOW_VERSION, INDEPENDENT_RIGID_MODE, LEGACY_RIGID_MODE, SDPIFlow,
+    CONTINUOUS_TORSION_MODE, FLOW_VERSION, INDEPENDENT_RIGID_MODE, LEGACY_RIGID_MODE, SDPIFlow,
 )
 
 
 class NonFiniteTrainingError(FloatingPointError):
     """Raised when a training sample cannot produce a valid optimization step."""
+
+
+LIGAND_GEOMETRY_SCALE_ANGSTROM = 1.0
+PROTEIN_GEOMETRY_SCALE_ANGSTROM = 1.0
 
 
 def clip_grad_norm_finite(parameters, max_norm=1.0):
@@ -232,18 +237,15 @@ class TriCoopDiffTrainer:
         rng_before = capture_rng_state()
         results = []
         try:
-            packed = getattr(self.model.trifuse, 'enhanced_conditions', False)
-            groups = (packed_groups(batches) if getattr(self.model.trifuse, 'refined_conditions', False)
-                      else [batches] if packed else ([batch] for batch in batches))
-            for group in groups:
-                losses = self.compute_losses(group) if packed else [self.compute_loss(**group[0])]
-                objective = sum(loss['loss_total'] for loss in losses)
-                if not torch.isfinite(objective):
+            for batch in batches:
+                loss_dict = self.compute_loss(**batch)
+                total = loss_dict['loss_total']
+                if not torch.isfinite(total):
                     raise NonFiniteTrainingError('non-finite total loss')
-                (objective / len(batches)).backward()
-                results.extend({key: value.item() if torch.is_tensor(value) else value
-                                for key, value in loss.items()} for loss in losses)
-                del losses, objective
+                (total / len(batches)).backward()
+                results.append({k: v.item() if torch.is_tensor(v) else v
+                                for k, v in loss_dict.items()})
+                del loss_dict, total
         except Exception:
             self.optimizer.zero_grad(set_to_none=True)
             restore_rng_state(rng_before)
@@ -304,23 +306,28 @@ VELOCITY_OBJECTIVE = 'sdpi_velocity_mse_v1'
 
 
 ENDPOINT_OBJECTIVE = 'executed_endpoint_geometry_v1'
-REAL_ENDPOINT_OBJECTIVE = 'real_initialization_reachable_endpoint_v2'
+REAL_ENDPOINT_OBJECTIVE = 'real_initialization_dual_interface_endpoint_v3'
+LIGAND_INTERFACE_CONTRACT = {
+    'version': 'reachable_ca_ligand_contacts_v1', 'cutoff_angstrom': 8.,
+    'error_scale_angstrom': 1., 'per_interface_weight': .5,
+    'geometry': 'relative_pair_vectors_and_distances',
+    'normalization': 'mean_per_interface_empty_is_zero',
+}
+LIGAND_INTERFACE_LOSS_KEYS = tuple(
+    f'loss_{kind}_{side}_ligand' for side in ('e3', 'poi') for kind in ('interface', 'contact'))
+POSE_OUTPUT_CONTRACT = {'version': 'topological_joint_legal_pose_v7',
+                        'translation_unit_angstrom': 10.,
+                        'rotation': 'unbounded_angular_velocity', 'torsion': 'unbounded_torsion_velocity',
+                        'rotor_geometry': 'executor_horizontal_tangent_and_signed_coupling',
+                        'execution': 'physical_reverse_velocity_without_inverse_time'}
 ENDPOINT_OBJECTIVES = (ENDPOINT_OBJECTIVE, REAL_ENDPOINT_OBJECTIVE)
 
 
 REAL_VALIDATION_DOCKQ_PROTOCOL = 'case_fixed_real_initialization_protein_fullatom_v4'
-BALANCED_VALIDATION_DOCKQ_PROTOCOL = 'case_requested_source_fullatom_v5'
 NEAR_TARGET_SUPERVISION = {
     'weight': .25, 'start_times': [1., .2], 'translation_std_angstrom': .5,
     'rotation_std_radians': .05, 'torsion_std_radians': .05,
     'entry_selection': 'source_zero_clock_orthogonal_cycle8_v1',
-}
-STATE_RECOVERY_SUPERVISION = {
-    'weight': .25, 'start_times': [.75, .5, .25],
-    'translation_std_angstrom': .5, 'rotation_std_radians': .05,
-    'torsion_std_radians': .05,
-    'entry_selection': 'alternate_eight_sample_near_and_rollout_blocks_v1',
-    'batch_execution': 'ragged_native_experts_v1',
 }
 LEGACY_NEAR_TARGET_SUPERVISION = {
     **{key: value for key, value in NEAR_TARGET_SUPERVISION.items()
@@ -351,113 +358,30 @@ def terminal_interface_losses(e3, native_poi, predicted_poi, cutoff):
     }, count
 
 
-def fullatom_interface_target(targets, reference):
-    """Prepare heavy-atom contacts once; targets never enter the model forward."""
-    if targets is None or not {'e3', 'poi'}.issubset(targets):
-        raise ValueError('v7 training requires fullatom_targets for both proteins')
-    atoms = [torch.as_tensor(targets[key], device=reference.device, dtype=reference.dtype)
-             for key in ('e3', 'poi')]
-    if any(value.ndim != 2 or value.shape[1] != 3 or not len(value)
-           or not torch.isfinite(value).all() for value in atoms):
-        raise ValueError('fullatom_targets must contain finite nonempty [N,3] coordinates')
-    a, b = atoms
-    fixed, moving = [], []
-    interface = torch.zeros(len(b), device=b.device, dtype=torch.bool)
-    with torch.no_grad():
-        for chunk in a.split(256):
-            distance = torch.cdist(chunk, b, compute_mode='donot_use_mm_for_euclid_dist')
-            row, column = (distance <= 5.).nonzero(as_tuple=True)
-            fixed.append(chunk[row])
-            moving.append(b[column])
-            interface |= (distance <= 10.).any(0)
-    return torch.cat(fixed), torch.cat(moving), b[interface]
+def terminal_ligand_interface_losses(e3, target_poi, target_ligand, poi, ligand):
+    """Two CA/ligand interface surrogates; targets never enter policy inputs.
 
-
-def terminal_fullatom_loss(target, native_poi, poi, body):
-    fixed, contacts, interface = target
-    center, native_center = poi.mean(1), native_poi.mean(1)
-    def transform(atoms):
-        return (atoms - native_center) @ body[0].T + center
-    loss = poi.sum() * 0
-    if len(contacts):
-        before = torch.linalg.vector_norm(contacts - fixed, dim=-1)
-        after = torch.linalg.vector_norm(transform(contacts) - fixed, dim=-1)
-        loss = loss + ((after - before) / 5.).square().mean()
-    if len(interface):
-        loss = loss + ((transform(interface) - interface) / 4.).square().mean()
-    return loss
-
-
-def fullatom_repulsion(targets, native_poi, native_ligand, poi, ligand, body, cutoff):
-    """Heavy-atom exclusion with native-safe thresholds and sparse gradients."""
-    a, b = [torch.as_tensor(targets[key], device=poi.device, dtype=poi.dtype)
-            for key in ('e3', 'poi')]
-    moved = (b - native_poi.mean(1)) @ body[0].T + poi.mean(1)
-    losses = []
-    for fixed, target, left, right in ((a, b, a, moved),
-            (a, native_ligand[0], a, ligand[0]),
-            (b, native_ligand[0], moved, ligand[0])):
-        rows, columns = [], []
+    Select contacts on the reachable target, not the prediction. Both sides
+    receive their own mean, so a large interface cannot swamp the other one.
+    These are coarse CA contacts, not all-atom warhead chemistry constraints.
+    """
+    losses, counts = {}, {}
+    cutoff = LIGAND_INTERFACE_CONTRACT['cutoff_angstrom']
+    scale = LIGAND_INTERFACE_CONTRACT['error_scale_angstrom']
+    for side, target, predicted in (('e3', e3, e3), ('poi', target_poi, poi)):
         with torch.no_grad():
-            for start in range(0, len(left), 256):
-                d = torch.cdist(left[start:start+256], right,
-                                compute_mode='donot_use_mm_for_euclid_dist')
-                row, column = (d < cutoff).nonzero(as_tuple=True)
-                rows.append(row + start)
-                columns.append(column)
-        row, column = torch.cat(rows), torch.cat(columns)
-        if not len(row):
-            losses.append((left.sum() + right.sum()) * 0)
-            continue
-        threshold = torch.linalg.vector_norm(fixed[row] - target[column], dim=-1).detach().clamp_max(cutoff)
-        distance = torch.linalg.vector_norm(left[row] - right[column], dim=-1)
-        penalty = ((threshold - distance).clamp_min(0) / cutoff).square()
-        # A radial norm has zero autograd direction at exact coincidence.
-        # In a tiny collision core, the target pair supplies an equivariant
-        # escape direction; the native-safe penetration factor still vanishes
-        # at the target. No arbitrary world-space axis or straight-through grad.
-        delta = right[column] - left[row]
-        native_delta = (target[column] - fixed[row]).detach()
-        native_direction = native_delta / torch.linalg.vector_norm(native_delta, dim=-1, keepdim=True).clamp_min(1e-12)
-        core = cutoff * .01
-        envelope = (1 - delta.square().sum(-1) / core**2).clamp_min(0).square()
-        penalty = penalty * (1 + envelope * (1 - (delta * native_direction).sum(-1) / core))
-        worst_left = penalty.new_zeros(len(left)).scatter_reduce(0, row, penalty, reduce='amax')
-        worst_right = penalty.new_zeros(len(right)).scatter_reduce(0, column, penalty, reduce='amax')
-        losses.append((worst_left.mean() + worst_right.mean()) / 2)
-    return torch.stack(losses).mean()
-
-
-def structural_endpoint_losses(targets, native_poi, ld, poi, ligand, body, target_ligand):
-    """Independent E3-L/POI-L crystal contacts and element-aware sterics."""
-    from tricoopdiff.geometry.reflect import (atom_vdw_radii, ligand_atomic_numbers,
-                                             ligand_nonbonded_mask, steric_pair_penalty)
-    a, b = [torch.as_tensor(targets[key], device=poi.device, dtype=poi.dtype) for key in ('e3', 'poi')]
-    moved = (b - native_poi.mean(1)) @ body[0].T + poi.mean(1)
-    ra, rb = [atom_vdw_radii(targets[key + '_atomic_numbers'], poi) for key in ('e3', 'poi')]
-    rl = atom_vdw_radii(ligand_atomic_numbers(ld), poi)
-    result = {}
-    for name, native, predicted in (('e3_ligand', a, a), ('poi_ligand', b, moved)):
-        with torch.no_grad():
-            contacts = torch.cdist(native, ld['coords'][0], compute_mode='donot_use_mm_for_euclid_dist') < 5.
-            rows, columns = contacts.nonzero(as_tuple=True)
-            distances = torch.linalg.vector_norm(native[rows] - ld['coords'][0, columns], dim=-1)
-        actual = torch.linalg.vector_norm(predicted[rows] - ligand[0, columns], dim=-1)
-        result['loss_' + name + '_contacts'] = ((actual - distances) / 5.).square().mean() if len(rows) else ligand.sum() * 0
-        result[name + '_contact_mae_angstrom'] = (actual - distances).abs().mean() if len(rows) else ligand.sum() * 0
-        result[name + '_native_contact_count'] = ligand.new_tensor(len(rows))
-        result[name + '_contact_recall'] = (actual < 5.).to(ligand.dtype).mean() if len(rows) else ligand.sum() * 0
-    pairs = [('e3_poi', a, moved, ra, rb, a, b, None),
-             ('e3_ligand', a, ligand[0], ra, rl, a, target_ligand[0], None),
-             ('poi_ligand', moved, ligand[0], rb, rl, b, target_ligand[0], None),
-             ('ligand_internal', ligand[0], ligand[0], rl, rl, target_ligand[0], target_ligand[0],
-              ligand_nonbonded_mask(ld, ligand.device))]
-    for name, left, right, rleft, rright, tleft, tright, mask in pairs:
-        penalty, count, _ = steric_pair_penalty(left, right, rleft, rright, mask=mask,
-                                              target_left=tleft, target_right=tright)
-        result['loss_' + name + '_steric'] = penalty
-        result[name + '_clash_pairs'] = count
-    return result
+            pairs = (torch.cdist(target[0], target_ligand[0],
+                                compute_mode='donot_use_mm_for_euclid_dist') <= cutoff).nonzero(as_tuple=True)
+            reference = target_ligand[0, pairs[1]] - target[0, pairs[0]]
+        counts[side] = len(pairs[0])
+        delta = ligand[0, pairs[1]] - predicted[0, pairs[0]]
+        zero = (ligand.sum() + predicted.sum()) * 0
+        losses[f'loss_interface_{side}_ligand'] = (
+            ((delta - reference) / scale).square().mean() if counts[side] else zero)
+        losses[f'loss_contact_{side}_ligand'] = (
+            ((delta.norm(dim=-1) - reference.norm(dim=-1)) / scale).square().mean()
+            if counts[side] else zero)
+    return losses, counts
 
 
 def coarse_intercomponent_repulsion(e3, native_poi, native_ligand, poi, ligand, cutoff=2.):
@@ -479,31 +403,43 @@ def coarse_intercomponent_repulsion(e3, native_poi, native_ligand, poi, ligand, 
     return torch.stack(penalties).mean()
 
 
-def validate_consensus_checkpoint(payload):
+def validate_assembly_checkpoint(payload):
     version = payload.get('checkpoint_version')
-    if not isinstance(version, int) or not LEGACY_CONSENSUS_CHECKPOINT_VERSION <= version <= CONSENSUS_CHECKPOINT_VERSION:
-        raise ValueError(f'consensus requires checkpoint_version=18 through {CONSENSUS_CHECKPOINT_VERSION}')
-    if payload.get('architecture') not in (ARCHITECTURE, DIRECT_ARCHITECTURE) or payload.get('generative_process') != FLOW_VERSION:
+    if not isinstance(version, int) or not LEGACY_CONSENSUS_CHECKPOINT_VERSION <= version <= ASSEMBLY_CHECKPOINT_VERSION:
+        raise ValueError(f'consensus requires checkpoint_version=18 through {ASSEMBLY_CHECKPOINT_VERSION}')
+    if payload.get('architecture') not in (ARCHITECTURE, DIRECT_ARCHITECTURE,
+                                           PREVIOUS_DIRECT_ARCHITECTURE) or payload.get('generative_process') != FLOW_VERSION:
         raise ValueError('checkpoint does not describe a supported consensus SDPI flow')
-    direct = payload.get('model_config', {}).get('direct_ternary_motion', False)
+    model_config = payload.get('model_config')
+    if not isinstance(model_config, dict):
+        raise ValueError('checkpoint model_config must be a mapping')
+    direct = model_config.get('direct_ternary_motion', False)
     for key in ('global_node_context', 'spatial_geometry', 'motion_attention',
                 'global_node_attention', 'rotation_scale_normalization'):
-        if payload.get('model_config', {}).get(key, False) and not direct:
+        if model_config.get(key, False) and not direct:
             raise ValueError(f'{key} requires direct ternary motion')
-    model_config = payload.get('model_config', {})
     if model_config.get('model_profile') is not None:
-        if model_config['model_profile'] not in MODEL_PROFILES:
+        for key in ('node_dim', 'input_dim'):
+            value = model_config.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f'production checkpoint requires a positive integer {key}')
+        if model_config['model_profile'] not in ('ternary_endpoint_v1', 'ternary_endpoint_v2',
+                                               'ternary_endpoint_v3', PRODUCTION_MODEL_PROFILE,
+                                               VECTOR_EXPERT_MODEL_PROFILE):
             raise ValueError('unknown checkpoint model profile')
         expected = production_model_config(model_config['node_dim'], model_config['input_dim'],
-                                           model_config['num_transformer_layers'],
                                            model_config.get('source_conditioning', False),
                                            model_profile=model_config['model_profile'],
                                            expert_scalar_dim=model_config.get('expert_scalar_dim', 58),
-                                           expert_film_dim=model_config.get('expert_film_dim', 48),
-                                           expert_vector_dim=model_config.get('expert_vector_dim', 20))
+                                           expert_vector_dim=model_config.get('expert_vector_dim', 20),
+                                           expert_backend=model_config.get('expert_backend', 'diffdock'),
+                                           **({'conditioning_contract': model_config['conditioning_contract']}
+                                              if 'conditioning_contract' in model_config else {}))
         if model_config != expected:
             raise ValueError('checkpoint violates its production model profile')
-    if bool(direct) != (payload.get('architecture') == DIRECT_ARCHITECTURE):
+    expected_architecture = (DIRECT_ARCHITECTURE if model_config.get('model_profile') == VECTOR_EXPERT_MODEL_PROFILE
+                             else PREVIOUS_DIRECT_ARCHITECTURE if direct else ARCHITECTURE)
+    if payload.get('architecture') != expected_architecture:
         raise ValueError('checkpoint architecture and rigid output configuration disagree')
     if direct and (version < ENDPOINT_PROTOCOL_CHECKPOINT_VERSION or
                    payload.get('model_config', {}).get('protein_pair_motion', False)):
@@ -514,38 +450,43 @@ def validate_consensus_checkpoint(payload):
         if not payload.get(key):
             raise ValueError(f'consensus checkpoint missing {key}')
     config = payload.get('runtime_config', {})
+    if ('ligand_geometry_scale_angstrom' in config
+            and config['ligand_geometry_scale_angstrom'] != LIGAND_GEOMETRY_SCALE_ANGSTROM):
+        raise ValueError('unsupported ligand endpoint supervision units')
+    if ('protein_geometry_scale_angstrom' in config
+            and config['protein_geometry_scale_angstrom'] != PROTEIN_GEOMETRY_SCALE_ANGSTROM):
+        raise ValueError('unsupported protein endpoint supervision units')
     if model_config.get('model_profile') == 'ternary_endpoint_v2' and version < 25:
         raise ValueError('ternary endpoint v2 requires checkpoint version 25')
     if model_config.get('model_profile') == 'ternary_endpoint_v3' and version < 26:
         raise ValueError('ternary endpoint v3 requires checkpoint version 26')
     if model_config.get('model_profile') == 'ternary_endpoint_v4' and version < 27:
         raise ValueError('ternary endpoint v4 requires checkpoint version 27')
-    if model_config.get('model_profile') == 'ternary_endpoint_v5' and version < 29:
-        raise ValueError('conditional expert v5 requires checkpoint version 29')
-    if model_config.get('model_profile') == 'ternary_endpoint_v6' and version < 30:
-        raise ValueError('geometric conditional expert v6 requires checkpoint version 30')
-    if model_config.get('model_profile') == 'ternary_endpoint_v7' and version < 31:
-        raise ValueError('vector conditional expert v7 requires checkpoint version 31')
-    if model_config.get('model_profile') == 'ternary_endpoint_v8' and version < 32:
-        raise ValueError('symmetric conditional expert v8 requires checkpoint version 32')
-    if model_config.get('model_profile') == 'ternary_endpoint_v9' and version < 33:
-        raise ValueError('integrated conditional expert v9 requires checkpoint version 33')
+    if model_config.get('model_profile') == VECTOR_EXPERT_MODEL_PROFILE and version < ASSEMBLY_CHECKPOINT_VERSION:
+        raise ValueError(f'ternary endpoint v14 legal pose requires checkpoint version {ASSEMBLY_CHECKPOINT_VERSION}')
+    if model_config.get('model_profile') == VECTOR_EXPERT_MODEL_PROFILE:
+        if config.get('pose_output_contract') != POSE_OUTPUT_CONTRACT:
+            raise ValueError('legal pose output contract differs')
+        expert_identity = config.get('expert_runtime_identity', {})
+        if model_config.get('expert_backend', 'diffdock') == 'matcha':
+            if (expert_identity.get('backend') != 'matcha'
+                    or expert_identity != payload['expert_base_identity']
+                    or config.get('expert_crop_policy') != FrozenMatcha.crop_policy
+                    or expert_identity.get('torsion_contract') != 'canonical_executor_bonds_and_fragments_v2'):
+                raise ValueError('Matcha checkpoint requires its own canonical input and frozen-prior identity')
+        elif (config.get('expert_crop_policy') != EXPERT_CROP_POLICY
+                or expert_identity.get('smooth_cross_edges') is not True
+                or expert_identity.get('smooth_edges', False)):
+            raise ValueError('current assembly requires cross-edge tapering, unchanged internal expert edges, and a fixed full-receptor node set')
     if version >= 25:
         profile = model_config.get('model_profile')
-        new_recipe = profile in MODEL_PROFILES[1:]
-        near_config = NEAR_TARGET_SUPERVISION if profile in MODEL_PROFILES[2:] else LEGACY_NEAR_TARGET_SUPERVISION
-        expected = {'training_recipe': (('endpoint_symmetric_fullatom_v2' if version >= 34 else 'endpoint_symmetric_fullatom_v1') if profile in MODEL_PROFILES[7:] else
-                                        'endpoint_fullatom_recovery_v1' if profile == 'ternary_endpoint_v7' else
-                                        'endpoint_state_recovery_v1' if profile == 'ternary_endpoint_v6' else
-                                        'endpoint_near_target_v2' if profile in MODEL_PROFILES[2:] else 'endpoint_near_target_v1')
+        new_recipe = profile in ('ternary_endpoint_v2', 'ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE)
+        near_config = NEAR_TARGET_SUPERVISION if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE) else LEGACY_NEAR_TARGET_SUPERVISION
+        expected = {'training_recipe': ('endpoint_near_target_v2' if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE) else 'endpoint_near_target_v1')
                                        if new_recipe else 'endpoint_only_v1',
                     'ema_update_contract': 'optimizer_step_warmup_v1' if new_recipe else 'optimizer_step_fixed_v1',
                     'near_target_supervision': near_config if new_recipe else None,
                     'validation_weights': 'ema'}
-        if profile in MODEL_PROFILES[5:]:
-            expected['state_recovery_supervision'] = STATE_RECOVERY_SUPERVISION
-        if profile in MODEL_PROFILES[6:]:
-            expected.update(packed_batch_limits=PACKED_BATCH_LIMITS, fullatom_interface_weight=.25)
         if any(config.get(key) != value for key, value in expected.items()):
             raise ValueError('checkpoint has an incompatible endpoint/EMA training recipe')
         if payload.get('checkpoint_kind') != 'inference_only':
@@ -557,6 +498,9 @@ def validate_consensus_checkpoint(payload):
         if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
             raise ValueError('version 22+ requires a positive effective batch size')
     objective = config.get('training_objective', VELOCITY_OBJECTIVE)
+    if (objective == REAL_ENDPOINT_OBJECTIVE and payload.get('checkpoint_kind') != 'inference_only'
+            and config.get('ligand_interface_contract') != LIGAND_INTERFACE_CONTRACT):
+        raise ValueError('endpoint training requires the dual ligand interface supervision contract')
     if version >= OBJECTIVE_CONTRACT_CHECKPOINT_VERSION and 'training_objective' not in config:
         raise ValueError('version 21+ requires an explicit training objective')
     if payload.get('checkpoint_kind') != 'inference_only' and objective not in (VELOCITY_OBJECTIVE, *ENDPOINT_OBJECTIVES):
@@ -581,14 +525,6 @@ def validate_consensus_checkpoint(payload):
                 raise ValueError('version 23+ requires explicit valid coarse steric settings')
     if 'expert_input_grad' in config and not isinstance(config['expert_input_grad'], bool):
         raise ValueError('expert_input_grad must be an explicit boolean')
-    if version >= 35 and not isinstance(config.get('expert_coordinate_grad'), bool):
-        raise ValueError('expert_coordinate_grad must be an explicit boolean')
-    if version >= 36:
-        if not isinstance(config.get('structural_supervision'), bool):
-            raise ValueError('structural_supervision must be an explicit boolean')
-        expected = 'dual_contacts025_vdw08_exclude123_v1' if config['structural_supervision'] else 'legacy'
-        if config.get('structure_loss_contract') != expected or config.get('step_contract') != 'fixed_training_steps_v1':
-            raise ValueError('invalid structural loss or inference-step contract')
     validate_clamp_mode(config.get('activation_clamp_mode', 'componentwise'))
     for key in ('activation_clamp', 'residual_weight', 'ema_decay'):
         value = config.get(key)
@@ -624,7 +560,7 @@ def validate_consensus_checkpoint(payload):
             raise ValueError('version 28+ requires an optimizer named parameter manifest')
 
 
-class ConsensusTrainer(TriCoopDiffTrainer):
+class AssemblyTrainer(TriCoopDiffTrainer):
     """Endpoint trainer without historical objective switches."""
 
     training_objective = REAL_ENDPOINT_OBJECTIVE
@@ -636,7 +572,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                  training_endpoint_protocol='none',
                  endpoint_loss_weight=0.1, interface_loss_weight=1.0,
                  interface_cutoff=10.0, effective_batch_size=1,
-                 steric_loss_weight=0.0, steric_cutoff=2.0, structural_supervision=False, **kwargs):
+                 steric_loss_weight=0.0, steric_cutoff=2.0, **kwargs):
         if not math.isfinite(residual_weight) or residual_weight < 0 or not 0 <= ema_decay < 1:
             raise ValueError('invalid residual regularization or EMA decay')
         kwargs['torsion_expert_aux_weight'] = 0.0
@@ -645,10 +581,6 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         if not math.isfinite(endpoint_loss_weight) or endpoint_loss_weight <= 0:
             raise ValueError('endpoint loss weight must be finite and positive')
         self.endpoint_loss_weight = float(endpoint_loss_weight)
-        self.structural_supervision = bool(structural_supervision)
-        self.model.trained_inference_steps = self.diffusion.inference_steps
-        if self.structural_supervision and not getattr(self.model.trifuse, 'symmetric_torsion', False):
-            raise ValueError('structural supervision requires the current symmetric full-atom model')
         if (not math.isfinite(interface_loss_weight) or interface_loss_weight < 0
                 or not math.isfinite(interface_cutoff) or interface_cutoff <= 0):
             raise ValueError('invalid interface supervision configuration')
@@ -667,26 +599,17 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         configure_expert_policy(self.model.expert, self.activation_clamp, self.activation_clamp_mode)
         self.ema_decay = float(ema_decay)
         profile = self.model.trifuse.config.get('model_profile')
-        self.training_recipe = ('endpoint_symmetric_fullatom_v2' if profile in MODEL_PROFILES[7:] else
-                                'endpoint_fullatom_recovery_v1' if profile == 'ternary_endpoint_v7' else
-                                'endpoint_state_recovery_v1' if profile == 'ternary_endpoint_v6' else
-                                'endpoint_near_target_v2' if profile in MODEL_PROFILES[2:]
+        self.training_recipe = ('endpoint_near_target_v2' if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE)
                                 else 'endpoint_near_target_v1' if profile == 'ternary_endpoint_v2'
                                 else 'endpoint_only_v1')
         self.ema_update_contract = ('optimizer_step_warmup_v1'
                                     if self.training_recipe != 'endpoint_only_v1'
                                     else 'optimizer_step_fixed_v1')
-        self.near_target_supervision = (dict(NEAR_TARGET_SUPERVISION) if profile in MODEL_PROFILES[2:]
+        self.near_target_supervision = (dict(NEAR_TARGET_SUPERVISION) if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE)
                                        else dict(LEGACY_NEAR_TARGET_SUPERVISION) if profile == 'ternary_endpoint_v2'
                                        else None)
         self.near_target_weight = (self.near_target_supervision['weight']
                                    if self.near_target_supervision is not None else 0.0)
-        self.state_recovery_supervision = (dict(STATE_RECOVERY_SUPERVISION)
-                                          if profile in MODEL_PROFILES[5:] else None)
-        self.fullatom_interface_weight = .25 if profile in MODEL_PROFILES[6:] else 0.
-        self.symmetric_supervision = profile in MODEL_PROFILES[7:]
-        self.validation_dockq_protocol = (BALANCED_VALIDATION_DOCKQ_PROTOCOL if self.symmetric_supervision
-                                           else REAL_VALIDATION_DOCKQ_PROTOCOL)
         if training_source_mix not in ('sdpi_only', 'sdpi_bitseed_1_1'):
             raise ValueError('training_source_mix must be sdpi_only or sdpi_bitseed_1_1')
         self.training_source_mix = training_source_mix
@@ -701,34 +624,10 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         self.set_phase(1)
         self.ema = {name: value.detach().clone() for name, value in self.model.trifuse.state_dict().items()}
 
-    def compute_loss(self, **batch):
-        return self.compute_losses([batch])[0]
-
-    def compute_losses(self, batches):
-        """Advance ragged trajectories together; all samples share one graph forward."""
-        trajectories = [self._loss_trajectory(**batch) for batch in batches]
-        pending, results = {}, [None] * len(batches)
-        for index, trajectory in enumerate(trajectories):
-            pending[index] = next(trajectory)
-        while pending:
-            indices = list(pending)
-            outputs = self.diffusion.forward_states(self.model, [pending[index] for index in indices])
-            pending = {}
-            for index, output in zip(indices, outputs):
-                try:
-                    pending[index] = trajectories[index].send(output)
-                except StopIteration as finished:
-                    results[index] = finished.value
-        return results
-
-    def _loss_trajectory(self, e3_data, poi_data, ligand_data, case='unknown',
+    def compute_loss(self, e3_data, poi_data, ligand_data, case='unknown',
                      t_override=None, t_pol_override=None, coupling_override=None,
                      diagnostics=False, source=0, conditions=None, near_target_zero=None,
-                     near_target_start_t=None, recovery_start_t=None, fullatom_targets=None):
-        if recovery_start_t is not None and (self.state_recovery_supervision is None
-                or recovery_start_t not in self.state_recovery_supervision['start_times']
-                or near_target_zero is not None):
-            raise ValueError('state recovery requires its recorded clock and a separate auxiliary entry')
+                     near_target_start_t=None):
         if near_target_start_t is not None and near_target_zero is None:
             raise ValueError('near-target start time requires an auxiliary entry')
         if near_target_zero is not None:
@@ -748,21 +647,24 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         ed = {**e3_data, 'coords': e3_data['coords'].to(self.device)}
         pd = {**poi_data, 'coords': poi_data['coords'].to(self.device)}
         ld = {**ligand_data, 'coords': ligand_data['coords'].to(self.device)}
-        atom_target = (fullatom_interface_target(fullatom_targets, ld['coords'])
-                       if self.fullatom_interface_weight else None)
         no_torsion = bool(getattr(self.model.expert.model, 'no_torsion', False))
         dt = ld['coords'].new_full((1,), 1 / self.diffusion.inference_steps)
         projection = None
         source = int(candidate_source_tensor(source, dt).item())
         from tricoopdiff.initialization import TernaryInitializer
-        from tricoopdiff.initialization.endpoints import reachable_ligand_target, ligand_symmetries
-        symmetries = ligand_symmetries(ld) if self.symmetric_supervision else None
+        from tricoopdiff.initialization.endpoints import reachable_ligand_target, EndpointProjectionError
         if coupling_override is None:
             if int(source) != 0:
                 raise ValueError('BiTSeed training requires its actual sampled state')
             seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
             ligand, poi, body, _ = TernaryInitializer(no_torsion=no_torsion).initialize(
                 ed['coords'][0], pd['coords'][0], ld, seed=seed)
+            try:
+                target, projection = reachable_ligand_target(
+                    ld, ligand, poi, pd['coords'], no_torsion=no_torsion)
+            except EndpointProjectionError as error:
+                error.diagnostics.update(case=case, seed=seed, no_torsion=no_torsion)
+                raise
         else:
             if 'initial_state' not in coupling_override:
                 raise ValueError('real initialization training rejects crystal-projected couplings')
@@ -770,140 +672,101 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             ligand, poi, body = [torch.as_tensor(state[key], device=self.device,
                                                 dtype=ld['coords'].dtype).reshape(1, -1, 3)
                                  for key in ('ligand', 'poi', 'body_frame')]
-            if 'target_ligand' in coupling_override and not self.symmetric_supervision:
+            if 'target_ligand' in coupling_override:
                 target = coupling_override['target_ligand']
-        candidates = None
-        if coupling_override is None or self.symmetric_supervision or 'target_ligand' not in coupling_override:
-            target, projection, candidates = reachable_ligand_target(
-                ld, ligand, poi, pd['coords'], no_torsion=no_torsion,
-                symmetries=symmetries, return_candidates=True)
-            candidates = torch.as_tensor(candidates, device=self.device, dtype=ld['coords'].dtype)
+            else:
+                target, projection = reachable_ligand_target(
+                    ld, ligand, poi, pd['coords'], no_torsion=no_torsion)
         target_ligand = torch.as_tensor(target, device=self.device,
                                         dtype=ld['coords'].dtype).reshape_as(ld['coords'])
         if ligand.shape != ld['coords'].shape or poi.shape != pd['coords'].shape:
             raise ValueError('actual initialization atom counts must match the indexed inputs')
-        capture_index = (max(1, min(self.diffusion.inference_steps - 1,
-                                   round((1 - recovery_start_t) * self.diffusion.inference_steps)))
-                         if recovery_start_t is not None and self.diffusion.inference_steps > 1 else None)
-        result = yield from self._endpoint_rollout_loss(
-            ed, pd, ld, ligand, poi, body, target_ligand, source, conditions,
-            capture_index=capture_index, atom_target=atom_target,
-            target_candidates=candidates, fullatom_targets=fullatom_targets)
+        result = self._endpoint_rollout_loss(
+            ed, pd, ld, ligand, poi, body, target_ligand, source, conditions)
         result['loss_endpoint_main'] = result['loss_total']
+        if projection is not None:
+            result['target_projection_rmsd_angstrom'] = projection['ligand_projection_rmsd_angstrom']
+            result['target_projection_nfev'] = projection['torsion_optimization']['nfev']
         if near_target_zero is not None:
             near_ligand, near_poi = target_ligand.detach(), pd['coords'].detach()
             near_body = torch.eye(3, device=self.device, dtype=near_ligand.dtype).unsqueeze(0)
             if not near_target_zero:
-                near_ligand, near_poi, near_body = self._perturb_state(
-                    near_ligand, near_poi, near_body, ld, self.near_target_supervision)
-            near = yield from self._endpoint_rollout_loss(
+                velocities = {
+                    'rigid_output_mode': INDEPENDENT_RIGID_MODE,
+                    **({'torsion_update_mode': CONTINUOUS_TORSION_MODE}
+                       if self.model.trifuse.config.get('model_profile') in ('ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE) else {}),
+                    'torsion': near_ligand.new_empty((1, 0 if no_torsion else int(ld['edge_mask'].sum()))).normal_(
+                        0, self.near_target_supervision['torsion_std_radians']),
+                    **{branch: {'tr': near_ligand.new_empty((1, 3)).normal_(
+                                    0, self.near_target_supervision['translation_std_angstrom']),
+                                'rot': near_ligand.new_empty((1, 3)).normal_(
+                                    0, self.near_target_supervision['rotation_std_radians'])}
+                       for branch in ('e3_ligand', 'poi_ligand')},
+                }
+                with torch.no_grad():
+                    near_ligand, near_poi, near_body = self.diffusion.differentiable_step(
+                        near_ligand, near_poi, near_body, velocities, dt.new_ones((1,)), ld)
+            near = self._endpoint_rollout_loss(
                 ed, pd, ld, near_ligand, near_poi, near_body, target_ligand, source,
-                conditions, t_start=start_t, steps=max(1, math.ceil(self.diffusion.inference_steps * start_t)),
-                atom_target=atom_target, target_candidates=candidates, fullatom_targets=fullatom_targets)
+                conditions, t_start=start_t, steps=max(1, math.ceil(self.diffusion.inference_steps * start_t)))
             result['components']['loss_near_target'] = near['loss_total']
             result['loss_total'] = result['loss_total'] + self.near_target_weight * near['loss_total']
-        if capture_index is not None:
-            recovery_state = self._perturb_state(*result.pop('recovery_state'), ld, self.state_recovery_supervision)
-            remaining = self.diffusion.inference_steps - capture_index
-            recovery = yield from self._endpoint_rollout_loss(
-                ed, pd, ld, *recovery_state, target_ligand, source, conditions,
-                t_start=remaining / self.diffusion.inference_steps, steps=remaining, atom_target=atom_target,
-                target_candidates=candidates, fullatom_targets=fullatom_targets)
-            result['components']['loss_state_recovery'] = recovery['loss_total']
-            result['loss_total'] = result['loss_total'] + self.state_recovery_supervision['weight'] * recovery['loss_total']
         if not torch.isfinite(result['loss_total']):
             raise NonFiniteTrainingError(f'case={case}: non-finite executed endpoint loss')
-        if projection is not None:
-            result['components']['projection_rmsd_angstrom'] = ligand.new_tensor(projection['ligand_projection_rmsd_angstrom'])
-            result['components']['projection_nfev'] = ligand.new_tensor(projection['torsion_optimization']['nfev'])
-            result['components']['projection_above_1A'] = ligand.new_tensor(float(projection['ligand_projection_rmsd_angstrom'] > 1.))
-        with torch.no_grad():
-            crystal = ld['coords'][0]
-            if symmetries is not None:
-                crystal = crystal[torch.as_tensor(symmetries, device=crystal.device)]
-            else:
-                crystal = crystal[None]
-            result['components']['ligand_crystal_rmsd_angstrom'] = (
-                result['predicted_ligand'] - crystal).square().sum(-1).mean(-1).min().sqrt()
         if diagnostics:
             return {**result, 'rms': {}, 'target_ligand': target_ligand,
                     'target_projection': projection, 'training_objective': self.training_objective}
         return {'loss_total': result['loss_total'], 'loss_score': result['loss_total'].detach().item(),
                 'loss_endpoint_main': result['loss_endpoint_main'].detach().item(),
                 'native_interface_pairs': result['native_interface_pairs'],
+                **{key: result[key] for key in ('target_projection_rmsd_angstrom', 'target_projection_nfev')
+                   if key in result},
+                **{f'{side}_ligand_interface_pairs': count
+                   for side, count in result['ligand_interface_pairs'].items()},
                 **{name: value.detach().item() for name, value in result['components'].items()}}
 
-    def _perturb_state(self, ligand, poi, body, ld, config):
-        no_torsion = bool(getattr(self.model.expert.model, 'no_torsion', False))
-        velocities = {
-            'rigid_output_mode': INDEPENDENT_RIGID_MODE,
-            **({'torsion_update_mode': SYMMETRIC_TORSION_MODE if getattr(self.model.trifuse, 'symmetric_torsion', False)
-                                      else CONTINUOUS_TORSION_MODE}
-               if getattr(self.model.trifuse, 'continuous_torsion', False) else {}),
-            'torsion': ligand.new_empty((1, 0 if no_torsion else int(ld['edge_mask'].sum()))).normal_(
-                0, config['torsion_std_radians']),
-            **{branch: {'tr': ligand.new_empty((1, 3)).normal_(0, config['translation_std_angstrom']),
-                        'rot': ligand.new_empty((1, 3)).normal_(0, config['rotation_std_radians'])}
-               for branch in ('e3_ligand', 'poi_ligand')},
-        }
-        with torch.no_grad():
-            return self.diffusion.differentiable_step(ligand, poi, body, velocities, ligand.new_ones(1), ld)
-
     def _endpoint_rollout_loss(self, ed, pd, ld, ligand, poi, body, target_ligand,
-                               source, conditions, t_start=1., steps=None, capture_index=None, atom_target=None,
-                               target_candidates=None, fullatom_targets=None):
+                               source, conditions, t_start=1., steps=None):
         """One geometric objective for both full starts and reachable short starts."""
-        captured = {}
-        for index, (t, dt) in enumerate(self.diffusion.reverse_times(ld['coords'], steps=steps, t_start=t_start)):
-            if index == capture_index:
-                captured['recovery_state'] = tuple(value.detach() for value in (ligand, poi, body))
-            output = yield ed, pd, ld, ligand, poi, body, t, dt, source, conditions
+        for t, dt in self.diffusion.reverse_times(ld['coords'], steps=steps, t_start=t_start):
+            output = self._forward_state(ed, pd, ld, ligand, poi, body, t, dt, source, conditions)
             normalized = self.diffusion.normalized_predictions(output, t)
             velocities = self.diffusion.velocities(normalized, ed['coords'], pd['coords'])
             ligand, poi, body = self.diffusion.differentiable_step(
                 ligand, poi, body, velocities, dt, ld)
-        scales = self.diffusion.scales(ed['coords'], pd['coords'])
-        if target_candidates is not None:
-            with torch.no_grad():
-                selected = (target_candidates - ligand[0]).square().mean((1, 2)).argmin()
-            target_ligand = target_candidates[selected].unsqueeze(0)
-        losses = {'loss_ligand_geometry': ((ligand - target_ligand) / scales[0]).square().mean(),
-                  'loss_protein_geometry': ((poi - pd['coords']) / scales[1]).square().mean()}
+        # Use the same physical coordinate scale for both moving components.
+        # Radius-normalizing only the protein makes sacrificing its interface
+        # artificially cheap when improving the ligand. Targets are reachable.
+        losses = {'loss_ligand_geometry': ((ligand - target_ligand) / LIGAND_GEOMETRY_SCALE_ANGSTROM).square().mean(),
+                  'loss_protein_geometry': ((poi - pd['coords']) / PROTEIN_GEOMETRY_SCALE_ANGSTROM).square().mean()}
         total = sum(losses.values())
-        if self.structural_supervision:
-            structural = structural_endpoint_losses(fullatom_targets, pd['coords'], ld, poi, ligand, body, target_ligand)
-            losses.update(structural)
-            total = total + .25 * (structural['loss_e3_ligand_contacts'] + structural['loss_poi_ligand_contacts'])
-            total = total + self.steric_loss_weight * sum(value for name, value in structural.items()
-                                                          if name.startswith('loss_') and name.endswith('_steric'))
-        losses['ligand_projected_rmsd_angstrom'] = (ligand - target_ligand).square().sum(-1).mean().sqrt()
-        if atom_target is not None:
-            losses['loss_fullatom_interface'] = terminal_fullatom_loss(atom_target, pd['coords'], poi, body)
-            total = total + self.fullatom_interface_weight * losses['loss_fullatom_interface']
+        ligand_interfaces, ligand_interface_counts = terminal_ligand_interface_losses(
+            ed['coords'], pd['coords'], target_ligand, poi, ligand)
+        losses.update(ligand_interfaces)
+        total = total + LIGAND_INTERFACE_CONTRACT['per_interface_weight'] * sum(ligand_interfaces.values())
         interface_pairs = 0
         if self.interface_loss_weight:
             interface, interface_pairs = terminal_interface_losses(
                 ed['coords'], pd['coords'], poi, self.interface_cutoff)
             losses.update(interface)
             total = total + self.interface_loss_weight * sum(interface.values())
-        if self.steric_loss_weight and not self.structural_supervision:
-            steric = (fullatom_repulsion(fullatom_targets, pd['coords'], target_ligand,
-                                         poi, ligand, body, self.steric_cutoff)
-                      if self.symmetric_supervision else
-                      coarse_intercomponent_repulsion(ed['coords'], pd['coords'], target_ligand,
-                                                       poi, ligand, self.steric_cutoff))
+        if self.steric_loss_weight:
+            steric = coarse_intercomponent_repulsion(ed['coords'], pd['coords'], target_ligand,
+                                                     poi, ligand, self.steric_cutoff)
             losses['loss_clash_geometry'] = steric
             total = total + self.steric_loss_weight * steric
         total = self.endpoint_loss_weight * total
+        ligand_rmsd = (ligand.detach() - target_ligand.detach()).square().sum(-1).mean().sqrt()
         return {'loss_total': total, 'components': losses, 'native_interface_pairs': interface_pairs,
-                'predicted_ligand': ligand, 'predicted_poi': poi, **captured}
+                'ligand_interface_pairs': ligand_interface_counts,
+                'ligand_target_rmsd_angstrom': ligand_rmsd,
+                'predicted_ligand': ligand, 'predicted_poi': poi}
 
     def train_batch(self, batches):
         if len(batches) > self.effective_batch_size:
             raise ValueError('microbatch group exceeds the recorded effective batch size')
         if self.near_target_weight:
-            if self.training_recipe in ('endpoint_near_target_v2', 'endpoint_state_recovery_v1',
-                                        'endpoint_fullatom_recovery_v1', 'endpoint_symmetric_fullatom_v2'):
+            if self.training_recipe == 'endpoint_near_target_v2':
                 batches = [{**batch, 'near_target_zero': ((self.samples_seen + offset) // 2) % 2 == 0,
                             'near_target_start_t': self.near_target_supervision['start_times'][
                                 ((self.samples_seen + offset) // 4) % 2]}
@@ -912,12 +775,6 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 batches = [{**batch, 'near_target_zero': (self.samples_seen + offset) % 2 == 0,
                             'near_target_start_t': self.near_target_supervision['start_t']}
                            for offset, batch in enumerate(batches)]
-        if self.state_recovery_supervision is not None and self.diffusion.inference_steps > 1:
-            batches = [({**batch, 'near_target_zero': None, 'near_target_start_t': None,
-                         'recovery_start_t': self.state_recovery_supervision['start_times'][
-                             ((self.samples_seen + offset) // 2) % 3]}
-                        if ((self.samples_seen + offset) // 8) % 2 == 0 else batch)
-                       for offset, batch in enumerate(batches)]
         result = super().train_batch(batches)
         decay = self.effective_ema_decay
         with torch.no_grad():
@@ -949,7 +806,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             self.model.trifuse.load_state_dict(raw)
 
     def validate_step(self, dockq_context=None, weights='ema', **batch):
-        if any(batch.get(key) is not None for key in ('near_target_zero', 'near_target_start_t', 'recovery_start_t')):
+        if any(batch.get(key) is not None for key in ('near_target_zero', 'near_target_start_t')):
             raise ValueError('validation evaluates the main endpoint only, not training-only auxiliary entries')
         if weights not in ('raw', 'ema'):
             raise ValueError('validation weights must be raw or ema')
@@ -968,6 +825,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 if not math.isfinite(metric['dockq']) or not 0 <= metric['dockq'] <= 1:
                     raise NonFiniteTrainingError('invalid full-atom validation DockQ')
                 output = {'loss_total': output['loss_total'],
+                          'ligand_target_rmsd_angstrom': output['ligand_target_rmsd_angstrom'],
                           'loss_endpoint_main': output['loss_endpoint_main'], **output['components'], **metric}
             return {key: value.item() if torch.is_tensor(value) else value for key, value in output.items()}
 
@@ -1093,9 +951,10 @@ class ConsensusTrainer(TriCoopDiffTrainer):
             restore_rng_state(payload['rng_state'])
 
     def checkpoint_payload(self, epoch=0, best_val_loss=float('inf'), best_val_dockq=None):
+        from tricoopdiff.initialization.endpoints import PROJECTION_SOLVER_VERSION
         """Build the shared training/inference payload without writing files."""
         payload = {
-            'checkpoint_version': CONSENSUS_CHECKPOINT_VERSION,
+            'checkpoint_version': ASSEMBLY_CHECKPOINT_VERSION,
             'architecture': self.model.architecture, 'generative_process': FLOW_VERSION,
             'expert_lora_config': None, 'expert_lora_state_dict': {},
             'runtime_config': {
@@ -1109,12 +968,12 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 'training_source_mix': self.training_source_mix,
                 'training_endpoint_protocol': self.training_endpoint_protocol,
                 'expert_input_grad': getattr(self.model, 'expert_input_grad', True),
-                'expert_coordinate_grad': getattr(self.model, 'expert_coordinate_grad', True),
-                'structural_supervision': self.structural_supervision,
-                'structure_loss_contract': 'dual_contacts025_vdw08_exclude123_v1' if self.structural_supervision else 'legacy',
-                'step_contract': 'fixed_training_steps_v1',
                 'training_objective': self.training_objective,
+                'target_projection_solver': PROJECTION_SOLVER_VERSION,
                 'endpoint_loss_weight': self.endpoint_loss_weight,
+                'ligand_geometry_scale_angstrom': LIGAND_GEOMETRY_SCALE_ANGSTROM,
+                'protein_geometry_scale_angstrom': PROTEIN_GEOMETRY_SCALE_ANGSTROM,
+                'ligand_interface_contract': dict(LIGAND_INTERFACE_CONTRACT),
                 'inference_steps': self.diffusion.inference_steps,
                 'interface_loss_weight': self.interface_loss_weight,
                 'interface_cutoff': self.interface_cutoff,
@@ -1122,34 +981,50 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 'steric_cutoff': self.steric_cutoff,
                 'effective_batch_size': self.effective_batch_size,
                 'training_recipe': self.training_recipe,
+                'pose_output_contract': (dict(POSE_OUTPUT_CONTRACT)
+                                         if self.model.trifuse.config.get('model_profile') == VECTOR_EXPERT_MODEL_PROFILE
+                                         else None),
                 'ema_update_contract': self.ema_update_contract,
                 'near_target_supervision': self.near_target_supervision,
-                **({'state_recovery_supervision': self.state_recovery_supervision}
-                   if self.state_recovery_supervision is not None else {}),
-                **({'packed_batch_limits': dict(PACKED_BATCH_LIMITS),
-                    'fullatom_interface_weight': self.fullatom_interface_weight}
-                   if self.fullatom_interface_weight else {}),
                 'validation_weights': 'ema',
-                'validation_dockq_protocol': self.validation_dockq_protocol,
+                'validation_dockq_protocol': REAL_VALIDATION_DOCKQ_PROTOCOL,
                 'expert_runtime_identity': expert_runtime_identity(self.model.expert),
+                'expert_crop_policy': (getattr(self.model.expert, 'crop_policy', EXPERT_CROP_POLICY)
+                                       if self.model.trifuse.config.get('model_profile') == VECTOR_EXPERT_MODEL_PROFILE
+                                       else None),
             },
             **self._optimization_payload({'epoch': epoch, 'best_val_loss': best_val_loss,
                                'best_val_dockq': (self.resume_best_val_dockq if best_val_dockq is None
                                                   else best_val_dockq),
                                'samples_seen': self.samples_seen, 'ema_updates': self.global_step}),
         }
-        validate_consensus_checkpoint(payload)
+        validate_assembly_checkpoint(payload)
         return payload
 
     def save_checkpoint(self, path, epoch=0, best_val_loss=float('inf'), best_val_dockq=None):
         atomic_torch_save(self.checkpoint_payload(epoch, best_val_loss, best_val_dockq), path)
 
     def load_checkpoint(self, path):
+        from tricoopdiff.initialization.endpoints import PROJECTION_SOLVER_VERSION
         payload = torch.load(path, map_location=self.device, weights_only=False)
-        validate_consensus_checkpoint(payload)
+        validate_assembly_checkpoint(payload)
+        saved_solver = payload['runtime_config'].get('target_projection_solver')
+        if saved_solver is None:
+            import warnings
+            warnings.warn('resuming optimization state with upgraded target projection solver; '
+                          'future sampled labels are recomputed with ' + PROJECTION_SOLVER_VERSION,
+                          RuntimeWarning, stacklevel=2)
+        elif saved_solver != PROJECTION_SOLVER_VERSION:
+            raise ValueError('unsupported checkpoint target projection solver')
         if payload.get('checkpoint_kind') == 'inference_only':
             raise ValueError('inference-only weights cannot resume the production training objective')
-        if (payload['checkpoint_version'] not in (24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, CONSENSUS_CHECKPOINT_VERSION)
+        if payload['runtime_config'].get('ligand_geometry_scale_angstrom') != LIGAND_GEOMETRY_SCALE_ANGSTROM:
+            raise ValueError('historical ligand loss used protein-radius units; load weights only, not resume')
+        if payload['runtime_config'].get('protein_geometry_scale_angstrom') != PROTEIN_GEOMETRY_SCALE_ANGSTROM:
+            raise ValueError('historical protein loss used protein-radius units; load weights only, not resume')
+        if payload['runtime_config'].get('ligand_interface_contract') != LIGAND_INTERFACE_CONTRACT:
+            raise ValueError('ligand interface supervision differs; load weights only, not resume')
+        if (payload['checkpoint_version'] not in (24, 25, 26, 27, 39, ASSEMBLY_CHECKPOINT_VERSION)
                 or payload['runtime_config'].get('training_objective') != REAL_ENDPOINT_OBJECTIVE):
             raise ValueError('training objective differs or checkpoint is historical; load weights only')
         for key in ('inference_steps', 'endpoint_loss_weight', 'interface_loss_weight',
@@ -1162,10 +1037,6 @@ class ConsensusTrainer(TriCoopDiffTrainer):
         if payload['runtime_config']['expert_runtime_identity'] != expert_runtime_identity(self.model.expert):
             raise ValueError('checkpoint expert runtime configuration differs')
         saved_grad = payload['runtime_config'].get('expert_input_grad', False)
-        if payload['runtime_config'].get('structural_supervision', False) != self.structural_supervision:
-            raise ValueError('checkpoint structural supervision differs; start a separate training run')
-        if payload['runtime_config'].get('expert_coordinate_grad', True) != getattr(self.model, 'expert_coordinate_grad', True):
-            raise ValueError('checkpoint expert coordinate-gradient contract differs; load weights only for a new run')
         if saved_grad != getattr(self.model, 'expert_input_grad', True):
             raise ValueError('expert input-gradient contract differs; use matching '
                              'expert_input_grad for resume or load weights only for a new run')
@@ -1194,7 +1065,7 @@ class ConsensusTrainer(TriCoopDiffTrainer):
                 raise ValueError(f'consensus checkpoint runtime mismatch: {key}')
         self._restore_optimization(payload)
         self.resume_best_val_dockq = payload['training_state'].get('best_val_dockq', float('-inf'))
-        if payload['runtime_config'].get('validation_dockq_protocol') != self.validation_dockq_protocol:
+        if payload['runtime_config'].get('validation_dockq_protocol') != REAL_VALIDATION_DOCKQ_PROTOCOL:
             # Keep optimizer/LR, but do not compare different validation protocols.
             self.resume_best_val_dockq = float('-inf')
             self.resume_best_val_loss = float('inf')

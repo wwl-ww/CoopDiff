@@ -197,6 +197,28 @@ def test_periodic_multitorsion_endpoint_projection_recovers_reachable_targets():
         assert np.allclose(projected['ligand'], endpoint[0].numpy(), atol=1e-8)
 
 
+def test_projection_retries_exhausted_budget_without_accepting_failure():
+    from unittest.mock import patch
+    import tricoopdiff.initialization.endpoints as endpoints
+    from test_sdpi_flow import fixture
+
+    _, data, _, poi, _ = fixture()
+    solve = endpoints.least_squares
+    calls = []
+    def exhausted_once(fun, x, **kwargs):
+        result = solve(fun, x, **kwargs)
+        calls.append(kwargs['max_nfev'])
+        if len(calls) == 1:
+            result.success, result.status = False, 0
+        return result
+    with patch.object(endpoints, 'least_squares', side_effect=exhausted_once):
+        _, _, report = endpoints.project_endpoint_coupling(data, poi, data['coords'], poi)
+    assert calls[:2] == [400, 1200]
+    assert report['torsion_optimization']['success']
+    assert report['ligand_projection_rmsd_angstrom'] < 1e-8
+    assert report['torsion_optimization']['attempts'][0]['status'] == 0
+
+
 def test_single_atom_fallback_has_translation_only_roundtrip():
     native_ligand = torch.tensor([[[0.0, 0.0, 0.0]]], dtype=torch.float64)
     endpoint_ligand = torch.tensor([[[4.0, -2.0, 7.0]]], dtype=torch.float64)

@@ -346,13 +346,11 @@ def main():
         "entrypoint_sha256": sha256_file(Path(__file__)),
         "runtime_source_sha256": {
             name: sha256_file(RUNTIME_ROOT / name) for name in (
-                "tricoopdiff/models/consensus.py", "tricoopdiff/sampler.py",
+                "tricoopdiff/models/assembly.py", "tricoopdiff/sampler.py",
                 "tricoopdiff/sdpi_flow.py", "tricoopdiff/initialization/candidates.py",
                 "scripts/evaluation_runner.py", "scripts/featurize_common.py",
                 "scripts/evaluation_common.py", "tricoopdiff/metrics/dockq.py",
-            ) + (("tricoopdiff/conditioning/conditioned_consensus_train.py",
-                  "tricoopdiff/conditioning/condition_features.py")
-                 if args.allow_conditioned_checkpoint else ())
+            )
         },
         "smoke_one_per_source": args.smoke_one_per_source,
         "allow_experimental_checkpoint": args.allow_experimental_checkpoint,

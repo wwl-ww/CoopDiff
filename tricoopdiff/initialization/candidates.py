@@ -17,6 +17,90 @@ EXPERT_ANCHOR_CONSENSUS_VERSION = "dual_diffdock_rigid_anchor_consensus_v1"
 FIXED_CANDIDATE_VERSION = "fixed_native_free_candidate_v1"
 
 
+@torch.no_grad()
+def coupled_anchor_perturbation(center, e3_coords, ligand_data, *, seed,
+                                torsion_std=.15, translation_std=.5,
+                                rotation_std=.05, contact_cutoff=8.):
+    """Perturb a predicted assembly, preserving two disjoint local anchors.
+
+    Contact atoms are selected solely from the supplied predicted center.
+    One legal rotor separates the anchors: E3's anchor is restored and POI
+    follows the other anchor. Without two identifiable anchors, explicitly
+    use rigid-only error augmentation, not a claimed linker perturbation.
+    Coordinates returned match FixedCandidateInitializer's batched contract.
+    """
+    from tricoopdiff.initialization import validate_ligand_graph
+    from tricoopdiff.geometry.rigid import rotation_exp
+    from tricoopdiff.sdpi_flow import _raw_torsions
+    from rdkit import Chem
+
+    if any(not np.isfinite(v) or v < 0 for v in
+           (torsion_std, translation_std, rotation_std)) or not np.isfinite(contact_cutoff) or contact_cutoff <= 0:
+        raise ValueError('perturbation scales must be finite nonnegative')
+    ligand = center['ligand'].reshape(-1, 3).clone()
+    poi = center['poi'].reshape(-1, 3).clone()
+    body = center['rotation'].reshape(3, 3).clone()
+    e3 = e3_coords.to(ligand).reshape(-1, 3)
+    if not all(torch.isfinite(v).all() for v in (ligand, poi, e3, body)):
+        raise ValueError('predicted anchor center must be finite')
+    mol = ligand_data['mol']
+    if isinstance(mol, bytes):
+        mol = Chem.Mol(mol)
+    bonds, masks = validate_ligand_graph(mol, ligand_data['edge_index'],
+                                        ligand_data['edge_mask'], ligand_data['mask_rotate'])
+    d_e3 = torch.cdist(ligand, e3).amin(1)
+    d_poi = torch.cdist(ligand, poi).amin(1)
+    options = []
+    for index, mask in enumerate(masks):
+        side = torch.as_tensor(mask, device=ligand.device)
+        for e3_side in (side, ~side):
+            a = torch.where(e3_side & (d_e3 < contact_cutoff))[0]
+            b = torch.where(~e3_side & (d_poi < contact_cutoff))[0]
+            if min(len(a), len(b)) < 3:
+                continue
+            # Reject collinear anchor sets rather than inventing an orientation.
+            try:
+                proper_rigid_fit(ligand[a], ligand[a])
+                proper_rigid_fit(ligand[b], ligand[b])
+            except ValueError:
+                continue
+            score = float(d_e3[a].mean() + d_poi[b].mean())
+            options.append((score, index, a, b))
+    rng = np.random.default_rng(seed)
+    metadata = {'version': 'coupled_predicted_anchor_v1', 'seed': int(seed),
+                'native_information_used': False, 'contact_cutoff_angstrom': contact_cutoff,
+                'torsion_std_radians': torsion_std,
+                'translation_std_angstrom': translation_std,
+                'rotation_std_radians': rotation_std}
+    if options:
+        _, index, a, b = min(options, key=lambda item: item[0])
+        angles = np.zeros(len(bonds))
+        angles[index] = rng.normal(0., torsion_std)
+        moved = ligand.new_tensor(_raw_torsions(ligand.cpu().numpy(),
+                                  bonds.cpu().numpy(), masks, angles))
+        ra, ta, error_a = proper_rigid_fit(moved[a], ligand[a])
+        moved = apply_rigid(moved, ra, ta)
+        rb, tb, error_b = proper_rigid_fit(ligand[b], moved[b])
+        poi = apply_rigid(poi, rb, tb)
+        body = rb @ body
+        ligand = moved
+        metadata.update(mode='two_anchor_coupled_torsion', rotor_index=index,
+                        torsion_delta_radians=float(angles[index]),
+                        e3_anchor_atoms=a.tolist(), poi_anchor_atoms=b.tolist(),
+                        e3_anchor_fit_rmsd=float(error_a), poi_anchor_fit_rmsd=float(error_b))
+    else:
+        metadata.update(mode='rigid_only_no_separable_anchors')
+    # Intentional small binding error; no promise that contacts remain exact.
+    rotation = rotation_exp(ligand.new_tensor(rng.normal(0., rotation_std, 3)))
+    pivot = poi.mean(0)
+    offset = pivot - rotation @ pivot + ligand.new_tensor(rng.normal(0., translation_std, 3))
+    poi = apply_rigid(poi, rotation, offset)
+    body = rotation @ body
+    if not is_proper_rotation(body):
+        raise ValueError('coupled perturbation produced an invalid body frame')
+    return {'ligand': ligand[None], 'poi': poi[None], 'rotation': body[None]}, metadata
+
+
 class FixedCandidateInitializer:
     """Replay one already generated native-free proposal for refinement."""
 

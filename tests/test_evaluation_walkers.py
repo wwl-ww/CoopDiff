@@ -116,9 +116,9 @@ def test_rank_request_keeps_rejected_walkers_without_aborting_other_seeds():
                 'torsion': torch.zeros(1, int(ligand_data['edge_mask'].sum()))}
     bad = {**velocity, 'e3_ligand': {**velocity['e3_ligand'],
                                    'tr': torch.full((1, 3), float('nan'))}}
-    with patch.object(flow, 'forward_states', side_effect=[
-            [{'normalized_velocity': bad}, {'normalized_velocity': velocity}],
-            [{'rank_features': torch.tensor([[1., 2.]])}]]):
+    with patch.object(flow, 'forward_state', side_effect=[
+            {'normalized_velocity': bad}, {'normalized_velocity': velocity},
+            {'rank_features': torch.tensor([[1., 2.]])}]):
         results = sample_ensemble(model, flow, TernaryInitializer(), {'coords': e3},
                                   {'coords': poi}, ligand_data, steps=1, device='cpu',
                                   seeds=[7, 8], return_rank_features=True)
