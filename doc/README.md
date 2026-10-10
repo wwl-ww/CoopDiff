@@ -1,6 +1,8 @@
 # 文档索引
 
-更新：2026-09-16。当前代码定义实现，实验 manifest 与逐例结果定义已运行事实；提案和历史 smoke 不能替代二者。
+最新交接：[当前模型、实验与运行状态](PROJECT_HANDOFF.md)（2026-10-10，`model-v4`）。接手项目先读此文；以下索引与事实边界主要记录2026-09-16的历史工作，不能当作当前Matcha实现。
+
+当前代码定义实现，实验 manifest 与逐例结果定义已运行事实；提案和历史 smoke 不能替代二者。
 
 ## 阅读顺序
 
@@ -19,7 +21,7 @@
 
 `AGENTS.md` 为贡献约定。`hh.md` 是用户原始讨论稿，非现行实现规格。
 
-## 当前事实边界
+## 历史事实边界（2026-09-16）
 
 - B/C 均已完成 100 epochs；训练分支按 validation loss 交付 C81 EMA（`3.1384998601`），本分支 PROTAC 精修工作基线仍为 C40 EMA。完整22例 Final/Union差异见[配对结果](../RANKING_PROTAC_RESEARCH.md)。
 - 正式模型使用冻结 DiffDock experts。LoRA 从头训练与 best-checkpoint 微调均未超过父模型，已停止并删除可训练实现。
