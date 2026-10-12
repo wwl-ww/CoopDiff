@@ -1080,6 +1080,8 @@ def test_v8_expert_node_identity_frame_and_scatter_gradients():
           'features': features, 'edge_index': edges}
     poi = {'coords': (positions[None] + torch.tensor([0., 2., 0.])).requires_grad_(),
            'features': features + 100, 'edge_index': edges}
+    e3['local_geometry'] = torch.arange(12 * 32).reshape(1, 12, 32).float() / 100
+    poi['local_geometry'] = e3['local_geometry'] + 1
     _, graph, _, state = assembly_fixture()
     state[:, -1] = .5
     ligand = {'coords': torch.tensor([[[0., 0., 0.], [1., 1., 0.],
@@ -1104,6 +1106,11 @@ def test_v8_expert_node_identity_frame_and_scatter_gradients():
                      receptor_crop_cutoff=torch.tensor([4.]), diffusion_state=state)
     finally:
         hook.remove()
+    structural_reads = vector_capture[0]['protein_local_geometry']
+    assert torch.equal(structural_reads[:12, :32], e3['local_geometry'][0])
+    assert torch.equal(structural_reads[12:24, :32], poi['local_geometry'][0])
+    assert structural_reads[:24, -1].eq(1).all()
+    assert structural_reads[24:].eq(0).all(), 'ligand nodes must not receive protein structure slots'
     vector_reads = vector_capture[0]['expert_node_vectors']
     e3_vectors, poi_vectors = vector_reads[:12], vector_reads[12:24]
     expert_scalar_reads = vector_capture[0]['expert_node_features']
@@ -1127,6 +1134,31 @@ def test_v8_expert_node_identity_frame_and_scatter_gradients():
     for coords in (e3['coords'], poi['coords'], ligand['coords']):
         assert coords.grad is not None and torch.isfinite(coords.grad).all()
         assert coords.grad.abs().sum() > 0, 'binary reads must retain coordinate Jacobians'
+    # Exercise the actual wrapper boundary, not only a node-count predicate.
+    from unittest.mock import patch
+    from tricoopdiff.models import assembly as assembly_module
+    calls = []
+    original_checkpoint = assembly_module.checkpoint
+
+    def traced_checkpoint(function, *args, **kwargs):
+        if function is vector_fuse:
+            calls.append(function)
+        return original_checkpoint(function, *args, **kwargs)
+
+    vector_model.train()
+    vector_model.checkpoint_ternary = True
+    node_count = 12 + 12 + 4
+    with patch.object(assembly_module, 'checkpoint', traced_checkpoint):
+        vector_model.checkpoint_min_nodes = node_count + 1
+        vector_model(e3, poi, ligand, torch.tensor([.5]), diffusion_state=state)
+        assert not calls, 'small cases must retain ternary activations'
+        vector_model.checkpoint_min_nodes = node_count
+        vector_model(e3, poi, ligand, torch.tensor([.5]), diffusion_state=state)
+        assert len(calls) == 1, 'threshold-sized cases must still recompute'
+        vector_model.checkpoint_min_nodes = 0
+        vector_model(e3, poi, ligand, torch.tensor([.5]), diffusion_state=state)
+        assert len(calls) == 2, 'zero threshold must preserve historical recomputation'
+
 
 
 def test_bounded_vector_retains_large_finite_directions_and_coordinate_gradients():
@@ -1414,6 +1446,32 @@ def test_physical_velocity_has_no_inverse_remaining_time_gain():
     assert all(torch.isfinite(terminal[b][f]).all() for b in BRANCHES for f in ('tr', 'rot', 'tor'))
 
 
+def test_matcha_film_ablation_preserves_active_stages_and_random_stream():
+    model = TernaryAssembly(node_dim=32, input_dim=16, expert_backend='matcha',
+                            expert_scalar_dim=320, expert_vector_dim=3).double()
+    receptor = {'features': torch.randn(1, 5, 16, dtype=torch.float64),
+                'coords': torch.randn(1, 5, 3, dtype=torch.float64)}
+    opposite = {'features': torch.randn(1, 7, 16, dtype=torch.float64),
+                'coords': torch.randn(1, 7, 3, dtype=torch.float64)}
+    _, graph, _, _ = assembly_fixture()
+    ligand = {'features': graph['node_features'][graph['node_types'] == 2][None],
+              'edge_index': graph['lig_edge_index'], 'edge_attr': graph['lig_edge_attr'].double(),
+              'coords': torch.randn(1, 4, 3, dtype=torch.float64)}
+    with torch.no_grad():
+        for head in model.binary_film:
+            head.bias.fill_(.25)
+    rng = torch.get_rng_state().clone()
+    for stage in range(3):
+        baseline = model.binary_condition(receptor, opposite, ligand, stage_index=stage)
+        assert all(value.count_nonzero() for value in baseline), 'fixture must exercise learned nonzero FiLM'
+        for mode, stages in (('all', {0, 1, 2}), ('off', set()), ('early', {0}), ('late', {1, 2})):
+            actual = model.binary_condition(receptor, opposite, ligand,
+                                             stage_index=stage, ablation_mode=mode)
+            assert all(torch.equal(value, expected if stage in stages else torch.zeros_like(expected))
+                       for value, expected in zip(actual, baseline)), 'FiLM ablation changed an enabled stage or leaked a disabled stage'
+    assert torch.equal(rng, torch.get_rng_state()), 'paired FiLM ablations must not consume random numbers'
+
+
 def test_matcha_mutual_condition_preserves_prior_and_live_geometry():
     torch.manual_seed(19)
     model = TernaryAssembly(node_dim=32, input_dim=16, expert_backend='matcha',
@@ -1611,3 +1669,379 @@ def test_flow_import_is_independent_of_model_and_legacy_diffusion():
         'assert "tricoopdiff.legacy.diffusion" not in sys.modules'
     )
     subprocess.run([sys.executable, '-c', code], check=True)
+
+
+def test_horizontal_rotor_decoder_is_invariant_to_independent_axis_reversal():
+    from tricoopdiff.models.assembly import LegalPoseDecoder, TORSION_REPRESENTATION_CONTRACT
+
+    torch.manual_seed(7)
+    decoder = LegalPoseDecoder(16, 4,
+        torsion_representation_contract=TORSION_REPRESENTATION_CONTRACT).double()
+    h = torch.randn(12, 16, dtype=torch.float64, requires_grad=True)
+    vectors = torch.randn(12, 4, 3, dtype=torch.float64, requires_grad=True)
+    coords = torch.randn(12, 3, dtype=torch.float64)
+    coords[6:] = torch.tensor([[0, 1, .3], [-1, 0, 0], [0, 0, 0],
+                              [1, 0, 0], [2, 1, 1], [3, 1, 0]])
+    coords.requires_grad_()
+    types = torch.tensor([0] * 3 + [1] * 3 + [2] * 6)
+    bonds = torch.tensor([[2, 3], [3, 4]])
+    masks = torch.tensor([[0, 0, 0, 1, 1, 1], [0, 0, 0, 0, 1, 1]], dtype=torch.bool)
+    state = torch.zeros(1, 9, dtype=torch.float64)
+    state[:, -1], state[:, 5:8] = .5, .05
+    opinions = [torch.tensor([.2, -.1], dtype=torch.float64), torch.zeros(2, dtype=torch.float64)]
+    original = decoder(h, vectors, coords, types, bonds, masks, state, opinions)
+    reversed_bonds, reversed_masks = bonds.clone(), masks.clone()
+    reversed_bonds[:, 0], reversed_masks[0] = bonds[:, 0].flip(0), ~masks[0]
+    alternate = decoder(h, vectors, coords, types, reversed_bonds, reversed_masks, state, opinions)
+    fields = lambda output: torch.cat([output[branch][field].flatten()
+        for branch in BRANCHES for field in ('tr', 'rot')] + [output['torsion'].flatten()])
+    assert torch.allclose(fields(original), fields(alternate), atol=2e-12, rtol=2e-10)
+    parameters = [h, vectors, coords, *decoder.parameters()]
+    first = torch.autograd.grad(fields(original).square().sum(), parameters, allow_unused=True)
+    second = torch.autograd.grad(fields(alternate).square().sum(), parameters, allow_unused=True)
+    for a, b in zip(first, second):
+        assert (a is None) == (b is None)
+        if a is not None:
+            assert torch.isfinite(a).all() and torch.isfinite(b).all()
+            assert torch.allclose(a, b, atol=2e-11, rtol=2e-8)
+    assert first[2].abs().sum() > 0, 'equivalent actions must retain coordinate gradients'
+
+
+def test_horizontal_rotor_model_contract_preserves_legacy_checkpoint_behavior():
+    from tricoopdiff.models.assembly import production_model_config, TORSION_REPRESENTATION_CONTRACT
+
+    _, graph, proposals, state = assembly_fixture()
+    graph['expert_node_vectors'] = torch.randn(15, 4, 3)
+    config = production_model_config(32, 16, expert_vector_dim=2)
+    assert config['torsion_representation_contract'] == TORSION_REPRESENTATION_CONTRACT
+    model = TernaryAssembly(**config).eval()
+    alternate = dict(graph)
+    alternate['lig_edge_mask'] = torch.tensor([False, False, False, True, False, False])
+    alternate['lig_mask_rotate'] = ~graph['lig_mask_rotate']
+    before = model(graph, proposals, state)['normalized_velocity']
+    after = model(alternate, proposals, state)['normalized_velocity']
+    for branch in BRANCHES:
+        for field in ('tr', 'rot'):
+            assert torch.allclose(before[branch][field], after[branch][field], atol=2e-6)
+    assert torch.allclose(before['torsion'], after['torsion'], atol=2e-6)
+    legacy_config = {key: value for key, value in config.items()
+                     if key != 'torsion_representation_contract'}
+    legacy = TernaryAssembly(**legacy_config)
+    assert not legacy.controller.assembly.equivalent_rotors
+    assert 'torsion_representation_contract' not in legacy.config
+    legacy.load_state_dict(model.state_dict(), strict=True)
+    assert set(legacy.state_dict()) == set(model.state_dict()), 'parameter schema must remain loadable'
+
+
+def test_protein_intrinsic_geometry_availability_and_controller_gradients():
+    from tricoopdiff.models.assembly import production_model_config, protein_local_geometry_features
+
+    _, graph, proposals, state = assembly_fixture()
+    graph['expert_node_vectors'] = torch.randn(15, 4, 3)
+    model = TernaryAssembly(**production_model_config(32, 16, expert_vector_dim=2)).eval()
+    geometry = torch.randn(15, 33)
+    geometry[:, -1] = (graph['node_types'] != 2).float()
+    geometry[graph['node_types'] == 2] = 0
+    geometry.requires_grad_()
+    output = model({**graph, 'protein_local_geometry': geometry}, proposals, state)['normalized_velocity']
+    loss = output['torsion'].square().sum() + output['poi_ligand']['tr'].square().sum()
+    gradient, projection_gradient = torch.autograd.grad(loss,
+        (geometry, model.controller.protein_geometry.weight))
+    assert gradient[:11, :32].abs().sum() > 0 and torch.isfinite(gradient).all()
+    assert projection_gradient.abs().sum() > 0 and torch.isfinite(projection_gradient).all()
+    assert gradient[11:].eq(0).all(), 'protein geometry may not bleed into ligand slots'
+    permutation = torch.tensor([4, 2, 0, 3, 1, 10, 8, 6, 9, 7, 5, 14, 12, 11, 13])
+    permuted = {**graph, 'protein_local_geometry': geometry[permutation]}
+    for key in ('node_features', 'node_coords', 'node_types',
+                'expert_node_features', 'expert_node_vectors'):
+        permuted[key] = graph[key][permutation]
+    ligand_order = permutation[11:] - 11
+    permuted['lig_edge_index'] = torch.argsort(ligand_order)[graph['lig_edge_index']]
+    permuted['lig_mask_rotate'] = graph['lig_mask_rotate'][:, ligand_order]
+    reordered = model(permuted, proposals, state)['normalized_velocity']
+    assert torch.allclose(output['torsion'], reordered['torsion'], atol=2e-6)
+    for branch in BRANCHES:
+        for field in ('tr', 'rot'):
+            assert torch.allclose(output[branch][field], reordered[branch][field], atol=2e-6)
+
+    receptor = {'coords': torch.zeros(1, 3, 3)}
+    missing = protein_local_geometry_features(receptor)
+    measured = protein_local_geometry_features({**receptor, 'local_geometry': torch.zeros(1, 3, 32)})
+    assert torch.equal(missing[:, :32], measured[:, :32])
+    assert missing[:, -1].eq(0).all() and measured[:, -1].eq(1).all()
+    assert not torch.equal(model.controller.protein_geometry(missing),
+                           model.controller.protein_geometry(measured))
+    try:
+        protein_local_geometry_features(receptor, required=True)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('required geometry contract must reject absent structure')
+    malformed = {**receptor, 'local_geometry': torch.zeros(1, 4, 32)}
+    try:
+        protein_local_geometry_features(malformed)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('structure slots must match exact receptor node order and count')
+    old_config = {key: value for key, value in model.config.items()
+                  if key not in ('protein_local_geometry_contract', 'torsion_representation_contract')}
+    legacy = TernaryAssembly(**old_config)
+    assert legacy.controller.protein_geometry is None
+    assert legacy.condition_protein_geometry is None
+    legacy.load_state_dict(legacy.state_dict(), strict=True)
+
+
+def test_matcha_condition_reads_intrinsic_geometry_without_altering_sequence_inputs():
+    from tricoopdiff.models.assembly import production_model_config
+
+    torch.manual_seed(38)
+    model = TernaryAssembly(**production_model_config(32, 16, expert_backend='matcha',
+        expert_scalar_dim=8, expert_vector_dim=2)).double()
+    receptor = {'features': torch.randn(1, 3, 16, dtype=torch.float64),
+                'coords': torch.randn(1, 3, 3, dtype=torch.float64),
+                'local_geometry': torch.randn(1, 3, 32, dtype=torch.float64, requires_grad=True)}
+    opposite = {'features': torch.randn(1, 4, 16, dtype=torch.float64),
+                'coords': torch.randn(1, 4, 3, dtype=torch.float64),
+                'local_geometry': torch.randn(1, 4, 32, dtype=torch.float64, requires_grad=True)}
+    _, graph, _, _ = assembly_fixture()
+    ligand = {'coords': torch.randn(1, 4, 3, dtype=torch.float64),
+              'features': graph['node_features'][11:][None].double(),
+              'edge_index': graph['lig_edge_index'], 'edge_attr': graph['lig_edge_attr'].double()}
+    original_sequence = receptor['features'].clone()
+    gamma, beta = model.binary_condition(receptor, opposite, ligand)
+    assert gamma.eq(0).all() and beta.eq(0).all(), 'fresh FiLM must preserve frozen prior'
+    with torch.no_grad():
+        model.binary_film[0].weight.normal_(std=.04)
+    gamma, beta = model.binary_condition(receptor, opposite, ligand)
+    grads = torch.autograd.grad((gamma + beta).square().sum(),
+        (receptor['local_geometry'], opposite['local_geometry'], model.condition_protein_geometry.weight))
+    assert all(torch.isfinite(g).all() and g.abs().sum() > 0 for g in grads)
+    moved = {**opposite, 'local_geometry': opposite['local_geometry'] + .3}
+    changed = model.binary_condition(receptor, moved, ligand)
+    assert not torch.allclose(beta, changed[1])
+    assert torch.equal(original_sequence, receptor['features']), 'frozen sequence inputs must stay unchanged'
+
+
+def test_chemical_path_cache_keeps_dynamic_geometry_and_graph_identity():
+    import tricoopdiff.models.assembly as assembly
+
+    relation = assembly.ComponentStructureEncoder.chemical_relations
+    cache = assembly._CHEMICAL_PATH_CACHE
+    cache.clear()
+    coords = torch.tensor([[0., 0., 0.], [1., 0., 0.], [2., 0., 0.]], requires_grad=True)
+    edges = torch.tensor([[0, 1], [1, 2]])
+    attributes = torch.zeros(2, 4, requires_grad=True)
+    first, connected = relation(coords, edges, attributes)
+    assert len(cache) == 1
+    moved = coords.detach().clone()
+    moved[1, 1] = 1.
+    moved.requires_grad_()
+    second, second_connected = relation(moved, edges, attributes)
+    assert len(cache) == 1, 'coordinate changes should reuse only static topology'
+    assert torch.equal(first[..., 0], second[..., 0])
+    assert not torch.equal(first[..., 5], second[..., 5]), 'bond lengths must be recomputed'
+    second[..., 5].sum().backward()
+    assert moved.grad is not None and moved.grad.abs().sum() > 0
+    first[..., 1:5].sum().backward()
+    assert torch.equal(attributes.grad, torch.ones_like(attributes))
+    connected.zero_()
+    assert second_connected.all(), 'callers must not mutate cached masks'
+    changed = edges.clone()
+    changed[:, 1] = torch.tensor([0, 2])
+    third, _ = relation(coords, changed, attributes)
+    assert len(cache) == 2 and first[0, 2, 0] != third[0, 2, 0]
+    changed_attributes = attributes.detach().clone()
+    changed_attributes[0, 0] = 1.
+    fourth, _ = relation(coords, edges, changed_attributes)
+    assert len(cache) == 3 and fourth[0, 1, 1] == 1.
+    relation(coords.double(), edges, attributes.double())
+    assert len(cache) == 4, 'dtype changes must not reuse cached tensor storage'
+    permutation = torch.tensor([2, 1, 0])
+    relation(coords[permutation], permutation[edges], attributes)
+    assert len(cache) == 5, 'atom reindexing must key the reindexed graph'
+    for value in range(assembly._CHEMICAL_PATH_CACHE_LIMIT + 2):
+        relation(coords, edges, torch.full((2, 4), float(value)))
+    assert len(cache) <= assembly._CHEMICAL_PATH_CACHE_LIMIT
+    cache.clear()
+
+
+def test_adaptive_checkpoint_headroom_guard_reuses_reserved_memory_and_respects_cap():
+    from unittest.mock import patch
+    from tricoopdiff.models.assembly import TernaryAssemblyModel
+
+    policy = SimpleNamespace(checkpoint_ternary=True, checkpoint_min_nodes=600,
+        checkpoint_memory_reserve_bytes=8 * 2**30,
+        checkpoint_activation_bytes_per_node_squared=114688,
+        checkpoint_memory_fraction=.75)
+    decide = lambda count, device: TernaryAssemblyModel._should_checkpoint_ternary(policy, count, device)
+    cuda, cpu = torch.device('cuda', 0), torch.device('cpu')
+    with patch('torch.cuda.mem_get_info', return_value=(40 * 2**30, 80 * 2**30)) as info, \
+         patch('torch.cuda.memory_allocated', return_value=10 * 2**30), \
+         patch('torch.cuda.memory_reserved', return_value=12 * 2**30):
+        assert not decide(255, cuda), 'ample memory should allow small-case activation retention'
+        assert decide(600, cuda), 'large-case size protection must remain active'
+        assert not decide(255, cpu)
+        assert info.call_count == 1, 'large cases and CPU must not query CUDA memory'
+    with patch('torch.cuda.mem_get_info', return_value=(2 * 2**30, 80 * 2**30)), \
+         patch('torch.cuda.memory_allocated', return_value=10 * 2**30), \
+         patch('torch.cuda.memory_reserved', return_value=12 * 2**30):
+        assert decide(255, cuda), 'low physical free memory must force recomputation'
+    with patch('torch.cuda.mem_get_info', return_value=(2 * 2**30, 80 * 2**30)), \
+         patch('torch.cuda.memory_allocated', return_value=10 * 2**30), \
+         patch('torch.cuda.memory_reserved', return_value=30 * 2**30):
+        assert not decide(255, cuda), 'allocator cache can safely supply reusable bytes'
+    with patch('torch.cuda.mem_get_info', return_value=(40 * 2**30, 80 * 2**30)), \
+         patch('torch.cuda.memory_allocated', return_value=58 * 2**30), \
+         patch('torch.cuda.memory_reserved', return_value=60 * 2**30):
+        assert decide(255, cuda), 'the per-process cap must limit usable headroom'
+
+
+def test_interaction_query_chunk_preserves_outputs_gradients_and_large_graph_guard():
+    from copy import deepcopy
+    from unittest.mock import patch
+    from tricoopdiff.models.assembly import EquivariantInteraction
+
+    torch.manual_seed(73)
+    reference = EquivariantInteraction(8, 4).double().train()
+    alternate = deepcopy(reference)
+    alternate.query_chunk_size = 256
+    count = 67
+    types = torch.arange(count) % 3
+    edges = torch.tensor([[2, 5], [5, 2]])
+    attrs = torch.randn(2, 4, dtype=torch.double)
+    inputs = [torch.randn(count, 8, dtype=torch.double),
+              torch.randn(count, 4, 3, dtype=torch.double),
+              torch.randn(count, 3, dtype=torch.double)]
+    outcomes, gradients, calls = [], [], []
+    for block in (reference, alternate):
+        local = [x.clone().requires_grad_() for x in inputs]
+        with patch.object(block, '_messages', wraps=block._messages) as messages:
+            output = block(*local, types, edges, attrs)
+            sum(value.square().mean() for value in output).backward()
+            calls.append(messages.call_count)
+        outcomes.append(output)
+        gradients.append([x.grad for x in local] + [p.grad for p in block.parameters()])
+    for left, right in zip(outcomes[0], outcomes[1]):
+        torch.testing.assert_close(left, right, rtol=1e-10, atol=1e-11)
+    for left, right in zip(gradients[0], gradients[1]):
+        torch.testing.assert_close(left, right, rtol=1e-9, atol=1e-10)
+    assert calls == [4, 2], 'larger chunks must reduce both forward and recomputation dispatches'
+    # Check row boundaries without allocating a large attention graph.
+    alternate.eval()
+    def messages(q, query_vectors, query_coords, keys, values, vectors, coords, types, bonds):
+        return q.new_zeros(len(q), 3 * alternate.width + 3), query_vectors.new_zeros(len(q), 12, 3)
+    with patch.object(alternate, '_messages', side_effect=messages) as mocked:
+        alternate(torch.zeros(600, 8, dtype=torch.double), torch.zeros(600, 4, 3, dtype=torch.double),
+                  torch.zeros(600, 3, dtype=torch.double), torch.arange(600) % 3, edges, attrs)
+        assert [len(call.args[0]) for call in mocked.call_args_list] == [64] * 9 + [24]
+
+
+def test_message_compile_is_runtime_only_and_requests_inductor_fullgraph():
+    from unittest.mock import patch
+    from tricoopdiff.models.assembly import EquivariantInteraction
+
+    layer = EquivariantInteraction(8, 4)
+    keys = tuple(layer.state_dict())
+    compiled = lambda *args: layer._messages(*args)
+    with patch('torch.compile', return_value=compiled) as compile_core, \
+            patch('torch._C._dynamo.eval_frame._set_lru_cache') as cache_order:
+        layer.set_compile_messages(True)
+        cache_order.assert_called_once_with(False)
+        assert layer._compiled_messages is compiled
+        assert compile_core.call_args.kwargs == dict(backend='inductor', fullgraph=True, dynamic=True,
+            recompile_limit=32, isolate_recompiles=True)
+        assert tuple(layer.state_dict()) == keys, 'runtime fusion must not rename checkpoint weights'
+    layer.set_compile_messages(False)
+    assert layer._compiled_messages is None
+    assert tuple(layer.state_dict()) == keys
+
+
+def test_rollout_static_cache_reuses_identity_but_keeps_coordinates_and_gradients_live():
+    from unittest.mock import patch
+    import tricoopdiff.inputs.graphs as graphs
+    import tricoopdiff.models.assembly as assembly
+
+    graphs._TRIFUSE_STATIC_CACHE.clear()
+    xyz = [torch.randn(n, 3, requires_grad=True) for n in (3, 2, 3)]
+    features = [torch.randn(n, 4) for n in (3, 2, 3)]
+    edges = torch.tensor([[0, 1], [1, 2]])
+    attrs = torch.zeros(2, 4)
+    def build(coords):
+        return graphs.build_trifuse_graph(coords[0], features[0], coords[1], features[1],
+                                          coords[2], features[2], lig_edge_index=edges)
+    first = build(xyz)
+    moved = [x + 1. for x in xyz]
+    second = build(moved)
+    assert first['node_features'] is second['node_features'], 'rollout should reuse frozen identity features'
+    assert first['component_indices'] is second['component_indices']
+    assert torch.equal(second['node_coords'], first['node_coords'] + 1.)
+    second['node_coords'].sum().backward()
+    assert all(torch.equal(x.grad, torch.ones_like(x)) for x in xyz)
+    features[0].add_(1.)
+    third = build(xyz)
+    assert third['node_features'] is not second['node_features'], 'source mutation must invalidate static identity'
+    third['node_types'].zero_()
+    assert build(xyz)['node_types'].tolist() == [0, 0, 0, 1, 1, 2, 2, 2]
+    features[0].requires_grad_()
+    with_grad = build(xyz)
+    with_grad['node_features'].sum().backward()
+    assert torch.equal(features[0].grad, torch.ones_like(features[0])), 'learnable identity cannot be cached detached'
+    assembly._CHEMICAL_SIGNATURE_CACHE.clear()
+    with patch.object(assembly.hashlib, 'sha256', wraps=assembly.hashlib.sha256) as hashing:
+        assembly.ComponentStructureEncoder.chemical_relations(xyz[2], edges, attrs)
+        first_calls = hashing.call_count
+        assembly.ComponentStructureEncoder.chemical_relations(moved[2], edges, attrs)
+        assert first_calls == 2 and hashing.call_count == first_calls, 'stable topology must not be rehashed per step'
+        edges[1, 1] = 0
+        assembly.ComponentStructureEncoder.chemical_relations(xyz[2], edges, attrs)
+        assert hashing.call_count > first_calls, 'in-place topology changes must be rehashed'
+    graphs._TRIFUSE_STATIC_CACHE.clear()
+
+
+def test_compiled_message_hints_fix_features_and_leave_lengths_dynamic():
+    from unittest.mock import patch
+    from tricoopdiff.models.assembly import EquivariantInteraction
+
+    layer = EquivariantInteraction(8, 4).train()
+    h = torch.randn(6, 8, requires_grad=True)
+    vectors = torch.randn(6, 4, 3, requires_grad=True)
+    coords = torch.randn(6, 3, requires_grad=True)
+    types = torch.arange(6) % 3
+    edges, attrs = torch.empty(2, 0, dtype=torch.long), torch.empty(0, 4)
+    with patch('torch._dynamo.mark_static', wraps=torch._dynamo.mark_static) as hints:
+        layer(h, vectors, coords, types, edges, attrs)
+        assert not hints.called, 'eager execution must not receive compiler hints'
+    # Exercise the production wrapper and real checkpoint recomputation without
+    # compiling CPU kernels or downloading anything.
+    layer._compiled_messages = layer._messages
+    with patch('torch._dynamo.mark_static', wraps=torch._dynamo.mark_static) as hints:
+        output = layer(h, vectors, coords, types, edges, attrs)
+        sum(value.square().mean() for value in output).backward()
+        assert hints.call_count == 16, 'all fixed dimensions must be re-marked during recomputation'
+        for call in hints.call_args_list:
+            tensor, dimensions = call.args
+            assert tensor.dtype.is_floating_point
+            assert 0 not in dimensions, 'node/query lengths must stay dynamic'
+            if tensor.shape[-1] == 3:
+                assert tensor._base is None and tensor.storage_offset() == 0
+                assert tensor.is_contiguous(), 'compiled geometry must have a stable recompute layout'
+            if tensor.ndim == 3 and tensor.shape[-1] == 4:
+                assert dimensions == (2,), 'bond query/key lengths must stay dynamic'
+
+
+def test_radial_two_operand_contraction_preserves_values_and_gradients():
+    torch.manual_seed(73)
+    inputs = [torch.randn(5, 7, 4, dtype=torch.double),
+              torch.randn(7, 4, 3, dtype=torch.double),
+              torch.randn(5, 7, 3, dtype=torch.double)]
+    reference = [x.clone().requires_grad_() for x in inputs]
+    candidate = [x.clone().requires_grad_() for x in inputs]
+    old = torch.einsum('ijh,jhv,ijc->ihvc', *reference)
+    weighted = candidate[0][..., None] * candidate[2][:, :, None, :]
+    new = torch.einsum('ijhc,jhv->ihvc', weighted, candidate[1])
+    torch.testing.assert_close(old, new, rtol=1e-12, atol=1e-12)
+    old_grads = torch.autograd.grad(old.square().mean(), reference)
+    new_grads = torch.autograd.grad(new.square().mean(), candidate)
+    for left, right in zip(old_grads, new_grads):
+        torch.testing.assert_close(left, right, rtol=1e-12, atol=1e-12)

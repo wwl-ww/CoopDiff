@@ -1382,3 +1382,54 @@ def test_native_contact_parser_keeps_insertion_codes_and_default_altlocs():
     assert native is not None
     assert np.array_equal(native['poi_ca'], np.array([[2., 0., 0.], [3., 0., 0.]])), \
         'inserted residues must remain separate, and altloc B must not replace featurized altloc A'
+
+
+def test_equal_atom_counts_do_not_verify_poi_correspondence():
+    coords = np.array([[0., 0., 0.], [1., 0., 0.]])
+    native = {'ligand': coords, 'poi_ca': coords, 'e3_ca': coords}
+    with patch('tricoopdiff.evaluate._parse_native_complex', return_value=native):
+        metric = compute_poi_dockq(coords[::-1], coords, 'unused')
+        verified = compute_poi_dockq(coords, coords, 'unused',
+                                     atom_correspondence_verified=True)
+    assert metric['atom_correspondence'] is False
+    assert 'dockq' not in metric, 'matching counts cannot establish atom order'
+    assert verified['atom_correspondence'] is True and verified['dockq'] == 1.
+
+
+def test_evaluation_matcha_backend_preserves_identity_checks():
+    from evaluation_runner import EvaluationRunner
+    runtime = {'activation_clamp': 100., 'activation_clamp_mode': 'irrep_norm',
+               'expert_runtime_identity': {'backend': 'matcha'}}
+    checkpoint = {'model_config': {'expert_backend': 'matcha'},
+                  'expert_base_identity': {'backend': 'matcha'},
+                  'runtime_config': runtime, 'checkpoint_version': 24}
+    expert = SimpleNamespace(provenance={'backend': 'matcha'})
+    expert.to = lambda device: expert
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        model_dir = root/'model'
+        model_dir.mkdir()
+        (model_dir/'model_parameters.yml').write_text('num_conv_layers: 11\n')
+        with ExitStack() as stack:
+            stack.enter_context(patch('evaluation_runner.sha256_file', return_value='hash'))
+            stack.enter_context(patch('evaluation_runner.torch.load', return_value=checkpoint))
+            stack.enter_context(patch('evaluation_runner.validate_checkpoint_payload'))
+            stack.enter_context(patch('evaluation_runner.validate_score_norm_version', return_value='norm'))
+            stack.enter_context(patch('tricoopdiff.models.expert.configure_expert_policy'))
+            stack.enter_context(patch('tricoopdiff.models.expert.expert_runtime_identity', return_value={'backend': 'matcha'}))
+            base = stack.enter_context(patch('evaluation_runner.validate_expert_base_identity', return_value={'backend': 'matcha'}))
+            matcha = stack.enter_context(patch('evaluation_runner.FrozenMatcha', return_value=expert))
+            diffdock = stack.enter_context(patch('evaluation_runner.build_diffdock_expert'))
+            runner = EvaluationRunner(root, 'checkpoint.pt', device='cpu', model_dir='model')
+            assert runner.expert is expert and runner.expert_backend == 'matcha'
+            matcha.assert_called_once()
+            assert matcha.call_args.kwargs['device'] == 'cpu'
+            diffdock.assert_not_called()
+            base.assert_called_once_with(checkpoint, expert)
+            runtime['expert_runtime_identity'] = {'backend': 'different'}
+            try:
+                EvaluationRunner(root, 'checkpoint.pt', device='cpu', model_dir='model')
+            except ValueError as error:
+                assert 'runtime differs' in str(error)
+            else:
+                raise AssertionError('Matcha runtime identity mismatch must fail')

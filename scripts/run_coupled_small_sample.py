@@ -26,7 +26,7 @@ from tricoopdiff.runtime import (evaluation_context, preserve_rng, atomic_torch_
 from tricoopdiff.models.expert import (build_diffdock_expert, configure_expert_policy,
                                         expert_runtime_identity)
 from tricoopdiff.initialization.candidates import (DualExpertAnchorInitializer,
-    coupled_anchor_perturbation)
+    coupled_anchor_perturbation, _proposal_geometry)
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.initialization.endpoints import reachable_ligand_target
 from tricoopdiff.metrics.dockq import compute_fullatom_dockq
@@ -41,7 +41,7 @@ def options():
     parser.add_argument('--same-complex-val', default=f'{base}/same_complex_val.json')
     parser.add_argument('--unseen-complex-val', default=f'{base}/unseen_complex_val.json')
     parser.add_argument('--output-dir', default=f'{base}/run')
-    parser.add_argument('--binary-steps', type=int, default=20)
+    parser.add_argument('--binary-steps', type=int, default=5)
     parser.add_argument('--torsion-std', type=float, default=.15)
     parser.add_argument('--translation-std', type=float, default=.5)
     parser.add_argument('--rotation-std', type=float, default=.05)
@@ -95,8 +95,31 @@ def center_hash(center):
     return digest.hexdigest()
 
 
+def validate_center_geometry(center, *, case, seed):
+    """Fail closed on unusable native-free anchors; never drop a failed case."""
+    geometry = center.get('geometry', {})
+    required = ('protein_ca_pairs_below_3A', 'minimum_protein_ca_distance',
+                'minimum_e3_ca_ligand_distance', 'minimum_poi_ca_ligand_distance')
+    try:
+        values = {key: float(geometry[key]) for key in required}
+        valid = (all(np.isfinite(value) for value in values.values())
+                 and values['protein_ca_pairs_below_3A'] == 0
+                 and 3.0 <= values['minimum_protein_ca_distance'] <= 15.0
+                 and 1.5 <= values['minimum_e3_ca_ligand_distance'] <= 8.0
+                 and 1.5 <= values['minimum_poi_ca_ligand_distance'] <= 8.0)
+    except (KeyError, TypeError, ValueError):
+        valid = False
+    if center.get('acceptable') is not True or not valid:
+        raise ValueError(
+            f'{case}: invalid coupled-local center seed={seed}; '
+            f'acceptable={center.get("acceptable")}; geometry={geometry}. '
+            'Native-free two-anchor geometry gate failed; no case was dropped '
+            'and no native quality selection was applied.')
+    return center
+
+
 @preserve_rng
-def generate_center(batch, expert, seed, binary_steps):
+def generate_center(batch, expert, seed, binary_steps=5, proposal_attempts=4):
     """Generate one actual BiTSeed center; failures abort rather than masquerade as E."""
     random.seed(seed)
     np.random.seed(seed % (2**32))
@@ -106,19 +129,44 @@ def generate_center(batch, expert, seed, binary_steps):
     ed, pd, ld = (batch[key] for key in ('e3_data', 'poi_data', 'ligand_data'))
     graph_only = {key: value for key, value in ld.items() if key != 'coords'}
     initializer = DualExpertAnchorInitializer(expert, ed, pd,
-        binary_steps=binary_steps, proposal_attempts=1)
+        binary_steps=binary_steps, proposal_attempts=proposal_attempts)
     candidates, generation, _ = initializer.generate_candidates(
         ed['coords'][0], pd['coords'][0], graph_only, seed=seed,
-        conformer_count=1, candidate_budget=1, binary_retry_limit=8,
-        binary_consecutive_failure_limit=8)
-    if len(candidates) != 1:
-        raise RuntimeError(f"{batch['case']}: no genuine BiTSeed center")
-    center = cpu_tree(candidates[0])
+        conformer_count=1, candidate_budget=proposal_attempts**2,
+        binary_retry_limit=2, binary_consecutive_failure_limit=3,
+        allow_partial=False)
+    diagnostics = []
+    acceptable = []
+    for candidate in candidates:
+        geometry, geometry_ok, _ = _proposal_geometry(ed['coords'][0],
+            candidate['poi'].reshape(-1,3), candidate['ligand'].reshape(-1,3),
+            separation=candidate.get('geometry',{}).get('poi_outward_separation',0.))
+        valid = candidate.get('acceptable') is True and geometry_ok
+        diagnostics.append({'candidate_id':candidate['candidate_id'],
+            'penalty':list(candidate['penalty']), 'acceptable':valid,
+            'stored_acceptable':candidate.get('acceptable'), 'geometry':geometry,
+            'fit_rmsd':candidate['fit_rmsd']})
+        if valid:
+            acceptable.append(candidate)
+    selection = {'pool_count':len(candidates), 'acceptable_count':len(acceptable),
+        'binary_steps':binary_steps, 'proposal_attempts':proposal_attempts,
+        'binary_retry_limit':2, 'binary_consecutive_failure_limit':3,
+        'selection':'minimum_geometry_penalty_among_acceptable',
+        'native_information_used':False, 'candidates':diagnostics}
+    print(json.dumps({'event':'center_candidate_pool','case':batch['case'],
+        'seed':seed, **selection}),flush=True)
+    if not acceptable:
+        raise ValueError(f"{batch['case']}: no legal center in native-free "
+            f"{len(candidates)}-candidate pool seed={seed}; no SDPI fallback; "
+            f"diagnostics={json.dumps(selection)}")
+    center = cpu_tree(min(acceptable, key=lambda candidate:candidate['penalty']))
+    validate_center_geometry(center, case=batch['case'], seed=seed)
     print(json.dumps({'event':'center_generated', 'case':batch['case'],
-                      'seed':seed, 'sha256':center_hash(center)}), flush=True)
+                      'seed':seed, 'sha256':center_hash(center),
+                      'acceptable_count':len(acceptable)}), flush=True)
     return {'center': center, 'seed': seed, 'sha256': center_hash(center),
-            'generation': generation, 'backend': 'frozen_diffdock_v1.1',
-            'native_information_used': False}
+            'generation': generation, 'selection_diagnostics':selection,
+            'backend': 'frozen_diffdock_v1.1', 'native_information_used': False}
 
 
 def perturb(batch, center_record, seed, opt):

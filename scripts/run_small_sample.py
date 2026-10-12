@@ -23,6 +23,7 @@ from tricoopdiff.runtime import (evaluation_context, preserve_rng, atomic_torch_
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.initialization.endpoints import reachable_ligand_target
 from tricoopdiff.metrics.dockq import compute_fullatom_dockq
+from native_contact_evaluation import native_contact_preflight, contact_strata
 
 
 def options():
@@ -94,6 +95,11 @@ def make_bank(batch, seed, context):
 
 def evaluate(trainer, loaders, banks, args, output):
     """Paired raw/EMA use the exact same persisted initial states and atom mapping."""
+    contact_audit = {}
+    for loader in loaders.values():
+        for case, entry in loader.entries_by_case.items():
+            if case not in contact_audit:
+                contact_audit[case] = native_contact_preflight(scoring_context(entry, args))
     for group, loader in loaders.items():
         for weights in ('raw', 'ema'):
             records = []
@@ -109,7 +115,8 @@ def evaluate(trainer, loaders, banks, args, output):
                     metric = compute_fullatom_dockq(ligand[0].cpu().numpy(),
                         result['predicted_poi'][0].cpu().numpy(),
                         batch['e3_data']['coords'][0].cpu().numpy(), **context)
-                    record = {'case': batch['case'], 'initial_seed': bank['seed'],
+                    record = {'case': batch['case'], **contact_audit[batch['case']],
+                        'initial_seed': bank['seed'],
                         'initial_dockq': bank['initial_dockq']['dockq'], **metric,
                         'loss_total': result['loss_total'].item(),
                         'loss_endpoint_main': result['loss_endpoint_main'].item(),
@@ -127,6 +134,7 @@ def evaluate(trainer, loaders, banks, args, output):
                 'loss_mean': sum(row['loss_total'] for row in records) / len(records),
                 'ligand_crystal_rmsd_mean': sum(row['ligand_crystal_rmsd_angstrom'] for row in records) / len(records),
                 'ligand_reachable_rmsd_mean': sum(row['ligand_target_rmsd_angstrom'] for row in records) / len(records),
+                **contact_strata(records),
                 'per_case': records}
             append_metric(output, payload)
             (Path(output)/f"eval_update{trainer.global_step}_{group}_{weights}.json").write_text(json.dumps(payload, indent=2))

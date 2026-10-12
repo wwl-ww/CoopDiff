@@ -171,6 +171,16 @@ epoch1同检查点、同65例和起点的 raw／EMA 对照：raw 平均 DockQ 0.
 
 ### 8个训练复合物上的起点对照
 
+2026-10-11 重试：使用当前主训练 raw update500 权重开展新的 E 类实验，独立目录 `/root/.local/share/coopdiff/e_retry_main_update500_seed73`，不覆盖下表历史结果。已启动主权重 raw/EMA 在修正后16个合法训练中心对应的新扰动起点上的基线评估，以及独立中心/跨复合物中心准备；后台 `run_experiment.py` 将在输入准备完成后自动接续400次少样本微调，20/100/200/400保存评估。微调仅迁移trainable raw权重，重置optimizer/RNG/计数，显式记录parent SHA；跨复合物8例均来自当前主训验证集，不在主训训练索引中。GPU0/1主训继续，评估/微调GPU2、中心准备GPU3。当前只有任务启动事实，尚无完整新分数，不能称已复现E的0.65172；进度与错误见该目录experiment_status.json、parent_evaluation.log、prepare_transfer.log。
+
+用户已授权按顺序完成 E 重试后再做条件消融。后台链路已排入固定微调update400的all/off/early/late配对评估（raw/EMA、相同bank及全部三组），all复用400评估，其他模式不重新训练或更换起点。门控只影响专家FiLM，controller仍读取两蛋白；early为正式clock的stage0、late为stage1/2，报告实际调用数（含near辅助rollout）及FiLM头范数。两个针对性检查通过（2 passed），这只证明门控实现及原条件梯度契约，不代表消融已运行或宽起点定位已改善。最终生成ablation_summary.json，局部起点的结论不可推广到盲定位。
+
+本次启动发现并修复实验入口的重复ESM内容hash和缓存路径不匹配等待：启动一次完整encoder校验后pin身份；16例全部结构文件逐字节SHA一致，实验索引改用正式缓存对应路径，病例/内容不变，映射证据source_path_equivalence.json。保留逐例内容校验和已生成17个中心续接；未修改GPU0/1主训。初始耗时不能作为实际训练速度估计，微调尚待输入准备完成。
+
+后续定位到初次评估probe未只读，曾将官方首例1AFQ的缓存source_signature重写为小样本副本路径。已核验原/新来源逐字节一致、encoder身份一致、缓存签名与原输入精确匹配，恢复该例canonical签名；其余15例未改官方缓存。实验改为独立feature_cache，所有16例兼容读取合计0.119秒、零丢例；只读已准备输入遇不兼容立即报错，不再等待不存在的writer。修复证据cache_isolation_audit.json。既有17个中心保留；当前后台PID以各pid文件为准。此处是修复启动问题，仍不代表400次微调或条件消融已完成。
+
+最新实测：update500同8例16个新扰动起点基线已完整完成，raw DockQ0.06191282、EMA0.07371099，两者0/16超过0.23；初态0.05063058、中心0.05093185。FiLM三个头均非零。已解除跨复合物中心准备对局部训练的不必要前置依赖：GPU2 E微调已开始，首4例load0.5277秒，原16中心及same-complex bank字节身份保持，400步目标不变；独立/跨复合物中心GPU3继续，失败记录保留且不放宽标准。独立transfer评估显式提供training-bank-root并验证checkpoint绑定的原bank及训练中心SHA；不允许借此换same-complex起点。微调update0审计确认raw权重逐tensor等于parent500、EMA从parent raw开始、optimizer为空、step/samples均0（weight_transfer_audit.json）。后台脚本先完成局部微调及条件消融，再补transfer评估，不让生成失败阻断已可做的实验。
+
 病例：`1AFQ_B_C_0FG`、`1ALZ_A_B_EOH`、`1BHX_B_F_R56`、`1HKD_A_B_GYP`、`5DRN_H_L_5CT`、`1CJT_A_B_DAD`、`1JLL_B_D_COA`、`1D8D_B_P_FII`。它们是缓存可用训练 cluster 的前8个代表例，不是按结果挑的；也不都是典型 PROTAC。
 
 共同设置：从 Matcha raw epoch1／update147 权重开始，优化器重置，400次 update、batch4、真实20步及相同 near 辅助训练；初始化 seed73／74用于训练、75／76用于 held-out。同8个复合物的未训练起点不等于未见复合物验证。下表 ligand RMSD 是**可达目标 RMSD**。
@@ -345,3 +355,42 @@ python scripts/run_cpu_tests.py
 用户明确偏好：只训练单模型seed；看loss也看DockQ；不再平均投入大量新范式；不要把一次性试验变成大量文件；错误实现应根本修正，而不是叠兼容补丁。最近清理授权针对无用脚本／测试，**不是授权为了文件少而删核心模型**。遵循 `AGENTS.md`，不使用SLURM，不修改main，不杀他人任务，不删除数据／checkpoint／结果，不把历史负结果或局部成功包装成已解决问题。
 
 项目交付的诚实边界：当前已有完整条件二元＋三元控制架构、实际终点训练和可恢复后台任务；固定点及小邻域可高分，但宽初态与跨复合物预测仍未达到目标。接手者最该延续的是这个问题与证据链，而不是此前不停重构的节奏。
+
+### 2026-10-11：CCD 化学图与合法 torsion 修复
+
+`MGD_BINARY_CONDITIONING_FINDINGS.md` 的真实训练样本审计暴露了 PDB 键级丢失和双键可旋转问题。修正版由 `tricoopdiff/inputs/ligand_chemistry.py` 按显式 CCD 原子名（含明确别名）恢复完整重原子图、键级、formal charge 和芳香性，保留沉积原子顺序及坐标；缺原子、重复名称、错误组件或不支持的键级均报错，不能按邻接猜测补化学。CCD 中的氢不用于发明重原子坐标。
+
+`extract_ligand` 从新的化学图同时重建 directed edge_mask 和 mask_rotate。允许的自由度为非环、非芳香的内部重原子单键，并排除酰胺/硫代酰胺 C–N；双键、三键、芳香键、环内键和末端键不进入执行器。`validate_ligand_graph` 对修正版再次检查化学合法性；`FrozenMatcha.canonical_torsions` 读取同一套轴和 fragment，未修改冻结专家源码或权重。
+
+新 SDF/MOL 输入使用 feature-cache v10 和 `bond_order_legal_torsions_v1` 身份，不能复用 v9 拓扑 mask。已有 PDB v9 缓存仅作为旧实验兼容路径，在内存中明确标记 `legacy_topology_v9`，保留旧自由度，不改写磁盘缓存。新 PDB 缓存构建会报错并要求先生成 CCD 修复索引。运行中的主训练和 E 重试仍属于旧化学输入队列，不能将其结果记为已经验证化学修复；新化学队列须使用独立缓存、重新生成 torsion 起点和明确的权重迁移身份，不能直接沿用旧 coupled bank。
+
+入口：
+
+```bash
+python scripts/prepare_chemical_index.py --index ORIGINAL.json --ccd-dir CCD_DIR --out-dir NEW_DATA_DIR --download-missing
+python scripts/migrate_chemical_feature_cache.py --old-index ORIGINAL.json --new-index NEW_DATA_DIR/index.json --old-cache OLD_CACHE --out-cache NEW_CACHE --model-parameters MODEL_PARAMETERS.yml
+```
+
+第一条默认离线；显式 `--download-missing` 从 RCSB 获取 CCD 并记录内容 hash。任何失败都会写入 `chemistry_manifest.json` 且不发布索引，不静默删样本。第二条验证旧输入/模型参数/编码器缓存身份，重建配体 features、edge_attr、torsion，保留已验证且未变的蛋白特征和共享 E3 frame 标签，使用原子顺序与坐标核验后才写独立 v10 缓存，不加载 ESM 或专家权重。
+
+五例真实输入验证产物：`/root/.local/share/coopdiff/chemistry_fix_v1/`。PGV torsion 42→41，LP5 31→30，T44 恢复12个芳香原子；五例重原子顺序和坐标不变，修正版均通过生产 cache-only 读取及专家/执行器 torsion 一致性检查。数据与化学回归检查44项通过，另加的旧缓存拒绝/禁止新建模糊PDB缓存检查2项通过。冻结专家源码 SHA256 仍为 `f9c1a02dc8508c729c421cb95c056a49725bfca98f2babca84ac54e1a162abe7`。这些检查证明输入和自由度修复，不证明预测指标提升。
+
+全量 CCD 扫描已结束：752份组件定义；6834例训练中5809例恢复成功、1025例重原子集合无法完整匹配CCD；253例验证中216例成功、37例无法匹配。失败均为 incomplete/modified component 类，不能仅凭此判为提取错误，也不能编造缺失原子的坐标。逐例证据在 `chemistry_fix_v1/full_{train,val}/chemistry_manifest.json`，两份完整新索引均未发布，未静默剔除样本。完整新数据队列尚未可训练，旧队列继续运行。
+
+### 2026-10-12：完整 CCD 队列与后台任务恢复
+
+严格的全量恢复失败项进一步分类：1025 train + 37 val 均为 CCD 重原子缺失，无 extra atom。抽查 `1DS8_L_M_BPH` 和 `1WYV_A_B_PLP` 的原始 `gt_complex.pdb` 也缺失相应原子，不能当成只需改名的输入错误。尚未证明全部失败项的原始结构成因，也不能把修饰/共价组分一概称为错误提取。
+
+新增显式 `--quarantine-incomplete`：发布独立 `complete_ccd_cohort_v1` 队列，保留原 split，完整记录排除原因，过滤 cluster/items/representative 并移除空 cluster；普通技术异常仍阻止发布，默认严格模式不变。新队列是5809 train/531 clusters、216 val/56 clusters，不能当成原6834/253全量的同人口对照。路径为 `chemistry_fix_v1/complete_cohort_{train,val}/index.json`；另有 `complete_cohort_data/{train,val}_full.json` 符号链接。6025例v10缓存已实际迁移完成，每例均验证 source identity、保留蛋白特征/训练坐标并通过 cache-only 与专家/执行器扭转一致性读取。Matcha metadata 正通过 CPU preparation 和原有内容寻址序列缓存重建，入口新增 `--device cpu --sequence-cache-dir ...`，避免重新占用训练GPU。
+
+主训练曾在update723后因1AFQ feature-file hash与Matcha metadata不一致超时；原因为此前特征缓存修复后未同步其依赖元数据。已备份元数据，确认原始输入hash、全部配体特征、torsion轴及mask完全一致后，仅更新metadata的feature-file hash。证据为 `main_training_seed73/1afq_metadata_repair_audit.json`，双卡从checkpoint723后台恢复，`resume_metadata_repaired.log` 已记录实际update724/725；恢复时未切换到新化学数据队列。
+
+E重试400次微调及same-complex四种FiLM消融已完成，跨复合物中心生成在EOH独立中心32个确定性池全部失败后停止；不能称整个实验完整成功。16个新局部起点的EMA DockQ：all .73402277、off .49686219、early .51025445、late .70129353；raw all .48398365。汇总为 `e_retry_main_update500_seed73/local_ablation_summary.json`。它们属于旧化学输入、固定父update500加400次小样本微调，不证明跨复合物泛化或化学修复收益。原8例训练里5DRN/1JLL、原8例跨复合物验证里1PPJ/1WYV/2BVR不满足完整CCD队列，后续若换样本必须显式声明，不能悄悄替换后声称同面板A/B。
+
+修正版6025例缓存迁移的完成记录为 `chemistry_fix_v1/complete_cohort_feature_cache_v10/cohort_migration_completion.json`。原生产writer增加CPU设备及复用序列缓存参数后，后台元数据任务为 `complete_cohort_matcha_preparation/progress.json`，最终状态以该文件为准，不能只凭feature缓存完成宣称训练入口全部就绪。
+
+后续化学A/B的预声明小面板位于 `chemistry_fix_v1/small8_chemistry_ablation_seed73/`，同一8 train+8 val各有legacy/corrected索引；未启动新训练。保留原面板6个train、5个val；train的5DRN→6XLZ、1JLL→1CQI均为原cluster内完整组分，val的1PPJ→2NUU、1WYV→2QIE、2BVR→2UZ1来自原val中按索引顺序首个可用且未选cluster。选择不读取模型分数；详细case/原因及全部路径在selection_manifest.json。两组使用同一新面板才能比较化学修复，不能与原E结果直接作同面板差值。化学及数据回归47项通过。
+
+进一步核对全部1062个原始TernaryDB gt_complex.pdb：文件均存在；按CCD canonical优先、无歧义alt-name映射后，没有任何缺失重原子可从对应原始文件找回。初步仅按alternate-name集合匹配会产生16例假阳性，已按与restore_ligand一致的名称优先级消除。证据为 `chemistry_fix_v1/missing_original_audit.json`；这证明在当前TernaryDB资产中不能通过重新提取补齐，不证明RCSB原始实验文件的情况。
+
+最终准备状态：6025例v10特征与6025例Matcha元数据全部完成，零失败；8+8修正版小面板通过实际TernaryDataLoader cache-read-only + metadata-read-only读取，16例专家/执行器torsion轴及mask一致，未加载推理专家或启动新训练。完成证据 `chemistry_fix_v1/complete_cohort_ready.json`；旧主训练恢复后已实际完成update731。

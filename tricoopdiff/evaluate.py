@@ -239,37 +239,14 @@ def compute_poi_dockq(
     pred_ligand: np.ndarray,
     native_complex_pdb: str,
     cutoff: float = 8.0,
+    *, atom_correspondence_verified: bool = False,
 ) -> Optional[Dict[str, float]]:
-    """
-    Frame-invariant PROTAC-POI interface contact recovery (DockQ-style Fnat).
+    """Report native contact recovery only with externally verified atom order.
 
-    DockQ's native-contact fraction (Fnat) measures how much of the native
-    PROTAC↔POI interface is recovered by the prediction. It is frame-invariant:
-    it depends only on the *relative* PROTAC-POI geometry, so it is valid even
-    though the sampler emits PROTAC+POI in the (featurized) E3 frame while the
-    native complex is in the PDB frame.
-
-    Atom correspondence (why this works):
-      - PROTAC atoms follow SDF order; the native HETATM block uses the same
-        order (both trace to ``ligand.sdf``/``ligand.pdb``).
-      - POI coords are featurized at Cα level (``all_atoms=False``), so both the
-        predicted POI (``poi_data['coords']`` template) and the native POI
-        (Cα extracted in residue order) have one atom per residue, same order.
-
-    If the atom counts do not match (correspondence broken), a coarse
-    contact-density ratio is returned instead and flagged via
-    ``atom_correspondence``.
-
-    Args:
-        pred_poi: [N_poi, 3] predicted POI Cα coords (E3 frame, from sampler).
-        pred_ligand: [N_lig, 3] predicted PROTAC coords (E3 frame, from sampler).
-        native_complex_pdb: path to the native ternary complex PDB.
-        cutoff: contact distance cutoff (Å) between PROTAC atom and POI Cα.
-
-    Returns:
-        Contact recovery ('dockq') only with matching atom counts. Otherwise
-        return 'contact_density_ratio' as a separate, non-correspondence
-        diagnostic; it is not Fnat. Return None for an unavailable native.
+    Equal atom counts do not prove ligand or residue identity/order. Callers
+    without a verified correspondence receive a contact-density diagnostic,
+    never an Fnat/DockQ value. ``atom_correspondence_verified`` must originate
+    from an explicit identity mapping, not a count comparison.
     """
     from scipy.spatial.distance import cdist
 
@@ -285,7 +262,7 @@ def compute_poi_dockq(
     pred_d = cdist(pred_ligand, pred_poi)
     n_pred = int((pred_d < cutoff).sum())
 
-    if not (n_lig_ok and n_poi_ok):
+    if not (atom_correspondence_verified and n_lig_ok and n_poi_ok):
         # A count ratio cannot measure recovery of specific native contacts.
         n_native = int((cdist(ref_lig, ref_poi) < cutoff).sum())
         if n_native == 0:

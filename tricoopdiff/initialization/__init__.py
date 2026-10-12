@@ -73,12 +73,17 @@ def validate_ligand_graph(mol, edge_index, edge_mask, mask_rotate):
     bonds = edges.T[selected]
     if masks.shape != (len(bonds), n):
         raise ValueError("torsion mask shape/order does not match canonical bonds")
+    from tricoopdiff.inputs.ligand_chemistry import is_legal_torsion, LEGACY_CHEMISTRY_CONTRACT
+    legacy = (mol.HasProp('tricoopdiff_chemistry_contract') and
+              mol.GetProp('tricoopdiff_chemistry_contract') == LEGACY_CHEMISTRY_CONTRACT)
     seen = set()
     for (u, v), mask in zip(bonds.tolist(), masks):
         bond_id = tuple(sorted((u, v)))
         if bond_id in seen or bool(mask[u]) or not bool(mask[v]):
             raise ValueError("duplicate/reversed torsion bond: rotate side must contain v, not u")
         seen.add(bond_id)
+        if not legacy and not is_legal_torsion(mol, u, v):
+            raise ValueError(f"chemically forbidden torsion axis: {u}--{v}")
         # Removing the axis bond must split the graph into exactly these sides.
         component, pending = {v}, [v]
         while pending:

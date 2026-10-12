@@ -52,7 +52,10 @@ def build_parser():
                    help="Official ternary JSON index containing --case")
     p.add_argument("--native-root", default="data/TernaryDB_release/pdbs",
                    help="Root containing <case>/gt_complex.pdb for indexed data")
+    p.add_argument("--deepternary-root", default="DeepTernary")
     p.add_argument("--model-dir", default="checkpoints/score_model")
+    p.add_argument("--matcha-source-dir", default="results/matcha_qualification_source")
+    p.add_argument("--matcha-weights-dir", default="results/matcha_qualification_weights")
     p.add_argument("--ckpt", default="best_ema_inference_epoch_model.pt")
     p.add_argument("--case", default="5T35_D_A_759",
                    help="Ternary complex case name (directory under --protac-dir)")
@@ -172,6 +175,9 @@ def main():
                 _PROJECT_ROOT, checkpoint=args.trifuse_ckpt,
                 device=args.device, model_dir=args.model_dir,
                 expert_checkpoint=args.ckpt,
+                deepternary_root=args.deepternary_root,
+                matcha_source_dir=args.matcha_source_dir,
+                matcha_weights_dir=args.matcha_weights_dir,
                 conformer_policy=args.conformer_policy,
             )
             report = runner.evaluate_case(

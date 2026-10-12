@@ -326,6 +326,8 @@ def local_minimization(
         [N, 3] adjusted coordinates
     """
     coords = coords.copy()
+    skip_sep = _bond_separation_lookup(len(coords), bonds) if bonds is not None else None
+    cov_radii = np.array([COVALENT_RADII.get(z, 0.76) for z in atomic_numbers])
 
     for _ in range(max_rounds):
         if not clash_atoms.any():
@@ -343,6 +345,11 @@ def local_minimization(
             vdw_sum = radii[idx] + radii  # [N]
             overlap = vdw_sum - dist  # [N]
             overlap = np.maximum(overlap, 0)  # only repulsive
+            if skip_sep is not None:
+                overlap[(skip_sep[idx] >= 0) & (skip_sep[idx] <= 3)] = 0
+            else:
+                overlap[dist < (cov_radii[idx] + cov_radii) * BOND_DISTANCE_TOLERANCE] = 0
+            overlap[idx] = 0
 
             # Repulsive force: F = -∇(overlap²) = 2 * overlap * direction
             forces = 2 * overlap[:, np.newaxis] * (delta / dist[:, np.newaxis])
@@ -412,6 +419,9 @@ def tricoop_reflect(
         # Re-check after minimization
         clash_mask = detect_clashes(coords, atomic_numbers, bonds=bonds)
         n_clashes = clash_mask.sum()
+        if bonds is not None and bond_types is not None:
+            bond_anomalies = detect_bond_anomalies(coords, bonds, bond_types, atomic_numbers)
+            n_bond_anomalies = bond_anomalies.sum()
 
     # 5. Validity flag: no hard violations
     is_valid = (n_clashes == 0 and n_bond_anomalies == 0)

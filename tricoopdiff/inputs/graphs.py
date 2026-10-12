@@ -7,11 +7,18 @@ validation against the pretrained expert's input contract.
 A third full ternary graph connects all three molecules for TriFuse coordination.
 """
 
+from collections import OrderedDict
 import math
 
 import torch
 from torch_geometric.data import HeteroData
 from torch_geometric.utils import subgraph
+
+from tricoopdiff.inputs.static_cache import tensor_view_key
+
+
+_TRIFUSE_STATIC_CACHE = OrderedDict()
+_TRIFUSE_STATIC_CACHE_LIMIT = 8
 
 
 def _validate_component(coords, features, name):
@@ -153,8 +160,24 @@ def build_trifuse_graph(
     n_poi = poi_coords.shape[0]
     n_lig = ligand_coords.shape[0]
 
-    # Concatenate all nodes
+    # Coordinates remain live; only labels, identity features and topology can
+    # survive rollout steps. Source references prevent storage-key reuse.
+    sources = (e3_features, poi_features, ligand_features, lig_edge_index)
+    signatures = tuple(tensor_view_key(value) if value is not None else None for value in sources)
+    cacheable = (all(value is None or not value.requires_grad for value in sources)
+                 and all(value is None or key is not None for value, key in zip(sources, signatures)))
+    static_key = (str(e3_coords.device), signatures) if cacheable else None
+    cached = _TRIFUSE_STATIC_CACHE.get(static_key) if cacheable else None
     node_coords = torch.cat([e3_coords, poi_coords, ligand_coords], dim=0)
+    if cached is not None and any(tensor_view_key(value) != key
+                                  for value, key in cached['versions']):
+        cached = None
+    if cached is not None:
+        _TRIFUSE_STATIC_CACHE.move_to_end(static_key)
+        static = cached['static']
+        return {**static, 'node_coords': node_coords,
+                'lig_edge_index': lig_edge_index, 'lig_edge_mask': lig_edge_mask,
+                'lig_mask_rotate': lig_mask_rotate, 'lig_edge_attr': lig_edge_attr}
 
     # For features, we need to handle potentially different feature dimensions.
     # Pad to max dim with zeros and store a mask.
@@ -181,7 +204,26 @@ def build_trifuse_graph(
         2 * torch.ones(n_lig, dtype=torch.long, device=node_coords.device),
     ], dim=0)
 
+    component_indices = tuple(torch.arange(start, stop, device=node_coords.device)
+        for start, stop in ((0, n_e3), (n_e3, n_e3 + n_poi),
+                            (n_e3 + n_poi, n_e3 + n_poi + n_lig)))
+    static = {'node_features': node_features, 'node_types': node_types,
+              'n_e3': n_e3, 'n_poi': n_poi, 'n_lig': n_lig,
+              'component_indices': component_indices,
+              'global_ligand_edges': (component_indices[2][lig_edge_index]
+                                      if lig_edge_index is not None else None)}
+    if cacheable:
+        tensors = (node_features, node_types, *component_indices, static['global_ligand_edges'])
+        versions = tuple((value, tensor_view_key(value)) for value in tensors if value is not None)
+        # Inference-mode outputs cannot safely be reused by a later training
+        # forward, even when their source tensors have version counters.
+        if all(key is not None for _, key in versions):
+            _TRIFUSE_STATIC_CACHE[static_key] = {
+                'sources': sources, 'static': static, 'versions': versions}
+            while len(_TRIFUSE_STATIC_CACHE) > _TRIFUSE_STATIC_CACHE_LIMIT:
+                _TRIFUSE_STATIC_CACHE.popitem(last=False)
     return {
+        **static,
         'node_coords': node_coords,          # [N_total, 3]
         'node_features': node_features,      # [N_total, max_dim]
         'node_types': node_types,            # [N_total]

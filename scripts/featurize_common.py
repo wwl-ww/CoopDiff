@@ -19,6 +19,7 @@ import os
 import sys
 import gc
 import time
+import warnings
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -52,14 +53,92 @@ os.chdir(_PROJECT_ROOT)
 # v7 also avoids distance cancellation for translated PDB coordinates.
 # v8 centers the exact retained ligand atoms, including isotope hydrogens.
 # v9 adds intrinsic monomer backbone/sidechain geometry (v8 can be enriched).
+# v10 rebuilds legal torsion masks from a bond-order-bearing molecular graph.
+# PDB v9 is a tagged historical compatibility path, never a new cache writer.
 # v5 caches contain reversed directed receptor edges and cannot be reused.
-_FEATURIZE_CACHE_VERSION = 9
+_FEATURIZE_CACHE_VERSION = 10
+# PDB v9 caches are read only for explicitly identified historical experiments.
+# New chemistry must use a complete bond-order-bearing SDF/MOL source.
+def _source_cache_version(ligand_path):
+    return 9 if Path(ligand_path).suffix.lower() == ".pdb" else _FEATURIZE_CACHE_VERSION
+
+
 LOCAL_GEOMETRY_DIM = 32
 
 
+def _encoder_file_digest(path):
+    """Hash contents directly: filesystem timestamps may have coarse resolution."""
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def esm_encoder_identity():
+    """Resolve only local assets; never instantiate or download an encoder."""
+    model = os.environ.get('TRICOOPDIFF_ESM_MODEL') or 'facebook/esm2_t33_650M_UR50D'
+    directory = Path(model).expanduser()
+    if not directory.is_dir():
+        if directory.is_absolute():
+            directory = None
+        else:
+            from huggingface_hub import try_to_load_from_cache
+            from huggingface_hub.errors import HFValidationError
+            try:
+                config = try_to_load_from_cache(model, 'config.json')
+            except (HFValidationError, OSError):
+                config = None
+            directory = Path(config).parent if isinstance(config, str) else None
+    files = {}
+    if directory is not None and directory.is_dir():
+        for path in sorted(directory.rglob('*')):
+            if path.is_file() and (path.suffix in ('.json', '.txt', '.model', '.bin', '.safetensors')
+                                   or path.name in ('merges.txt', 'vocab.txt')):
+                files[str(path.relative_to(directory))] = _encoder_file_digest(str(path.resolve()))
+    weights = any(name.endswith('.safetensors') or Path(name).name.startswith('pytorch_model')
+                  and name.endswith('.bin') for name in files)
+    tokenizer = any(Path(name).name in ('tokenizer.json', 'vocab.txt', 'tokenizer.model') for name in files)
+    shards_complete = True
+    if directory is not None:
+        for name in files:
+            if name.endswith('.index.json'):
+                try:
+                    index = json.loads((directory / name).read_text())
+                    shard_names = set(index['weight_map'].values())
+                    shards_complete = shards_complete and bool(shard_names) and all(
+                        shard in files for shard in shard_names)
+                except (KeyError, TypeError, ValueError, OSError):
+                    shards_complete = False
+    complete = 'config.json' in files and weights and tokenizer and shards_complete
+    return {'model': model, 'status': 'local_assets_hashed' if complete else 'unresolved_local_assets',
+            'files': files}
+
+
+def _esm_identity_verified(identity):
+    return isinstance(identity, dict) and identity.get('status') == 'local_assets_hashed'
+
+
+def _accept_legacy_esm_cache(cached, expected_signature):
+    """Keep old research assets usable, explicitly exposing unverified ESM origin."""
+    if cached.get('esm_encoder_identity') is not None:
+        return False
+    if cached.get('source_signature') != expected_signature:
+        return False
+    if os.environ.get('TRICOOPDIFF_ALLOW_LEGACY_ESM_CACHE', '1') != '1':
+        return False
+    warnings.warn('Using legacy feature cache: ESM encoder identity is unverified. '
+                  'Set TRICOOPDIFF_ALLOW_LEGACY_ESM_CACHE=0 to require verified assets.',
+                  RuntimeWarning, stacklevel=2)
+    cached['esm_cache_status'] = 'legacy_encoder_unverified'
+    return True
+
+
 def _featurize_signature(protein1, protein2, ligand_path, score_model_args,
-                         cache_version=_FEATURIZE_CACHE_VERSION):
+                         cache_version='auto', include_esm=True, encoder_identity=None):
     """Fingerprint source structures and model preprocessing arguments."""
+    if cache_version == 'auto':
+        cache_version = _source_cache_version(ligand_path)
     digest = hashlib.sha256()
     for path in (protein1, protein2, ligand_path):
         resolved = Path(path).resolve()
@@ -72,6 +151,8 @@ def _featurize_signature(protein1, protein2, ligand_path, score_model_args,
     )
     if cache_version is not None:
         digest.update(f'featurize_schema_v{cache_version}'.encode())
+    if include_esm:
+        digest.update(json.dumps(esm_encoder_identity() if encoder_identity is None else encoder_identity, sort_keys=True).encode())
     return digest.hexdigest()
 
 
@@ -259,12 +340,8 @@ def extract_receptor(batch_graph, device):
 
 def extract_ligand(batch_graph, device):
     """Ligand tensors → the dict format TriCoopDiff.forward expects."""
-    # mask_rotate (per-rotatable-bond atom mask, [n_rot, n_atoms] bool) is stored
-    # as a numpy array on the ligand node; torch_geometric collate wraps per-ligand
-    # arrays in a list (Batch) even at batch_size=1. Normalize to the single array.
-    mask_rotate = batch_graph['ligand'].mask_rotate
-    if isinstance(mask_rotate, (list, tuple)):
-        mask_rotate = mask_rotate[0]
+    # Rebuild axes and masks together from chemical bonds; never reuse the
+    # vendored topology-only torsion map.
     from rdkit import Chem
 
     mol = batch_graph.mol[0] if isinstance(batch_graph.mol, (list, tuple)) else batch_graph.mol
@@ -272,13 +349,18 @@ def extract_ligand(batch_graph, device):
         mol = Chem.RemoveHs(mol)
     if mol.GetNumAtoms() != batch_graph['ligand'].pos.shape[0]:
         raise ValueError("RDKit atom order/count does not match ligand graph")
+    from tricoopdiff.inputs.ligand_chemistry import CHEMISTRY_CONTRACT, legal_torsion_masks
+    edge_index = batch_graph['ligand', 'ligand'].edge_index
+    edge_mask, mask_rotate = legal_torsion_masks(mol, edge_index)
+    mol.SetProp('tricoopdiff_chemistry_contract', CHEMISTRY_CONTRACT)
     return {
-        'mol': mol.ToBinary(),
+        'chemistry_contract': CHEMISTRY_CONTRACT,
+        'mol': mol.ToBinary(Chem.PropertyPickleOptions.AllProps),
         'coords': batch_graph['ligand'].pos.unsqueeze(0).to(device),
         'features': batch_graph['ligand'].x.unsqueeze(0).to(device),
         'edge_index': batch_graph['ligand', 'ligand'].edge_index.to(device),
         'edge_attr': batch_graph['ligand', 'ligand'].edge_attr.to(device),
-        'edge_mask': batch_graph['ligand'].edge_mask.to(device),
+        'edge_mask': torch.as_tensor(edge_mask, device=device),
         'mask_rotate': mask_rotate,
     }
 
@@ -309,7 +391,8 @@ def _to_device_and_batch(data, device):
 
 def featurize_complex(case_label, protein1, protein2, ligand_path,
                       score_model_args, device, cache_dir=None,
-                      cache_read_only=False, cache_wait_seconds=3600., cache_only=False):
+                      cache_read_only=False, cache_wait_seconds=3600., cache_only=False,
+                      expected_esm_encoder_identity=None):
     """Featurize one ternary complex into the three B=1 data dicts.
 
     Args:
@@ -335,14 +418,24 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
         translation instead of the 0 that ``InferenceDataset``'s per-molecule
         centering would otherwise produce.
     """
+    # Read-only runs may pin a content-hashed encoder identity at startup.
+    # These workers never load the encoder; each cache still proves its source
+    # and encoder identity against the run's immutable expected provenance.
+    if expected_esm_encoder_identity is not None:
+        if not (cache_read_only or cache_only):
+            raise ValueError('pinned encoder identity requires read-only feature loading')
+        if not _esm_identity_verified(expected_esm_encoder_identity):
+            raise ValueError('pinned encoder identity must be verified from local assets')
     for p in (protein1, protein2, ligand_path):
         if p is not None and not Path(p).is_absolute():
             raise ValueError(f"expected absolute path, got: {p}")
 
+    cache_version = _source_cache_version(ligand_path)
     cache_path = None
-    cache_signature = _featurize_signature(
-        protein1, protein2, ligand_path, score_model_args
+    legacy_cache_signature = _featurize_signature(
+        protein1, protein2, ligand_path, score_model_args, include_esm=False
     )
+    cache_signature = legacy_cache_signature
     if cache_wait_seconds < 0:
         raise ValueError('cache_wait_seconds must be nonnegative')
     if cache_dir is not None:
@@ -354,11 +447,28 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
                 # which PyTorch 2.6's default weights_only=True refuses to unpickle.
                 # The file is written by us (trusted), so full unpickling is safe.
                 cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+                cache_signature = legacy_cache_signature
+                runtime_identity = None
+                if cached.get('esm_encoder_identity') is not None:
+                    runtime_identity = (expected_esm_encoder_identity
+                                        if expected_esm_encoder_identity is not None
+                                        else esm_encoder_identity())
+                    cache_signature = _featurize_signature(
+                        protein1, protein2, ligand_path, score_model_args,
+                        encoder_identity=runtime_identity)
                 # v8 already has correct atom order/frames/ESM. Enrich it from
                 # source monomers without rebuilding embeddings or graphs.
-                if (cached.get('cache_version') in (7, 8) and cached.get('source_signature') ==
+                if (expected_esm_encoder_identity is None
+                        and cache_version == 9
+                        and cached.get('cache_version') in (7, 8)
+                        and os.environ.get('TRICOOPDIFF_ALLOW_LEGACY_ESM_CACHE', '1') == '1'
+                        and cached.get('esm_encoder_identity') is None
+                        and cached.get('source_signature') ==
                         _featurize_signature(protein1, protein2, ligand_path, score_model_args,
-                                             cache_version=None)):
+                                             cache_version=None, include_esm=False)):
+                    if cached.get('esm_encoder_identity') is None:
+                        if not _accept_legacy_esm_cache(cached, cached['source_signature']):
+                            raise ValueError(f'{case_label}: legacy ESM cache disabled by strict policy')
                     if cached['cache_version'] == 7:
                         # v7 differed only in retained/isotope-H ligand centering.
                         # Correct that translation from source, retaining ESM and topology.
@@ -367,19 +477,35 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
                         cached['ligand_data']['coords'] = position - position.mean(0) + position.new_tensor(center)
                     for key, path in (('e3_data', protein1), ('poi_data', protein2)):
                         cached[key]['local_geometry'] = protein_local_geometry(path, cached[key])[0].cpu()
-                    cached.update(cache_version=_FEATURIZE_CACHE_VERSION, source_signature=cache_signature)
+                    cached.update(cache_version=cache_version, source_signature=(
+                        _featurize_signature(protein1, protein2, ligand_path, score_model_args, include_esm=False)
+                        if cached.get('esm_cache_status') == 'legacy_encoder_unverified' else cache_signature))
                     if not cache_read_only:
                         atomic_torch_save(cached, cache_path)
                 if (
-                    cached.get('cache_version') == _FEATURIZE_CACHE_VERSION
-                    and cached.get('source_signature') == cache_signature
+                    cached.get('cache_version') == cache_version
+                    and ((_esm_identity_verified(runtime_identity) and
+                          cached.get('esm_encoder_identity') == runtime_identity and
+                          cached.get('source_signature') == cache_signature) or
+                         (expected_esm_encoder_identity is None and
+                          _accept_legacy_esm_cache(cached, cache_signature)))
                 ):
                     for key in ('e3_data', 'poi_data'):
                         geometry = cached[key].get('local_geometry')
                         if (not torch.is_tensor(geometry) or geometry.shape !=
                                 (cached[key]['coords'].shape[0], LOCAL_GEOMETRY_DIM)
                                 or not torch.isfinite(geometry).all()):
-                            raise ValueError(f'{case_label}: v9 cache lacks valid {key} local_geometry')
+                            raise ValueError(f'{case_label}: cache lacks valid {key} local_geometry')
+                    if cache_version == 9:
+                        from rdkit import Chem
+                        from tricoopdiff.inputs.ligand_chemistry import LEGACY_CHEMISTRY_CONTRACT
+                        cached['ligand_data'] = dict(cached['ligand_data'])
+                        mol = Chem.Mol(cached['ligand_data']['mol'])
+                        mol.SetProp('tricoopdiff_chemistry_contract', LEGACY_CHEMISTRY_CONTRACT)
+                        cached['ligand_data']['mol'] = mol.ToBinary(Chem.PropertyPickleOptions.AllProps)
+                        cached['ligand_data']['chemistry_contract'] = LEGACY_CHEMISTRY_CONTRACT
+                    elif cached['ligand_data'].get('chemistry_contract') != 'bond_order_legal_torsions_v1':
+                        raise ValueError(f'{case_label}: corrected cache lacks chemistry contract')
                     e3 = _to_device_and_batch(cached['e3_data'], device)
                     poi = _to_device_and_batch(cached['poi_data'], device)
                     lig = _to_device_and_batch(cached['ligand_data'], device)
@@ -397,6 +523,14 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
 
     if cache_only:
         raise FileNotFoundError(f'{case_label}: cache-only mode requires a compatible cache directory')
+    if cache_version == 9:
+        raise ValueError('PDB ligand chemistry is ambiguous: prepare a CCD-corrected SDF index; '
+                         'legacy v9 caches may only be reused, never rebuilt')
+    encoder_identity = esm_encoder_identity()
+    if not _esm_identity_verified(encoder_identity):
+        raise ValueError('ESM local encoder assets are incomplete; cannot record verified cache identity')
+    cache_signature = _featurize_signature(
+        protein1, protein2, ligand_path, score_model_args, encoder_identity=encoder_identity)
     embeddings_map = generate_esm_embeddings([protein1, protein2], device)
 
     e3_graph = featurize_subgraph(
@@ -444,8 +578,10 @@ def featurize_complex(case_label, protein1, protein2, ligand_path,
             'ligand_data': _strip_batch_and_cpu(ligand_data),
             'receptor_feat_dim': receptor_feat_dim,
             't_e3_to_poi': torch.tensor(t_e3_to_poi, dtype=torch.float32),
-            'cache_version': _FEATURIZE_CACHE_VERSION,
+            'cache_version': cache_version,
             'source_signature': cache_signature,
+            'esm_encoder_identity': encoder_identity,
+            'esm_cache_status': 'encoder_identity_recorded',
         }
         atomic_torch_save(payload, cache_path)
 

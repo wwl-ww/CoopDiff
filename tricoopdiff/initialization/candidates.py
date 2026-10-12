@@ -1,6 +1,7 @@
 """Native-free ternary anchors composed from two frozen DiffDock proposals."""
 
 import random
+from numbers import Integral
 
 import numpy as np
 import torch
@@ -555,8 +556,8 @@ class DualExpertAnchorInitializer:
     def __init__(self, expert, e3_data, poi_data, *, binary_steps=5,
                  proposal_attempts=4, conformer_policy="etkdgv3_random",
                  selection="geometry"):
-        if binary_steps < 2:
-            raise ValueError("binary_steps must be at least 2")
+        if isinstance(binary_steps, bool) or not isinstance(binary_steps, Integral) or binary_steps < 2:
+            raise ValueError("binary_steps must be an integer at least 2")
         if proposal_attempts < 1:
             raise ValueError("proposal_attempts must be positive")
         if selection not in {"geometry", "consensus"}:
@@ -587,14 +588,16 @@ class DualExpertAnchorInitializer:
             torch.cuda.manual_seed_all(int(seed))
         schedule = self.process.get_inference_schedule(self.binary_steps)
         times = schedule["tr_schedule"]
-        actual_steps = self.binary_steps - 1
+        actual_steps = len(times) - 1
         pos = position
         for index in range(actual_steps):
             time = torch.as_tensor(
                 times[index], device=pos.device, dtype=pos.dtype,
             ).reshape(1)
-            dt = (time - float(times[index + 1])
-                  if index < actual_steps - 1 else time.clone())
+            next_time = torch.as_tensor(
+                times[index + 1], device=pos.device, dtype=pos.dtype,
+            ).reshape(1)
+            dt = time - next_time
             tr_sigma, _, _ = self.process.t_to_sigma(time, time, time)
             cutoff = (tr_sigma[0] * 3 + 20
                       if self.expert.model.dynamic_max_cross else None)

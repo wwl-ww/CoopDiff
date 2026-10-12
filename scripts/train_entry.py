@@ -89,6 +89,8 @@ def parse_args(argv=None):
     p.add_argument('--interface-loss-weight', type=float, default=1.0)
     p.add_argument('--interface-cutoff', type=float, default=10.0,
                    help='Native C-alpha interface cutoff in Angstrom, not full-atom DockQ contact membership')
+    p.add_argument('--interface-error-scale', type=float, default=10.0,
+                   help='PP interface error normalization in Angstrom, independent of contact cutoff')
     p.add_argument('--steric-loss-weight', type=float, default=None,
                    help='Coarse short-range repulsion; default .05')
     p.add_argument('--checkpoint-ternary', action=argparse.BooleanOptionalAction, default=True,
@@ -110,6 +112,9 @@ def parse_args(argv=None):
     p.add_argument('--expert-backend', choices=('diffdock', 'matcha'), default='diffdock')
     p.add_argument('--matcha-source-dir', default='results/matcha_qualification_source')
     p.add_argument('--matcha-weights-dir', default='results/matcha_qualification_weights')
+    p.add_argument('--matcha-frame-policy', choices=('legacy_argmax_v1', 'ordered_residue_com_v1'),
+                   default='legacy_argmax_v1',
+                   help='Explicit Matcha reference-frame protocol; saved identity governs resume')
 
     # Featurization
     p.add_argument("--cache_dir", default="results/featurize_cache",
@@ -143,7 +148,8 @@ def parse_args(argv=None):
     tokens = sys.argv[1:] if argv is None else argv
     args.explicit_loss_options = [token.split('=')[0] for token in tokens
                                  if token.split('=')[0] in ('--interface-loss-weight',
-                                     '--interface-cutoff', '--steric-loss-weight')]
+                                     '--interface-cutoff', '--interface-error-scale', '--steric-loss-weight')]
+    args.explicit_frame_policy = any(token.split('=')[0] == '--matcha-frame-policy' for token in tokens)
     if args.batch_size < 1:
         p.error('--batch_size must be positive')
     return args
@@ -218,6 +224,44 @@ def append_metric(output_dir, payload):
     with path.open('a', encoding='utf-8') as handle:
         handle.write(json.dumps(payload, allow_nan=False) + '\n')
         handle.flush()
+
+
+def epoch_data_state(args, epoch, entries, cursor, losses):
+    """Persist the sampled epoch, including cluster choices already made."""
+    return {'contract': 'single_process_epoch_cursor_v1',
+            'index_sha256': sha256_file(args.train_data),
+            'batch_size': args.batch_size, 'epoch': epoch,
+            'entries': entries, 'next_sample': cursor, 'train_losses': losses,
+            'seed': args.seed, 'random_flip_proteins': args.random_flip_proteins}
+
+
+def restore_epoch_data_state(state, args, loader, epoch):
+    """Reject a cursor that would silently change the dataset or batch stream."""
+    if not isinstance(state, dict):
+        raise ValueError('resume epoch data state must be a mapping')
+    expected = {'contract': 'single_process_epoch_cursor_v1',
+                'index_sha256': sha256_file(args.train_data),
+                'batch_size': args.batch_size, 'epoch': epoch,
+                'seed': args.seed, 'random_flip_proteins': args.random_flip_proteins}
+    if any(state.get(key) != value for key, value in expected.items()):
+        raise ValueError('resume epoch data contract differs from the active run')
+    entries, cursor, losses = (state.get(key) for key in
+                               ('entries', 'next_sample', 'train_losses'))
+    if (not isinstance(entries, list) or len(entries) != len(loader)
+            or any(not isinstance(entry, dict)
+                   or loader.entries_by_case.get(entry.get('case')) != entry for entry in entries)
+            or len({entry['case'] for entry in entries}) != len(entries)):
+        raise ValueError('resume epoch entries differ from the current training population')
+    if (isinstance(cursor, bool) or not isinstance(cursor, int)
+            or not 0 <= cursor <= len(entries)
+            or (cursor != len(entries) and cursor % args.batch_size)
+            or not isinstance(losses, list) or len(losses) != cursor):
+        raise ValueError('resume epoch cursor/statistics are inconsistent')
+    if any(not isinstance(row, dict) or 'loss_total' not in row
+           or any(not isinstance(value, (int, float)) or not np.isfinite(value)
+                  for value in row.values()) for row in losses):
+        raise ValueError('resume epoch loss statistics must be finite numeric records')
+    return entries, cursor, list(losses)
 
 
 def main():
@@ -322,6 +366,11 @@ def main():
     if args.resume:
         print(f"[3/6] Resuming from {args.resume}...")
         trainer.load_checkpoint(args.resume)
+        if getattr(trainer, 'resume_data_state', None) is None:
+            import warnings
+            warnings.warn('checkpoint has no saved epoch data cursor; exact intra-epoch '
+                          'continuation cannot be established for legacy checkpoints',
+                          RuntimeWarning)
     else:
         print("[3/6] Training from scratch...")
 
@@ -342,20 +391,29 @@ def main():
         )
 
     for epoch in range(start_epoch, args.epochs + 1):
-        train_losses = []
+        saved_data = getattr(trainer, 'resume_data_state', None) if epoch == start_epoch else None
+        if saved_data is not None:
+            epoch_entries, next_sample, train_losses = restore_epoch_data_state(
+                saved_data, args, train_loader, epoch)
+        else:
+            epoch_entries, next_sample, train_losses = train_loader._epoch_entries(), 0, []
         n_skipped = 0
         t0 = time.time()
-        for batch_idx, microbatches in enumerate(iter_training_batches(train_loader, args.batch_size)):
+        remaining = (train_loader._load_one(entry) for entry in epoch_entries[next_sample:])
+        for batch_idx, microbatches in enumerate(iter_training_batches(remaining, args.batch_size)):
             microbatches = [prepare_source_batch(
                 batch, trainer.samples_seen + offset, args.training_arm, endpoint_store,
             ) for offset, batch in enumerate(microbatches)]
             group_losses = _guarded_train_batch(trainer, microbatches,
                 failure_path=Path(args.output_dir) / 'projection_failure.pt')
             train_losses.extend(group_losses)
+            next_sample += len(microbatches)
             if args.save_steps > 0 and trainer.global_step % args.save_steps == 0:
                 trainer.save_checkpoint(
                     os.path.join(args.output_dir, 'progress_model.pt'), epoch=epoch - 1,
-                    best_val_loss=best_val_loss, best_val_dockq=best_val_dockq)
+                    best_val_loss=best_val_loss, best_val_dockq=best_val_dockq,
+                    data_state=epoch_data_state(args, epoch, epoch_entries,
+                                               next_sample, train_losses))
             for batch, loss_dict in zip(microbatches, group_losses):
                 append_metric(args.output_dir, {
                     'event': 'train_step', 'epoch': epoch,
@@ -432,11 +490,17 @@ def main():
             trainer.save_checkpoint(
                 os.path.join(args.output_dir, "best_loss_model.pt"),
                 epoch=epoch, best_val_loss=best_val_loss, best_val_dockq=best_val_dockq,
+                selection={'metric': 'endpoint_selection_loss', 'scope': 'training_objective',
+                           'value': float(val_loss), 'weights': 'ema'},
             )
         if improved_dockq or (val_dockq is None and improved_loss):
             trainer.save_checkpoint(
                 os.path.join(args.output_dir, 'best_model.pt'), epoch=epoch,
-                best_val_loss=best_val_loss, best_val_dockq=best_val_dockq)
+                best_val_loss=best_val_loss, best_val_dockq=best_val_dockq,
+                selection={'metric': 'protein_protein_dockq' if val_dockq is not None else 'legacy_loss',
+                           'scope': 'PP_only' if val_dockq is not None else 'training_objective',
+                           'value': float(val_dockq if val_dockq is not None else val_loss),
+                           'weights': 'ema'})
             print('  -> Saved best by ' + ('DockQ' if val_dockq is not None else 'legacy loss'))
 
         if epoch % args.save_interval == 0:
@@ -475,8 +539,23 @@ def build_trainer(args, device, input_dim=None):
     if backend == 'matcha':
         if args.training_arm != 'A1':
             raise ValueError('Matcha currently supports SDPI training, not DiffDock BiTSeed caches')
-        frozen_expert = FrozenMatcha(source_dir=args.matcha_source_dir,
-                                    weights_dir=args.matcha_weights_dir).to(device)
+        frame_policy = getattr(args, 'matcha_frame_policy', 'legacy_argmax_v1')
+        if args.resume:
+            saved_identity = torch.load(args.resume, map_location='cpu', weights_only=False)
+            saved_policy = saved_identity['expert_base_identity'].get('frame_policy', 'legacy_argmax_v1')
+            if getattr(args, 'explicit_frame_policy', False) and frame_policy != saved_policy:
+                raise ValueError('resume cannot change the Matcha frame policy')
+            frame_policy = saved_policy
+        args.matcha_frame_policy = frame_policy
+        expert_type = FrozenMatcha
+        if frame_policy == 'ordered_residue_com_v1':
+            from tricoopdiff.models.ordered_matcha_frame import FrozenOrderedResidueMatcha
+            expert_type = FrozenOrderedResidueMatcha
+        elif frame_policy != 'legacy_argmax_v1':
+            raise ValueError(f'unsupported Matcha frame policy: {frame_policy}')
+        frozen_expert = expert_type(source_dir=args.matcha_source_dir,
+                                    weights_dir=args.matcha_weights_dir,
+                                    device=str(device)).to(device)
     else:
         frozen_expert = build_diffdock_expert(model_dir=args.expert_model_dir, device=str(device))
 
@@ -516,6 +595,8 @@ def build_trainer(args, device, input_dim=None):
             raise ValueError('resume checkpoint input features do not match the data')
         for key, option, old_default in (('interface_loss_weight', '--interface-loss-weight', 0.),
                                          ('interface_cutoff', '--interface-cutoff', 10.),
+                                         ('interface_error_scale', '--interface-error-scale',
+                                          saved['runtime_config'].get('interface_cutoff', 10.)),
                                          ('steric_loss_weight', '--steric-loss-weight', 0.)):
             if option not in args.explicit_loss_options:
                 setattr(args, key, saved['runtime_config'].get(key, old_default))
@@ -546,6 +627,7 @@ def build_trainer(args, device, input_dim=None):
         ema_decay=args.ema_decay,
         interface_loss_weight=args.interface_loss_weight,
         interface_cutoff=args.interface_cutoff,
+        interface_error_scale=getattr(args, 'interface_error_scale', 10.),
         effective_batch_size=args.batch_size,
         steric_loss_weight=args.steric_loss_weight,
         training_source_mix=(
@@ -744,19 +826,21 @@ class TernaryDataLoader:
     def __init__(self, data_json, score_model_args, shuffle=True, device="cuda",
                  cache_dir=None, skip_on_error=False, max_clusters=None,
                  random_flip_proteins=False, cache_read_only=False,
-                 cache_wait_seconds=3600., expert=None, cached_only=False):
+                 cache_wait_seconds=3600., expert=None, cached_only=False,
+                 matcha_metadata_read_only=False, expected_esm_encoder_identity=None):
         self.entries, self.clusters, self.entries_by_case = _load_index(data_json)
         if cached_only:
             if cache_dir is None:
                 raise ValueError('cached-only loading requires a cache directory')
-            original = len(self.entries), len(self.clusters)
+            original = len(self.entries), len(self.clusters) if self.clusters is not None else None
             self.entries = [entry for entry in self.entries
                             if (Path(cache_dir) / (entry['case'] + '.pt')).is_file()]
             self.entries_by_case = {entry['case']: entry for entry in self.entries}
-            self.clusters = [cluster for cluster in self.clusters
-                             if any(case in self.entries_by_case for case in cluster['items'])]
+            if self.clusters is not None:
+                self.clusters = [cluster for cluster in self.clusters
+                                 if any(case in self.entries_by_case for case in cluster['items'])]
             print(f'[data] cached-only entries {len(self.entries)}/{original[0]}, '
-                  f'clusters {len(self.clusters)}/{original[1]}', flush=True)
+                  f'clusters {len(self.clusters) if self.clusters is not None else None}/{original[1]}', flush=True)
             if not self.entries:
                 raise ValueError('cached-only index has no available entries')
         if max_clusters is not None:
@@ -776,7 +860,9 @@ class TernaryDataLoader:
         self.expert = expert
         self.skip_on_error = skip_on_error
         self.random_flip_proteins = bool(random_flip_proteins)
+        self.expected_esm_encoder_identity = expected_esm_encoder_identity
         self.cache_read_only = bool(cache_read_only)
+        self.matcha_metadata_read_only = bool(matcha_metadata_read_only)
         self.cache_wait_seconds = float(cache_wait_seconds)
         self.skipped = []
 
@@ -834,6 +920,7 @@ class TernaryDataLoader:
             self.score_model_args, self.device, cache_dir=self.cache_dir,
             cache_read_only=self.cache_read_only,
             cache_wait_seconds=self.cache_wait_seconds,
+            expected_esm_encoder_identity=getattr(self, 'expected_esm_encoder_identity', None),
         )
         if getattr(self.expert, 'backend', None) == 'matcha':
             e3_data, poi_data, ligand_data = preserve_rng(self._prepare_matcha)(
@@ -864,6 +951,20 @@ class TernaryDataLoader:
                     'features': sha256_file(cache_path) if cache_path and cache_path.exists() else None}
         metadata_path = Path(self.cache_dir) / 'matcha_metadata' / (entry['case'] + '.pt') if self.cache_dir else None
         cached = torch.load(metadata_path, map_location='cpu', weights_only=False) if metadata_path and metadata_path.exists() else None
+        if getattr(self, 'matcha_metadata_read_only', False):
+            deadline = time.monotonic() + self.cache_wait_seconds
+            announced = False
+            while cached is None or cached.get('identity') != identity:
+                if metadata_path is None:
+                    raise ValueError('read-only Matcha metadata requires cache_dir')
+                if not announced:
+                    print(f'[data] waiting for verified Matcha metadata: {entry["case"]}', flush=True)
+                    announced = True
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f'verified Matcha metadata unavailable: {metadata_path}')
+                time.sleep(min(1., max(0., deadline - time.monotonic())))
+                cached = (torch.load(metadata_path, map_location='cpu', weights_only=False)
+                          if metadata_path.is_file() else None)
         if cached is None or cached.get('identity') != identity:
             prepared = self.expert.prepare_case(*data, paths[:2])
             metadata = [{key: value.detach().cpu() if torch.is_tensor(value) else value

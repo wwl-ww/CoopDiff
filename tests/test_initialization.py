@@ -1162,3 +1162,79 @@ def test_audit_rejects_nonfinite_and_bad_shapes():
             pass
         else:
             raise AssertionError('invalid audit inputs must fail')
+
+
+def test_binary_anchor_integrates_every_real_schedule_interval():
+    """The last low-noise interval must not be merged into its predecessor."""
+    from types import SimpleNamespace
+    from tricoopdiff.initialization.candidates import DualExpertAnchorInitializer
+
+    class ZeroExpert:
+        model = SimpleNamespace(dynamic_max_cross=False, no_torsion=False)
+
+        def __call__(self, graph):
+            return torch.zeros(1, 3), torch.zeros(1, 3), torch.zeros(0)
+
+    for steps in (2, 5, 20):
+        for dtype in (torch.float32, torch.float64):
+            coords = torch.zeros(1, 3, 3, dtype=dtype)
+            receptor = {'coords': coords, 'features': torch.zeros(1, 3, 1)}
+            ligand = {'features': torch.zeros(1, 3, 1),
+                      'edge_index': None, 'edge_attr': None,
+                      'edge_mask': None, 'mask_rotate': None}
+            initializer = DualExpertAnchorInitializer(
+                ZeroExpert(), receptor, receptor, binary_steps=steps)
+            calls = []
+
+            def record_step(position, tr, rot, tor, t, rt, tt, dt, rdt, tdt,
+                            *, add_noise):
+                calls.append((float(t), float(dt), add_noise, t.dtype, dt.dtype))
+                return position + dt, position + dt
+
+            initializer.process.reverse_step_protac = record_step
+            crop = {'coords': coords[0], 'features': receptor['features'][0],
+                    'edge_index': None}
+            with patch('tricoopdiff.initialization.candidates.crop_receptor_to_ligand', return_value=crop), \
+                 patch('tricoopdiff.initialization.candidates.build_subgraph_e3l', return_value=object()), \
+                 patch('tricoopdiff.initialization.candidates._set_time_embeddings'):
+                result = initializer._dock_rigid(receptor, ligand, coords, seed=73)
+            schedule = initializer.process.get_inference_schedule(steps)['tr_schedule']
+            assert len(calls) == steps, 'binary_steps must count actual expert updates'
+            assert np.allclose([row[0] for row in calls], schedule[:-1])
+            assert np.allclose([row[1] for row in calls], -np.diff(schedule))
+            assert [row[2] for row in calls] == [True] * (steps - 1) + [False]
+            assert all(row[3] == dtype and row[4] == dtype for row in calls)
+            assert torch.allclose(result, torch.ones_like(result)), 'full schedule must integrate to t=0'
+
+
+def test_binary_anchor_rejects_invalid_step_counts():
+    from types import SimpleNamespace
+    from tricoopdiff.initialization.candidates import DualExpertAnchorInitializer
+
+    expert = SimpleNamespace(model=SimpleNamespace(no_torsion=False))
+    for invalid in (0, 1, 2.5, True):
+        try:
+            DualExpertAnchorInitializer(expert, {}, {}, binary_steps=invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'invalid binary step count was accepted: {invalid!r}')
+
+
+def test_reflect_minimization_excludes_topological_neighbours():
+    from tricoopdiff.geometry.reflect import local_minimization
+    coords = np.array([[0., 0., 0.], [1.54, 0., 0.], [2., 1., 0.], [3., 1., 0.]])
+    result = local_minimization(coords, np.array([6] * 4), np.ones(4, dtype=bool),
+                                max_rounds=1, bonds=[(0, 1), (1, 2), (2, 3)])
+    assert np.array_equal(result, coords), 'repulsion moved atoms only separated by 1-3 bonds'
+
+
+def test_reflect_rechecks_bond_anomalies_on_final_coordinates():
+    from tricoopdiff.geometry.reflect import tricoop_reflect, detect_bond_anomalies
+    coords = np.array([[0., 0., 0.], [2.30, 0., 0.], [0.5, 0., 0.]])
+    numbers = np.array([6, 6, 6])
+    result = tricoop_reflect(coords, numbers, bonds=[(0, 1)], bond_types=[1])
+    expected = detect_bond_anomalies(result['coords'], [(0, 1)], [1], numbers)
+    assert np.array_equal(result['bond_anomalies'], expected), 'returned pre-repair bond status'
+    assert result['n_bond_anomalies'] == expected.sum()
+    assert result['is_valid'] == (result['n_clashes'] == 0 and expected.sum() == 0)

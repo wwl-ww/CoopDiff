@@ -406,14 +406,15 @@ def test_failed_featurization_publish_preserves_cache_and_removes_partial_file(t
 
 def test_v8_cache_enrichment_preserves_embeddings_without_esm(tmp_path):
     inputs = []
-    for name in ('e3.pdb', 'poi.pdb', 'ligand.sdf'):
+    for name in ('e3.pdb', 'poi.pdb', 'ligand.pdb'):
         path = tmp_path / name
         path.write_text(name)
         inputs.append(str(path.resolve()))
+    from rdkit import Chem
     args = Namespace(remove_hs=True)
-    data = {'coords': torch.zeros(3, 3), 'features': torch.ones(3, 2)}
+    data = {'coords': torch.zeros(3, 3), 'features': torch.ones(3, 2), 'mol': Chem.MolFromSmiles('CCC').ToBinary()}
     payload = {'cache_version': 8,
-               'source_signature': featurize_common._featurize_signature(*inputs, args, cache_version=None),
+               'source_signature': featurize_common._featurize_signature(*inputs, args, cache_version=None, include_esm=False),
                'e3_data': dict(data), 'poi_data': dict(data), 'ligand_data': dict(data),
                'receptor_feat_dim': 2}
     torch.save(payload, tmp_path / 'demo.pt')
@@ -451,14 +452,15 @@ def test_cache_only_never_rebuilds_missing_or_stale_features(tmp_path):
 
 def test_v7_cache_only_corrects_center_without_rebuilding_esm(tmp_path):
     inputs = []
-    for name in ('e3.pdb', 'poi.pdb', 'ligand.sdf'):
+    for name in ('e3.pdb', 'poi.pdb', 'ligand.pdb'):
         path = tmp_path / name
         path.write_text(name)
         inputs.append(str(path.resolve()))
+    from rdkit import Chem
     args = Namespace(remove_hs=True)
-    data = {'coords': torch.arange(9).float().reshape(3, 3), 'features': torch.ones(3, 2)}
+    data = {'coords': torch.arange(9).float().reshape(3, 3), 'features': torch.ones(3, 2), 'mol': Chem.MolFromSmiles('CCC').ToBinary()}
     torch.save({'cache_version': 7,
-        'source_signature': featurize_common._featurize_signature(*inputs, args, cache_version=None),
+        'source_signature': featurize_common._featurize_signature(*inputs, args, cache_version=None, include_esm=False),
         'e3_data': dict(data), 'poi_data': dict(data), 'ligand_data': dict(data), 'receptor_feat_dim': 2}, tmp_path / 'demo.pt')
     with patch.object(featurize_common, 'generate_esm_embeddings', side_effect=AssertionError('ESM must not run')), \
             patch.object(featurize_common, 'protein_local_geometry', return_value=torch.ones(1, 3, 32)), \
@@ -542,3 +544,181 @@ def test_undefined_bond_endpoint_is_not_treated_as_hydrogen(tmp_path):
     else:
         raise AssertionError('malformed CCD bond was silently ignored')
     assert not output.exists()
+
+
+def test_esm_cache_signature_tracks_encoder_content_without_loading(tmp_path, monkeypatch):
+    inputs = []
+    for name in ('a.pdb', 'b.pdb', 'lig.sdf'):
+        path = tmp_path / name
+        path.write_text(name)
+        inputs.append(path)
+    model = tmp_path / 'encoder'
+    model.mkdir()
+    (model / 'config.json').write_text('{"hidden_size":1280}')
+    (model / 'tokenizer_config.json').write_text('{"mode":"A"}')
+    weight = model / 'model.safetensors'
+    weight.write_bytes(b'weights-A')
+    monkeypatch.setenv('TRICOOPDIFF_ESM_MODEL', str(model))
+    first = featurize_common._featurize_signature(*inputs, Namespace(remove_hs=True))
+    weight.write_bytes(b'weights-B')
+    second = featurize_common._featurize_signature(*inputs, Namespace(remove_hs=True))
+    assert first != second, 'same-path encoder weight change reused ESM cache signature'
+    (model / 'tokenizer_config.json').write_text('{"mode":"B"}')
+    third = featurize_common._featurize_signature(*inputs, Namespace(remove_hs=True))
+    assert third != second, 'tokenizer change reused ESM cache signature'
+    monkeypatch.setenv('TRICOOPDIFF_ESM_MODEL', str(tmp_path / 'another_encoder'))
+    assert third != featurize_common._featurize_signature(*inputs, Namespace(remove_hs=True))
+
+
+def test_legacy_esm_cache_is_explicit_and_can_be_rejected(monkeypatch):
+    import pytest
+    cached = {'source_signature': 'old'}
+    monkeypatch.setenv('TRICOOPDIFF_ALLOW_LEGACY_ESM_CACHE', '1')
+    with pytest.warns(RuntimeWarning, match='unverified'):
+        assert featurize_common._accept_legacy_esm_cache(cached, 'old')
+    assert cached['esm_cache_status'] == 'legacy_encoder_unverified'
+    monkeypatch.setenv('TRICOOPDIFF_ALLOW_LEGACY_ESM_CACHE', '0')
+    assert not featurize_common._accept_legacy_esm_cache(cached, 'old')
+    assert not featurize_common._accept_legacy_esm_cache(
+        {'source_signature': 'old', 'esm_encoder_identity': {'model': 'different'}}, 'old')
+
+
+def test_cached_only_loader_supports_unclustered_indices(tmp_path):
+    from train_entry import TernaryDataLoader
+    for index_dict in (False, True):
+        entries = [{'case': case, 'protein1': '/a.pdb', 'protein2': '/b.pdb',
+                    'ligand': '/c.sdf'} for case in ('present', 'missing')]
+        index = tmp_path / 'index.json'
+        index.write_text(json.dumps({'entries': entries} if index_dict else entries))
+        (tmp_path / 'present.pt').touch()
+        loader = TernaryDataLoader(str(index), Namespace(), cache_dir=str(tmp_path), cached_only=True)
+        assert [entry['case'] for entry in loader.entries] == ['present']
+        assert loader.clusters is None
+        assert len(loader) == 1
+
+
+def test_old_v9_esm_cache_remains_readable_with_explicit_unverified_status(tmp_path, monkeypatch):
+    import pytest
+    inputs = []
+    for name in ('a.pdb', 'b.pdb', 'lig.pdb'):
+        path = tmp_path / name
+        path.write_text(name)
+        inputs.append(str(path))
+    from rdkit import Chem
+    args = Namespace(remove_hs=True)
+    protein = {'coords': torch.zeros(3, 3), 'features': torch.ones(3, 2),
+               'local_geometry': torch.ones(3, 32), 'mol': Chem.MolFromSmiles('CCC').ToBinary()}
+    cache = {'cache_version': 9, 'source_signature': featurize_common._featurize_signature(
+        *inputs, args, include_esm=False), 'e3_data': protein, 'poi_data': protein,
+        'ligand_data': protein, 'receptor_feat_dim': 2}
+    target = tmp_path / 'legacy.pt'
+    torch.save(cache, target)
+    original_bytes = target.read_bytes()
+    monkeypatch.setenv('TRICOOPDIFF_ALLOW_LEGACY_ESM_CACHE', '1')
+    with patch.object(featurize_common, 'generate_esm_embeddings', side_effect=AssertionError('ESM rebuilt')):
+        with pytest.warns(RuntimeWarning, match='unverified'):
+            result = featurize_common.featurize_complex('legacy', *inputs, args, 'cpu',
+                cache_dir=tmp_path, cache_only=True)
+        assert torch.equal(result[0]['features'], torch.ones(1, 3, 2))
+        assert target.read_bytes() == original_bytes, 'legacy read rewrote active training asset'
+        monkeypatch.setenv('TRICOOPDIFF_ALLOW_LEGACY_ESM_CACHE', '0')
+        with pytest.raises(FileNotFoundError, match='compatible'):
+            featurize_common.featurize_complex('legacy', *inputs, args, 'cpu',
+                cache_dir=tmp_path, cache_only=True)
+
+
+def test_esm_identity_tracks_nested_shards_and_rejects_incomplete_assets(tmp_path, monkeypatch):
+    model = tmp_path / 'esm'
+    (model / 'shards').mkdir(parents=True)
+    (model / 'config.json').write_text('{}')
+    (model / 'vocab.txt').write_text('A\nC\n')
+    index = model / 'model.safetensors.index.json'
+    index.write_text(json.dumps({'weight_map': {'encoder.weight': 'shards/part.safetensors'}}))
+    shard = model / 'shards/part.safetensors'
+    shard.write_bytes(b'weight_A')
+    monkeypatch.setenv('TRICOOPDIFF_ESM_MODEL', str(model))
+    first = featurize_common.esm_encoder_identity()
+    assert featurize_common._esm_identity_verified(first)
+    assert 'shards/part.safetensors' in first['files']
+    shard.write_bytes(b'weight_B')
+    assert first != featurize_common.esm_encoder_identity(), 'nested shard mutation was omitted'
+    index.write_text(json.dumps({'weight_map': {'a': 'shards/part.safetensors', 'b': 'missing.safetensors'}}))
+    assert not featurize_common._esm_identity_verified(featurize_common.esm_encoder_identity())
+    monkeypatch.setenv('TRICOOPDIFF_ESM_MODEL', 'invalid/local/relative/path')
+    assert not featurize_common._esm_identity_verified(featurize_common.esm_encoder_identity())
+
+
+def test_strict_legacy_v8_cache_only_rejects_without_mutation_or_esm(tmp_path, monkeypatch):
+    import pytest
+    inputs = []
+    for name in ('e3.pdb', 'poi.pdb', 'lig.sdf'):
+        path = tmp_path / name
+        path.write_text(name)
+        inputs.append(str(path))
+    args = Namespace(remove_hs=True)
+    target = tmp_path / 'old.pt'
+    torch.save({'cache_version': 8, 'source_signature': featurize_common._featurize_signature(
+        *inputs, args, cache_version=None, include_esm=False)}, target)
+    original = target.read_bytes()
+    monkeypatch.setenv('TRICOOPDIFF_ALLOW_LEGACY_ESM_CACHE', '0')
+    with patch.object(featurize_common, 'generate_esm_embeddings', side_effect=AssertionError('ESM loaded')):
+        with pytest.raises(FileNotFoundError, match='compatible'):
+            featurize_common.featurize_complex('old', *inputs, args, 'cpu', cache_dir=tmp_path,
+                                               cache_only=True)
+    assert target.read_bytes() == original
+
+
+def test_unresolved_esm_identity_cannot_be_accepted_as_verified_cache(tmp_path, monkeypatch):
+    import pytest
+    identity = {'model': 'uncached/model', 'status': 'unresolved_local_assets', 'files': {}}
+    monkeypatch.setattr(featurize_common, 'esm_encoder_identity', lambda: identity)
+    inputs = []
+    for name in ('e3.pdb', 'poi.pdb', 'lig.sdf'):
+        path = tmp_path / name
+        path.write_text(name)
+        inputs.append(str(path))
+    args = Namespace(remove_hs=True)
+    torch.save({'cache_version': 9, 'source_signature': featurize_common._featurize_signature(*inputs, args),
+                'esm_encoder_identity': identity}, tmp_path / 'bad.pt')
+    with pytest.raises(FileNotFoundError, match='compatible'):
+        featurize_common.featurize_complex('bad', *inputs, args, 'cpu', cache_dir=tmp_path, cache_only=True)
+    with pytest.raises(ValueError, match='incomplete'):
+        featurize_common.featurize_complex('bad', *inputs, args, 'cpu', cache_dir=tmp_path)
+
+
+def test_read_only_pinned_encoder_reuses_hash_but_checks_cache_and_sources(tmp_path, monkeypatch):
+    import pytest
+    identity = {'model': 'local/encoder', 'status': 'local_assets_hashed',
+                'files': {'weights.safetensors': 'verified-content-digest'}}
+    inputs = []
+    for name in ('e3.pdb', 'poi.pdb', 'lig.sdf'):
+        path = tmp_path / name
+        path.write_text(name)
+        inputs.append(str(path))
+    args = Namespace(remove_hs=True)
+    data = {'coords': torch.zeros(2, 3), 'local_geometry': torch.zeros(2, 32)}
+    payload = {'cache_version': 10, 'esm_encoder_identity': identity,
+               'source_signature': featurize_common._featurize_signature(
+                   *inputs, args, encoder_identity=identity),
+               'e3_data': data, 'poi_data': data, 'ligand_data': {'coords': torch.zeros(1, 3), 'chemistry_contract': 'bond_order_legal_torsions_v1'},
+               'receptor_feat_dim': 1281}
+    torch.save(payload, tmp_path / 'pinned.pt')
+    monkeypatch.setattr(featurize_common, 'esm_encoder_identity',
+                        lambda: (_ for _ in ()).throw(AssertionError('weights must not be rehashed')))
+    def load():
+        return featurize_common.featurize_complex(
+            'pinned', *inputs, args, 'cpu', cache_dir=tmp_path, cache_only=True,
+            expected_esm_encoder_identity=identity)
+    assert load()[3] == 1281 and load()[3] == 1281
+    payload['esm_encoder_identity'] = {**identity, 'files': {'weights.safetensors': 'changed'}}
+    torch.save(payload, tmp_path / 'pinned.pt')
+    with pytest.raises(FileNotFoundError, match='compatible'):
+        load()
+    payload['esm_encoder_identity'] = identity
+    torch.save(payload, tmp_path / 'pinned.pt')
+    Path(inputs[0]).write_text('changed structure')
+    with pytest.raises(FileNotFoundError, match='compatible'):
+        load()
+    with pytest.raises(ValueError, match='read-only'):
+        featurize_common.featurize_complex('pinned', *inputs, args, 'cpu',
+                                          expected_esm_encoder_identity=identity)

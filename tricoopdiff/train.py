@@ -25,6 +25,7 @@ from tricoopdiff.models.assembly import (
     production_model_config,
     LEGACY_CONSENSUS_CHECKPOINT_VERSION, PREVIOUS_CONSENSUS_CHECKPOINT_VERSION,
     SOURCE_CONTRACT_VERSION,
+    LEGACY_TORSION_REPRESENTATION,
     candidate_source_tensor,
 )
 from tricoopdiff.models.expert import (expert_base_identity, validate_expert_base_identity,
@@ -239,11 +240,22 @@ class TriCoopDiffTrainer:
         error_check = getattr(self, 'distributed_error_check', None)
         try:
             for batch in batches:
+                deterministic_rng = capture_rng_state() if getattr(self, 'require_deterministic_forward', False) else None
                 loss_dict = self.compute_loss(**batch)
                 total = loss_dict['loss_total']
                 if not torch.isfinite(total):
                     raise NonFiniteTrainingError('non-finite total loss')
                 (total / len(batches)).backward()
+                if deterministic_rng is not None:
+                    after = capture_rng_state()
+                    if (deterministic_rng['python'] != after['python']
+                            or deterministic_rng['numpy'][0] != after['numpy'][0]
+                            or not np.array_equal(deterministic_rng['numpy'][1], after['numpy'][1])
+                            or deterministic_rng['numpy'][2:] != after['numpy'][2:]
+                            or not torch.equal(deterministic_rng['torch_cpu'], after['torch_cpu'])
+                            or any(not torch.equal(before, current) for before, current in
+                                   zip(deterministic_rng['torch_cuda'], after['torch_cuda']))):
+                        raise RuntimeError('cost-balanced zero-dropout forward consumed unplanned RNG')
                 results.append({k: v.item() if torch.is_tensor(v) else v
                                 for k, v in loss_dict.items()})
                 del loss_dict, total
@@ -352,8 +364,10 @@ LEGACY_NEAR_TARGET_SUPERVISION = {
 }
 
 
-def terminal_interface_losses(e3, native_poi, predicted_poi, cutoff):
+def terminal_interface_losses(e3, native_poi, predicted_poi, cutoff, *, error_scale=10.0):
     """Native C-alpha interface coordinate/distance surrogates, not DockQ."""
+    if not math.isfinite(error_scale) or error_scale <= 0:
+        raise ValueError('interface error scale must be finite and positive')
     with torch.no_grad():
         target_distances = torch.cdist(e3[0], native_poi[0], compute_mode='donot_use_mm_for_euclid_dist')
         contacts = target_distances <= cutoff
@@ -369,8 +383,8 @@ def terminal_interface_losses(e3, native_poi, predicted_poi, cutoff):
         e3[0, e3_indices] - native_poi[0, poi_indices], dim=-1)
     return {
         'loss_interface_geometry': ((predicted_poi[0, poi_interface]
-                                    - native_poi[0, poi_interface]) / cutoff).square().mean(),
-        'loss_contact_geometry': ((predicted_distances - target_distances) / cutoff).square().mean(),
+                                    - native_poi[0, poi_interface]) / error_scale).square().mean(),
+        'loss_contact_geometry': ((predicted_distances - target_distances) / error_scale).square().mean(),
     }, count
 
 
@@ -449,6 +463,10 @@ def validate_assembly_checkpoint(payload):
                                            expert_scalar_dim=model_config.get('expert_scalar_dim', 58),
                                            expert_vector_dim=model_config.get('expert_vector_dim', 20),
                                            expert_backend=model_config.get('expert_backend', 'diffdock'),
+                                           torsion_representation_contract=model_config.get(
+                                               'torsion_representation_contract', LEGACY_TORSION_REPRESENTATION),
+                                           protein_local_geometry_contract=model_config.get(
+                                               'protein_local_geometry_contract', 'none'),
                                            **({'conditioning_contract': model_config['conditioning_contract']}
                                               if 'conditioning_contract' in model_config else {}))
         if model_config != expected:
@@ -534,6 +552,11 @@ def validate_assembly_checkpoint(payload):
                     raise ValueError(f'endpoint training requires valid {key}')
             if config['interface_cutoff'] <= 0:
                 raise ValueError('interface cutoff must be positive')
+            if 'interface_error_scale' in config:
+                scale = config['interface_error_scale']
+                if (isinstance(scale, bool) or not isinstance(scale, (int, float))
+                        or not math.isfinite(scale) or scale <= 0):
+                    raise ValueError('interface error scale must be positive and finite')
         if version >= 23:
             weight, cutoff = config.get('steric_loss_weight'), config.get('steric_cutoff')
             if (not isinstance(weight, (float, int)) or not math.isfinite(weight) or weight < 0
@@ -587,7 +610,7 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                  training_source_mix='sdpi_only',
                  training_endpoint_protocol='none',
                  endpoint_loss_weight=0.1, interface_loss_weight=1.0,
-                 interface_cutoff=10.0, effective_batch_size=1,
+                 interface_cutoff=10.0, interface_error_scale=10.0, effective_batch_size=1,
                  steric_loss_weight=0.0, steric_cutoff=2.0, **kwargs):
         if not math.isfinite(residual_weight) or residual_weight < 0 or not 0 <= ema_decay < 1:
             raise ValueError('invalid residual regularization or EMA decay')
@@ -604,6 +627,9 @@ class AssemblyTrainer(TriCoopDiffTrainer):
             raise ValueError('effective batch size must be a positive integer')
         self.interface_loss_weight = float(interface_loss_weight)
         self.interface_cutoff = float(interface_cutoff)
+        if not math.isfinite(interface_error_scale) or interface_error_scale <= 0:
+            raise ValueError('interface error scale must be finite and positive')
+        self.interface_error_scale = float(interface_error_scale)
         if (not math.isfinite(steric_loss_weight) or steric_loss_weight < 0
                 or not math.isfinite(steric_cutoff) or steric_cutoff <= 0):
             raise ValueError('invalid coarse steric configuration')
@@ -643,7 +669,8 @@ class AssemblyTrainer(TriCoopDiffTrainer):
     def compute_loss(self, e3_data, poi_data, ligand_data, case='unknown',
                      t_override=None, t_pol_override=None, coupling_override=None,
                      diagnostics=False, source=0, conditions=None, near_target_zero=None,
-                     near_target_start_t=None):
+                     near_target_start_t=None, initialization_seed_override=None,
+                     near_noise_override=None):
         if near_target_start_t is not None and near_target_zero is None:
             raise ValueError('near-target start time requires an auxiliary entry')
         if near_target_zero is not None:
@@ -672,7 +699,8 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         if coupling_override is None:
             if int(source) != 0:
                 raise ValueError('BiTSeed training requires its actual sampled state')
-            seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
+            seed = (int(torch.randint(0, 2**31 - 1, (1,)).item())
+                    if initialization_seed_override is None else int(initialization_seed_override))
             ligand, poi, body, _ = TernaryInitializer(no_torsion=no_torsion).initialize(
                 ed['coords'][0], pd['coords'][0], ld, seed=seed)
             try:
@@ -689,7 +717,35 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                                                 dtype=ld['coords'].dtype).reshape(1, -1, 3)
                                  for key in ('ligand', 'poi', 'body_frame')]
             if 'target_ligand' in coupling_override:
-                target = coupling_override['target_ligand']
+                # A caller-supplied label is not evidence that it belongs to
+                # this conformer's reachable set or this native target.
+                from tricoopdiff.initialization.endpoints import endpoint_input_signature
+                supplied = torch.as_tensor(coupling_override['target_ligand'],
+                                           device=self.device, dtype=ld['coords'].dtype)
+                if supplied.numel() != ld['coords'].numel() or not torch.isfinite(supplied).all():
+                    raise ValueError('precomputed target has invalid shape or nonfinite coordinates')
+                supplied = supplied.reshape_as(ld['coords'])
+                signature = endpoint_input_signature({
+                    'e3_data': {}, 'poi_data': {'native': pd['coords'], 'initial': poi},
+                    'ligand_data': {**{key: ld[key] for key in
+                        ('coords', 'edge_index', 'edge_mask', 'mask_rotate') if key in ld},
+                        'initial': ligand, 'target': supplied, 'no_torsion': no_torsion}})
+                cache = getattr(self, '_verified_override_targets', {})
+                if signature not in cache:
+                    projected, report = reachable_ligand_target(
+                        ld, ligand, poi, pd['coords'], no_torsion=no_torsion)
+                    projected = torch.as_tensor(projected, device=self.device,
+                                                dtype=supplied.dtype).reshape_as(supplied)
+                    error = (projected - supplied).square().sum(-1).mean().sqrt()
+                    if not torch.isfinite(error) or error.item() > 1e-3:
+                        raise ValueError(
+                            f'{case}: precomputed target does not match the reachable '
+                            f'native projection for this initialization (RMSD={error.item():.6g} A)')
+                    if len(cache) >= 128:
+                        cache.pop(next(iter(cache)))
+                    cache[signature] = report
+                    self._verified_override_targets = cache
+                target, projection = supplied, cache[signature]
             else:
                 target, projection = reachable_ligand_target(
                     ld, ligand, poi, pd['coords'], no_torsion=no_torsion)
@@ -707,7 +763,7 @@ class AssemblyTrainer(TriCoopDiffTrainer):
             near_ligand, near_poi = target_ligand.detach(), pd['coords'].detach()
             near_body = torch.eye(3, device=self.device, dtype=near_ligand.dtype).unsqueeze(0)
             if not near_target_zero:
-                velocities = {
+                velocities = near_noise_override if near_noise_override is not None else {
                     'rigid_output_mode': INDEPENDENT_RIGID_MODE,
                     **({'torsion_update_mode': CONTINUOUS_TORSION_MODE}
                        if self.model.trifuse.config.get('model_profile') in ('ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE) else {}),
@@ -763,7 +819,8 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         interface_pairs = 0
         if self.interface_loss_weight:
             interface, interface_pairs = terminal_interface_losses(
-                ed['coords'], pd['coords'], poi, self.interface_cutoff)
+                ed['coords'], pd['coords'], poi, self.interface_cutoff,
+                error_scale=self.interface_error_scale)
             losses.update(interface)
             total = total + self.interface_loss_weight * sum(interface.values())
         if self.steric_loss_weight:
@@ -782,16 +839,16 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         if len(batches) > self.effective_batch_size:
             raise ValueError('microbatch group exceeds the recorded effective batch size')
         sample_offset = getattr(self, 'distributed_sample_offset', 0)
+        indices = getattr(self, 'distributed_sample_indices', None)
+        if indices is None:
+            indices = [self.samples_seen + sample_offset + offset for offset in range(len(batches))]
+        elif len(indices) != len(batches) or any(not isinstance(index, int) or index < self.samples_seen for index in indices):
+            raise ValueError('distributed sample indices must identify every actual global sample')
         if self.near_target_weight:
-            if self.training_recipe == 'endpoint_near_target_v2':
-                batches = [{**batch, 'near_target_zero': ((self.samples_seen + sample_offset + offset) // 2) % 2 == 0,
-                            'near_target_start_t': self.near_target_supervision['start_times'][
-                                ((self.samples_seen + sample_offset + offset) // 4) % 2]}
-                           for offset, batch in enumerate(batches)]
-            else:
-                batches = [{**batch, 'near_target_zero': (self.samples_seen + sample_offset + offset) % 2 == 0,
-                            'near_target_start_t': self.near_target_supervision['start_t']}
-                           for offset, batch in enumerate(batches)]
+            from tricoopdiff.distributed import endpoint_near_policy
+            batches = [{**batch, 'near_target_zero': endpoint_near_policy(self, index)[0],
+                        'near_target_start_t': endpoint_near_policy(self, index)[1]}
+                       for index, batch in zip(indices, batches)]
         result = super().train_batch(batches)
         decay = self.effective_ema_decay
         with torch.no_grad():
@@ -994,6 +1051,7 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                 'inference_steps': self.diffusion.inference_steps,
                 'interface_loss_weight': self.interface_loss_weight,
                 'interface_cutoff': self.interface_cutoff,
+                'interface_error_scale': self.interface_error_scale,
                 'steric_loss_weight': self.steric_loss_weight,
                 'steric_cutoff': self.steric_cutoff,
                 'effective_batch_size': self.effective_batch_size,
@@ -1018,8 +1076,14 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         validate_assembly_checkpoint(payload)
         return payload
 
-    def save_checkpoint(self, path, epoch=0, best_val_loss=float('inf'), best_val_dockq=None):
-        atomic_torch_save(self.checkpoint_payload(epoch, best_val_loss, best_val_dockq), path)
+    def save_checkpoint(self, path, epoch=0, best_val_loss=float('inf'), best_val_dockq=None,
+                        *, data_state=None, selection=None):
+        payload = self.checkpoint_payload(epoch, best_val_loss, best_val_dockq)
+        if data_state is not None:
+            payload['single_process_data_state'] = data_state
+        if selection is not None:
+            payload['checkpoint_selection'] = selection
+        atomic_torch_save(payload, path)
 
     def load_checkpoint(self, path, *, distributed_context=None):
         from tricoopdiff.initialization.endpoints import PROJECTION_SOLVER_VERSION
@@ -1068,6 +1132,10 @@ class AssemblyTrainer(TriCoopDiffTrainer):
             expected = self.diffusion.inference_steps if key == 'inference_steps' else getattr(self, key)
             if payload['runtime_config'].get(key) != expected:
                 raise ValueError(f'checkpoint {key} differs from the trainer')
+        saved_scale = payload['runtime_config'].get(
+            'interface_error_scale', payload['runtime_config']['interface_cutoff'])
+        if saved_scale != self.interface_error_scale:
+            raise ValueError('checkpoint interface_error_scale differs from the trainer')
         validate_expert_base_identity(payload, self.model.expert)
         if payload['runtime_config']['expert_runtime_identity'] != expert_runtime_identity(self.model.expert):
             raise ValueError('checkpoint expert runtime configuration differs')
@@ -1099,6 +1167,7 @@ class AssemblyTrainer(TriCoopDiffTrainer):
             if payload['runtime_config'].get(key) != value:
                 raise ValueError(f'consensus checkpoint runtime mismatch: {key}')
         self._restore_optimization(payload)
+        self.resume_data_state = payload.get('single_process_data_state')
         self.resume_best_val_dockq = payload['training_state'].get('best_val_dockq', float('-inf'))
         if payload['runtime_config'].get('validation_dockq_protocol') != REAL_VALIDATION_DOCKQ_PROTOCOL:
             # Keep optimizer/LR, but do not compare different validation protocols.

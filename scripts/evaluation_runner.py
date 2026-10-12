@@ -13,7 +13,7 @@ from featurize_common import featurize_complex
 from tricoopdiff.sdpi_flow import SDPIFlow
 from tricoopdiff.initialization import TernaryInitializer
 from tricoopdiff.evaluate import evaluate_model
-from tricoopdiff.models.expert import build_diffdock_expert
+from tricoopdiff.models.expert import build_diffdock_expert, FrozenMatcha
 from tricoopdiff.models.assembly import (
     DIRECT_RANK_FEATURE_STATE, LEGACY_RANK_FEATURE_STATE,
     TernaryAssemblyModel, TernaryAssembly,
@@ -34,7 +34,9 @@ class EvaluationRunner:
                  deepternary_root=None, deterministic=True,
                  conformer_policy="etkdgv3_random",
                  allow_experimental_checkpoint=False,
-                 allow_conditioned_checkpoint=False):
+                 allow_conditioned_checkpoint=False,
+                 matcha_source_dir="results/matcha_qualification_source",
+                 matcha_weights_dir="results/matcha_qualification_weights"):
         self.reproducibility = configure_inference_reproducibility(deterministic)
         self.reproducibility['torus_score_norm_version'] = SCORE_NORM_VERSION
         self.root = Path(project_root).resolve()
@@ -92,11 +94,26 @@ class EvaluationRunner:
         with (self.model_dir / "model_parameters.yml").open() as handle:
             self.score_model_args = Namespace(**yaml.full_load(handle))
         self.expert_config_sha256 = sha256_file(self.model_dir / "model_parameters.yml")
-        self.expert = build_diffdock_expert(
-            model_dir=str(self.model_dir), device=str(self.device),
-            ckpt=expert_checkpoint,
-            num_conv_layers=self.score_model_args.num_conv_layers,
-        )
+        self.expert_backend = self.checkpoint.get('model_config', {}).get('expert_backend', 'diffdock')
+        if self.expert_backend == 'matcha':
+            frame_policy = self.checkpoint['expert_base_identity'].get('frame_policy', 'legacy_argmax_v1')
+            expert_type = FrozenMatcha
+            if frame_policy == 'ordered_residue_com_v1':
+                from tricoopdiff.models.ordered_matcha_frame import FrozenOrderedResidueMatcha
+                expert_type = FrozenOrderedResidueMatcha
+            elif frame_policy != 'legacy_argmax_v1':
+                raise ValueError(f'unsupported Matcha frame policy: {frame_policy}')
+            self.expert = expert_type(
+                source_dir=str(self.root / matcha_source_dir),
+                weights_dir=str(self.root / matcha_weights_dir),
+                device=str(self.device)).to(self.device)
+        elif self.expert_backend == 'diffdock':
+            self.expert = build_diffdock_expert(
+                model_dir=str(self.model_dir), device=str(self.device),
+                ckpt=expert_checkpoint,
+                num_conv_layers=self.score_model_args.num_conv_layers)
+        else:
+            raise ValueError(f'unsupported checkpoint expert backend {self.expert_backend!r}')
         from tricoopdiff.models.expert import configure_expert_policy
         configure_expert_policy(self.expert, self.activation_clamp, self.activation_clamp_mode)
         if self.checkpoint.get('model_config', {}).get('model_profile') == 'ternary_endpoint_v14':
@@ -165,6 +182,18 @@ class EvaluationRunner:
             str(paths["ligand"]), self.score_model_args, str(self.device),
             cache_dir=str(cache_dir),
         )
+        if self.expert_backend == 'matcha':
+            # Reuse the training metadata identity/cache contract; receptor
+            # graphs alone do not contain Matcha sequence/chemical inputs.
+            from train_entry import TernaryDataLoader
+            from tricoopdiff.runtime import preserve_rng
+            metadata_loader = Namespace(expert=self.expert, cache_dir=str(cache_dir),
+                                        device=self.device)
+            entry = {'case': case, **{key: str(paths[key])
+                                     for key in ('protein1', 'protein2', 'ligand')}}
+            e3_data, poi_data, ligand_data = preserve_rng(
+                TernaryDataLoader._prepare_matcha)(metadata_loader, entry,
+                    (e3_data, poi_data, ligand_data))
         self._ensure_model(input_dim)
         conditions, condition_audit, condition_path = None, None, None
         if condition_manifest is not None:
@@ -253,8 +282,10 @@ class EvaluationRunner:
                 else LEGACY_RANK_FEATURE_STATE if return_rank_features else None
             ),
             "checkpoint_sha256": self.checkpoint_sha256,
-            "expert_checkpoint_sha256": self.expert.provenance["score_checkpoint_sha256"],
+            "expert_checkpoint_sha256": self.expert.provenance.get("score_checkpoint_sha256"),
             "expert_config_sha256": self.expert_config_sha256,
+            "expert_backend": self.expert_backend,
+            "expert_base_identity": self.reproducibility["checkpoint_expert_base_identity"],
             "input_signature": evaluation_input_signature(
                 {**paths, **({'condition_manifest': condition_path} if condition_path else {})},
                 native_complex_pdb),

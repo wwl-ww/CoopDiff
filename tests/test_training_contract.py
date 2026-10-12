@@ -7,6 +7,7 @@ if __name__ == "__main__":
 
 import copy
 import io
+import json
 import os
 import random
 import tempfile
@@ -150,7 +151,19 @@ def test_matcha_metadata_cache_checks_identity_and_survives_protein_flip():
                    for a, b in zip(first, second))
         flipped = swap_protein_reference(*second)
         assert flipped[0]['matcha'] is second[1]['matcha']
+        loader.matcha_metadata_read_only = True
+        loader.cache_wait_seconds = 0.
+        loader._prepare_matcha(entry, data)
+        assert loader.expert.calls == 1, 'metadata followers must reuse verified writer output'
         paths[0].write_text('changed protein')
+        try:
+            loader._prepare_matcha(entry, data)
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError('metadata followers must reject stale metadata')
+        assert loader.expert.calls == 1, 'metadata followers must never load a sequence encoder'
+        loader.matcha_metadata_read_only = False
         loader._prepare_matcha(entry, data)
         assert loader.expert.calls == 2, 'changed indexed inputs must invalidate Matcha metadata'
 
@@ -189,6 +202,8 @@ def test_consensus_builder_passes_only_active_model_dimensions():
             model_profile='ternary_endpoint_v14', expert_scalar_dim=58, expert_vector_dim=20,
             information_contract='conditional_node_evidence_without_rigid_advice_v2',
             rigid_decoder_contract='independent_horizontal_rotor_coupling_v4',
+            torsion_representation_contract='horizontal_equivalent_rotor_v2',
+            protein_local_geometry_contract='intrinsic32_masked_v1',
         )
         assert model.call_args.kwargs['expert_input_grad'] is True
         assert result is model.return_value
@@ -1030,9 +1045,11 @@ def test_training_entry_keeps_dockq_best_separate_from_loss_best():
             self.saved[Path(path).name] = state
     class Loader:
         def __iter__(self):
-            yield from [{'case': 'sample'}] * 3
+            yield from ({'case': item['case']} for item in self._epoch_entries())
         def _epoch_entries(self):
-            return [entry]
+            return [{**entry, 'case': f'sample{i}'} for i in range(3)]
+        def _load_one(self, item):
+            return {'case': item['case']}
     entry = {'case': 'sample', 'protein1': 'p1', 'protein2': 'p2', 'ligand': 'lig'}
     trainer = Trainer()
     validation = [{'selection_loss': .1, 'selection_dockq': .7, 'by_source': {'sdpi': .1}},
@@ -1700,13 +1717,15 @@ def test_gloo_weighted_gradient_and_failure_contract():
 def test_global_batch_shards_are_disjoint_without_padding():
     shards = [shard_global_batch(list(range(8)), 8, rank, 2) for rank in range(2)]
     assert shards == [list(range(4)), list(range(4, 8))]
-    for size, entries in ((3, [1, 2, 3]), (4, [1, 2, 3])):
+    tail = [shard_global_batch([1, 2, 3], 4, rank, 2) for rank in range(2)]
+    assert tail == [[1, 2], [3]], 'unpadded tail must retain all real samples'
+    for size, entries in ((3, [1, 2, 3]), (4, [1])):
         try:
             shard_global_batch(entries, size, 0, 2)
         except ValueError:
             pass
         else:
-            raise AssertionError('unequal shards or incomplete batch must be rejected')
+            raise AssertionError('invalid global size or empty rank must be rejected')
 
 
 def test_distributed_near_target_offsets_follow_global_sample_order():
@@ -1772,3 +1791,275 @@ def test_distributed_checkpoint_requires_matching_topology_and_entry():
                 assert 'distributed' in str(error)
             else:
                 raise AssertionError('distributed state resumed with incompatible entry/topology')
+
+
+def test_precomputed_target_cannot_bypass_reachable_projection():
+    trainer, batch, coupling = training_contract_endpoint_trainer_fixture()
+    invalid = coupling['target_ligand'].clone()
+    invalid[:, 0] += 3.
+    try:
+        trainer.compute_loss(**batch, coupling_override={**coupling, 'target_ligand': invalid})
+    except ValueError as error:
+        assert 'precomputed target' in str(error)
+    else:
+        raise AssertionError('an incompatible precomputed label bypassed projection')
+    trainer.compute_loss(**batch, coupling_override=coupling)
+    with patch('tricoopdiff.initialization.endpoints.reachable_ligand_target',
+               side_effect=AssertionError('unchanged verified target must reuse validation')):
+        trainer.compute_loss(**batch, coupling_override=coupling)
+    shifted = {**coupling, 'initial_state': {**coupling['initial_state'],
+               'ligand': coupling['initial_state']['ligand'] * 1.3}}
+    try:
+        trainer.compute_loss(**batch, coupling_override=shifted)
+    except ValueError as error:
+        assert 'precomputed target' in str(error)
+    else:
+        raise AssertionError('changed conformer reused a stale target verification')
+
+
+def test_training_entry_resumes_only_remaining_epoch_samples():
+    import train_entry
+    from tricoopdiff.train import REAL_ENDPOINT_OBJECTIVE
+    with tempfile.TemporaryDirectory() as output:
+        index = Path(output) / 'train.json'
+        entries = [{'case': f'case{i}', 'protein1': 'p1', 'protein2': 'p2', 'ligand': 'l'}
+                   for i in range(4)]
+        index.write_text(json.dumps(entries))
+        args = parse_args(['--train_data', str(index), '--val_data', str(index),
+                           '--output_dir', output, '--device', 'cpu', '--epochs', '1',
+                           '--batch_size', '2', '--save-steps', '1', '--resume', 'fixture.pt'])
+        args.resolved_model_config = {'dropout': 0.}
+        loss = {'loss_total': .2, 'loss_ligand_geometry': .1, 'loss_protein_geometry': .1}
+        class Trainer:
+            training_objective = REAL_ENDPOINT_OBJECTIVE
+            global_step = 1
+            samples_seen = 2
+            resume_epoch = 0
+            resume_best_val_loss = float('inf')
+            resume_best_val_dockq = float('-inf')
+            optimizer = SimpleNamespace(param_groups=[{'lr': .001}])
+            resume_data_state = train_entry.epoch_data_state(args, 1, entries, 2, [loss, loss])
+            def __init__(self):
+                self.seen, self.saved = [], {}
+            def load_checkpoint(self, path): pass
+            def set_phase(self, phase): pass
+            def train_batch(self, batches):
+                self.seen.extend(batch['case'] for batch in batches)
+                self.global_step += 1
+                self.samples_seen += len(batches)
+                return [dict(loss) for _ in batches]
+            def scheduler_step(self, value): pass
+            def save_checkpoint(self, path, **state): self.saved[Path(path).name] = state
+        class Loader:
+            entries_by_case = {entry['case']: entry for entry in entries}
+            def __len__(self): return len(entries)
+            def _epoch_entries(self):
+                raise AssertionError('resuming a sampled epoch must not resample it')
+            def _load_one(self, entry): return {'case': entry['case']}
+        trainer, loader = Trainer(), Loader()
+        validation = {'selection_loss': .1, 'selection_dockq': .5,
+                      'by_source': {}, 'dockq_protocol': 'fixture'}
+        val_loader = SimpleNamespace(_epoch_entries=lambda: entries)
+        with patch('train_entry.parse_args', return_value=args), \
+             patch('train_entry._load_entries', return_value=entries), \
+             patch('train_entry._load_score_model_args', return_value=SimpleNamespace()), \
+             patch('train_entry.featurize_complex', return_value=(None, None, None, 16)), \
+             patch('train_entry.build_trainer', return_value=(SimpleNamespace(expert=None), None, trainer)), \
+             patch('train_entry.TernaryDataLoader', side_effect=[loader, val_loader]), \
+             patch('train_entry.validation_metric_context', return_value={}), \
+             patch('train_entry.validate', return_value=validation), redirect_stdout(io.StringIO()):
+            train_entry.main()
+        assert trainer.seen == ['case2', 'case3']
+        assert trainer.samples_seen == 4 and trainer.global_step == 2
+        assert trainer.saved['best_model.pt']['selection']['scope'] == 'PP_only'
+        state = train_entry.epoch_data_state(args, 1, entries, 2, [loss, loss])
+        for changes in ({'batch_size': 3}, {'next_sample': 1}, {'index_sha256': 'stale'}):
+            try:
+                train_entry.restore_epoch_data_state({**state, **changes}, args, loader, 1)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'incompatible data continuation accepted: {changes}')
+
+
+def test_interface_contact_cutoff_is_independent_of_error_scale():
+    from tricoopdiff.train import terminal_interface_losses
+    e3 = torch.zeros(1, 1, 3, dtype=torch.float64)
+    native = torch.tensor([[[2., 0., 0.]]], dtype=torch.float64)
+    predicted = native + torch.tensor([[[.5, .25, 0.]]], dtype=torch.float64)
+    a, count_a = terminal_interface_losses(e3, native, predicted, 3.)
+    b, count_b = terminal_interface_losses(e3, native, predicted, 8.)
+    assert count_a == count_b == 1
+    assert all(torch.equal(a[key], b[key]) for key in a), 'cutoff changed error normalization'
+    scaled, _ = terminal_interface_losses(e3, native, predicted, 3., error_scale=5.)
+    assert all(torch.allclose(scaled[key], 4 * a[key]) for key in a)
+    trainer, _, _ = training_contract_endpoint_trainer_fixture()
+    payload = trainer.checkpoint_payload()
+    assert payload['runtime_config']['interface_error_scale'] == 10.
+    del payload['runtime_config']['interface_error_scale']
+    with patch('tricoopdiff.train.torch.load', return_value=payload):
+        trainer.load_checkpoint('legacy.pt')
+    payload['runtime_config']['interface_error_scale'] = 5.
+    with patch('tricoopdiff.train.torch.load', return_value=payload):
+        try:
+            trainer.load_checkpoint('incompatible.pt')
+        except ValueError as error:
+            assert 'interface_error_scale' in str(error)
+        else:
+            raise AssertionError('resume silently changed PP interface loss scale')
+
+
+def test_matcha_builder_constructs_expert_on_requested_cpu_device():
+    args = parse_args(['--train_data', 'unused', '--val_data', 'unused',
+                       '--output_dir', 'unused', '--expert-backend', 'matcha', '--device', 'cpu'])
+    class ConstructionReached(Exception):
+        pass
+    with patch('tricoopdiff.models.expert.FrozenMatcha', side_effect=ConstructionReached) as factory:
+        try:
+            build_trainer(args, torch.device('cpu'), input_dim=1281)
+        except ConstructionReached:
+            pass
+        else:
+            raise AssertionError('Matcha construction was not reached')
+    assert factory.call_args.kwargs['device'] == 'cpu', 'CPU preflight must never allocate a CUDA expert'
+
+
+def test_distributed_tail_cursor_counts_real_samples_across_epochs():
+    from tricoopdiff.distributed import validate_distributed_checkpoint
+    from tricoopdiff.runtime import capture_rng_state
+
+    rng = capture_rng_state()
+    state = {'contract':'explicit_sample_weighted_allreduce_v1', 'world_size':2,
+             'global_batch_size':4, 'rank_rng_states':[rng,rng],
+             'next_data_cursor':{'epoch':1,'offset':0}}
+    payload = {'distributed_state':state,'global_step':147,
+               'training_state':{'samples_seen':587}}
+    assert validate_distributed_checkpoint(payload,2,4,epoch_size=587) is state
+    state['next_data_cursor'] = {'epoch':1,'offset':4}
+    payload['global_step'], payload['training_state']['samples_seen'] = 148,591
+    validate_distributed_checkpoint(payload,2,4,epoch_size=587)
+    payload['training_state']['samples_seen'] = 592
+    try:
+        validate_distributed_checkpoint(payload,2,4,epoch_size=587)
+    except ValueError as error:
+        assert 'sample count' in str(error)
+    else:
+        raise AssertionError('padded sample counter was accepted')
+
+
+def test_distributed_validation_merges_unequal_shards_by_case_count():
+    from train_distributed import merge_epoch_validation
+
+    reports = [dict(per_case=[{'case':'a'},{'case':'b'}],source_counts={'sdpi':2},
+                    selection_loss=2., selection_dockq=.2),
+               dict(per_case=[{'case':'c'}],source_counts={'sdpi':1},
+                    selection_loss=8., selection_dockq=.8)]
+    merged = merge_epoch_validation(reports)
+    assert merged['selection_loss'] == 4.
+    assert abs(merged['selection_dockq'] - .4) < 1e-7
+    assert merged['source_counts']['sdpi'] == 3
+
+
+def test_distributed_epoch_best_checkpoint_keeps_rank_resume_state(tmp_path):
+    from types import SimpleNamespace
+    import train_distributed as entry
+
+    index = tmp_path/'index.json'
+    index.write_text('{}')
+    args = SimpleNamespace(batch_size=4, initialization_protocol={'name':'online_sdpi_v1'},
+        train_data=str(index),val_data=str(index),seed=73,phase=1,
+        random_flip_proteins=True,distributed_epoch_size=587,checkpoint_ternary=False,
+        distributed_epoch_validation=True)
+    model = SimpleNamespace(trifuse=torch.nn.Linear(1,1))
+    trainer = SimpleNamespace(model=model,global_step=147,
+        checkpoint_payload=lambda **values: {'global_step':147,'training_state':values})
+
+    def all_gather(output, value):
+        output[:] = [value,value]
+
+    with patch.object(entry.dist,'all_gather_object',side_effect=all_gather), \
+         patch.object(entry.dist,'gather_object',side_effect=lambda value, output, dst: all_gather(output,value)), \
+         patch.object(entry.dist,'barrier'):
+        entry.save_state(trainer,args,0,2,tmp_path,{'epoch':1,'offset':0},
+            names=['best_model.pt','progress_model.pt'],best_val_loss=2.,best_val_dockq=.4,
+            selection={'metric':'protein_protein_dockq','scope':'PP_only','value':.4,'weights':'ema'})
+    payload = torch.load(tmp_path/'best_model.pt',map_location='cpu',weights_only=False)
+    assert payload['checkpoint_kind'] == 'distributed_training'
+    assert payload['checkpoint_selection']['scope'] == 'PP_only'
+    assert payload['training_state']['best_val_loss'] == 2.
+    state = payload['distributed_state']
+    assert state['next_data_cursor'] == {'epoch':1,'offset':0}
+    assert len(state['rank_rng_states']) == 2 and state['epoch_validation_enabled']
+    assert (tmp_path/'progress_model.pt').is_file()
+
+
+def test_balanced_presampling_preserves_logical_rng_and_global_near_indices():
+    from tricoopdiff.distributed import (balanced_sample_assignment,
+        endpoint_near_policy, presample_endpoint_randomness)
+    from tricoopdiff.runtime import capture_rng_state, restore_rng_state, preserve_rng
+    from tricoopdiff.train import AssemblyTrainer
+
+    original = capture_rng_state()
+    try:
+        config = SimpleNamespace(training_recipe='endpoint_near_target_v2', near_target_weight=.25,
+            near_target_supervision={'start_times':[1.,.2], 'torsion_std_radians':.15,
+                'translation_std_angstrom':.5, 'rotation_std_radians':.05},
+            model=SimpleNamespace(expert=SimpleNamespace(model=SimpleNamespace(no_torsion=False)),
+                trifuse=SimpleNamespace(config={'model_profile':'ternary_endpoint_v4'})))
+        all_prepared = []
+        for logical_rank in range(2):
+            torch.manual_seed(73 + logical_rank)
+            np.random.seed(73 + logical_rank)
+            before = capture_rng_state()
+            batches = [{'case':str(index), 'ligand_data':{'coords':torch.zeros(1,3,3),
+                        'edge_mask':torch.tensor([True, False, True])}}
+                       for index in range(2 * logical_rank, 2 * logical_rank + 2)]
+            flips = [np.random.random() < .5 for _ in batches]
+            expected = []
+            for index, batch in enumerate(batches):
+                sample_index = 4 + 2 * logical_rank + index
+                seed = int(torch.randint(0,2**31-1,(1,)).item())
+                normals = []
+                if not endpoint_near_policy(config,sample_index)[0]:
+                    normals.append(torch.empty(1,2).normal_(0,.15))
+                    for _ in range(2):
+                        normals.extend([torch.empty(1,3).normal_(0,.5),torch.empty(1,3).normal_(0,.05)])
+                expected.append((seed,normals))
+            after = capture_rng_state()
+            restore_rng_state(before)
+            assert [np.random.random() < .5 for _ in batches] == flips
+            prepared = [presample_endpoint_randomness(config,batch,4+2*logical_rank+index)
+                        for index,batch in enumerate(batches)]
+            assert torch.equal(after['torch_cpu'],torch.get_rng_state())
+            assert np.array_equal(after['numpy'][1],np.random.get_state()[1])
+            for batch, (seed,normals) in zip(prepared,expected):
+                assert batch['initialization_seed_override'] == seed
+                if normals:
+                    noise=batch['near_noise_override']
+                    actual=[noise['torsion']]+[noise[branch][key] for branch in
+                        ('e3_ligand','poi_ligand') for key in ('tr','rot')]
+                    assert all(torch.equal(a,b) for a,b in zip(actual,normals))
+            all_prepared.extend(prepared)
+        assignment=balanced_sample_assignment([100.,90.,10.,10.],2)
+        assert sorted(index for indices in assignment for index in indices)==list(range(4))
+        assert assignment == [[0,3],[1,2]]
+
+        class ToyAssembly(AssemblyTrainer):
+            def compute_loss(self, **batch):
+                recorded.append((batch['case'],batch['near_target_zero'],batch['near_target_start_t']))
+                return {'loss_total':self.model.trifuse.weight.square().sum()}
+        recorded=[]
+        trainer=ToyAssembly.__new__(ToyAssembly)
+        trainer.model=torch.nn.Module();trainer.model.trifuse=torch.nn.Linear(1,1,bias=False)
+        trainer.optimizer=torch.optim.SGD(trainer.model.parameters(),lr=.01)
+        trainer.global_step=0;trainer.samples_seen=4;trainer.effective_batch_size=4
+        trainer.training_recipe=config.training_recipe;trainer.near_target_weight=.25
+        trainer.near_target_supervision=config.near_target_supervision
+        trainer.ema_decay=.99;trainer.ema_update_contract='optimizer_step_warmup_v1'
+        trainer.ema={key:value.clone() for key,value in trainer.model.trifuse.state_dict().items()}
+        trainer.distributed_sample_indices=[4+index for index in assignment[1]]
+        trainer.require_deterministic_forward=True
+        trainer.train_batch([all_prepared[index] for index in assignment[1]])
+        assert recorded == [(str(index),*endpoint_near_policy(config,4+index)) for index in assignment[1]]
+    finally:
+        restore_rng_state(original)
