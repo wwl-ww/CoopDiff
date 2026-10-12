@@ -13,6 +13,7 @@
 ## 轻量验证
 
 ```bash
+python scripts/run_cpu_tests.py
 python tests/test_model_build.py
 python tests/test_initialization.py
 python tests/test_sdpi_flow.py
@@ -21,7 +22,9 @@ python tests/test_prepare_data.py
 bash scripts/gpu_status.sh
 ```
 
-按修改范围选择检查；以上不是本次文档整理重新跑过的测试声明。某些 `test_*.py` 仅定义函数，直接执行不一定运行全部断言，使用其实际 runner 或显式测试调用。GPU 模型检查先单例、单 walker，再扩规模；零初始化 smoke 不代表训练后准确率。
+完整 CPU 回归使用 `run_cpu_tests.py`：隔离子进程、离线、禁用 GPU，逐函数调用并支持 `tmp_path`；单文件超时可用 `--timeout` 调整。某些 `test_*.py` 仅定义函数，直接执行不一定运行全部断言。GPU 模型检查先单例、单 walker，再扩规模；零初始化 smoke 不代表训练后准确率。
+
+保留的 `validate_consensus_model.py` 是固定训练样本的梯度/冻结专家/EMA/轨迹检查；CUDA 模式必须显式设置获授权的 `CUDA_VISIBLE_DEVICES`，不再绑定 GPU3。它会优化并写出 smoke-only 权重，不属于默认 CPU 回归，也不是双来源效果评估。
 
 ## MGD94 当前精修实验的最小复跑
 
@@ -60,12 +63,12 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python scripts/evaluate_selected_refinem
 
 `bash scripts/gpu_status.sh` 一次显示所有卡；结合用户、完整命令、PPID、会话和日志确定所属任务。PPID=1 仅表示重新托管，不能单独证明断线安全。
 
-本机直接使用用户授权的物理 GPU，持久作业使用已配置的 tmux/独立会话，日志重定向到运行目录；断开终端后复查任务和输出仍更新。旧 SLURM wrapper 仅为历史参考，不作为当前启动入口。tmux 若遇到环境中的 libtinfo 冲突，可只对 tmux 命令使用 `env -u LD_LIBRARY_PATH tmux ...`，不修改全局运行环境。
+本机直接使用用户授权的物理 GPU，持久作业使用已配置的 tmux/独立会话，日志重定向到运行目录；断开终端后复查任务和输出仍更新。旧 SLURM wrapper 已在 model-v3 清理，可从 `92cf1f0` 查阅。tmux 若遇到环境中的 libtinfo 冲突，可只对 tmux 命令使用 `env -u LD_LIBRARY_PATH tmux ...`，不修改全局运行环境。
 
 多 worker 使用互斥 case 划分或真正带原子认领的队列，单独日志；不要让两个进程同时写同一 case/manifest。显存够不保证 1.5–2 倍加速，记录吞吐、峰值显存和失败率。更改并发不改变 candidate ID、seed 或科学配置。
 
 ## 训练与交付门禁
 
-联合训练实现已从 `exp/dual-init` 合入当前分支，原工作树及训练产物仍独立保留；合并代码不迁移checkpoint/cache。历史 v13/LoRA smoke 不能替代当前 Consensus/factorial 或双来源训练验收。旧夜间 `overnight_dual.json` 的双状态设想也不等于本次单模型双初始化目标。
+联合训练实现已从 `exp/dual-init` 合入当前分支，原工作树及训练产物仍独立保留；合并代码不迁移checkpoint/cache。历史 v13/LoRA smoke 不能替代当前 Consensus/factorial 或双来源训练验收。旧夜间配置已移除，其双状态设想也不等于本次单模型双初始化目标。
 
 训练前审计实际 PDB-disjoint split；随后检查 finite forward/backward、预期可训练参数更新、专家冻结、保存恢复、独立验证和双来源能力。固定一例降 loss 不是泛化证据。checkpoint 记录架构/配置/数据/数值身份，结果记录命令、commit、seed、进程或 job ID。不要覆盖旧权重，也不随文档清理删除数据或日志。

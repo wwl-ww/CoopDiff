@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,7 @@ from rdkit import Chem
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 
 def _resolve(path):
@@ -78,26 +80,67 @@ def main():
     parser.add_argument('--index', required=True)
     parser.add_argument('--out', required=True)
     parser.add_argument('--limit', type=int)
+    parser.add_argument('--prepare-cache', action='store_true',
+                        help='Materialize and validate production features, fullatom targets and symmetry maps')
+    parser.add_argument('--cache-dir', default='results/featurize_cache_proposal_oracle')
+    parser.add_argument('--reuse-cache-dir', action='append', default=[],
+                        help='Reuse only source-signature-verified caches before rebuilding ESM')
+    parser.add_argument('--expert-model-dir', default='checkpoints/score_model')
+    parser.add_argument('--device', default='cpu')
     parser.add_argument('--min-ligand-heavy-atoms', type=int, default=20,
                         help='Use 1 for the joint-pool contract; 20 is the legacy diagnostic filter')
     args = parser.parse_args()
     if args.min_ligand_heavy_atoms < 1:
         parser.error('min-ligand-heavy-atoms must be positive')
 
-    payload = json.loads(_resolve(args.index).read_text(encoding='utf-8'))
-    entries = payload.get('entries', payload)
+    from train_entry import _load_entries
+    entries = _load_entries(str(_resolve(args.index)))
+    if args.prepare_cache:
+        import torch
+        from train_entry import _load_score_model_args, fullatom_targets
+        from featurize_common import featurize_complex, _featurize_signature, _FEATURIZE_CACHE_VERSION
+        from tricoopdiff.initialization.endpoints import ligand_symmetries
+        from tricoopdiff.runtime import atomic_torch_save
+        score_args = _load_score_model_args(_resolve(args.expert_model_dir))
     if args.limit is not None:
         entries = entries[:args.limit]
     records = []
     for entry in entries:
         try:
-            records.append(audit_entry(entry, args.min_ligand_heavy_atoms))
+            record = audit_entry(entry, args.min_ligand_heavy_atoms)
+            if args.prepare_cache:
+                filename = entry['case'].replace('/', '_') + '.pt'
+                destination = _resolve(args.cache_dir) / filename
+                if not destination.exists():
+                    for directory in args.reuse_cache_dir:
+                        source = _resolve(directory) / filename
+                        if not source.is_file():
+                            continue
+                        cached = torch.load(source, map_location='cpu', weights_only=False)
+                        version = cached.get('cache_version')
+                        if version not in (8, _FEATURIZE_CACHE_VERSION):
+                            continue
+                        signature = _featurize_signature(entry['protein1'], entry['protein2'], entry['ligand'],
+                                                        score_args, cache_version=None if version == 8 else version)
+                        if cached.get('source_signature') == signature:
+                            atomic_torch_save(cached, destination)
+                            break
+                e3, poi, ligand, _ = featurize_complex(entry['case'], entry['protein1'], entry['protein2'],
+                    entry['ligand'], score_args, args.device, cache_dir=str(_resolve(args.cache_dir)))
+                fullatom_targets(entry, e3, poi)
+                record.update(protein_nodes=[e3['coords'].shape[1], poi['coords'].shape[1]],
+                              symmetry_count=len(ligand_symmetries(ligand)), feature_cache_version=_FEATURIZE_CACHE_VERSION)
+            records.append(record)
         except Exception as error:
             records.append({
                 'case': entry['case'],
                 'ok': False,
                 'error': f'{type(error).__name__}: {error}',
             })
+        if len(records) % 25 == 0 or not records[-1]['ok']:
+            print(json.dumps({'completed': len(records), 'total': len(entries),
+                              'failed': sum(not row['ok'] for row in records),
+                              'last': records[-1]}), flush=True)
     report = {
         'index': args.index,
         'min_ligand_heavy_atoms': args.min_ligand_heavy_atoms,

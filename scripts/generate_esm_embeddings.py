@@ -2,7 +2,7 @@
 """
 Precompute ESM2-650M per-residue embeddings for PROTAC benchmark proteins.
 
-Uses tricoopdiff.esm_embedder (HuggingFace transformers via HF mirror).
+Uses tricoopdiff.inputs.esm_embedder (HuggingFace transformers via HF mirror).
 Output format: {protein_path: [per-chain tensor, ...]} stored as .pt file.
 
 Usage:
@@ -49,7 +49,7 @@ def main():
     protein_paths = sorted(protein_paths)
     print(f"Unique protein files: {len(protein_paths)}")
 
-    from tricoopdiff.esm_embedder import ESMEmbedder
+    from tricoopdiff.inputs.esm_embedder import ESMEmbedder
 
     print(f"Loading ESM2-650M on {args.device}...")
     embedder = ESMEmbedder(device=args.device)

@@ -215,6 +215,5 @@ def apply_patches():
 
 
 # Apply on import (idempotent). This guarantees the patch is in place the
-# moment `diffdock_compat` is imported, which expert_factory does before any
-# DiffDock import.
+# moment the package is imported, before any model binds DiffDock kernels.
 apply_patches()
