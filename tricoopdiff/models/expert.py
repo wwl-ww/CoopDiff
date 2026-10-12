@@ -119,8 +119,12 @@ class FrozenMatcha(nn.Module):
     node_vector_dim = 5
     no_torsion = False
 
-    def __init__(self, source_dir, weights_dir, device='cuda'):
+    def __init__(self, source_dir, weights_dir, device='cuda', frame_policy='legacy_argmax_v1'):
         super().__init__()
+        if frame_policy not in ('legacy_argmax_v1', 'backbone_rigid_transport_v1'):
+            raise ValueError('unknown frozen Matcha frame policy')
+        self.frame_policy = (getattr(type(self), 'frame_policy', frame_policy)
+                             if frame_policy == 'legacy_argmax_v1' else frame_policy)
         import inspect
         import sys
         source_dir, weights_dir = Path(source_dir).resolve(), Path(weights_dir).resolve()
@@ -148,6 +152,9 @@ class FrozenMatcha(nn.Module):
             'advice_contract': 'forward_velocity_negative_reverse_clock_tr_div10_v1',
             'torsion_contract': 'canonical_executor_bonds_and_fragments_v2',
             'source_model_sha256': sha256_file(source_dir / 'matcha/models/models.py')}
+        if frame_policy == 'backbone_rigid_transport_v1':
+            self.provenance.update(frame_policy=frame_policy,
+                                   candidate_adapter_sha256=sha256_file(__file__))
         # Node evidence depends on all imported model/preprocessing code and on
         # the sequence encoder, not only on the three motion-head checkpoints.
         source_files = sorted((source_dir / 'matcha').rglob('*.py'))
@@ -210,18 +217,36 @@ class FrozenMatcha(nn.Module):
             difference = reference - positions
             if (difference - difference.mean(0)).abs().max() > 1e-3:
                 raise ValueError('Matcha preparation requires the indexed protein reference frame')
-            centered = positions - positions.mean(0)
-            first = int(centered.square().sum(-1).argmax())
-            axis = centered[first] / centered[first].norm()
-            perpendicular = centered - (centered @ axis)[:, None] * axis
-            second = int(perpendicular.square().sum(-1).argmax())
-            if perpendicular[second].norm() < 1e-3:
-                raise ValueError('protein cannot define a nondegenerate rigid reference frame')
+            frame_metadata = {}
+            if self.frame_policy == 'backbone_rigid_transport_v1':
+                residue = next((r for r in structure[0].get_residues()
+                    if r.id[0] == ' ' and all(name in r for name in ('N', 'CA', 'C'))), None)
+                if residue is None:
+                    raise ValueError('candidate Matcha frame requires an input N-CA-C backbone')
+                first_axis = positions.new_tensor(residue['N'].coord-residue['CA'].coord)
+                second_axis = positions.new_tensor(residue['C'].coord-residue['CA'].coord)
+                if first_axis.norm() < 1e-3:
+                    raise ValueError('degenerate input backbone first axis')
+                e1 = first_axis/first_axis.norm()
+                second_axis = second_axis-(second_axis @ e1)*e1
+                if second_axis.norm() < 1e-3:
+                    raise ValueError('collinear input backbone frame')
+                e2 = second_axis/second_axis.norm()
+                frame_metadata['reference_basis'] = torch.stack((e1, e2, torch.linalg.cross(e1, e2)), -1)
+                first, second = 0, 0  # Unused by the transported-frame reader.
+            else:
+                centered = positions - positions.mean(0)
+                first = int(centered.square().sum(-1).argmax())
+                axis = centered[first] / centered[first].norm()
+                perpendicular = centered - (centered @ axis)[:, None] * axis
+                second = int(perpendicular.square().sum(-1).argmax())
+                if perpendicular[second].norm() < 1e-3:
+                    raise ValueError('protein cannot define a nondegenerate rigid reference frame')
             proteins.append({**data, 'matcha': {
                 'features': torch.cat(embeddings).unsqueeze(0).detach(),
                 'sequence': torch.tensor([[aa.index(a) if a in aa else 0 for a in sequence]],
                                          device=device).unsqueeze(-1),
-                'anchors': (first, second)}})
+                'anchors': (first, second), **frame_metadata}})
         del esm
         mol = ligand_data['mol']
         mol = Chem.Mol(mol) if isinstance(mol, bytes) else Chem.Mol(mol)
@@ -266,12 +291,17 @@ class FrozenMatcha(nn.Module):
         rp, lp = receptor['coords'][0], ligand['coords'][0]
         data, chem = receptor['matcha'], ligand['matcha']
         origin = rp.mean(0)
-        centered = rp - origin
-        first, second = data['anchors']
-        e1 = centered[first] / centered[first].norm()
-        e2 = centered[second] - (centered[second] @ e1) * e1
-        e2 = e2 / e2.norm()
-        frame = torch.stack((e1, e2, torch.linalg.cross(e1, e2)), -1)
+        if self.frame_policy == 'backbone_rigid_transport_v1':
+            frame = data.get('current_basis')
+            if frame is None:
+                raise ValueError('candidate Matcha reader requires transported current basis')
+        else:
+            centered = rp - origin
+            first, second = data['anchors']
+            e1 = centered[first] / centered[first].norm()
+            e2 = centered[second] - (centered[second] @ e1) * e1
+            e2 = e2 / e2.norm()
+            frame = torch.stack((e1, e2, torch.linalg.cross(e1, e2)), -1)
         index, local_time = matcha_stage_clock(reverse_t)
         batch = SimpleNamespace(protein=SimpleNamespace(
             pos=((rp - origin) @ frame).unsqueeze(0), x=data['features'], seq=data['sequence'],

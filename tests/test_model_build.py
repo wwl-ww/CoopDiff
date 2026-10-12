@@ -735,6 +735,105 @@ def test_cross_edge_taper_preserves_internal_weights():
 
 # Assembly
 
+def test_candidate_quality_head_reads_three_components_and_backpropagates():
+    from tricoopdiff.models.assembly import (
+        production_model_config, candidate_source_tensor, CANDIDATE_SOURCE_NAMES,
+    )
+    _, graph, proposals, state = assembly_fixture()
+    graph['expert_node_features'] = torch.randn(15, 6)
+    graph['expert_node_vectors'] = torch.randn(15, 4, 3)
+    graph['fullatom_scalar_features'] = torch.randn(15, 9)
+    graph['fullatom_vector_features'] = torch.randn(15, 3, 3)
+    model = TernaryAssembly(**production_model_config(16, 16, True,
+        expert_backend='matcha', expert_scalar_dim=2, expert_vector_dim=2,
+        protein_local_geometry_contract='none', candidate_driven=True))
+    output = model(graph, proposals, state, source='hdock_matcha')
+    assert output['quality_errors'].shape == (1, 5)
+    assert output['candidate_score'].shape == (1,)
+    assert model.controller.quality[0].in_features == 144, 'scoring must preserve component distributions'
+    output['quality_errors'].sum().backward()
+    assert model.controller.quality[-1].weight.grad.abs().sum() > 0
+    assert model.controller.source.weight.grad is None, 'quality supervision must not rewrite motion features'
+    assert model.controller.protein.weight.grad is None, 'quality gradients must stop before the motion trunk'
+    assert candidate_source_tensor('hdock_matcha', state, CANDIDATE_SOURCE_NAMES).item() == 2
+    try:
+        candidate_source_tensor('hdock_matcha', state)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('legacy checkpoints must not silently interpret new candidate source')
+
+
+def test_candidate_refinement_scores_final_state_and_keeps_input_pool():
+    from tricoopdiff.models.assembly import TernaryAssemblyModel, production_model_config
+
+    expert = torch.nn.Linear(1, 1)
+    expert.backend = 'matcha'
+    expert.frame_policy = 'backbone_rigid_transport_v1'
+    expert.node_scalar_dim = 2
+    expert.node_vector_dim = 2
+    expert.read_pair = lambda *args: None
+    expert.model = SimpleNamespace(dynamic_max_cross=False, no_torsion=True)
+    fuse = TernaryAssembly(**production_model_config(16, 16, True,
+        expert_backend='matcha', expert_scalar_dim=2, expert_vector_dim=2,
+        protein_local_geometry_contract='none', candidate_driven=True))
+    model = TernaryAssemblyModel(expert, fuse)
+    calls = []
+
+    def forward(e3, poi, ligand, t_e3l, **kwargs):
+        calls.append((t_e3l.clone(), poi['coords'].clone()))
+        zero = e3['coords'].new_zeros(1, 3)
+        motion = {'rigid_output_mode': 'independent_centroids_v1',
+                  'e3_ligand': {'tr': zero, 'rot': zero},
+                  'poi_ligand': {'tr': zero+0.01, 'rot': zero},
+                  'torsion': zero[:, :0]}
+        return {'normalized_velocity': motion, 'quality_errors': zero.new_ones(1, 5),
+                'candidate_score': -poi['coords'].mean().reshape(1)}
+
+    model.forward = forward
+    e3 = {'coords': torch.randn(1, 5, 3)}
+    poi = {'coords': torch.randn(1, 6, 3)}
+    ligand = {'coords': torch.randn(1, 4, 3)}
+    candidate = {'ligand': ligand['coords'].clone(), 'poi': poi['coords'].clone(),
+        'rotation': torch.eye(3)[None], 'candidate_id': ('generated', 1),
+        'provenance': {'candidate_source': 'hdock_matcha'}}
+    original = candidate['poi'].clone()
+    model.train()
+    result = model.refine_candidates(e3, poi, ligand, [candidate], steps=2)[0]
+    assert len(calls) == 3 and calls[-1][0].item() == 0, 'score must read actual terminal state'
+    assert torch.equal(calls[-1][1], result['poi'])
+    assert torch.equal(candidate['poi'], original), 'refinement mutated the reusable bank'
+    assert model.training, 'inference must restore the caller mode'
+    assert not torch.equal(original, result['poi']), 'protein refinement action was not executed'
+
+
+def test_candidate_fullatom_evidence_has_rigid_invariance_and_sidechain_sensitivity():
+    from rdkit import Chem
+    from tricoopdiff.models.assembly import candidate_fullatom_evidence
+
+    coords = torch.tensor([[0., 0., 0.], [5., 1., 1.], [1., 1., 1.]])
+    types = torch.tensor([0, 1, 2])
+    e3 = {'steric_atoms': torch.tensor([[[0., 0., 0.], [.9, 1., 1.]]]),
+          'steric_radii': torch.tensor([1.7, 1.7])}
+    poi = {'coords': coords[1:2][None], 'steric_ca_center': coords[1],
+           'steric_atoms': coords[1:2][None], 'steric_radii': torch.tensor([1.7])}
+    ligand = {'coords': coords[2:][None], 'mol': Chem.MolFromSmiles('C')}
+    scalar, vector = candidate_fullatom_evidence(coords, types, e3, poi, ligand, torch.eye(3))
+    rotation = so3_exp(torch.tensor([.2, -.3, .1]))
+    translation = torch.tensor([3., 4., 5.])
+    def moved(value):
+        return value @ rotation.T+translation
+    transformed = candidate_fullatom_evidence(moved(coords), types,
+        {**e3, 'steric_atoms': moved(e3['steric_atoms'])},
+        {**poi, 'coords': moved(poi['coords']), 'steric_atoms': moved(poi['steric_atoms']),
+         'steric_ca_center': moved(poi['steric_ca_center'])},
+        {**ligand, 'coords': moved(ligand['coords'])}, torch.eye(3))
+    assert torch.allclose(scalar, transformed[0], atol=1e-5)
+    assert torch.allclose(vector @ rotation.T, transformed[1], atol=1e-5)
+    altered = {**e3, 'steric_atoms': e3['steric_atoms']+torch.tensor([5., 0., 0.])}
+    changed = candidate_fullatom_evidence(coords, types, altered, poi, ligand, torch.eye(3))[0]
+    assert not torch.allclose(scalar[2], changed[2]), 'ligand node cannot see sidechain motion'
+
 def test_rigid_body_output_heads_are_parameter_independent():
     from tricoopdiff.models.assembly import LegalPoseDecoder
 

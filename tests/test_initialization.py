@@ -10,11 +10,101 @@ import tempfile
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import torch
 from rdkit import Chem
 from scipy.spatial.transform import Rotation
+
+
+def test_joint_matcha_generator_is_native_blind_and_uses_all_three_stages():
+    from tricoopdiff.initialization.candidates import generate_joint_matcha_ligand
+
+    class Stage(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.times = []
+
+        def forward_step(self, batch):
+            self.times.append(float(batch.ligand.t))
+            assert batch.protein.pos.shape[1] == 7, 'generator dropped one protein chain'
+            return batch.ligand.pos.new_ones(1, 3), batch.ligand.pos.new_zeros(1, 3), None, None
+
+    expert = torch.nn.Module()
+    expert.backend = 'matcha'
+    expert.provenance = {'test': 'no weights'}
+    expert.stages = torch.nn.ModuleList([Stage() for _ in range(3)])
+    e3 = {'coords': torch.randn(1, 3, 3),
+          'matcha': {'features': torch.ones(1, 3, 2), 'sequence': torch.ones(1, 3, 1)}}
+    poi = {'coords': torch.randn(1, 4, 3),
+           'matcha': {'features': torch.ones(1, 4, 2), 'sequence': torch.ones(1, 4, 1)}}
+    ligand = {'mol': Chem.MolFromSmiles('CC').ToBinary(), 'coords': torch.randn(1, 2, 3),
+              'matcha': {'features': torch.zeros(1, 2, 2),
+                        'bonds': torch.empty(0, 2, dtype=torch.long),
+                        'masks': torch.empty(0, 2, dtype=torch.bool)}}
+    candidate = {'ligand': ligand['coords'], 'poi': poi['coords'], 'rotation': torch.eye(3)[None],
+                 'provenance': {'candidate_source': 'hdock_matcha'}, 'candidate_id': ('test', 1)}
+    fake = ModuleType('matcha.utils.transforms')
+    fake.apply_tor_changes_to_pos = lambda pos, *args, **kwargs: pos
+    with patch.dict('sys.modules', {'matcha.utils.transforms': fake}):
+        first = generate_joint_matcha_ligand(expert, e3, poi, ligand, candidate, seed=73, steps_per_stage=2)
+        changed = generate_joint_matcha_ligand(expert, e3, poi,
+            {**ligand, 'coords': ligand['coords']+1000}, candidate, seed=73, steps_per_stage=2)
+    assert torch.equal(first['ligand'], changed['ligand']), 'generator used the native ligand coordinates'
+    assert torch.equal(first['poi'], candidate['poi']), 'generator moved the HDOCK proteins'
+    assert all(stage.times == [0., .5, 0., .5] for stage in expert.stages)
+
+
+def test_assembly_candidate_frame_and_rigidity():
+    from tricoopdiff.initialization.candidates import assembly_candidate_from_pose
+    from tricoopdiff.geometry.rigid import rotation_exp
+
+    e3 = torch.tensor([[0., 0., 0.], [2., 0., 0.], [0., 3., 0.], [0., 0., 4.]])
+    poi = e3 * 1.2
+    ligand = e3[:3] + 1.
+    body = rotation_exp(torch.tensor([.1, -.2, .3]))
+    placed = apply_rigid(poi, body, torch.tensor([8., 2., 1.]))
+    frame = rotation_exp(torch.tensor([-.3, .2, .1]))
+    offset = torch.tensor([13., -8., 4.])
+    pose_e3 = apply_rigid(e3, frame, offset)
+    pose_poi = apply_rigid(placed, frame, offset)
+    pose_ligand = apply_rigid(ligand, frame, offset)
+    result = assembly_candidate_from_pose(e3, poi, pose_e3, pose_poi, pose_ligand,
+                                         candidate_id='generated-rank1', rank=1)
+    assert torch.allclose(result['ligand'][0], ligand, atol=1e-5), 'ligand lost shared E3 frame'
+    assert torch.allclose(result['poi'][0], placed, atol=1e-5), 'protein relative pose changed'
+    assert torch.allclose(result['rotation'][0], body, atol=1e-5), 'body rotation convention changed'
+    assert result['provenance']['candidate_source'] == 'hdock_matcha'
+    assert not result['provenance']['native_information_used']
+    distorted = pose_poi.clone()
+    distorted[0, 0] += .5
+    try:
+        assembly_candidate_from_pose(e3, poi, pose_e3, distorted, pose_ligand,
+                                     candidate_id='distorted', rank=1)
+    except ValueError as error:
+        assert 'rigid image' in str(error)
+    else:
+        raise AssertionError('nonrigid protein candidate was silently projected')
+
+
+def test_short_chain_candidate_keeps_allatom_supplied_rotation():
+    from tricoopdiff.initialization.candidates import assembly_candidate_from_pose
+    from tricoopdiff.geometry.rigid import rotation_exp
+
+    e3 = torch.tensor([[0., 0., 0.], [2., 0., 0.], [0., 3., 0.], [0., 0., 4.]])
+    poi = torch.tensor([[0., 0., 0.], [2., 0., 0.]])
+    rotation = rotation_exp(torch.tensor([.5, 0., 0.]))
+    placed = apply_rigid(poi, rotation, torch.tensor([4., 2., 1.]))
+    result = assembly_candidate_from_pose(e3, poi, e3, placed, e3[:2]+1.,
+        candidate_id='short-chain', rank=1, poi_rotation=rotation)
+    assert torch.equal(result['rotation'][0], rotation), 'CA-only fit discarded rotation around the two-point axis'
+    try:
+        assembly_candidate_from_pose(e3, poi, e3, placed, e3[:2]+1., candidate_id='short-chain', rank=1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a two-point CA reference must not invent a full body orientation')
 
 from helpers import flow_example, ligand_input
 from tricoopdiff.geometry.rigid import (

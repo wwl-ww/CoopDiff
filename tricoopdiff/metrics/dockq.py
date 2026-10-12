@@ -127,6 +127,7 @@ def compute_fullatom_dockq(
     deepternary_root,
     metric_protein1_pdb=None,
     metric_protein2_pdb=None,
+    pred_poi_rotation=None,
 ):
     """Rebuild both proteins and call DeepTernary's full-atom ``cal_dockq``.
 
@@ -145,7 +146,18 @@ def compute_fullatom_dockq(
 
     # TriCoopDiff predicts POI as a rigid body at Cα level. Apply that fitted
     # rigid transform to every protein2 atom before invoking full-atom DockQ.
-    poi_r, poi_t = _fit_rigid(p2_ca, pred_poi_ca_pdb)
+    if pred_poi_rotation is None:
+        poi_r, poi_t = _fit_rigid(p2_ca, pred_poi_ca_pdb)
+    else:
+        body = np.asarray(pred_poi_rotation)
+        if (body.shape != (3, 3) or not np.isfinite(body).all()
+                or not np.allclose(body.T @ body, np.eye(3), atol=1e-4)
+                or not np.isclose(np.linalg.det(body), 1., atol=1e-4)):
+            raise ValueError('supplied POI body rotation must be proper SO(3)')
+        # Input featurization translates monomers without changing orientation.
+        # The executor's body rotation resolves short/collinear CA ambiguity.
+        poi_r = body.T @ frame_r
+        poi_t = pred_poi_ca_pdb.mean(0)-p2_ca.mean(0) @ poi_r
     for role, source, target, rotation, translation in (
             ('E3', np.asarray(featurized_e3_ca), p1_ca, frame_r, frame_t),
             ('POI', p2_ca, pred_poi_ca_pdb, poi_r, poi_t)):

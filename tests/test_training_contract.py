@@ -19,6 +19,29 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+
+
+def test_candidate_sterics_include_element_radius_and_internal_nonbonded_pairs():
+    from rdkit import Chem
+    from tricoopdiff.train import candidate_fullatom_repulsion
+
+    ligand = torch.tensor([[[0., 0., 0.], [1.5, 0., 0.], [3., 0., 0.],
+                            [4.5, 0., 0.], [.1, .1, 0.]]], requires_grad=True)
+    ld = {'mol': Chem.MolFromSmiles('CCCCC')}
+    ed = {'coords': torch.tensor([[[100., 0., 0.]]]),
+          'steric_atoms': torch.tensor([[[100., 0., 0.]]]), 'steric_radii': torch.tensor([1.7])}
+    pd = {'coords': torch.tensor([[[200., 0., 0.]]]),
+          'steric_atoms': torch.tensor([[[200., 0., 0.]]]), 'steric_radii': torch.tensor([1.7])}
+    internal = candidate_fullatom_repulsion(ed, pd, ld, pd['coords'], ligand, torch.eye(3)[None])
+    assert internal > 0, 'distal ligand overlap must not be excluded as a bonded neighbor'
+    internal.backward()
+    assert torch.isfinite(ligand.grad).all() and ligand.grad.abs().sum() > 0
+    # A 2.4-A carbon contact is above the old 2-A threshold but below .75*(1.7+1.7).
+    carbon = torch.zeros(1, 1, 3)
+    ed = {**ed, 'steric_atoms': torch.tensor([[[2.4, 0., 0.]]])}
+    external = candidate_fullatom_repulsion(ed, pd, {'mol': Chem.MolFromSmiles('C')},
+                                           pd['coords'], carbon, torch.eye(3)[None])
+    assert external > 0, 'element-aware repulsion missed a 2.4-A carbon overlap'
 import torch.multiprocessing as mp
 
 import select_best_checkpoint

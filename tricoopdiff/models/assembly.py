@@ -111,6 +111,12 @@ ENDPOINT_PROTOCOL_CHECKPOINT_VERSION = 20
 LEGACY_CONSENSUS_CHECKPOINT_VERSION = 18
 PREVIOUS_CONSENSUS_CHECKPOINT_VERSION = 19
 SOURCE_NAMES = ('sdpi', 'bitseed')
+CANDIDATE_SOURCE_NAMES = (*SOURCE_NAMES, 'hdock_matcha')
+CANDIDATE_FRAMEWORK_VERSION = 'hdock_matcha_joint_refinement_v1'
+QUALITY_COMPONENTS = ('protein', 'ligand', 'e3_ligand', 'poi_ligand', 'clash')
+CANDIDATE_GEOMETRY_CONTRACT = 'smooth_allatom_cross_proximity_v1'
+CANDIDATE_QUALITY_CONTRACT = 'detached_component_distribution_native_geometry_v3'
+CANDIDATE_CONDITION_CONTRACT = 'fullatom_source_clock_node_film_v1'
 SOURCE_CONTRACT_VERSION = 'candidate_source_conditioning_v1'
 LEGACY_PRODUCTION_MODEL_PROFILE = 'ternary_endpoint_v1'
 FEATURE_PRODUCTION_MODEL_PROFILE = 'ternary_endpoint_v2'
@@ -133,7 +139,8 @@ def production_model_config(node_dim, input_dim, source_conditioning=False, *,
                             information_contract=INFORMATION_CONTRACT,
                             rigid_decoder_contract=RIGID_DECODER_CONTRACT,
                             torsion_representation_contract=TORSION_REPRESENTATION_CONTRACT,
-                            protein_local_geometry_contract=PROTEIN_LOCAL_GEOMETRY_CONTRACT):
+                            protein_local_geometry_contract=PROTEIN_LOCAL_GEOMETRY_CONTRACT,
+                            candidate_driven=False):
     """One explicit new-model recipe; older weights retain their own config."""
     if model_profile not in (LEGACY_PRODUCTION_MODEL_PROFILE, FEATURE_PRODUCTION_MODEL_PROFILE,
                             PREVIOUS_PRODUCTION_MODEL_PROFILE, PRODUCTION_MODEL_PROFILE,
@@ -150,6 +157,13 @@ def production_model_config(node_dim, input_dim, source_conditioning=False, *,
                 spatial_geometry=True, motion_attention=True,
                 global_node_attention=True, rotation_scale_normalization=True,
                 model_profile=model_profile)
+    if candidate_driven:
+        if expert_backend != 'matcha' or not source_conditioning:
+            raise ValueError('candidate framework requires Matcha and explicit source conditioning')
+        config['candidate_driven'] = True
+        config['candidate_geometry_contract'] = CANDIDATE_GEOMETRY_CONTRACT
+        config['candidate_quality_contract'] = CANDIDATE_QUALITY_CONTRACT
+        config['candidate_condition_contract'] = CANDIDATE_CONDITION_CONTRACT
     if model_profile in (FEATURE_PRODUCTION_MODEL_PROFILE, PREVIOUS_PRODUCTION_MODEL_PROFILE,
                          PRODUCTION_MODEL_PROFILE, VECTOR_EXPERT_MODEL_PROFILE):
         if isinstance(expert_scalar_dim, bool) or not isinstance(expert_scalar_dim, int) or expert_scalar_dim <= 0:
@@ -180,17 +194,61 @@ def production_model_config(node_dim, input_dim, source_conditioning=False, *,
     return config
 
 
-def candidate_source_tensor(source, reference):
+def candidate_source_tensor(source, reference, source_names=SOURCE_NAMES):
     """Normalize one immutable trajectory source to a ``[1]`` class tensor."""
     if isinstance(source, str):
-        if source not in SOURCE_NAMES:
+        if source not in source_names:
             raise ValueError(f'unknown candidate source: {source!r}')
-        source = SOURCE_NAMES.index(source)
+        source = source_names.index(source)
     value = torch.as_tensor(source, device=reference.device).reshape(-1)
     if (value.shape != (1,) or value.dtype == torch.bool or value.is_complex()
-            or not bool(((value == 0) | (value == 1)).all())):
-        raise ValueError('candidate source must be one SDPI/BiTSeed class')
+            or not bool(((value >= 0) & (value < len(source_names)) & (value == value.long())).all())):
+        raise ValueError('candidate source must be one declared source class')
     return value.long()
+
+
+def candidate_fullatom_evidence(coords, types, e3, poi, ligand, body):
+    """Node-level cross-component heavy-atom geometry, without target access.
+
+    Sidechain atoms remain rigid with each monomer. Ligand nodes therefore
+    observe actual sidechain obstacles, not only C-alpha proxy distances.
+    Scalars are invariant; smooth local displacement vectors are equivariant.
+    """
+    from rdkit import Chem
+
+    if any(key not in part for part in (e3, poi) for key in ('steric_atoms', 'steric_radii')):
+        raise ValueError('candidate model requires full-atom monomer templates')
+    # POI templates are attached to the input monomer, not its current coords.
+    # The immutable template center is supplied explicitly by the data loader.
+    if 'steric_ca_center' not in poi:
+        raise ValueError('candidate POI requires its immutable template center')
+    p2 = (poi['steric_atoms'][0]-poi['steric_ca_center']) @ body.T + poi['coords'][0].mean(0)
+    mol = ligand['mol']
+    mol = Chem.Mol(mol) if isinstance(mol, bytes) else mol
+    table = Chem.GetPeriodicTable()
+    lr = coords.new_tensor([table.GetRvdw(atom.GetAtomicNum()) for atom in mol.GetAtoms()])
+    query_radii = coords.new_full((len(coords),), 1.7)
+    query_radii[types == 2] = lr
+    components = ((e3['steric_atoms'][0], e3['steric_radii']),
+                  (p2, poi['steric_radii']), (ligand['coords'][0], lr))
+    scalars, vectors = [], []
+    for component, (atoms, radii) in enumerate(components):
+        chunks, directions = [], []
+        for start in range(0, len(coords), 64):
+            delta = atoms[None]-coords[start:start+64, None]
+            distance = torch.linalg.vector_norm(delta, dim=-1)
+            weights = (-distance.square()/4.).softmax(-1)
+            local_distance = (weights*distance).sum(-1)
+            limits = .75*(query_radii[start:start+64, None]+radii[None])
+            overlap = torch.relu(limits-distance)
+            chunks.append(torch.stack((torch.log1p(local_distance/10.),
+                torch.log1p(torch.exp(-distance.square()/16.).sum(-1)),
+                torch.log1p(overlap.square().sum(-1))), -1))
+            directions.append(bounded_vector((weights[..., None]*delta).sum(1)/10.))
+        cross = (types != component).to(coords.dtype)[:, None]
+        scalars.append(torch.cat(chunks)*cross)
+        vectors.append(torch.cat(directions)*cross)
+    return torch.cat(scalars, -1), torch.stack(vectors, 1)
 
 
 _CHEMICAL_PATH_CACHE = OrderedDict()
@@ -642,10 +700,12 @@ class UnifiedTernaryController(nn.Module):
 
     def __init__(self, input_dim, width, scalar_dim, vector_dim, source_conditioning,
                  torsion_representation_contract=LEGACY_TORSION_REPRESENTATION,
-                 protein_local_geometry_contract='none'):
+                 protein_local_geometry_contract='none', candidate_driven=False):
         super().__init__()
         channels = max(4, width // 4)
         self.scalar_dim, self.vector_dim = scalar_dim, vector_dim
+        self.candidate_driven = candidate_driven
+        self.fullatom_scalar = nn.Linear(9, width) if candidate_driven else None
         self.protein = nn.Linear(input_dim, width)
         self.protein_geometry_contract = protein_local_geometry_contract
         self.protein_geometry = (nn.Linear(33, width, bias=False)
@@ -657,11 +717,14 @@ class UnifiedTernaryController(nn.Module):
         self.structure = ComponentStructureEncoder(width)
         self.structure_read = nn.ModuleList([nn.Linear(2 * width, width) for _ in range(3)])
         self.source = None
+        self.source_names = CANDIDATE_SOURCE_NAMES if candidate_driven else SOURCE_NAMES
         if source_conditioning:
             with torch.random.fork_rng(devices=[]):
                 torch.random.default_generator.manual_seed(0)
-                self.source = nn.Embedding(len(SOURCE_NAMES), width)
-        self.vector_input = nn.Linear(2 * vector_dim + 3, channels, bias=False)
+                self.source = nn.Embedding(len(self.source_names), width)
+        self.quality = (nn.Sequential(nn.Linear(9 * width, width), nn.SiLU(),
+            nn.Linear(width, len(QUALITY_COMPONENTS))) if candidate_driven else None)
+        self.vector_input = nn.Linear(2 * vector_dim + (6 if candidate_driven else 3), channels, bias=False)
         self.layers = nn.ModuleList([EquivariantInteraction(width, channels) for _ in range(3)])
         self.assembly = LegalPoseDecoder(width, channels,
             torsion_representation_contract=torsion_representation_contract)
@@ -699,13 +762,24 @@ class UnifiedTernaryController(nn.Module):
         h[ligand] = self.ligand(graph['node_features'][ligand])
         identity = h + self.types(types)
         h = identity + self.expert(scalar) + self.clock(state)
+        fullatom_vectors = None
+        if self.candidate_driven:
+            physical = graph.get('fullatom_scalar_features')
+            fullatom_vectors = graph.get('fullatom_vector_features')
+            if (physical is None or fullatom_vectors is None or physical.shape != (len(h), 9)
+                    or fullatom_vectors.shape != (len(h), 3, 3)
+                    or not torch.isfinite(physical).all() or not torch.isfinite(fullatom_vectors).all()):
+                raise ValueError('candidate controller requires node-aligned all-atom proximity evidence')
+            h = h + self.fullatom_scalar(physical)
         if self.source is not None:
-            h = h + self.source(candidate_source_tensor(source, h))
+            h = h + self.source(candidate_source_tensor(source, h, self.source_names))
         centers = torch.stack([coords[types == i].mean(0) for i in range(3)])
         offsets = bounded_vector((coords[:, None] - centers[None]) / 10.)
         # Conditional binary node evidence informs the joint controller; binary
         # rigid-head outputs are not broadcast as shared physical-body actions.
         vectors = torch.cat((bounded_vector(raw_vectors), offsets), 1)
+        if fullatom_vectors is not None:
+            vectors = torch.cat((vectors, fullatom_vectors), 1)
         vectors = self.vector_input(vectors.transpose(1, 2)).transpose(1, 2)
         component_indices = graph.get('component_indices')
         ligand_ids = (component_indices[2] if component_indices is not None
@@ -737,9 +811,24 @@ class UnifiedTernaryController(nn.Module):
         if masks.shape != (bonds.shape[1], len(ligand_ids)):
             raise ValueError('assembly torsion masks must match directed rotating bonds')
         body_motion = self.assembly(h, vectors, coords, types, bonds, masks, state, opinions)
-        return {'normalized_velocity': body_motion,
-                'rank_features': torch.stack([h[types == i].mean(0) for i in range(3)]).mean(0, keepdim=True),
-                'residual_penalty': h.new_zeros(())}
+        components = torch.stack([h[types == i].mean(0) for i in range(3)])
+        result = {'normalized_velocity': body_motion,
+                  'rank_features': components.mean(0, keepdim=True),
+                  'residual_penalty': h.new_zeros(())}
+        if self.quality is not None:
+            # A mean alone hides sparse bad contacts and heterogeneous local
+            # evidence. Keep component identity and distribution statistics;
+            # these remain invariant under node ordering and rigid transforms.
+            quality_features = torch.cat([
+                torch.cat((nodes.mean(0), nodes.amax(0),
+                           nodes.var(0, unbiased=False).add(1e-8).sqrt()))
+                for nodes in (h[types == i] for i in range(3))
+            ]).unsqueeze(0).detach()
+            # Ranking fits observed structures, not the motion representation.
+            # Its auxiliary loss must not silently retune the assembly field.
+            errors = torch.nn.functional.softplus(self.quality(quality_features))
+            result.update(quality_errors=errors, candidate_score=-errors.mean(-1))
+        return result
 
 
 class TernaryAssembly(nn.Module):
@@ -789,10 +878,18 @@ class TernaryAssembly(nn.Module):
                  information_contract=INFORMATION_CONTRACT,
                  rigid_decoder_contract=RIGID_DECODER_CONTRACT,
                  torsion_representation_contract=LEGACY_TORSION_REPRESENTATION,
-                 protein_local_geometry_contract='none'):
+                 protein_local_geometry_contract='none', candidate_driven=False,
+                 candidate_geometry_contract=None, candidate_quality_contract=None,
+                 candidate_condition_contract=None):
         # A saved model_config without the new field reconstructs historical
         # behavior. New training recipes use production_model_config's V2.
         super().__init__()
+        if candidate_geometry_contract is not None and candidate_geometry_contract != CANDIDATE_GEOMETRY_CONTRACT:
+            raise ValueError('retired candidate geometry contract')
+        if candidate_quality_contract not in (None, CANDIDATE_QUALITY_CONTRACT):
+            raise ValueError('retired candidate quality contract')
+        if candidate_condition_contract not in (None, CANDIDATE_CONDITION_CONTRACT):
+            raise ValueError('retired candidate conditioning contract')
         if model_profile != VECTOR_EXPERT_MODEL_PROFILE or not direct_ternary_motion:
             raise ValueError('retired architecture: construct a fresh ternary_endpoint_v14 model')
         self.config = production_model_config(
@@ -802,11 +899,12 @@ class TernaryAssembly(nn.Module):
             conditioning_contract=conditioning_contract, information_contract=information_contract,
             rigid_decoder_contract=rigid_decoder_contract,
             torsion_representation_contract=torsion_representation_contract,
-            protein_local_geometry_contract=protein_local_geometry_contract)
+            protein_local_geometry_contract=protein_local_geometry_contract,
+            candidate_driven=candidate_driven)
         self.controller = UnifiedTernaryController(
             self.config['input_dim'], node_dim, expert_scalar_dim,
             expert_vector_dim, source_conditioning, torsion_representation_contract,
-            protein_local_geometry_contract)
+            protein_local_geometry_contract, candidate_driven)
         self.condition_protein_geometry = (nn.Linear(33, node_dim, bias=False)
             if expert_backend == "matcha" and protein_local_geometry_contract != "none" else None)
         if expert_backend == 'matcha':
@@ -814,6 +912,8 @@ class TernaryAssembly(nn.Module):
             self.condition_key = nn.Linear(self.config['input_dim'], node_dim)
             self.condition_value = nn.Linear(self.config['input_dim'], node_dim)
             self.condition_geometry = nn.Linear(3, node_dim, bias=False)
+            self.condition_fullatom = nn.Linear(9, node_dim, bias=False) if candidate_driven else None
+            self.condition_clock = nn.Linear(9, node_dim) if candidate_driven else None
             self.condition_ligand = LigandFeatureEncoder(node_dim)
             self.condition_chemistry = ComponentStructureEncoder(node_dim)
             self.condition_interface = nn.Linear(2 * node_dim + 3, node_dim)
@@ -824,7 +924,7 @@ class TernaryAssembly(nn.Module):
                 nn.init.zeros_(film.bias)
 
     def binary_condition(self, receptor, opposite, ligand, *, stage_index=0,
-                         ablation_mode='all'):
+                         ablation_mode='all', diffusion_state=None, source=0):
         """Nodewise opposite-protein context; no target or pooled condition token."""
         if isinstance(stage_index, bool) or not isinstance(stage_index, int) or not 0 <= stage_index < 3:
             raise ValueError('Matcha condition requires an explicit valid stage index')
@@ -833,6 +933,24 @@ class TernaryAssembly(nn.Module):
         q = self.condition_query(receptor['features'][0])
         k = self.condition_key(opposite['features'][0])
         value = self.condition_value(opposite['features'][0])
+        if self.condition_fullatom is not None:
+            receiving = receptor.get('candidate_fullatom_features')
+            sending = opposite.get('candidate_fullatom_features')
+            if (receiving is None or sending is None or receiving.shape != (len(q), 9)
+                    or sending.shape != (len(k), 9)
+                    or not torch.isfinite(receiving).all() or not torch.isfinite(sending).all()):
+                raise ValueError('candidate FiLM requires both proteins\' full-atom interface evidence')
+            if (diffusion_state is None or diffusion_state.shape != (1, 9)
+                    or not torch.isfinite(diffusion_state).all()):
+                raise ValueError('candidate FiLM requires the shared refinement clock')
+            receiving = self.condition_fullatom(receiving)
+            sending = self.condition_fullatom(sending)
+            clock = self.condition_clock(diffusion_state)
+            source_feature = self.controller.source(candidate_source_tensor(
+                source, q, CANDIDATE_SOURCE_NAMES))
+            q = q + receiving + clock + source_feature
+            k = k + sending
+            value = value + sending
         if self.condition_protein_geometry is not None:
             required = self.config['protein_local_geometry_contract'] == 'intrinsic32_required_v1'
             receiving_geometry = self.condition_protein_geometry(
@@ -873,6 +991,8 @@ class TernaryAssembly(nn.Module):
         atom_weights = (torch.log(atom_support.clamp_min(1e-30)) - receiver_distance).softmax(-1)
         context = self.condition_interface(torch.cat((weights @ value,
             atom_weights @ ligand_identity, geometry), -1)) + self.condition_geometry(geometry)
+        if self.condition_fullatom is not None:
+            context = context + receiving + clock + source_feature
         gamma, beta = self.binary_film[stage_index](context).chunk(2, -1)
         enabled = (ablation_mode == 'all' or
                    ablation_mode == 'early' and stage_index == 0 or
@@ -913,6 +1033,11 @@ class TernaryAssemblyModel(nn.Module):
         if getattr(frozen_expert, 'backend', 'diffdock') == 'diffdock':
             frozen_expert.model.smooth_cross_edges = True
         self.expert_input_grad = bool(expert_input_grad)
+        if trifuse.config.get('candidate_driven'):
+            if not self.expert_input_grad:
+                raise ValueError('candidate endpoint training requires complete expert coordinate gradients')
+            if getattr(frozen_expert, 'frame_policy', None) != 'backbone_rigid_transport_v1':
+                raise ValueError('candidate experts require the rigid-transport backbone frame')
         self.checkpoint_ternary = bool(checkpoint_ternary)
         if isinstance(checkpoint_min_nodes, bool) or not isinstance(checkpoint_min_nodes, int) or checkpoint_min_nodes < 0:
             raise ValueError('checkpoint_min_nodes must be a nonnegative integer')
@@ -927,6 +1052,52 @@ class TernaryAssemblyModel(nn.Module):
         for module in self.trifuse.modules():
             if isinstance(module, EquivariantInteraction):
                 module.set_compile_messages(enabled)
+
+    def refine_candidates(self, e3_data, poi_data, ligand_data, candidates, *, steps=5):
+        """Jointly refine generated assemblies; score only their actual final states.
+
+        Native targets are not arguments. E3 remains fixed; POI rigid pose and
+        ligand rigid/torsion coordinates share the legal geometric executor.
+        The caller must supply a trained candidate-framework checkpoint before
+        treating the learned scores as inference-time quality predictions.
+        """
+        from tricoopdiff.runtime import evaluation_context
+        from tricoopdiff.initialization.candidates import _valid_candidate
+
+        if not self.trifuse.config.get('candidate_driven') or not candidates:
+            raise ValueError('joint refinement requires a candidate model and nonempty pool')
+        flow = SDPIFlow(inference_steps=steps)
+        results = []
+        with evaluation_context(self):
+            for candidate in candidates:
+                if not _valid_candidate(candidate):
+                    raise ValueError('candidate pool contains invalid geometry')
+                source = candidate.get('provenance', {}).get('candidate_source')
+                source_index = candidate_source_tensor(source, e3_data['coords'], CANDIDATE_SOURCE_NAMES)
+                ligand, poi, body = [candidate[key].to(e3_data['coords']).clone()
+                                     for key in ('ligand', 'poi', 'rotation')]
+                if ligand.shape != ligand_data['coords'].shape or poi.shape != poi_data['coords'].shape:
+                    raise ValueError('candidate atom counts differ from indexed features')
+                for t, dt in flow.reverse_times(ligand):
+                    output = flow.forward_state(self, e3_data, poi_data, ligand_data,
+                                                ligand, poi, body, t, dt, source_index)
+                    velocity = flow.velocities(output['normalized_velocity'],
+                                               e3_data['coords'], poi_data['coords'])
+                    ligand, poi, body = flow.step(ligand, poi, body, velocity, dt, ligand_data)
+                    if not all(torch.isfinite(x).all() for x in (ligand, poi, body)):
+                        raise FloatingPointError('nonfinite refined candidate')
+                zero = ligand.new_zeros(1)
+                final = flow.forward_state(self, e3_data, poi_data, ligand_data,
+                                           ligand, poi, body, zero, zero, source_index)
+                if not all(torch.isfinite(final[key]).all()
+                           for key in ('quality_errors', 'candidate_score')):
+                    raise FloatingPointError('nonfinite terminal candidate quality')
+                results.append({'ligand': ligand, 'poi': poi, 'rotation': body,
+                    'candidate_id': candidate['candidate_id'],
+                    'provenance': candidate['provenance'],
+                    'quality_errors': final['quality_errors'],
+                    'candidate_score': final['candidate_score']})
+        return results
 
     def set_ternary_query_chunk_size(self, chunk_size):
         """Batch equivalent query rows; retain 64-row chunks on large graphs."""
@@ -1020,8 +1191,22 @@ class TernaryAssemblyModel(nn.Module):
                 or bool(((dt < 0) | (dt > t_e3l[:, None])).any())
                 or bool(((t_e3l > 0) & (dt[:, 0] <= 0)).any())):
             raise ValueError('all motion DOFs require the same valid remaining-time step')
+        if self.trifuse.config.get('candidate_driven') and r_e3_to_poi is None:
+            raise ValueError('candidate model requires explicit POI body rotation')
         frame = (r_e3_to_poi[0] if r_e3_to_poi is not None
                  else torch.eye(3, device=t_e3l.device, dtype=ligand_data['coords'].dtype))
+        fullatom_geometry = None
+        if self.trifuse.config.get('candidate_driven'):
+            parts = (e3_data, poi_data, ligand_data)
+            coords = torch.cat([part['coords'][0] for part in parts])
+            types = torch.cat([torch.full((part['coords'].shape[1],), index,
+                device=coords.device, dtype=torch.long) for index, part in enumerate(parts)])
+            fullatom_geometry = candidate_fullatom_evidence(
+                coords, types, e3_data, poi_data, ligand_data, frame)
+            sizes = [part['coords'].shape[1] for part in parts]
+            physical = fullatom_geometry[0].split(sizes)
+            e3_data = {**e3_data, 'candidate_fullatom_features': physical[0]}
+            poi_data = {**poi_data, 'candidate_fullatom_features': physical[1]}
         raw, node_reads = {}, []
         # Private graph tensors ensure even in-place expert internals cannot
         # mutate the shared state or the other branch's input.
@@ -1029,14 +1214,24 @@ class TernaryAssemblyModel(nn.Module):
             for index, (branch, receptor) in enumerate(zip(BRANCHES, (e3_data, poi_data))):
                 if getattr(self.expert, 'backend', 'diffdock') == 'matcha':
                     opposite = poi_data if index == 0 else e3_data
+                    if self.trifuse.config.get('candidate_driven'):
+                        basis = receptor['matcha'].get('reference_basis')
+                        if basis is None:
+                            raise ValueError('candidate model requires rigid-transport Matcha metadata')
+                        receptor = {**receptor, 'matcha': {**receptor['matcha'],
+                            'current_basis': frame @ basis if index else basis}}
                     expert_ligand = ligand_data
                     if not self.expert_input_grad:
                         receptor = {**receptor, 'coords': receptor['coords'].detach()}
+                        if 'candidate_fullatom_features' in receptor:
+                            receptor['candidate_fullatom_features'] = receptor['candidate_fullatom_features'].detach()
                         opposite = {**opposite, 'coords': opposite['coords'].detach()}
+                        if 'candidate_fullatom_features' in opposite:
+                            opposite['candidate_fullatom_features'] = opposite['candidate_fullatom_features'].detach()
                         expert_ligand = {**ligand_data, 'coords': ligand_data['coords'].detach()}
                     stage_index, _ = matcha_stage_clock(t_e3l)
                     modulation = self.trifuse.binary_condition(receptor, opposite, expert_ligand,
-                                                             stage_index=stage_index)
+                        stage_index=stage_index, diffusion_state=diffusion_state, source=source)
                     def read_pair(rec, lig, time, film):
                         return self.expert.read_pair(rec, lig, time, film)
                     if torch.is_grad_enabled() and (self.expert_input_grad
@@ -1085,6 +1280,10 @@ class TernaryAssemblyModel(nn.Module):
             ligand_data['coords'][0], ligand_data['features'][0],
             lig_edge_index=ligand_data['edge_index'], lig_edge_mask=ligand_data['edge_mask'],
             lig_mask_rotate=ligand_data['mask_rotate'], lig_edge_attr=ligand_data['edge_attr'])
+        if self.trifuse.config.get('candidate_driven'):
+            scalar_geometry, vector_geometry = fullatom_geometry
+            graph['fullatom_scalar_features'] = scalar_geometry
+            graph['fullatom_vector_features'] = vector_geometry
         if self.trifuse.config.get('protein_local_geometry_contract', 'none') != 'none':
             required = self.trifuse.config['protein_local_geometry_contract'] == 'intrinsic32_required_v1'
             graph['protein_local_geometry'] = torch.cat((

@@ -2,6 +2,8 @@
 
 import random
 from numbers import Integral
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -16,6 +18,221 @@ from tricoopdiff.geometry.rigid import apply_rigid, is_proper_rotation, proper_r
 EXPERT_ANCHOR_VERSION = "dual_diffdock_rigid_anchor_v1"
 EXPERT_ANCHOR_CONSENSUS_VERSION = "dual_diffdock_rigid_anchor_consensus_v1"
 FIXED_CANDIDATE_VERSION = "fixed_native_free_candidate_v1"
+
+
+def assembly_candidate_from_pose(e3_reference, poi_reference, e3_pose, poi_pose,
+                                 ligand_pose, *, candidate_id, rank,
+                                 rigid_tolerance=.02, poi_rotation=None):
+    """Import a generated assembly into the E3 frame without target alignment.
+
+    Protein arrays must contain corresponding C-alpha atoms in identical order.
+    Ligand atoms must already be mapped to the indexed chemical graph. References
+    are input monomers, not the native complex. Output follows the existing
+    batched motion-state contract, but carries a distinct, unaliased source.
+    """
+    if not isinstance(rank, Integral) or isinstance(rank, bool) or rank < 1:
+        raise ValueError('candidate rank must be a positive integer')
+    if not candidate_id or not np.isfinite(rigid_tolerance) or rigid_tolerance <= 0:
+        raise ValueError('candidate identity and positive rigid tolerance are required')
+    if not isinstance(e3_reference, torch.Tensor) or not e3_reference.is_floating_point():
+        raise ValueError('E3 reference must be a floating point tensor')
+    tensors = []
+    for name, value in zip(('e3_reference', 'poi_reference', 'e3_pose', 'poi_pose',
+                            'ligand_pose'),
+                           (e3_reference, poi_reference, e3_pose, poi_pose, ligand_pose)):
+        value = torch.as_tensor(value, device=e3_reference.device,
+                                dtype=e3_reference.dtype)
+        if value.ndim == 3 and value.shape[0] == 1:
+            value = value[0]
+        if (value.ndim != 2 or value.shape[1] != 3 or not len(value)
+                or not torch.isfinite(value).all()):
+            raise ValueError(f'{name} must be finite nonempty [N,3] or [1,N,3]')
+        tensors.append(value)
+    e3, poi, pose_e3, pose_poi, ligand = tensors
+    if e3.shape != pose_e3.shape or poi.shape != pose_poi.shape:
+        raise ValueError('protein candidate must preserve indexed C-alpha correspondence')
+    frame_rotation, frame_translation, _ = proper_rigid_fit(pose_e3, e3)
+    mapped_e3 = apply_rigid(pose_e3, frame_rotation, frame_translation)
+    mapped_poi = apply_rigid(pose_poi, frame_rotation, frame_translation)
+    if poi_rotation is None:
+        body_rotation, body_translation, _ = proper_rigid_fit(poi, mapped_poi)
+    else:
+        body_rotation = torch.as_tensor(poi_rotation, device=poi.device, dtype=poi.dtype)
+        if body_rotation.shape != (3, 3) or not is_proper_rotation(body_rotation):
+            raise ValueError('all-atom supplied body rotation must be proper SO(3)')
+        body_translation = mapped_poi.mean(0)-body_rotation @ poi.mean(0)
+    errors = [torch.linalg.vector_norm(mapped_e3-e3, dim=-1).max(),
+              torch.linalg.vector_norm(apply_rigid(poi, body_rotation,
+                                                   body_translation)-mapped_poi,
+                                       dim=-1).max()]
+    if any(float(error) > rigid_tolerance for error in errors):
+        raise ValueError('protein candidate is not a rigid image of the input monomer')
+    return {
+        'ligand': apply_rigid(ligand, frame_rotation, frame_translation).unsqueeze(0),
+        'poi': mapped_poi.unsqueeze(0),
+        'rotation': body_rotation.unsqueeze(0),
+        'candidate_id': ('hdock_matcha', str(candidate_id), int(rank)),
+        'provenance': {
+            'version': 'hdock_matcha_assembly_candidate_v1',
+            'candidate_source': 'hdock_matcha',
+            'candidate_id': str(candidate_id), 'protein_candidate_rank': int(rank),
+            'native_information_used': False,
+            'frame': 'indexed_input_e3',
+            'max_rigid_error_angstrom': [float(error) for error in errors],
+        },
+    }
+
+
+def load_assembly_candidate(protein_pose, ligand_pose, e3_reference, poi_reference,
+                            ligand_data, *, candidate_id, rank,
+                            protein1_path, protein2_path):
+    """Read a generated PDB/SDF with exact protein and chemical correspondence.
+
+    No native complex is accepted by this interface. Input monomer C-alpha
+    identities determine the read order, not whichever order a writer used.
+    Molecular matching is graph-only; conformer coordinates never select a map.
+    """
+    from rdkit import Chem
+    from tricoopdiff.runtime import sha256_file
+
+    def ca_records(path, chain=None):
+        values = {}
+        for line in Path(path).read_text().splitlines():
+            if (line.startswith('ATOM') and line[12:16].strip() == 'CA'
+                    and line[16] in (' ', 'A') and (chain is None or line[21] == chain)):
+                key = (line[22:27], line[17:20])
+                if key in values and line[16] != ' ':
+                    continue
+                values[key] = [float(line[30:38]), float(line[38:46]), float(line[46:54])]
+        if not values:
+            raise ValueError(f'no matching C-alpha atoms in {path}')
+        return values
+
+    posed = []
+    for chain, reference_path in (('A', protein1_path), ('B', protein2_path)):
+        reference = ca_records(reference_path)
+        prediction = ca_records(protein_pose, chain)
+        if set(reference) != set(prediction):
+            raise ValueError(f'HDOCK chain {chain} residue identities differ from indexed monomer')
+        posed.append([prediction[key] for key in reference])
+    def atom_records(path, chain=None):
+        records = {}
+        for line in Path(path).read_text().splitlines():
+            if (line.startswith('ATOM') and line[16] in (' ', 'A')
+                    and (chain is None or line[21] == chain)):
+                key = (line[22:27], line[17:20], line[12:16])
+                if key not in records or line[16] == ' ':
+                    records[key] = [float(line[30:38]), float(line[38:46]), float(line[46:54])]
+        return records
+    source_atoms, predicted_atoms = atom_records(protein2_path), atom_records(protein_pose, 'B')
+    if set(source_atoms) != set(predicted_atoms):
+        raise ValueError('candidate POI must retain all indexed monomer atom identities')
+    reference_tensor = e3_reference.reshape(-1, 3)
+    frame_rotation, frame_translation, _ = proper_rigid_fit(reference_tensor.new_tensor(posed[0]), reference_tensor)
+    source = reference_tensor.new_tensor(list(source_atoms.values()))
+    target = apply_rigid(reference_tensor.new_tensor([predicted_atoms[k] for k in source_atoms]),
+                         frame_rotation, frame_translation)
+    body_rotation, offset, _ = proper_rigid_fit(source, target)
+    if torch.linalg.vector_norm(apply_rigid(source, body_rotation, offset)-target, dim=-1).max() > .02:
+        raise ValueError('candidate all-atom POI is not rigid')
+    predicted_mol = Chem.SDMolSupplier(str(ligand_pose), removeHs=True)[0]
+    expected = ligand_data['mol']
+    expected = Chem.Mol(expected) if isinstance(expected, bytes) else Chem.Mol(expected)
+    expected = Chem.RemoveHs(expected)
+    # Legacy PDB caches can tag symmetry-equivalent, non-stereogenic atoms.
+    # Clear only invalid graph stereotags; never assign from target coordinates.
+    Chem.AssignStereochemistry(expected, cleanIt=True, force=True)
+    if predicted_mol is None or predicted_mol.GetNumAtoms() != expected.GetNumAtoms():
+        raise ValueError('candidate ligand must preserve the complete indexed heavy-atom graph')
+    match = predicted_mol.GetSubstructMatch(expected, useChirality=True)
+    if (len(match) != expected.GetNumAtoms()
+            or predicted_mol.GetNumBonds() != expected.GetNumBonds()):
+        raise ValueError('candidate ligand chemistry or chirality differs from indexed molecule')
+    xyz = predicted_mol.GetConformer().GetPositions()[list(match)]
+    result = assembly_candidate_from_pose(e3_reference, poi_reference, *posed, xyz,
+                                          candidate_id=candidate_id, rank=rank,
+                                          poi_rotation=body_rotation)
+    result['provenance'].update(protein_pose_sha256=sha256_file(protein_pose),
+                                ligand_pose_sha256=sha256_file(ligand_pose))
+    return result
+
+
+@torch.no_grad()
+def generate_joint_matcha_ligand(expert, e3_data, poi_data, ligand_data, candidate,
+                                *, seed=73, steps_per_stage=10):
+    """Dock one fresh conformer to the fixed two-chain candidate receptor.
+
+    Both chain-wise sequence encodings enter every stage. This native-blind
+    sampler uses forward-time Matcha head units, never the reverse-clock
+    controller's scaled advice. Protein geometry and candidate rank stay fixed.
+    """
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    from scipy.spatial.transform import Rotation
+    from matcha.utils.transforms import apply_tor_changes_to_pos
+    from tricoopdiff.geometry.rigid import rotation_exp
+
+    if (getattr(expert, 'backend', None) != 'matcha' or not _valid_candidate(candidate)
+            or isinstance(steps_per_stage, bool) or not isinstance(steps_per_stage, int)
+            or steps_per_stage < 1):
+        raise ValueError('joint generation requires frozen Matcha, a valid pose and positive steps')
+    mol = ligand_data['mol']
+    mol = Chem.Mol(mol) if isinstance(mol, bytes) else Chem.Mol(mol)
+    generated = Chem.AddHs(mol)
+    generated.RemoveAllConformers()
+    params = AllChem.ETKDGv3()
+    params.randomSeed = int(seed) % (2**31-1)
+    if AllChem.EmbedMolecule(generated, params) != 0:
+        raise ValueError('joint ligand ETKDG generation failed')
+    generated = Chem.RemoveHs(generated)
+    reference = e3_data['coords']
+    base = reference.new_tensor(generated.GetConformer().GetPositions())
+    receptor_coords = torch.cat((reference, candidate['poi'].to(reference)), 1)
+    origin = receptor_coords.mean(1, keepdim=True)
+    protein = SimpleNamespace(pos=receptor_coords-origin,
+        x=torch.cat((e3_data['matcha']['features'], poi_data['matcha']['features']), 1),
+        seq=torch.cat((e3_data['matcha']['sequence'], poi_data['matcha']['sequence']), 1),
+        is_padded_mask=torch.zeros(1, receptor_coords.shape[1], device=reference.device, dtype=torch.bool))
+    chem = ligand_data['matcha']
+    bonds, masks = chem['bonds'], chem['masks']
+    rng = np.random.RandomState(int(seed) % (2**32))
+
+    def randomize(center):
+        rotation = base.new_tensor(Rotation.random(random_state=rng).as_matrix())
+        pos = (base-base.mean(0)) @ rotation.T + center
+        angles = base.new_tensor(rng.uniform(-np.pi, np.pi, len(bonds)))
+        return apply_tor_changes_to_pos(pos, bonds, masks, angles, is_reverse_order=True)
+
+    pos = randomize(base.new_tensor(rng.normal(0, 5, 3)))
+    ligand = SimpleNamespace(pos=pos[None], x=chem['features'], t=base.new_zeros(1),
+        num_atoms=torch.tensor([len(base)], device=base.device),
+        is_padded_mask=torch.zeros(1, len(base), device=base.device, dtype=torch.bool),
+        num_rotatable_bonds=torch.tensor([len(bonds)], device=base.device),
+        rotatable_bonds=bonds, mask_rotate=[masks],
+        tor_ptr=torch.tensor([0, len(bonds)], device=base.device))
+    batch = SimpleNamespace(protein=protein, ligand=ligand)
+    from tricoopdiff.runtime import evaluation_context
+    with evaluation_context(expert), torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+        for index, stage in enumerate(expert.stages):
+            if index == 1:
+                pos = randomize(pos.mean(0))
+            for step in range(steps_per_stage):
+                ligand.pos = pos[None]
+                ligand.t.fill_(step / steps_per_stage)
+                tr, rot, tor, _ = stage.forward_step(batch)
+                if len(bonds):
+                    if tor is None or tor.numel() != len(bonds):
+                        raise ValueError('joint Matcha torsion count differs from executor')
+                    pos = apply_tor_changes_to_pos(pos.clone(), bonds, masks,
+                        tor/steps_per_stage, is_reverse_order=False)
+                center = pos.mean(0, keepdim=True)
+                pos = (pos-center) @ rotation_exp(rot[0]/steps_per_stage).T + center + tr[0]/steps_per_stage
+                if not torch.isfinite(pos).all():
+                    raise FloatingPointError('nonfinite joint Matcha pose')
+    return {**candidate, 'ligand': pos[None]+origin,
+        'provenance': {**candidate['provenance'], 'ligand_seed': int(seed),
+            'generator': 'joint_two_chain_matcha_forward_v1',
+            'steps_per_stage': steps_per_stage, 'expert_identity': expert.provenance}}
 
 
 @torch.no_grad()
@@ -217,6 +434,12 @@ def _selection_key(candidate):
 
 
 def _candidate_source(candidate):
+    declared = candidate.get('provenance', {}).get('candidate_source')
+    if declared is not None:
+        from tricoopdiff.models.assembly import CANDIDATE_SOURCE_NAMES
+        if declared not in CANDIDATE_SOURCE_NAMES:
+            raise ValueError('unknown generated candidate source')
+        return declared
     candidate_id = candidate.get("candidate_id", ())
     if candidate_id and candidate_id[0] == "sdpi":
         return "sdpi"

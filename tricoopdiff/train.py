@@ -27,6 +27,7 @@ from tricoopdiff.models.assembly import (
     SOURCE_CONTRACT_VERSION,
     LEGACY_TORSION_REPRESENTATION,
     candidate_source_tensor,
+    CANDIDATE_SOURCE_NAMES,
 )
 from tricoopdiff.models.expert import (expert_base_identity, validate_expert_base_identity,
                                     configure_expert_policy, expert_runtime_identity, FrozenMatcha)
@@ -104,11 +105,17 @@ class TriCoopDiffTrainer:
                 if head is not None:
                     head.requires_grad_(False)
             fuse_parameters = [parameter for parameter in fuse_parameters if parameter.requires_grad]
-        self._configure_optimizer([{
-            'params': fuse_parameters,
-            'lr': lr,
-            'name': 'trifuse',
-        }], weight_decay)
+        if model.trifuse.config.get('candidate_driven'):
+            quality_parameters = list(model.trifuse.controller.quality.parameters())
+            quality_ids = {id(parameter) for parameter in quality_parameters}
+            parameter_groups = [
+                {'params': [p for p in fuse_parameters if id(p) not in quality_ids],
+                 'lr': lr, 'name': 'assembly_motion'},
+                {'params': quality_parameters, 'lr': lr, 'name': 'candidate_quality'},
+            ]
+        else:
+            parameter_groups = [{'params': fuse_parameters, 'lr': lr, 'name': 'trifuse'}]
+        self._configure_optimizer(parameter_groups, weight_decay)
 
         self.global_step = 0
         self.samples_seen = 0
@@ -414,6 +421,42 @@ def terminal_ligand_interface_losses(e3, target_poi, target_ligand, poi, ligand)
     return losses, counts
 
 
+def candidate_fullatom_repulsion(ed, pd, ld, poi, ligand, body):
+    """Element-aware cross-component and nonbonded ligand repulsion.
+
+    Monomer all-atom templates move with the same POI body rotation as the
+    C-alpha executor. Ligand 1-2, 1-3 and 1-4 pairs are excluded. This is a
+    steric surrogate, not a complete force field or a physical-validity proof.
+    """
+    from rdkit import Chem
+
+    if any(key not in data for data in (ed, pd) for key in ('steric_atoms', 'steric_radii')):
+        raise ValueError('candidate training requires all-atom monomer steric templates')
+    a, b = ed['steric_atoms'][0], pd['steric_atoms'][0]
+    b = (b-pd['coords'][0].mean(0)) @ body[0].T + poi[0].mean(0)
+    mol = ld['mol']
+    mol = Chem.Mol(mol) if isinstance(mol, bytes) else mol
+    table = Chem.GetPeriodicTable()
+    lr = ligand.new_tensor([table.GetRvdw(atom.GetAtomicNum()) for atom in mol.GetAtoms()])
+    l = ligand[0]
+
+    def penalty(x, y, rx, ry):
+        total = l.sum()*0
+        for start in range(0, len(x), 256):
+            distance = torch.cdist(x[start:start+256], y, compute_mode='donot_use_mm_for_euclid_dist')
+            limit = .75*(rx[start:start+256, None]+ry[None])
+            total = total + torch.relu(limit-distance).square().sum()
+        return total/max(1, min(len(x), len(y)))
+
+    ar, br = ed['steric_radii'], pd['steric_radii']
+    result = penalty(a, l, ar, lr)+penalty(b, l, br, lr)+penalty(a, b, ar, br)
+    topology = l.new_tensor(Chem.GetDistanceMatrix(mol))
+    nonbonded = torch.triu(topology > 3, diagonal=1)
+    distance = torch.cdist(l, l, compute_mode='donot_use_mm_for_euclid_dist')
+    limit = .75*(lr[:, None]+lr[None])
+    return result+(torch.relu(limit-distance).square()*nonbonded).sum()/max(1, len(l))
+
+
 def coarse_intercomponent_repulsion(e3, native_poi, native_ligand, poi, ligand, cutoff=2.):
     """Conservative short-range CA/ligand penalty, not all-atom sterics.
 
@@ -693,7 +736,9 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         no_torsion = bool(getattr(self.model.expert.model, 'no_torsion', False))
         dt = ld['coords'].new_full((1,), 1 / self.diffusion.inference_steps)
         projection = None
-        source = int(candidate_source_tensor(source, dt).item())
+        source_names = (CANDIDATE_SOURCE_NAMES if self.model.trifuse.config.get('candidate_driven')
+                        else ('sdpi', 'bitseed'))
+        source = int(candidate_source_tensor(source, dt, source_names).item())
         from tricoopdiff.initialization import TernaryInitializer
         from tricoopdiff.initialization.endpoints import reachable_ligand_target, EndpointProjectionError
         if coupling_override is None:
@@ -716,6 +761,14 @@ class AssemblyTrainer(TriCoopDiffTrainer):
             ligand, poi, body = [torch.as_tensor(state[key], device=self.device,
                                                 dtype=ld['coords'].dtype).reshape(1, -1, 3)
                                  for key in ('ligand', 'poi', 'body_frame')]
+            if self.model.trifuse.config.get('candidate_driven'):
+                eye = torch.eye(3, device=body.device, dtype=body.dtype).unsqueeze(0)
+                if (ligand.shape != ld['coords'].shape or poi.shape != pd['coords'].shape
+                        or body.shape != (1, 3, 3)
+                        or not all(torch.isfinite(x).all() for x in (ligand, poi, body))
+                        or not torch.allclose(body.transpose(-1, -2) @ body, eye, atol=1e-4, rtol=1e-4)
+                        or not torch.allclose(torch.linalg.det(body), body.new_ones(1), atol=1e-4, rtol=1e-4)):
+                    raise ValueError('candidate training requires finite aligned coordinates and a proper body rotation')
             if 'target_ligand' in coupling_override:
                 # A caller-supplied label is not evidence that it belongs to
                 # this conformer's reachable set or this native target.
@@ -747,8 +800,13 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                     self._verified_override_targets = cache
                 target, projection = supplied, cache[signature]
             else:
+                projection_initial, projection_native = poi, pd['coords']
+                if self.model.trifuse.config.get('candidate_driven'):
+                    projection_native = pd['steric_atoms']
+                    projection_initial = ((projection_native-pd['coords'].mean(1, keepdim=True))
+                        @ body.transpose(-1, -2)+poi.mean(1, keepdim=True))
                 target, projection = reachable_ligand_target(
-                    ld, ligand, poi, pd['coords'], no_torsion=no_torsion)
+                    ld, ligand, projection_initial, projection_native, no_torsion=no_torsion)
         target_ligand = torch.as_tensor(target, device=self.device,
                                         dtype=ld['coords'].dtype).reshape_as(ld['coords'])
         if ligand.shape != ld['coords'].shape or poi.shape != pd['coords'].shape:
@@ -811,6 +869,11 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         # artificially cheap when improving the ligand. Targets are reachable.
         losses = {'loss_ligand_geometry': ((ligand - target_ligand) / LIGAND_GEOMETRY_SCALE_ANGSTROM).square().mean(),
                   'loss_protein_geometry': ((poi - pd['coords']) / PROTEIN_GEOMETRY_SCALE_ANGSTROM).square().mean()}
+        if self.model.trifuse.config.get('candidate_driven'):
+            moved_atoms = ((pd['steric_atoms']-pd['coords'].mean(1, keepdim=True))
+                @ body.transpose(-1, -2)+poi.mean(1, keepdim=True))
+            losses['loss_protein_geometry'] = ((moved_atoms-pd['steric_atoms'])/
+                                              PROTEIN_GEOMETRY_SCALE_ANGSTROM).square().mean()
         total = sum(losses.values())
         ligand_interfaces, ligand_interface_counts = terminal_ligand_interface_losses(
             ed['coords'], pd['coords'], target_ligand, poi, ligand)
@@ -824,11 +887,32 @@ class AssemblyTrainer(TriCoopDiffTrainer):
             losses.update(interface)
             total = total + self.interface_loss_weight * sum(interface.values())
         if self.steric_loss_weight:
-            steric = coarse_intercomponent_repulsion(ed['coords'], pd['coords'], target_ligand,
-                                                     poi, ligand, self.steric_cutoff)
+            steric = (candidate_fullatom_repulsion(ed, pd, ld, poi, ligand, body)
+                      if self.model.trifuse.config.get('candidate_driven') else
+                      coarse_intercomponent_repulsion(ed['coords'], pd['coords'], target_ligand,
+                                                      poi, ligand, self.steric_cutoff))
             losses['loss_clash_geometry'] = steric
             total = total + self.steric_loss_weight * steric
         total = self.endpoint_loss_weight * total
+        if self.model.trifuse.config.get('candidate_driven'):
+            # Fit a value read on the *actual final structure*, not the last
+            # pre-update state. Stop geometry gradients: ranking supervision
+            # must not reward moving a structure toward an easier score label.
+            zero = ligand.new_zeros(1)
+            final = self._forward_state(ed, pd, ld, ligand.detach(), poi.detach(),
+                                        body.detach(), zero, zero, source, conditions)
+            native_interfaces, _ = terminal_ligand_interface_losses(
+                ed['coords'], pd['coords'], ld['coords'], poi, ligand)
+            targets = torch.stack((losses['loss_protein_geometry'],
+                ((ligand-ld['coords'])/LIGAND_GEOMETRY_SCALE_ANGSTROM).square().mean(),
+                native_interfaces['loss_interface_e3_ligand'] + native_interfaces['loss_contact_e3_ligand'],
+                native_interfaces['loss_interface_poi_ligand'] + native_interfaces['loss_contact_poi_ligand'],
+                (losses['loss_clash_geometry'] if 'loss_clash_geometry' in losses else
+                 candidate_fullatom_repulsion(ed, pd, ld, poi, ligand, body))))
+            quality_loss = torch.nn.functional.smooth_l1_loss(
+                final['quality_errors'], torch.log1p(targets.detach()).reshape(1, -1))
+            losses['loss_candidate_quality'] = quality_loss
+            total = total + .1 * quality_loss
         ligand_rmsd = (ligand.detach() - target_ligand.detach()).square().sum(-1).mean().sqrt()
         return {'loss_total': total, 'components': losses, 'native_interface_pairs': interface_pairs,
                 'ligand_interface_pairs': ligand_interface_counts,
