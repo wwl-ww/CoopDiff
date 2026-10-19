@@ -111,9 +111,91 @@ def _dockq_protein_records(model_records, native_records):
             # protein featurizer does, without merging inserted residues.
             if key not in selected or line[16] < selected[key][16]:
                 selected[key] = line
+        # The vendored fnat binary compares contacts in chain-encounter order.
+        # Normalize both inputs to the same chain order before invoking it;
+        # otherwise a B,A native file against an A,B model can report Fnat=0
+        # even when their residue contact pairs overlap.
+        chains = sorted({line[21] for line in selected.values()})
         return [f'{line[:16]} {line[17:22]}{numbering[line[22:27]]:4d} {line[27:]}'
-                for line in selected.values()]
+                for chain in chains for line in selected.values()
+                if line[21] == chain]
     return normalize(model_records), normalize(native_records)
+
+
+def _align_pose_residue_numbers(model_records, native_records):
+    """Map each model chain's sequence onto native residue IDs before DockQ."""
+    from Bio.Align import PairwiseAligner
+    from Bio.SeqUtils import seq1
+
+    aligner = PairwiseAligner()
+    aligner.mode = 'global'
+    aligner.match_score = 2.
+    aligner.mismatch_score = -1.
+    aligner.open_gap_score = -5.
+    aligner.extend_gap_score = -.5
+
+    output = []
+    for chain in ('A', 'B'):
+        model = {}
+        native = {}
+        for line in model_records:
+            if line[21] == chain:
+                model.setdefault(line[22:27], []).append(line)
+        for line in native_records:
+            if line[21] == chain:
+                native.setdefault(line[22:27], []).append(line)
+        model_residues = list(model.values())
+        native_residues = list(native.values())
+        model_seq = ''.join(seq1(lines[0][17:20]) for lines in model_residues)
+        native_seq = ''.join(seq1(lines[0][17:20]) for lines in native_residues)
+        alignment = aligner.align(model_seq, native_seq)[0]
+        matched = 0
+        for model_index, native_index in zip(*alignment.indices):
+            if (model_index < 0 or native_index < 0
+                    or model_seq[model_index] != native_seq[native_index]):
+                continue
+            native_number = native_residues[native_index][0][22:27]
+            output.extend(line[:22] + native_number + line[27:]
+                          for line in model_residues[model_index])
+            matched += 1
+        if matched < 20:
+            raise ValueError(f'only {matched} sequence-matched residues for chain {chain}')
+    return output
+
+
+def compute_fullatom_pose_dockq(protein_pose_pdb, native_complex_pdb, deepternary_root):
+    """Score an actual HDOCK unbound all-atom pose, without CA reprojection."""
+    from tricoopdiff.diffdock.datasets.constants import three_to_one
+
+    model_records = [line for line in Path(protein_pose_pdb).read_text().splitlines()
+                     if line.startswith('ATOM') and line[21] in ('A', 'B')
+                     and line[17:20] in three_to_one]
+    native_records = [line for line in Path(native_complex_pdb).read_text().splitlines()
+                      if line.startswith('ATOM') and line[21] in ('A', 'B')
+                      and line[17:20] in three_to_one]
+    if ({line[21] for line in model_records} != {'A', 'B'}
+            or {line[21] for line in native_records} != {'A', 'B'}):
+        raise ValueError('full-atom pose DockQ requires two protein chains A and B')
+    model_records = _align_pose_residue_numbers(model_records, native_records)
+    model_records, native_records = _dockq_protein_records(model_records, native_records)
+    deepternary_root = Path(deepternary_root).resolve()
+    if str(deepternary_root) not in sys.path:
+        sys.path.insert(0, str(deepternary_root))
+    from DockQ.dockq_util import cal_dockq
+
+    with tempfile.TemporaryDirectory(prefix='tricoopdiff-pose-dockq-') as temp_dir:
+        model_path = Path(temp_dir)/'model.pdb'
+        native_path = Path(temp_dir)/'native.pdb'
+        model_path.write_text('\n'.join(model_records)+'\n')
+        native_path.write_text('\n'.join(native_records)+'\n')
+        fnat, irms, lrms, dockq = cal_dockq(str(model_path), str(native_path))
+    if (not np.isfinite((fnat, irms, lrms, dockq)).all()
+            or not 0 <= fnat <= 1 or not 0 <= dockq <= 1 or min(irms, lrms) < 0):
+        raise ValueError('invalid full-atom pose DockQ result')
+    return {'dockq': float(dockq), 'fnat': float(fnat),
+            'irms': float(irms), 'lrms': float(lrms),
+            'method': 'DeepTernary/DockQ/dockq_util.py::cal_dockq',
+            'protocol': 'sequence_aligned_unbound_protein_pose_fullatom_v2'}
 
 
 def compute_fullatom_dockq(
@@ -164,7 +246,11 @@ def compute_fullatom_dockq(
         # A least-squares fit is not proof of rigid representability. Silently
         # projecting a distorted prediction would score a different structure.
         # Allow PDB rounding and accumulated float32 integration error only.
-        tolerance = 1e-3 + 64 * np.finfo(np.float32).eps * max(
+        # Candidate poses may accumulate several float32 rigid updates before
+        # being mapped back to the PDB frame.  A 1e-3 A floor rejects otherwise
+        # exact rigid images by a few microns (observed ~1.4e-3 A); this remains
+        # far below any meaningful structural deformation.
+        tolerance = 2e-3 + 64 * np.finfo(np.float32).eps * max(
             float(np.abs(source).max()), float(np.abs(target).max()))
         error = np.linalg.norm(source @ rotation + translation - target, axis=-1).max()
         if not np.isfinite(error) or error > tolerance:

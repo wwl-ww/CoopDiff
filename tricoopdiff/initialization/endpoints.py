@@ -406,7 +406,7 @@ RESAMPLED_TRAINING_ENDPOINT_PROTOCOL = "online_bitseed_raw_resampled_v2"
 
 
 class EndpointProjectionError(ValueError):
-    """A reproducible failed target solve, not a reason to skip training data."""
+    """A sampled endpoint is unreachable under the configured motion contract."""
 
     def __init__(self, report, ligand_data, initial_ligand, initial_poi, native_poi):
         super().__init__(f'reachable target torsion projection did not converge: {report}')
@@ -422,7 +422,7 @@ class EndpointProjectionError(ValueError):
 
 
 def reachable_ligand_target(ligand_data, initial_ligand, initial_poi, native_poi,
-                            *, no_torsion=False):
+                            *, no_torsion=False, return_coupling=False):
     """Project only the supervision target, never the inference-like input.
 
     Bond lengths/rigid fragments stay those of the sampled conformer. Protein
@@ -430,11 +430,13 @@ def reachable_ligand_target(ligand_data, initial_ligand, initial_poi, native_poi
     coordinate surrogate, not an assertion of exact native ligand geometry.
     """
     reference = {**ligand_data, 'coords': initial_ligand}
-    _, projected, report = project_endpoint_coupling(
+    coupling, projected, report = project_endpoint_coupling(
         reference, initial_poi, ligand_data['coords'], native_poi,
         no_torsion=no_torsion)
     if not report['torsion_optimization']['success']:
         raise EndpointProjectionError(report, ligand_data, initial_ligand, initial_poi, native_poi)
+    if return_coupling:
+        return projected['ligand'], report, coupling
     return projected['ligand'], report
 
 

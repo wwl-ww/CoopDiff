@@ -36,6 +36,8 @@ def actual_candidate_source(init_mode, initialization):
         source = initialization.get("candidate_source")
     elif init_mode == "expert_anchor":
         source = "sdpi" if initialization.get("fallback") else "bitseed"
+    elif init_mode == "protac_binary_anchor":
+        source = "sdpi"
     else:
         raise ValueError(f"unsupported initialization mode: {init_mode}")
     if source not in SOURCE_NAMES:
@@ -144,7 +146,9 @@ def sample_single(
     e3_coords = e3_data["coords"][0].detach()            # [N_e3, 3]
 
     e3_center = e3_coords.mean(dim=0, keepdim=True)
-    if init_mode not in {"sdpi", "expert_anchor", "fixed_candidate"}:
+    protac_anchor_mode = init_mode == 'protac_binary_anchor'
+    if init_mode not in {"sdpi", "expert_anchor", "fixed_candidate",
+                         "protac_binary_anchor"}:
         raise ValueError(f"unsupported initialization mode: {init_mode}")
     if t_anchor is None:
         t_anchor = 1.0
@@ -152,6 +156,21 @@ def sample_single(
         raise ValueError("broad-prior sampling requires t_anchor=1")
     if init_mode == "fixed_candidate" and not 0.0 < float(t_anchor) <= 1.0:
         raise ValueError("fixed-candidate refinement requires t_anchor in (0, 1]")
+    if protac_anchor_mode:
+        if t_anchor != 1.0 or freeze_poi:
+            raise ValueError('binary-anchor assembly requires full-time, moving-POI execution')
+        if (not isinstance(conditions, dict) or
+                conditions.get('contract') != 'external_binary_exact_bond_anchor_v1' or
+                not getattr(getattr(model, 'trifuse', None), 'config', {}).get('protac_anchor_contract')):
+            raise ValueError('binary-anchor sampling requires a PROTAC model and external binary condition')
+        from tricoopdiff.initialization.protac import validate_anchor_graph_identity
+        validate_anchor_graph_identity(conditions, ligand_data.get('mol'))
+        if conditions.get('mapping_hypotheses'):
+            from tricoopdiff.initialization.protac import select_binary_mapping_hypothesis
+            if seed is None:
+                seed = int(np.random.randint(0, 2**31 - 1))
+            index = int(seed) % len(conditions['mapping_hypotheses'])
+            conditions = select_binary_mapping_hypothesis(conditions, index)
     if not isinstance(diffusion, SDPIFlow):
         raise ValueError('sampling requires SDPIFlow, not the legacy DSM process')
     if initializer.no_torsion != bool(getattr(model.expert.model, 'no_torsion', False)):
@@ -159,6 +178,23 @@ def sample_single(
     ligand_pos, poi_pos, r_e3_to_poi, initialization = initializer.initialize(
         e3_coords, poi_template, ligand_data, seed=seed,
     )
+    if protac_anchor_mode:
+        from tricoopdiff.initialization.protac import assemble_from_binary_anchors
+        assembled = assemble_from_binary_anchors(
+            ligand_pos[0], poi_template,
+            torch.as_tensor(conditions['anchor1_xyz'], device=ligand_pos.device,
+                            dtype=ligand_pos.dtype),
+            torch.as_tensor(conditions['anchor2_xyz'], device=ligand_pos.device,
+                            dtype=ligand_pos.dtype),
+            conditions['anchor1_atoms'], conditions['anchor2_atoms'])
+        ligand_pos = assembled['ligand'].unsqueeze(0)
+        poi_pos = assembled['protein2'].unsqueeze(0)
+        r_e3_to_poi = assembled['protein2_rotation'].unsqueeze(0)
+        initialization.update(init_mode=init_mode,
+            binary_anchor_contract=conditions['contract'],
+            native_ternary_coordinates_used=False,
+            anchor_fit_rmsd=assembled['anchor_rmsd'].detach().cpu().tolist(),
+            mapping_hypothesis_index=conditions.get('mapping_hypothesis_index'))
     if not torch.isfinite(ligand_pos).all() or not torch.isfinite(poi_pos).all():
         raise FloatingPointError("non-finite sdpi initialization")
     if ligand_pos.shape != ligand_data['coords'].shape or poi_pos.shape != poi_data['coords'].shape:
@@ -248,6 +284,15 @@ def sample_single(
                 raise ValueError('velocity_transform must preserve the rigid output mode')
             if velocities.get('torsion_update_mode') != original_torsion_mode:
                 raise ValueError('velocity_transform must preserve the torsion update mode')
+        model_config = getattr(getattr(model, 'trifuse', None), 'config', {})
+        motion_contract = model_config.get('motion_contract', 'sdpi_flow_velocity_v1')
+        if motion_contract == 'bounded_iterative_correction_v1':
+            velocities = diffusion.bounded_correction(velocities)
+            action_dt = torch.ones_like(dt_tr)
+        elif motion_contract == 'sdpi_flow_velocity_v1':
+            action_dt = dt_tr
+        else:
+            raise ValueError(f'unknown saved motion contract: {motion_contract!r}')
         s_q = {**velocities['e3_ligand'], 'tor': velocities['torsion']}
         s_pol = velocities['poi_ligand']
         sanitized_components = _nonfinite_components(velocities)
@@ -266,11 +311,17 @@ def sample_single(
             break
 
         add_noise = False  # deterministic reverse flow, not temperature SDE
-        ligand_pos, poi_pos, r_e3_to_poi = diffusion.step(
-            ligand_pos, poi_pos, r_e3_to_poi,
-            velocities,
-            dt_tr, ligand_data, freeze_poi=freeze_poi,
-        )
+        if protac_anchor_mode:
+            from tricoopdiff.initialization.protac import anchored_flow_step
+            ligand_pos, poi_pos, r_e3_to_poi, anchor_errors = anchored_flow_step(
+                ligand_pos, poi_pos, r_e3_to_poi, velocities, action_dt,
+                ligand_data, poi_template.unsqueeze(0), conditions)
+        else:
+            ligand_pos, poi_pos, r_e3_to_poi = diffusion.step(
+                ligand_pos, poi_pos, r_e3_to_poi,
+                velocities,
+                action_dt, ligand_data, freeze_poi=freeze_poi,
+            )
 
         if return_trace:
             lig_com = ligand_pos.mean(dim=1)[0]
@@ -281,6 +332,8 @@ def sample_single(
                 "add_noise": add_noise,
                 "sanitized_components": sanitized_components,
                 "freeze_poi": bool(freeze_poi),
+                "anchor_fit_rmsd": (anchor_errors.detach().cpu().tolist()
+                                     if protac_anchor_mode else None),
                 "rigid_output_mode": velocities.get('rigid_output_mode', 'dual_interfaces_v1'),
                 "torsion_update_mode": velocities.get('torsion_update_mode', 'legacy_kabsch_v1'),
                 "t": {

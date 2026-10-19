@@ -100,6 +100,35 @@ def validate_ligand_graph(mol, edge_index, edge_mask, mask_rotate):
     return bonds, masks.numpy()
 
 
+def embed_chemical_graph(mol, seed, policy="etkdgv3_random"):
+    """Shared native-blind conformer generation; preserve the SDPI policy."""
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    if policy not in ("etkdgv3_random", "diffdock_v1_1"):
+        raise ValueError('unsupported conformer policy')
+    mol = Chem.Mol(mol)
+    mol.RemoveAllConformers()
+    embedded = Chem.AddHs(mol)
+    params = AllChem.ETKDGv2() if policy == "diffdock_v1_1" else AllChem.ETKDGv3()
+    params.randomSeed = int(seed) % (2**31-1)
+    random_coords = policy == "etkdgv3_random"
+    params.useRandomCoords = random_coords
+    attempts, embedded_id = 0, -1
+    limit = 3 if policy == "diffdock_v1_1" else 1
+    while attempts < limit and embedded_id == -1:
+        embedded_id = AllChem.EmbedMolecule(embedded, params)
+        attempts += 1
+    if embedded_id == -1 and policy == "diffdock_v1_1":
+        params.useRandomCoords = True
+        random_coords = True
+        embedded_id = AllChem.EmbedMolecule(embedded, params)
+        if embedded_id != -1:
+            AllChem.MMFFOptimizeMolecule(embedded, confId=embedded_id)
+    if embedded_id == -1:
+        raise ValueError("full-ligand ETKDG embedding failed; no native-pose fallback")
+    return embedded, attempts, random_coords
+
+
 class TernaryInitializer:
     """Only sdpi is supported; old shell/fixed-Å/local priors are removed."""
 
@@ -119,7 +148,6 @@ class TernaryInitializer:
         from the native coordinates. No atom matching or Kabsch inference occurs.
         """
         from rdkit import Chem
-        from rdkit.Chem import AllChem
         from tricoopdiff.diffdock.utils.torsion import modify_conformer_torsion_angles
 
         if seed is None:
@@ -139,28 +167,8 @@ class TernaryInitializer:
         mol = Chem.Mol(mol)
         mol.RemoveAllConformers()
         conformer_seed = int(rng.randint(0, 2**31 - 1))
-        embedded = Chem.AddHs(mol)
-        params = (AllChem.ETKDGv2() if self.conformer_policy == "diffdock_v1_1"
-                  else AllChem.ETKDGv3())
-        params.randomSeed = conformer_seed
-        used_random_coords = self.conformer_policy == "etkdgv3_random"
-        params.useRandomCoords = used_random_coords
-        conformer_attempts = 0
-        embedded_id = -1
-        max_attempts = 3 if self.conformer_policy == "diffdock_v1_1" else 1
-        while conformer_attempts < max_attempts and embedded_id == -1:
-            embedded_id = AllChem.EmbedMolecule(embedded, params)
-            conformer_attempts += 1
-        # DiffDock v1.1's generate_conformer() reaches this branch only after
-        # three ordinary ETKDGv2 failures, then optimizes the random embedding.
-        if embedded_id == -1 and self.conformer_policy == "diffdock_v1_1":
-            params.useRandomCoords = True
-            used_random_coords = True
-            embedded_id = AllChem.EmbedMolecule(embedded, params)
-            if embedded_id != -1:
-                AllChem.MMFFOptimizeMolecule(embedded, confId=embedded_id)
-        if embedded_id == -1:
-            raise ValueError("full-ligand ETKDG embedding failed; no native-pose fallback")
+        embedded, conformer_attempts, used_random_coords = embed_chemical_graph(
+            mol, conformer_seed, self.conformer_policy)
         # AddHs appends atoms; retain the original graph's exact atom order.
         shared = torch.as_tensor(
             embedded.GetConformer().GetPositions()[:mol.GetNumAtoms()],

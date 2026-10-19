@@ -735,6 +735,17 @@ def test_cross_edge_taper_preserves_internal_weights():
 
 # Assembly
 
+def test_rotation_endpoint_angle_has_finite_correct_small_and_large_gradients():
+    from tricoopdiff.geometry.rigid import rotation_angle_squared
+
+    for angle in (0., 1e-7, 2.5, torch.pi-1e-7):
+        vector = torch.tensor([angle, 0., 0.], dtype=torch.float64, requires_grad=True)
+        error = rotation_angle_squared(so3_exp(vector))
+        error.backward()
+        assert torch.allclose(error, vector.new_tensor(angle**2), atol=1e-10)
+        assert torch.isfinite(vector.grad).all()
+        assert torch.allclose(vector.grad, vector.new_tensor([2*angle, 0., 0.]), atol=1e-8)
+
 def test_candidate_quality_head_reads_three_components_and_backpropagates():
     from tricoopdiff.models.assembly import (
         production_model_config, candidate_source_tensor, CANDIDATE_SOURCE_NAMES,
@@ -744,18 +755,40 @@ def test_candidate_quality_head_reads_three_components_and_backpropagates():
     graph['expert_node_vectors'] = torch.randn(15, 4, 3)
     graph['fullatom_scalar_features'] = torch.randn(15, 9)
     graph['fullatom_vector_features'] = torch.randn(15, 3, 3)
+    graph['candidate_reference_scalar'] = torch.zeros(15, 4)
+    graph['candidate_reference_vectors'] = torch.randn(15, 4, 3)
     model = TernaryAssembly(**production_model_config(16, 16, True,
         expert_backend='matcha', expert_scalar_dim=2, expert_vector_dim=2,
         protein_local_geometry_contract='none', candidate_driven=True))
-    output = model(graph, proposals, state, source='hdock_matcha')
+    output = model(graph, proposals, state, source='hdock_matcha', task_mode='refine')
+    for branch in BRANCHES:
+        for field in ('tr', 'rot'):
+            assert torch.count_nonzero(output['normalized_velocity'][branch][field]) == 0
+    assert torch.count_nonzero(output['normalized_velocity']['torsion']) == 0
     assert output['quality_errors'].shape == (1, 5)
     assert output['candidate_score'].shape == (1,)
-    assert model.controller.quality[0].in_features == 144, 'scoring must preserve component distributions'
+    assert model.controller.quality[0].in_features == 228, 'scoring must read static identity and actual contacts'
+    other_clock = state.clone()
+    other_clock[:, -1] = 0.
+    other_graph = {**graph, 'candidate_reference_scalar': graph['candidate_reference_scalar']+3.}
+    other = model(other_graph, proposals, other_clock, source='sdpi', task_mode='assemble')
+    assert torch.equal(output['quality_errors'], other['quality_errors']), (
+        'quality must evaluate current geometry, not source, clock or candidate history')
     output['quality_errors'].sum().backward()
     assert model.controller.quality[-1].weight.grad.abs().sum() > 0
     assert model.controller.source.weight.grad is None, 'quality supervision must not rewrite motion features'
     assert model.controller.protein.weight.grad is None, 'quality gradients must stop before the motion trunk'
     assert candidate_source_tensor('hdock_matcha', state, CANDIDATE_SOURCE_NAMES).item() == 2
+    from tricoopdiff.models.assembly import task_source_index
+    assert task_source_index('sdpi', 'assemble', state).item() == 0
+    assert task_source_index('sdpi', 'refine', state).item() == 3
+    assert task_source_index('hdock_matcha', 'refine', state).item() == 5
+    try:
+        model(graph, proposals, state, source='sdpi')
+    except ValueError as error:
+        assert 'explicit task_mode' in str(error)
+    else:
+        raise AssertionError('task must not be silently inferred from initialization source')
     try:
         candidate_source_tensor('hdock_matcha', state)
     except ValueError:
@@ -857,21 +890,7 @@ def test_rigid_body_output_heads_are_parameter_independent():
             'one-step rigid heads must not share parameters across physical bodies')
 
 
-def test_shared_rigid_migration_duplicates_values_not_parameter_storage():
-    model = TernaryAssembly(node_dim=32, input_dim=16)
-    legacy = dict(model.state_dict())
-    for layer in ('0', '2'):
-        for suffix in ('weight', 'bias'):
-            prefix = 'controller.assembly.rigid'
-            value = legacy.pop(f'{prefix}.{BRANCHES[0]}.{layer}.{suffix}')
-            legacy.pop(f'{prefix}.{BRANCHES[1]}.{layer}.{suffix}')
-            legacy[f'{prefix}.{layer}.{suffix}'] = value
-    migrated = model.migrate_shared_rigid_weights(legacy)
-    model.load_state_dict(migrated, strict=True)
-    for left, right in zip(model.controller.assembly.rigid[BRANCHES[0]].parameters(),
-                           model.controller.assembly.rigid[BRANCHES[1]].parameters()):
-        assert torch.equal(left, right)
-        assert left.data_ptr() != right.data_ptr(), 'migration must not tie the new body heads'
+
 
 
 def test_matcha_evidence_preserves_complete_frame_and_equivariance():
@@ -893,35 +912,28 @@ def test_matcha_evidence_preserves_complete_frame_and_equivariance():
     gradients = torch.autograd.grad((vectors * weights).sum(), (receptor, ligand, frame))
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
     assert (gradients[2].abs().sum(0) > 0).all(), 'each local frame axis must remain differentiable'
+    from tricoopdiff.models.assembly import candidate_reference_evidence
+    e3 = {'coords': receptor[:3][None], 'matcha': {'reference_basis': frame}}
+    poi = {'coords': receptor[3:][None], 'matcha': {'reference_basis': frame},
+           'candidate_reference': {'poi': (receptor[3:]+1.)[None].detach(),
+               'ligand': (ligand-2.)[None].detach(), 'body': frame[None].detach()}}
+    ld = {'coords': ligand[None]}
+    xyz = torch.cat((receptor, ligand))
+    types = torch.tensor([0]*3+[1]*4+[2]*4)
+    scalar, vector = candidate_reference_evidence(xyz, types, e3, poi, ld)
+    moved_e3 = {'coords': e3['coords'] @ rotation.T+17., 'matcha': {'reference_basis': rotation @ frame}}
+    moved_poi = {'coords': poi['coords'] @ rotation.T+17.,
+        'matcha': {'reference_basis': rotation @ frame},
+        'candidate_reference': {**poi['candidate_reference'],
+            'poi': poi['candidate_reference']['poi'] @ rotation.T+17.,
+            'ligand': poi['candidate_reference']['ligand'] @ rotation.T+17.}}
+    rotated_scalar, rotated_vector = candidate_reference_evidence(
+        xyz @ rotation.T+17., types, moved_e3, moved_poi, {'coords': ld['coords'] @ rotation.T+17.})
+    assert torch.allclose(scalar, rotated_scalar, atol=1e-12)
+    assert torch.allclose(vector @ rotation.T, rotated_vector, atol=1e-12)
 
 
-def test_logit_only_weight_migration_preserves_logits_and_zeros_new_values():
-    model = TernaryAssembly(node_dim=32, input_dim=16)
-    current = model.state_dict()
-    legacy = {key: value.clone() for key, value in current.items()}
-    heads = [('controller.structure.geometry.2', 1),
-             ('controller.assembly.distance.2', 1)]
-    heads.extend((f'controller.layers.{i}.geometry.2', layer.heads)
-                 for i, layer in enumerate(model.controller.layers))
-    for prefix, count in heads:
-        for suffix in ('weight', 'bias'):
-            key = f'{prefix}.{suffix}'
-            legacy[key] = legacy[key][-count:].clone()
-    migrated = model.migrate_logit_only_geometry(legacy)
-    model.load_state_dict(migrated, strict=True)
-    for prefix, count in heads:
-        for suffix in ('weight', 'bias'):
-            key = f'{prefix}.{suffix}'
-            assert torch.equal(migrated[key][-count:], legacy[key])
-            assert torch.count_nonzero(migrated[key][:-count]) == 0
-    malformed = dict(legacy)
-    malformed['controller.structure.geometry.2.weight'] = torch.empty(2, 32)
-    try:
-        model.migrate_logit_only_geometry(malformed)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError('migration must reject unrelated shape mismatches')
+
 
 
 def test_rigid_decoder_reads_distance_with_identical_node_identities():
@@ -960,6 +972,36 @@ def test_interaction_geometry_reaches_scalar_values_with_repeated_identities():
     gradient = torch.autograd.grad(scalar.square().sum(), layer.geometry[-1].weight)[0]
     assert gradient.norm() > 1e-6, (
         'scalar geometry must not vanish merely because source identity values coincide')
+
+
+def test_large_structure_chunk_checkpoint_preserves_outputs_and_gradients():
+    from copy import deepcopy
+    from tricoopdiff.models.assembly import ComponentStructureEncoder
+    torch.manual_seed(73)
+    chunked = ComponentStructureEncoder(8).double().train()
+    direct = deepcopy(chunked).eval()
+    features = torch.randn(600, 8, dtype=torch.double)
+    positions = torch.randn(600, 3, dtype=torch.double)
+    types = torch.zeros(600, dtype=torch.long)
+    edges = torch.empty(2, 0, dtype=torch.long)
+    attributes = torch.empty(0, 4, dtype=torch.double)
+    weight = torch.randn_like(features)
+    outputs, gradients = [], []
+    for model in (chunked, direct):
+        h = features.clone().requires_grad_()
+        xyz = positions.clone().requires_grad_()
+        result = model(h, xyz, types, edges, attributes)
+        (result*weight).sum().backward()
+        outputs.append(result.detach())
+        gradients.append((h.grad, xyz.grad))
+    assert torch.allclose(outputs[0], outputs[1], atol=1e-10, rtol=1e-10)
+    for first, second in zip(gradients[0], gradients[1]):
+        assert torch.isfinite(first).all()
+        assert torch.allclose(first, second, atol=1e-9, rtol=1e-9)
+    for first, second in zip(chunked.parameters(), direct.parameters()):
+        if first.grad is not None or second.grad is not None:
+            assert first.grad is not None and second.grad is not None
+            assert torch.allclose(first.grad, second.grad, atol=1e-9, rtol=1e-9)
 
 
 def test_protein_structure_reads_distances_with_identical_node_identities():
@@ -2144,3 +2186,30 @@ def test_radial_two_operand_contraction_preserves_values_and_gradients():
     new_grads = torch.autograd.grad(new.square().mean(), candidate)
     for left, right in zip(old_grads, new_grads):
         torch.testing.assert_close(left, right, rtol=1e-12, atol=1e-12)
+
+
+def test_protac_anchor_context_is_explicit_and_node_aligned():
+    from tricoopdiff.models.assembly import (
+        PROTAC_ANCHOR_CONTRACT, TernaryAssembly, TernaryAssemblyModel,
+        production_model_config,
+    )
+
+    n_e3, n_poi, n_ligand = 4, 4, 6
+    graph = {'node_coords': torch.randn(n_e3+n_poi+n_ligand, 3),
+             'node_types': torch.tensor([0]*n_e3+[1]*n_poi+[2]*n_ligand),
+             'component_indices': (torch.arange(n_e3), torch.arange(n_e3, n_e3+n_poi),
+                                   torch.arange(n_e3+n_poi, n_e3+n_poi+n_ligand))}
+    ligand_ids = graph['component_indices'][2]
+    condition = {'contract': 'external_binary_exact_bond_anchor_v1',
+                 'anchor1_atoms': (0, 1, 2), 'anchor2_atoms': (3, 4, 5)}
+    ligand_data = {'coords': graph['node_coords'][ligand_ids][None],
+                   'mask_rotate': torch.tensor([[False, False, False, True, True, True]])}
+    TernaryAssemblyModel._add_protac_anchor_context(graph, condition, ligand_data)
+    assert graph['protac_anchor_scalar'].shape == (14, 5)
+    assert graph['protac_anchor_vectors'].shape == (14, 2, 3)
+    assert graph['protac_torsion_mask'].tolist() == [True]
+    model = TernaryAssembly(**production_model_config(
+        16, 16, expert_scalar_dim=2, expert_vector_dim=2,
+        protac_anchor_contract=PROTAC_ANCHOR_CONTRACT))
+    assert model.controller.protac_anchor_scalar is not None
+    assert model.controller.vector_input.in_features == 2*2+3+2

@@ -919,6 +919,26 @@ def test_dockq_preserves_inserted_residues_without_duplicate_altloc_atoms():
     assert all(line[26] == ' ' and line[16] == ' ' for line in model)
 
 
+def test_pose_dockq_aligns_extra_terminal_residues_before_numbering():
+    residues = ('ALA', 'VAL', 'LEU', 'ILE', 'PHE', 'TYR', 'TRP', 'SER',
+                'THR', 'ASN', 'GLN', 'ASP', 'GLU', 'LYS', 'ARG', 'HIS',
+                'CYS', 'MET', 'PRO', 'GLY', 'ALA', 'VAL', 'LEU', 'ILE', 'PHE')
+
+    def lines(chain, sequence):
+        return [f'ATOM  {i:5d} CA   {name} {chain}{i:4d}    '
+                f'{float(i):8.3f}{0.:8.3f}{0.:8.3f}'
+                f'{1.:6.2f}{0.:6.2f}           C'
+                for i, name in enumerate(sequence, 1)]
+
+    native = lines('A', residues) + lines('B', residues)
+    model = lines('A', residues) + lines('B', ('GLY', 'GLY') + residues)
+    aligned = deepternary_metric_alignment_exact._align_pose_residue_numbers(model, native)
+    chain_b = [line for line in aligned if line[21] == 'B']
+    assert len(chain_b) == len(residues)
+    assert [int(line[22:26]) for line in chain_b] == list(range(1, 26))
+    assert chain_b[0][17:20] == 'ALA'
+
+
 def test_exact_metric_maps_predictions_from_shared_model_frame_to_pdb_frame():
     e3_local = np.asarray([
         [0., 0., 0.], [2., 0., 0.], [0., 3., 0.], [0., 0., 4.],

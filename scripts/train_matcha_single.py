@@ -187,66 +187,14 @@ def main():
                        ROOT/'tricoopdiff/train.py', ROOT/'tricoopdiff/sdpi_flow.py')})
     step = 0
     if transfer is not None:
-        saved_config = dict(transfer['model_config'])
-        legacy_conditioning = 'conditioning_contract' not in saved_config
-        legacy_geometry = 'information_contract' not in saved_config
-        legacy_advice = saved_config.get('information_contract') in (None, 'geometric_message_values_v1')
-        legacy_frame = saved_config.get('expert_vector_dim') == 3
-        legacy_rigid = 'rigid_decoder_contract' not in saved_config
-        legacy_velocity = saved_config.get('rigid_decoder_contract') in (None, 'separate_ligand_poi_heads_v1')
-        if legacy_conditioning:
-            saved_config['conditioning_contract'] = config['conditioning_contract']
-        if legacy_geometry:
-            saved_config['information_contract'] = config['information_contract']
-        if legacy_advice:
-            saved_config['information_contract'] = config['information_contract']
-        if legacy_frame:
-            saved_config['expert_vector_dim'] = config['expert_vector_dim']
-        if legacy_rigid:
-            saved_config['rigid_decoder_contract'] = config['rigid_decoder_contract']
-        if legacy_velocity:
-            saved_config['rigid_decoder_contract'] = config['rigid_decoder_contract']
-        if (saved_config != config or transfer['backend_manifest']['stage_weights_sha256']
-                != manifest['stage_weights_sha256']):
-            raise ValueError('weights-only transfer requires matching architecture and pretrained stages')
-        weights = dict(transfer['trainable_weights'])
-        if legacy_conditioning:
-            # Explicit, function-preserving migration, not a partial state load.
-            weights['condition_geometry.weight'] = torch.zeros_like(model.trifuse.condition_geometry.weight)
-        if legacy_geometry:
-            weights = model.trifuse.migrate_logit_only_geometry(weights)
-        if legacy_rigid:
-            weights = model.trifuse.migrate_shared_rigid_weights(weights)
-        if legacy_frame:
-            key = 'controller.vector_input.weight'
-            old = weights[key]
-            expanded = old.new_zeros((old.shape[0], 17))
-            if old.shape != (expanded.shape[0], 13) or expanded.shape[1] != 17:
-                raise ValueError('unsupported Matcha vector evidence migration')
-            # A/B expert slots each grow 3 -> 5; offsets/advice stay unchanged.
-            expanded[:, :3] = old[:, :3].to(expanded)
-            expanded[:, 5:8] = old[:, 3:6].to(expanded)
-            expanded[:, 10:] = old[:, 6:].to(expanded)
-            weights[key] = expanded
-        if legacy_advice:
-            key = 'controller.vector_input.weight'
-            old = weights[key]
-            expected = model.trifuse.state_dict()[key]
-            if old.shape != (expected.shape[0], expected.shape[1] + 4):
-                raise ValueError('unsupported rigid-advice removal migration')
-            # Deliberately not function-preserving: remove the four global
-            # rigid-advice channels, retaining node vectors and offsets only.
-            weights[key] = old[:, :-4].clone()
-        model.trifuse.load_state_dict(weights, strict=True)
+        if (transfer['model_config'] != config or
+                transfer['backend_manifest']['stage_weights_sha256'] != manifest['stage_weights_sha256']):
+            raise ValueError('weights transfer requires the current architecture and pretrained stages')
+        model.trifuse.load_state_dict(transfer['trainable_weights'], strict=True)
         trainer.ema = {name: value.detach().clone() for name, value in model.trifuse.state_dict().items()}
         print(json.dumps(dict(kind='weights_only_transfer', source=args.weights_from,
-                              source_step=transfer['step'], optimizer_reset=True,
-                              zero_initialized_message_values=legacy_geometry,
-                              zero_initialized_frame_axes=legacy_frame,
-                              duplicated_rigid_heads=legacy_rigid,
-                              removed_rigid_advice=legacy_advice,
-                              removed_inverse_time_gain=legacy_velocity,
-                              zero_initialized_geometry=legacy_conditioning)), flush=True)
+                              source_step=transfer['step'], optimizer_reset=True)), flush=True)
+
     if checkpoint is not None:
         if checkpoint['model_config'] != config or checkpoint['runtime'] != runtime:
             raise ValueError('resume architecture/training contract mismatch')

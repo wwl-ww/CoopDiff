@@ -46,6 +46,21 @@ def is_proper_rotation(rotation, atol=1e-4):
                                atol=atol, rtol=0.))
 
 
+def rotation_angle_squared(rotation):
+    """Principal SO(3) angle squared, finite at identity and near half turns.
+
+    atan2 avoids acos's singular endpoint derivative. The exact half-turn
+    remains a nonunique shortest-path boundary, not a globally smooth chart.
+    """
+    matrix = rotation.double()
+    skew = torch.stack((matrix[..., 2, 1]-matrix[..., 1, 2],
+                        matrix[..., 0, 2]-matrix[..., 2, 0],
+                        matrix[..., 1, 0]-matrix[..., 0, 1]), -1)/2.
+    sine = torch.linalg.vector_norm(skew, dim=-1)
+    cosine = (matrix.diagonal(dim1=-2, dim2=-1).sum(-1)-1.)/2.
+    return torch.atan2(sine, cosine).square().to(rotation.dtype)
+
+
 def apply_rigid(points, rotation, translation):
     return points @ rotation.transpose(-1, -2) + translation.unsqueeze(-2)
 

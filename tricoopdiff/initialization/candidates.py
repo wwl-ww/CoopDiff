@@ -135,25 +135,31 @@ def load_assembly_candidate(protein_pose, ligand_pose, e3_reference, poi_referen
     body_rotation, offset, _ = proper_rigid_fit(source, target)
     if torch.linalg.vector_norm(apply_rigid(source, body_rotation, offset)-target, dim=-1).max() > .02:
         raise ValueError('candidate all-atom POI is not rigid')
-    predicted_mol = Chem.SDMolSupplier(str(ligand_pose), removeHs=True)[0]
     expected = ligand_data['mol']
     expected = Chem.Mol(expected) if isinstance(expected, bytes) else Chem.Mol(expected)
     expected = Chem.RemoveHs(expected)
     # Legacy PDB caches can tag symmetry-equivalent, non-stereogenic atoms.
     # Clear only invalid graph stereotags; never assign from target coordinates.
     Chem.AssignStereochemistry(expected, cleanIt=True, force=True)
-    if predicted_mol is None or predicted_mol.GetNumAtoms() != expected.GetNumAtoms():
-        raise ValueError('candidate ligand must preserve the complete indexed heavy-atom graph')
-    match = predicted_mol.GetSubstructMatch(expected, useChirality=True)
-    if (len(match) != expected.GetNumAtoms()
-            or predicted_mol.GetNumBonds() != expected.GetNumBonds()):
-        raise ValueError('candidate ligand chemistry or chirality differs from indexed molecule')
-    xyz = predicted_mol.GetConformer().GetPositions()[list(match)]
+    if ligand_pose is None:
+        # Import proteins only. This is an explicit placeholder, never a
+        # deployable ligand pose; joint generation replaces it before saving.
+        xyz = np.zeros((expected.GetNumAtoms(), 3))
+    else:
+        predicted_mol = Chem.SDMolSupplier(str(ligand_pose), removeHs=True)[0]
+        if predicted_mol is None or predicted_mol.GetNumAtoms() != expected.GetNumAtoms():
+            raise ValueError('candidate ligand must preserve the complete indexed heavy-atom graph')
+        match = predicted_mol.GetSubstructMatch(expected, useChirality=True)
+        if (len(match) != expected.GetNumAtoms()
+                or predicted_mol.GetNumBonds() != expected.GetNumBonds()):
+            raise ValueError('candidate ligand chemistry or chirality differs from indexed molecule')
+        xyz = predicted_mol.GetConformer().GetPositions()[list(match)]
     result = assembly_candidate_from_pose(e3_reference, poi_reference, *posed, xyz,
                                           candidate_id=candidate_id, rank=rank,
                                           poi_rotation=body_rotation)
     result['provenance'].update(protein_pose_sha256=sha256_file(protein_pose),
-                                ligand_pose_sha256=sha256_file(ligand_pose))
+                                ligand_pose_sha256=sha256_file(ligand_pose) if ligand_pose else None,
+                                ligand_state='imported' if ligand_pose else 'pending_joint_generation')
     return result
 
 
@@ -167,7 +173,6 @@ def generate_joint_matcha_ligand(expert, e3_data, poi_data, ligand_data, candida
     controller's scaled advice. Protein geometry and candidate rank stay fixed.
     """
     from rdkit import Chem
-    from rdkit.Chem import AllChem
     from scipy.spatial.transform import Rotation
     from matcha.utils.transforms import apply_tor_changes_to_pos
     from tricoopdiff.geometry.rigid import rotation_exp
@@ -178,12 +183,8 @@ def generate_joint_matcha_ligand(expert, e3_data, poi_data, ligand_data, candida
         raise ValueError('joint generation requires frozen Matcha, a valid pose and positive steps')
     mol = ligand_data['mol']
     mol = Chem.Mol(mol) if isinstance(mol, bytes) else Chem.Mol(mol)
-    generated = Chem.AddHs(mol)
-    generated.RemoveAllConformers()
-    params = AllChem.ETKDGv3()
-    params.randomSeed = int(seed) % (2**31-1)
-    if AllChem.EmbedMolecule(generated, params) != 0:
-        raise ValueError('joint ligand ETKDG generation failed')
+    from tricoopdiff.initialization import embed_chemical_graph
+    generated, _, _ = embed_chemical_graph(mol, seed)
     generated = Chem.RemoveHs(generated)
     reference = e3_data['coords']
     base = reference.new_tensor(generated.GetConformer().GetPositions())
@@ -231,6 +232,7 @@ def generate_joint_matcha_ligand(expert, e3_data, poi_data, ligand_data, candida
                     raise FloatingPointError('nonfinite joint Matcha pose')
     return {**candidate, 'ligand': pos[None]+origin,
         'provenance': {**candidate['provenance'], 'ligand_seed': int(seed),
+            'ligand_state': 'joint_generated', 'conformer_policy': 'etkdgv3_random',
             'generator': 'joint_two_chain_matcha_forward_v1',
             'steps_per_stage': steps_per_stage, 'expert_identity': expert.provenance}}
 

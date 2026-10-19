@@ -21,6 +21,17 @@ import numpy as np
 import torch
 
 
+def test_dockq_normalization_is_independent_of_native_chain_order():
+    from tricoopdiff.metrics.dockq import _dockq_protein_records
+
+    first = 'ATOM      1  CA  ALA A  10       0.000   0.000   0.000  1.00  0.00           C'
+    second = 'ATOM      2  CA  GLY B  20       1.000   0.000   0.000  1.00  0.00           C'
+    model, native = _dockq_protein_records([first, second], [second, first])
+    assert [line[21] for line in model] == ['A', 'B']
+    assert [line[21] for line in native] == ['A', 'B'], (
+        'the vendored fnat binary requires consistent chain-encounter order')
+
+
 def test_candidate_sterics_include_element_radius_and_internal_nonbonded_pairs():
     from rdkit import Chem
     from tricoopdiff.train import candidate_fullatom_repulsion
@@ -42,6 +53,78 @@ def test_candidate_sterics_include_element_radius_and_internal_nonbonded_pairs()
     external = candidate_fullatom_repulsion(ed, pd, {'mol': Chem.MolFromSmiles('C')},
                                            pd['coords'], carbon, torch.eye(3)[None])
     assert external > 0, 'element-aware repulsion missed a 2.4-A carbon overlap'
+
+
+def test_bounded_action_loss_is_finite_for_ligands_without_rotatable_bonds():
+    from tricoopdiff.train import bounded_action_regression_loss
+
+    predicted = {
+        'e3_ligand': {'tr': torch.ones(1, 3, requires_grad=True),
+                      'rot': torch.ones(1, 3, requires_grad=True)},
+        'poi_ligand': {'tr': torch.ones(1, 3, requires_grad=True),
+                       'rot': torch.ones(1, 3, requires_grad=True)},
+        'torsion': torch.empty(1, 0, requires_grad=True),
+    }
+    target = {
+        'e3_ligand': {'tr': torch.zeros(1, 3), 'rot': torch.zeros(1, 3)},
+        'poi_ligand': {'tr': torch.zeros(1, 3), 'rot': torch.zeros(1, 3)},
+        'torsion': torch.empty(1, 0),
+    }
+    loss = bounded_action_regression_loss(predicted, target, {
+        'translation_angstrom': 2., 'rotation_radians': .35, 'torsion_radians': .35})
+    assert torch.isfinite(loss), 'empty torsion action must not turn the repair loss into NaN'
+    loss.backward()
+    assert all(torch.isfinite(value.grad).all() for branch in predicted.values()
+               for value in (branch.values() if isinstance(branch, dict) else (branch,))
+               if value.grad is not None)
+
+
+def test_bounded_rigid_labels_support_diatomic_and_single_atom_ligands():
+    from tricoopdiff.geometry.rigid import rotation_exp
+    from tricoopdiff.train import bounded_rigid_target_action
+
+    for destination in (torch.tensor([[[2., 1., 0.], [2., 2., 0.]]]),
+                        torch.tensor([[[2., 1., 0.], [2., 0., 0.]]])):
+        source = torch.tensor([[[0., 0., 0.], [1., 0., 0.]]])
+        action = bounded_rigid_target_action(source, destination)
+        rotation = rotation_exp(-action['rot'][0])
+        moved = ((source[0] - source[0].mean(0)) @ rotation.T
+                 + destination[0].mean(0))
+        assert torch.allclose(moved, destination[0], atol=1e-5), (
+            'diatomic correction must align its observable bond axis, including antiparallel axes')
+
+    source = torch.tensor([[[0., 0., 0.]]])
+    destination = torch.tensor([[[3., -2., 1.]]])
+    action = bounded_rigid_target_action(source, destination)
+    assert torch.equal(action['rot'], torch.zeros_like(action['rot'])), (
+        'a single atom has no observable rotational correction')
+    assert torch.equal(action['tr'], source.mean(1) - destination.mean(1))
+
+
+def test_protac_training_rejects_anchor_indices_for_another_atom_order_before_rollout():
+    from rdkit import Chem
+    from tricoopdiff.initialization.protac import atom_order_graph_signature
+    from tricoopdiff.train import AssemblyTrainer
+
+    molecule = Chem.MolFromSmiles('CCOCCN')
+    other_order = Chem.RenumberAtoms(molecule, list(reversed(range(6))))
+    trainer = object.__new__(AssemblyTrainer)
+    trainer.device = torch.device('cpu')
+    trainer.near_target_weight = 0.
+    trainer.model = SimpleNamespace(trifuse=SimpleNamespace(config={
+        'protac_anchor_contract': 'dual_bound_anchor_node_context_v1'}))
+    e3 = {'coords': torch.zeros(1, 2, 3)}
+    poi = {'coords': torch.ones(1, 3, 3)}
+    ligand = {'coords': torch.zeros(1, 6, 3), 'mol': molecule}
+    condition = {'contract': 'synthetic_independent_binary_frames_v1',
+        'protein2_reference': poi['coords'][0],
+        'atom_order_graph_sha256': atom_order_graph_signature(other_order)}
+    try:
+        trainer.compute_loss(e3, poi, ligand, conditions=condition)
+    except ValueError as error:
+        assert 'atom indices' in str(error)
+    else:
+        raise AssertionError('wrong atom ordering reached model rollout')
 import torch.multiprocessing as mp
 
 import select_best_checkpoint
@@ -196,6 +279,7 @@ def test_trainer_owns_recorded_activation_clamp_runtime():
         def __init__(self):
             super().__init__()
             self.trifuse = torch.nn.Linear(2, 2)
+            self.trifuse.config = {}
             self.expert = torch.nn.Module()
             self.expert.model = SimpleNamespace()
 
@@ -790,15 +874,15 @@ def test_interface_checkpoint_preserves_batch_progress_and_rejects_loss_changes(
 def test_resume_builder_uses_saved_model_and_loss_recipe_not_current_defaults():
     from tricoopdiff.models.assembly import production_model_config
 
-    trainer, _, _ = training_contract_endpoint_trainer_fixture()
+    trainer, _, _ = training_contract_endpoint_trainer_fixture('ternary_endpoint_v14')
     payload = trainer.checkpoint_payload()
-    payload['model_config'] = production_model_config(32, 16, model_profile='ternary_endpoint_v1')
+    payload['model_config'] = production_model_config(32, 16)
     payload['runtime_config']['steric_loss_weight'] = .05
     payload['runtime_config']['interface_loss_weight'] = .7
     args = parse_args(['--train_data', 'unused', '--val_data', 'unused',
                        '--output_dir', 'unused', '--resume', 'saved.pt'])
     with patch('train_entry.torch.load', return_value=payload), \
-            patch('tricoopdiff.models.expert.build_diffdock_expert', return_value=SimpleNamespace(num_conv_layers=11, node_scalar_dim=58)), \
+            patch('tricoopdiff.models.expert.build_diffdock_expert', return_value=SimpleNamespace(num_conv_layers=11, node_scalar_dim=58, node_vector_dim=20)), \
             patch('tricoopdiff.models.assembly.TernaryAssembly') as fuse, \
             patch('tricoopdiff.models.assembly.TernaryAssemblyModel'), \
             patch('tricoopdiff.train.AssemblyTrainer') as builder:
@@ -862,6 +946,53 @@ def test_coarse_repulsion_is_target_preserving_short_range_and_differentiable():
     assert coarse_intercomponent_repulsion(e3, close_native, ligand, close_native, ligand) == 0
     far = native_poi + 100
     assert coarse_intercomponent_repulsion(e3, native_poi, ligand, far, ligand) == 0
+
+
+def test_bounded_correction_limits_physical_dof_norms():
+    from tricoopdiff.sdpi_flow import SDPIFlow, BOUNDED_CORRECTION_LIMITS
+
+    action = {
+        'e3_ligand': {'tr': torch.tensor([[3., 4., 0.]]), 'rot': torch.tensor([[0., 0., 1.]])},
+        'poi_ligand': {'tr': torch.tensor([[0., 0., 0.]]), 'rot': torch.tensor([[0., 0., 0.]])},
+        'torsion': torch.tensor([[1., -1.]]),
+        'rigid_output_mode': 'independent_centroids_v1',
+        'torsion_update_mode': 'continuous_horizontal_v1',
+    }
+    clipped = SDPIFlow.bounded_correction(action)
+    assert torch.allclose(torch.linalg.vector_norm(clipped['e3_ligand']['tr'], dim=-1),
+                          torch.tensor([BOUNDED_CORRECTION_LIMITS['translation_angstrom']]))
+    assert torch.allclose(torch.linalg.vector_norm(clipped['e3_ligand']['rot'], dim=-1),
+                          torch.tensor([BOUNDED_CORRECTION_LIMITS['rotation_radians']]))
+    assert torch.equal(clipped['torsion'], torch.tensor([[.35, -.35]]))
+    assert clipped['rigid_output_mode'] == action['rigid_output_mode']
+    assert clipped['torsion_update_mode'] == action['torsion_update_mode']
+
+
+def test_quality_gated_repair_scales_actions_without_changing_the_bounded_contract():
+    from tricoopdiff.models.assembly import QUALITY_GATED_REPAIR_MOTION_CONTRACT
+    from tricoopdiff.sdpi_flow import SDPIFlow, INDEPENDENT_RIGID_MODE, CONTINUOUS_TORSION_MODE
+
+    flow = SDPIFlow(inference_steps=1)
+    ligand = torch.tensor([[[0., 0., 0.], [1., 0., 0.]]])
+    poi = torch.tensor([[[0., 4., 0.], [1., 4., 0.]]])
+    body = torch.eye(3).unsqueeze(0)
+    ligand_data = {'edge_index': torch.empty(2, 0, dtype=torch.long),
+                   'edge_mask': torch.empty(0, dtype=torch.bool),
+                   'mask_rotate': torch.empty(0, 2, dtype=torch.bool)}
+    base = {'normalized_velocity': {
+        'e3_ligand': {'tr': torch.tensor([[1., 0., 0.]]), 'rot': torch.zeros(1, 3)},
+        'poi_ligand': {'tr': torch.zeros(1, 3), 'rot': torch.zeros(1, 3)},
+        'torsion': torch.empty(1, 0),
+        'rigid_output_mode': INDEPENDENT_RIGID_MODE,
+        'torsion_update_mode': CONTINUOUS_TORSION_MODE}}
+    moved = []
+    for gate in (.25, .5):
+        output = {**base, 'repair_gate': torch.tensor([[gate]])}
+        (next_ligand, _, _), _ = flow.apply_prediction(
+            output, torch.ones(1), torch.ones(1), ligand, poi, ligand, poi, body,
+            ligand_data, motion_contract=QUALITY_GATED_REPAIR_MOTION_CONTRACT)
+        moved.append(torch.linalg.vector_norm(next_ligand-ligand))
+    assert moved[1] > moved[0] > 0, 'larger learned trust gate must permit proportionally more repair'
 
 
 def test_microbatch_training_matches_mean_gradient_and_updates_ema_once():
@@ -1160,6 +1291,7 @@ def test_a1_never_consumes_cached_endpoint():
 
 def test_sampler_conditions_on_actual_fallback_source():
     assert actual_candidate_source('sdpi', {}) == 'sdpi'
+    assert actual_candidate_source('protac_binary_anchor', {}) == 'sdpi'
     assert actual_candidate_source('expert_anchor', {'fallback': None}) == 'bitseed'
     assert actual_candidate_source(
         'expert_anchor', {'fallback': 'broad_sdpi_clash_filter'},
@@ -1220,127 +1352,10 @@ def test_base_velocity_trainer_initializes_residual_weight():
     assert trainer.residual_weight == 0 and result['loss_residual'] == 1
 
 
-def test_v2_training_adds_reachable_short_starts_and_updates_ema_once():
-    trainer, batch, coupling = training_contract_endpoint_trainer_fixture('ternary_endpoint_v2', inference_steps=20)
-    trainer.effective_batch_size = 2
-    old_ema = {name: value.clone() for name, value in trainer.ema.items()}
-    arguments = {**batch, 'source': 1, 'coupling_override': coupling}
-    with patch.object(trainer, '_endpoint_rollout_loss', wraps=trainer._endpoint_rollout_loss) as rollout:
-        rows = trainer.train_batch([arguments, arguments])
-    assert len(rows) == 2 and all('loss_near_target' in row for row in rows)
-    assert trainer.global_step == 1 and trainer.samples_seen == 2
-    assert len(trainer.model.calls) == 48, 'each microbatch must execute 20 full + 4 short steps'
-    assert all(source == 1 for _, source in trainer.model.calls), 'short starts must inherit source'
-    assert np.allclose([clock for clock, _ in trainer.model.calls[20:24]], [.2, .15, .1, .05])
-    zero, perturbed = rollout.call_args_list[1], rollout.call_args_list[3]
-    assert torch.equal(zero.args[3], coupling['target_ligand'])
-    assert torch.equal(zero.args[4], batch['poi_data']['coords'])
-    assert not torch.equal(perturbed.args[3], coupling['target_ligand'])
-    assert not torch.equal(perturbed.args[4], batch['poi_data']['coords'])
-    decay = 2 / 11
-    assert trainer.effective_ema_decay == decay
-    for name, value in trainer.ema.items():
-        assert torch.allclose(value, decay * old_ema[name]
-                              + (1 - decay) * trainer.model.trifuse.state_dict()[name])
-    assert trainer.model.trifuse.motion.grad is not None
-    assert torch.isfinite(trainer.model.trifuse.motion.grad).all()
-
-
-def test_v2_exact_target_has_zero_auxiliary_loss_and_finite_gradient():
-    trainer, batch, coupling = training_contract_endpoint_trainer_fixture('ternary_endpoint_v2')
-    with torch.no_grad():
-        trainer.model.trifuse.motion.zero_()
-        trainer.model.trifuse.torsion.zero_()
-    output = trainer.compute_loss(**batch, coupling_override=coupling,
-                                  near_target_zero=True, diagnostics=True)
-    assert output['components']['loss_near_target'] < 1e-25
-    output['loss_total'].backward()
-    for parameter in (trainer.model.trifuse.motion, trainer.model.trifuse.torsion):
-        assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
-
-
-def test_v2_validation_uses_full_starts_and_can_explicitly_read_raw_weights():
-    trainer, batch, coupling = training_contract_endpoint_trainer_fixture('ternary_endpoint_v2')
-    trainer.ema['motion'] = trainer.ema['motion'] + .1
-    raw = trainer.validate_step(**batch, coupling_override=coupling, weights='raw')
-    ema = trainer.validate_step(**batch, coupling_override=coupling)
-    assert 'loss_near_target' not in raw and 'loss_near_target' not in ema
-    assert len(trainer.model.calls) == 6
-    assert raw['loss_total'] != ema['loss_total']
-    assert raw['loss_endpoint_main'] == raw['loss_total']
-    for auxiliary in ({'near_target_zero': True}, {'near_target_start_t': .2}):
-        try:
-            trainer.validate_step(**batch, coupling_override=coupling, **auxiliary)
-        except ValueError as error:
-            assert 'main endpoint only' in str(error)
-        else:
-            raise AssertionError('validation selection loss accidentally included the training auxiliary')
-    with trainer.ema_parameters():
-        try:
-            trainer.validate_step(**batch, coupling_override=coupling, weights='raw')
-        except RuntimeError as error:
-            assert 'raw validation' in str(error)
-        else:
-            raise AssertionError('temporary EMA weights were misreported as raw')
-
-
-def test_v2_checkpoint_records_recipe_and_resumes_warmup_and_entry_parity():
-    import copy
-
-    trainer, batch, coupling = training_contract_endpoint_trainer_fixture('ternary_endpoint_v2')
-    trainer.train_step(**batch, coupling_override=coupling)
-    payload = copy.deepcopy(trainer.checkpoint_payload())
-    assert payload['checkpoint_version'] == 55
-    payload['checkpoint_version'] = 25  # Historical v2 weights retain their old recipe.
-    assert payload['runtime_config']['ema_update_contract'] == 'optimizer_step_warmup_v1'
-    assert payload['runtime_config']['near_target_supervision']['weight'] == .25
-    assert payload['training_state']['ema_updates'] == payload['global_step'] == 1
-    restored, _, _ = training_contract_endpoint_trainer_fixture('ternary_endpoint_v2')
-    with patch('tricoopdiff.train.torch.load', return_value=payload):
-        restored.load_checkpoint('unused.pt')
-    assert restored.effective_ema_decay == trainer.effective_ema_decay
-    for corrupted in ('ema_updates', 'near_target_supervision'):
-        changed = copy.deepcopy(payload)
-        if corrupted == 'ema_updates':
-            changed['training_state']['ema_updates'] += 1
-        else:
-            changed['runtime_config']['near_target_supervision']['weight'] = 1.
-        with patch('tricoopdiff.train.torch.load', return_value=changed):
-            try:
-                restored.load_checkpoint('unused.pt')
-            except ValueError:
-                pass
-            else:
-                raise AssertionError(f'new recipe accepted corrupt {corrupted}')
-    trainer.train_step(**batch, coupling_override=coupling)
-    with patch('tricoopdiff.train.torch.load', return_value=payload):
-        restored.load_checkpoint('unused.pt')
-    restored.train_step(**batch, coupling_override=coupling)
-    assert all(torch.equal(value, restored.model.trifuse.state_dict()[name])
-               for name, value in trainer.model.trifuse.state_dict().items())
-    assert all(torch.equal(value, restored.ema[name]) for name, value in trainer.ema.items())
-
-
-def test_v1_version24_resume_preserves_fixed_ema_and_no_auxiliary():
-    import copy
-
-    trainer, batch, coupling = training_contract_endpoint_trainer_fixture('ternary_endpoint_v1')
-    payload = copy.deepcopy(trainer.checkpoint_payload())
-    payload['checkpoint_version'] = 24
-    for key in ('training_recipe', 'ema_update_contract', 'near_target_supervision', 'validation_weights'):
-        payload['runtime_config'].pop(key)
-    payload['training_state'].pop('ema_updates')
-    restored, _, _ = training_contract_endpoint_trainer_fixture('ternary_endpoint_v1')
-    with patch('tricoopdiff.train.torch.load', return_value=payload):
-        restored.load_checkpoint('unused.pt')
-    assert restored.effective_ema_decay == .999
-    assert restored.near_target_weight == 0
-    result = restored.train_step(**batch, coupling_override=coupling)
-    assert 'loss_near_target' not in result and len(restored.model.calls) == 3
 
 
 def test_v4_near_entry_cycle_is_orthogonal_to_source_and_batch_boundaries():
-    trainer, batch, coupling = training_contract_endpoint_trainer_fixture('ternary_endpoint_v4')
+    trainer, batch, coupling = training_contract_endpoint_trainer_fixture('ternary_endpoint_v14')
     trainer.effective_batch_size = 8
     seen = []
     def record(**arguments):
@@ -1357,7 +1372,7 @@ def test_v4_near_entry_cycle_is_orthogonal_to_source_and_batch_boundaries():
 
 
 def test_v4_near_supervision_executes_both_inference_and_short_clocks():
-    trainer, batch, coupling = training_contract_endpoint_trainer_fixture('ternary_endpoint_v4', inference_steps=20)
+    trainer, batch, coupling = training_contract_endpoint_trainer_fixture('ternary_endpoint_v14', inference_steps=20)
     for start in (1., .2):
         trainer.model.calls.clear()
         result = trainer.compute_loss(**batch, coupling_override=coupling,
@@ -1377,36 +1392,18 @@ def test_v4_near_supervision_executes_both_inference_and_short_clocks():
             raise AssertionError('unrecorded auxiliary clock was accepted')
 
 
-def test_production_entry_rejects_old_v2_training_recipe_without_reinterpretation():
-    from tricoopdiff.train import validate_assembly_checkpoint
-
-    trainer, _, _ = training_contract_endpoint_trainer_fixture('ternary_endpoint_v2')
-    payload = trainer.checkpoint_payload()
-    payload['checkpoint_version'] = 25
-    validate_assembly_checkpoint(payload)  # Historical inference remains legal.
-    args = parse_args(['--train_data', 'unused', '--val_data', 'unused',
-                       '--output_dir', 'unused', '--resume', 'saved.pt'])
-    with patch('train_entry.torch.load', return_value=payload), \
-            patch('tricoopdiff.models.expert.build_diffdock_expert',
-                  return_value=SimpleNamespace(node_scalar_dim=58)):
-        try:
-            build_trainer(args, 'cpu', input_dim=4)
-        except ValueError as error:
-            assert 'historical coupled near-target recipe' in str(error)
-        else:
-            raise AssertionError('production silently resumed the coupled v2 recipe')
 
 
 def test_v4_resume_preserves_cycle_and_rejects_historical_recipe():
     import copy
     from tricoopdiff.train import LEGACY_NEAR_TARGET_SUPERVISION
 
-    trainer, batch, coupling = training_contract_endpoint_trainer_fixture('ternary_endpoint_v4')
+    trainer, batch, coupling = training_contract_endpoint_trainer_fixture('ternary_endpoint_v14')
     trainer.samples_seen = 5
     payload = copy.deepcopy(trainer.checkpoint_payload())
     assert payload['runtime_config']['training_recipe'] == 'endpoint_near_target_v2'
     assert payload['runtime_config']['near_target_supervision']['start_times'] == [1., .2]
-    restored, _, _ = training_contract_endpoint_trainer_fixture('ternary_endpoint_v4')
+    restored, _, _ = training_contract_endpoint_trainer_fixture('ternary_endpoint_v14')
     with patch('tricoopdiff.train.torch.load', return_value=payload):
         restored.load_checkpoint('unused.pt')
     assert restored.samples_seen == 5
@@ -1449,7 +1446,7 @@ def test_v8_unified_architecture_has_distinct_checkpoint_contract():
 def test_failed_stochastic_microbatch_restores_rng_and_entry_phase():
     from tricoopdiff.runtime import capture_rng_state
 
-    trainer, batch, coupling = training_contract_endpoint_trainer_fixture('ternary_endpoint_v3')
+    trainer, batch, coupling = training_contract_endpoint_trainer_fixture('ternary_endpoint_v14')
     trainer.samples_seen = 2  # This phase uses actual random near-target perturbations.
     trainer.effective_batch_size = 2
     before = capture_rng_state()
@@ -1507,7 +1504,7 @@ def test_optimizer_manifest_rejects_same_shape_moment_swaps_before_live_mutation
     import copy
     import warnings
 
-    trainer, _, _ = training_contract_endpoint_trainer_fixture('ternary_endpoint_v4')
+    trainer, _, _ = training_contract_endpoint_trainer_fixture('ternary_endpoint_v14')
     trainer.model.trifuse.extra = torch.nn.Parameter(trainer.model.trifuse.motion.detach().clone())
     trainer.ema['extra'] = trainer.model.trifuse.extra.detach().clone()
     first, second = trainer.model.trifuse.motion, trainer.model.trifuse.extra
@@ -1542,18 +1539,18 @@ def test_optimizer_manifest_rejects_same_shape_moment_swaps_before_live_mutation
                 raise AssertionError(f'optimizer silently accepted {corruption}')
         assert trainer.optimizer is optimizer
         assert all(torch.equal(value, before[name]) for name, value in trainer.model.trifuse.state_dict().items())
-    # Old v4/27 checkpoints remain readable, without pretending names were known.
+    # Old snapshots cannot acquire current architecture semantics by relabeling.
     legacy = copy.deepcopy(payload)
     legacy['checkpoint_version'] = 27
     legacy.pop('optimizer_mapping_contract')
     legacy.pop('optimizer_parameter_manifest')
-    with warnings.catch_warnings(record=True) as caught, \
-            patch('tricoopdiff.train.torch.load', return_value=legacy):
-        warnings.simplefilter('always')
-        trainer.load_checkpoint('unused.pt')
-    assert any('trusts registration order' in str(item.message) for item in caught)
-    assert torch.equal(trainer.optimizer.state[first]['exp_avg'], optimizer.state[first]['exp_avg'])
-    assert torch.equal(trainer.optimizer.state[second]['exp_avg'], optimizer.state[second]['exp_avg'])
+    with patch('tricoopdiff.train.torch.load', return_value=legacy):
+        try:
+            trainer.load_checkpoint('unused.pt')
+        except ValueError as error:
+            assert 'checkpoint version' in str(error)
+        else:
+            raise AssertionError('retired checkpoint was accepted as the current architecture')
 
 
 # Checkpoint contract

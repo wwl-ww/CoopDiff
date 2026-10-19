@@ -18,6 +18,7 @@
 | [运行指南](训练入口%20SLURM%20与%20Phase1%20smoke%20交接文档.md) | 环境、入口、复跑与验收；SLURM 仅为历史记录 |
 | [问题账本](../Q.md) | 已修复缺陷、未解决限制和证据路径 |
 | [独立二元评估](独立DiffDock小分子评估.md) | 历史两案例对照、小分子 LRMSD/DockQ 口径 |
+| [Matcha 预训练重叠审计](../results/matcha_pretraining_overlap_20261012/README.md) | Matcha 上游 PDBBind/MOAD 训练列表与 MGD94、PROTAC22 的逐例交集和证据边界 |
 | [Ranking与PROTAC条件调研](../RANKING_PROTAC_RESEARCH.md) | 2026-09-15研究提案、C40/C81完整对照、原始资料与后续实验；不是已实现协议 |
 
 `AGENTS.md` 为贡献约定。`hh.md` 是用户原始讨论稿，非现行实现规格。

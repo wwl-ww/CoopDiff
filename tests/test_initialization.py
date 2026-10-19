@@ -5,6 +5,7 @@ if __name__ == "__main__":
 
     run_tests(__file__)
 
+import hashlib
 import math
 import tempfile
 from copy import deepcopy
@@ -16,6 +17,140 @@ import numpy as np
 import torch
 from rdkit import Chem
 from scipy.spatial.transform import Rotation
+
+
+def test_online_cache_reuses_pending_slots_and_never_generates_after_full():
+    import assembly_pipeline as pipeline
+    from tricoopdiff.runtime import atomic_torch_save
+    with tempfile.TemporaryDirectory() as temporary:
+        opt = SimpleNamespace(bank=Path(temporary), online_cache_size=4, seed=73)
+        entry = {'case': 'case'}
+        directory = opt.bank/'case'
+        base = {'format': 'test', 'generator_sha256': 'testdigest'}
+        case_seed = (73+int(hashlib.sha256(b'case').hexdigest()[:8], 16)) % (2**31-1)
+        for slot in range(4):
+            protocol = {**base, 'cache_contract': 'fill_new_then_uniform_fixed_slots_v1',
+                'capacity': 4, 'slot': slot, 'slot_seed': (case_seed+1009*(slot+1)) % (2**31-1)}
+            atomic_torch_save({'protocol': protocol, 'candidate': {'slot': slot}},
+                              directory/f'online_slot_{slot}.pt')
+        with patch.object(pipeline, 'generation_protocol', return_value=base), \
+             patch.object(pipeline, 'docking_job', side_effect=AssertionError('unexpected generation')):
+            # Even if all files exist after an interrupted update, replay the
+            # pending visit's new slot rather than randomly drawing another.
+            for visit in range(4):
+                candidate, _, _ = pipeline.online_candidate(opt, entry, None, None, visit)
+                assert candidate['slot'] == visit
+            choices = [pipeline.online_candidate(opt, entry, None, None, visit)[0]['slot']
+                       for visit in range(4, 104)]
+            assert set(choices) == {0, 1, 2, 3}
+            again = [pipeline.online_candidate(opt, entry, None, None, visit)[0]['slot']
+                     for visit in range(4, 104)]
+            assert choices == again, 'resume changed online cache choices'
+            assert len(list(directory.glob('online_slot_*.pt'))) == 4
+            from tricoopdiff.runtime import atomic_json
+            atomic_json({'protocol': base, 'reason': 'joint ligand ETKDG generation failed'},
+                        directory/'initialization_failed.testdigest.json')
+            try:
+                pipeline.online_candidate(opt, entry, None, None, 104)
+            except pipeline.ConformerGenerationFailure:
+                pass
+            else:
+                raise AssertionError('failed ETKDG case was retried instead of skipped')
+
+
+def test_cached_only_pipeline_never_rebuilds_missing_features():
+    import assembly_pipeline as pipeline
+    with tempfile.TemporaryDirectory() as temporary:
+        opt = SimpleNamespace(cache_dir=temporary, feature_cache_source=None,
+                              cached_only=True, device='cpu')
+        entry = {'case': 'missing', 'protein1': 'p1', 'protein2': 'p2', 'ligand': 'lig'}
+        error = FileNotFoundError('missing: cache-only mode requires a compatible cache directory')
+        with patch.object(pipeline, 'featurize_complex', side_effect=error) as read:
+            try:
+                pipeline.load_case(opt, entry, None, None)
+            except pipeline.FeatureCacheUnavailable:
+                pass
+            else:
+                raise AssertionError('missing cache was reconstructed')
+            assert read.call_args.kwargs['cache_only'] is True
+        # Structural cache corruption is not reclassified as missing data.
+        with patch.object(pipeline, 'featurize_complex', side_effect=ValueError('corrupt tensor')):
+            try:
+                pipeline.load_case(opt, entry, None, None)
+            except ValueError as exc:
+                assert str(exc) == 'corrupt tensor'
+            else:
+                raise AssertionError('cache corruption was silently ignored')
+
+
+def test_cached_only_admission_is_pinned_without_reordering_cases():
+    import assembly_pipeline as pipeline
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        index = root/'index.json'
+        index.touch()
+        cache = root/'features'
+        cache.mkdir()
+        (cache/'b.pt').touch()
+        opt = SimpleNamespace(output=root, cache_dir=cache, feature_cache_source=None, index=index)
+        entries = [{'case': 'a'}, {'case': 'b'}, {'case': 'c'}]
+        manifest = pipeline.cached_admission(opt, entries)
+        assert manifest['ordered_cases'] == ['a', 'b', 'c']
+        assert manifest['available_cases'] == ['b']
+        assert manifest['missing_cache_cases'] == ['a', 'c']
+        (cache/'a.pt').touch()
+        assert pipeline.cached_admission(opt, entries) == manifest, 'resume expanded its dataset'
+
+
+def test_retained_pose_generator_identity_is_explicit_and_not_rewritten():
+    import assembly_pipeline as pipeline
+    opt = SimpleNamespace(reuse_generator_sha256=['old'])
+    expected = {'generator_sha256': 'new', 'seed': 73, 'expert': 'fixed'}
+    recorded = {**expected, 'generator_sha256': 'old'}
+    assert pipeline.same_generation_protocol(recorded, expected, opt)
+    assert recorded['generator_sha256'] == 'old'
+    assert not pipeline.same_generation_protocol({**recorded, 'seed': 74}, expected, opt)
+    assert not pipeline.same_generation_protocol({**recorded, 'generator_sha256': 'unknown'}, expected, opt)
+
+
+def test_shared_conformer_policy_embeds_once_with_random_coordinates():
+    from rdkit.Chem import AllChem
+    from tricoopdiff.initialization import embed_chemical_graph
+    original = AllChem.EmbedMolecule
+    calls = []
+
+    def checked(mol, params):
+        calls.append(params.useRandomCoords)
+        return original(mol, params)
+
+    with patch.object(AllChem, 'EmbedMolecule', side_effect=checked):
+        result, attempts, random_coords = embed_chemical_graph(Chem.MolFromSmiles('CCCC'), 73)
+    assert calls == [True], 'shared generation duplicated embedding or changed SDPI policy'
+    assert attempts == 1 and random_coords and result.GetNumConformers() == 1
+
+
+def test_cluster_epoch_plan_reuses_original_sampling_and_preserves_rng():
+    import assembly_pipeline as pipeline
+    entries = [{'case': name} for name in 'abcdefgh']
+    clusters = [{'items': list(pair), 'representative': [pair[0]]}
+                for pair in ('ab', 'cd', 'ef', 'gh')]
+    available = set('abdefgh')
+    np.random.seed(321)
+    expected_next = np.random.random()
+    np.random.seed(321)
+    selected, shards, owners = pipeline.cluster_epoch_plan(entries, clusters, available, 73, 2, 4)
+    assert np.random.random() == expected_next, 'epoch selection consumed rollout RNG'
+    eligible = [e for e in entries if e['case'] in available]
+    loader = SimpleNamespace(entries=eligible, entries_by_case={e['case']: e for e in eligible},
+                             clusters=clusters, shuffle=True)
+    np.random.seed(75)
+    original = pipeline.TernaryDataLoader._epoch_entries(loader)
+    assert selected == original, 'cluster 80/20 choices or shuffle differs from original loader'
+    assert len(selected) == 4 and [len(s) for s in shards] == [1]*4
+    assert sum(len(s) for s in shards) == len(selected)
+    assert 'c' not in [e['case'] for e in selected]
+    for rank, shard in enumerate(shards):
+        assert all(owners[entries[i]['case']] == rank for i in shard)
 
 
 def test_joint_matcha_generator_is_native_blind_and_uses_all_three_stages():
@@ -1328,3 +1463,226 @@ def test_reflect_rechecks_bond_anomalies_on_final_coordinates():
     assert np.array_equal(result['bond_anomalies'], expected), 'returned pre-repair bond status'
     assert result['n_bond_anomalies'] == expected.sum()
     assert result['is_valid'] == (result['n_clashes'] == 0 and expected.sum() == 0)
+
+
+def test_protac_training_split_keeps_disjoint_warheads_and_linker():
+    from tricoopdiff.initialization.protac import split_training_warheads
+
+    molecule = Chem.MolFromSmiles('CCCCCCCCCCCC')
+    indices = np.arange(molecule.GetNumAtoms(), dtype=float)
+    ligand = np.stack((1.5*indices, .6*(-1.)**indices, .4*np.sin(indices)), axis=1)
+    protein1 = ligand[:3] + np.array([0., 0., 2.])
+    protein2 = ligand[-3:] + np.array([0., 0., 2.])
+    split = split_training_warheads(molecule, ligand, protein1, protein2,
+                                    min_anchor_atoms=5)
+    assert split is not None, 'two separated bound ends were rejected'
+    first, second, linker = (set(split[key]) for key in
+                             ('anchor1_atoms', 'anchor2_atoms', 'linker_atoms'))
+    assert first.isdisjoint(second) and first.isdisjoint(linker) and second.isdisjoint(linker)
+    assert first | second | linker == set(range(molecule.GetNumAtoms()))
+    assert {0, 1, 2} <= first and {9, 10, 11} <= second
+    assert len(linker) >= 2
+    assert split_training_warheads(molecule, ligand, protein1, protein1,
+                                   min_anchor_atoms=5) is None, \
+        'single shared pocket was mislabeled as two warheads'
+
+
+def test_protac_linker_closure_returns_the_selected_conformer():
+    from rdkit.Chem import AllChem
+    from tricoopdiff.initialization.protac import close_linker_to_binary_anchors
+
+    ligand = Chem.MolFromSmiles('CCCCCCCCCC')
+    parameters = AllChem.ETKDGv3()
+    parameters.randomSeed = 29
+    assert AllChem.EmbedMolecule(ligand, parameters) == 0
+    reference = ligand.GetConformer().GetPositions()
+    candidates = close_linker_to_binary_anchors(
+        ligand, [0, 1, 2], reference[[0, 1, 2]],
+        [7, 8, 9], reference[[7, 8, 9]], starts=3, max_iterations=100)
+    assert any(row['conformer_id'] != 0 for row in candidates)
+    for row in candidates:
+        assert row['ligand'].GetNumConformers() == 1
+        assert np.allclose(row['ligand'].GetConformer().GetPositions(),
+                           row['coordinates'], atol=1e-6), \
+            'linker refinement must receive the conformer selected by closure'
+
+
+def test_protac_binary_anchor_assembly_preserves_both_local_binding_poses():
+    from tricoopdiff.geometry.rigid import apply_rigid, invert_rigid, rotation_exp
+    from tricoopdiff.initialization.protac import assemble_from_binary_anchors
+
+    dtype = torch.float64
+    ligand = torch.tensor([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.],
+                           [4., 0., 0.], [5., 0., 0.], [4., 1., 0.], [4., 0., 1.]],
+                          dtype=dtype)
+    protein2 = torch.tensor([[0., 3., 0.], [0., 4., 1.], [1., 3., 1.]], dtype=dtype)
+    body_rotation = rotation_exp(torch.tensor([.2, -.3, .1], dtype=dtype))
+    body_translation = torch.tensor([2., -4., 3.], dtype=dtype)
+    inverse_rotation, inverse_translation = invert_rigid(body_rotation, body_translation)
+    local_anchor2 = apply_rigid(ligand[4:], inverse_rotation, inverse_translation)
+    global_rotation = rotation_exp(torch.tensor([-.4, .2, .3], dtype=dtype))
+    conformer = apply_rigid(ligand, global_rotation,
+                            torch.tensor([7., -5., 2.], dtype=dtype)).requires_grad_()
+    result = assemble_from_binary_anchors(conformer, protein2, ligand[:4],
+                                          local_anchor2, (0, 1, 2, 3), (4, 5, 6, 7))
+    expected_protein2 = apply_rigid(protein2, body_rotation, body_translation)
+    assert torch.allclose(result['ligand'], ligand, atol=1e-8)
+    assert torch.allclose(result['protein2'], expected_protein2, atol=1e-8)
+    assert torch.allclose(result['anchor_rmsd'], torch.zeros(2, dtype=dtype), atol=1e-8)
+    result['protein2'].square().sum().backward()
+    assert conformer.grad is not None and torch.isfinite(conformer.grad).all()
+    assert conformer.grad.abs().sum() > 0, 'linker/warhead geometry cannot steer protein pose'
+
+
+def test_protac_binary_mapping_keeps_all_native_blind_hypotheses():
+    from tricoopdiff.initialization.protac import assemble_binary_mapping_hypotheses
+
+    ligand = torch.tensor([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.],
+                           [4., 0., 0.], [5., 0., 0.], [4., 1., 0.]])
+    protein2 = torch.tensor([[4., 3., 0.], [5., 3., 0.], [4., 3., 1.]])
+    condition = {'mapping_hypotheses': [
+        {'anchor1_atoms': (0, 1, 2), 'anchor2_atoms': (3, 4, 5),
+         'anchor1_xyz': ligand[:3].numpy(), 'anchor2_xyz': ligand[3:].numpy()},
+        {'anchor1_atoms': (0, 1, 2), 'anchor2_atoms': (3, 4, 5),
+         'anchor1_xyz': ligand[:3].numpy(), 'anchor2_xyz': ligand[3:].numpy()},
+    ]}
+    results = assemble_binary_mapping_hypotheses(ligand, protein2, condition)
+    assert len(results) == 2, 'a symmetry-related mapping was silently discarded'
+    assert results[0]['anchor_fit_rmsd'] <= results[1]['anchor_fit_rmsd']
+    assert 'DockQ' not in results[0], 'oracle metric entered mapping feasibility ranking'
+
+
+def test_protac_training_binary_condition_erases_native_relative_pose():
+    from tricoopdiff.initialization.protac import (atom_order_graph_signature,
+                                                   make_training_binary_condition)
+
+    ligand = torch.tensor([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.],
+                           [8., 0., 0.], [9., 0., 0.], [8., 1., 0.]])
+    protein2 = torch.tensor([[8., 2., 0.], [9., 2., 0.], [8., 2., 1.]])
+    molecule = Chem.MolFromSmiles('CCCCCC')
+    split = {'contract': 'synthetic_binary_anchor_split_v1',
+             'anchor1_atoms': (0, 1, 2), 'anchor2_atoms': (3, 4, 5),
+             'atom_order_graph_sha256': atom_order_graph_signature(molecule)}
+    condition = make_training_binary_condition(
+        split, ligand, protein2, generator=torch.Generator().manual_seed(17))
+    assert condition['native_full_ligand_conformer_is_input'] is False
+    assert torch.allclose(condition['anchor1_xyz'], ligand[:3])
+    assert torch.allclose(torch.cdist(condition['anchor2_xyz'],
+                                      condition['protein2_reference']),
+                          torch.cdist(ligand[3:], protein2), atol=1e-5)
+    assert not torch.allclose(condition['anchor2_xyz'], ligand[3:]), \
+        'native relative binary frames leaked into training input'
+
+
+def test_protac_external_anchor_mapping_uses_graph_not_ternary_conformer():
+    from tricoopdiff.initialization.protac import match_external_binary_anchors
+
+    full = Chem.MolFromSmiles('NCCCOCCCl')
+    fragments = [Chem.PathToSubmol(full, bond_path) for bond_path in ((0, 1), (5, 6))]
+    for fragment, offset in zip(fragments, (0., 10.)):
+        conformer = Chem.Conformer(fragment.GetNumAtoms())
+        for atom, point in enumerate(((offset, 0., 0.), (offset+1., 0., 0.),
+                                      (offset+1., 1., 0.))):
+            conformer.SetAtomPosition(atom, point)
+        fragment.AddConformer(conformer)
+    before = match_external_binary_anchors(full, *fragments)
+    assert before is not None, 'unique external warheads were not mapped'
+    assert set(before['anchor1_atoms']).isdisjoint(before['anchor2_atoms'])
+    assert before['native_ternary_coordinates_used'] is False
+    assert len(before['mapping_hypotheses']) == before['symmetry_mapping_count']
+    limited = match_external_binary_anchors(full, *fragments, hypothesis_limit=1)
+    assert limited['symmetry_mapping_count'] == before['symmetry_mapping_count']
+    assert len(limited['mapping_hypotheses']) == 1
+    assert limited['attachment_atoms'] == before['attachment_atoms']
+    assert limited['mapping_hypotheses'][0]['anchor1_atoms'] == \
+        before['mapping_hypotheses'][0]['anchor1_atoms']
+    assert limited['mapping_hypotheses'][0]['anchor2_atoms'] == \
+        before['mapping_hypotheses'][0]['anchor2_atoms']
+    projected = match_external_binary_anchors(
+        full, *fragments, geometry_limit=2,
+        geometry_fragment_atoms=(tuple(range(fragments[0].GetNumAtoms())),
+                                 tuple(range(fragments[1].GetNumAtoms()))))
+    assert projected['symmetry_mapping_count'] == before['symmetry_mapping_count']
+    assert 1 <= len(projected['mapping_hypotheses']) <= 2
+    assert all(len(row['anchor1_fragment_atoms']) == fragments[0].GetNumAtoms()
+               for row in projected['mapping_hypotheses'])
+    assert before['selected_mapping_policy'] == 'inspection_only_enumerate_for_inference'
+    from tricoopdiff.initialization.protac import validate_anchor_graph_identity
+    assert validate_anchor_graph_identity(before, full) == before['atom_order_graph_sha256']
+    renumbered = Chem.RenumberAtoms(full, list(reversed(range(full.GetNumAtoms()))))
+    try:
+        validate_anchor_graph_identity(before, renumbered)
+    except ValueError as error:
+        assert 'atom indices' in str(error)
+    else:
+        raise AssertionError('chemically identical but differently ordered ligand was accepted')
+    random_conformer = Chem.Conformer(full.GetNumAtoms())
+    for atom in range(full.GetNumAtoms()):
+        random_conformer.SetAtomPosition(atom, (atom*7., atom*3., -atom*5.))
+    full.AddConformer(random_conformer)
+    after = match_external_binary_anchors(full, *fragments)
+    assert before['attachment_atoms'] == after['attachment_atoms']
+    assert before['anchor1_atoms'] == after['anchor1_atoms']
+    assert before['anchor2_atoms'] == after['anchor2_atoms']
+
+
+def test_protac_bridge_ignores_unmapped_warhead_substituent():
+    from tricoopdiff.initialization.protac import _bridge_attachment
+
+    molecule = Chem.MolFromSmiles('CC(C)CCC')
+    bridge = _bridge_attachment(molecule, (1, 2), (4, 5))
+    assert bridge == (1, 4, frozenset({3})), \
+        'a peripheral binary-warhead substituent invalidated the true linker'
+
+
+def test_protac_linker_closure_holds_both_binary_poses_fixed():
+    from rdkit.Chem import AllChem
+    from tricoopdiff.initialization.protac import close_linker_to_binary_anchors
+
+    molecule = Chem.MolFromSmiles('c1ccccc1CCc1ccccc1')
+    molecule = Chem.AddHs(molecule)
+    assert AllChem.EmbedMolecule(molecule, randomSeed=31) == 0
+    target = molecule.GetConformer().GetPositions()
+    heavy = Chem.RemoveHs(molecule).GetNumAtoms()
+    first, second = list(range(6)), list(range(8, 14))
+    candidates = close_linker_to_binary_anchors(
+        molecule, first, target[first], second, target[second],
+        seed=47, starts=2, max_iterations=100)
+    assert candidates
+    result = candidates[0]
+    assert result['coordinates'].shape == (heavy, 3)
+    assert result['anchor1_rmsd'] < 1e-6
+    assert result['anchor2_rmsd'] < 1e-6
+    assert np.isfinite(result['strain_energy'])
+    assert np.isfinite(result['coordinates']).all()
+
+
+def test_protac_linker_step_moves_protein_without_breaking_binary_anchors():
+    from tricoopdiff.initialization.protac import anchored_flow_step, linker_torsion_mask
+
+    ligand = torch.tensor([[[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.],
+                            [4., 0., 0.], [5., 0., 0.], [4., 1., 0.], [4., 0., 1.]]],
+                          dtype=torch.float64)
+    protein2 = torch.tensor([[[4., 3., 0.], [5., 3., 1.], [4., 4., 1.]]],
+                            dtype=torch.float64)
+    data = {'coords': ligand, 'edge_index': torch.tensor([[3], [4]]),
+            'edge_mask': torch.tensor([True]),
+            'mask_rotate': torch.tensor([[False]*4+[True]*4])}
+    condition = {'anchor1_atoms': (0, 1, 2, 3), 'anchor2_atoms': (4, 5, 6, 7),
+                 'anchor1_xyz': ligand[0, :4], 'anchor2_xyz': ligand[0, 4:]}
+    assert linker_torsion_mask(data, condition['anchor1_atoms'],
+                               condition['anchor2_atoms']).tolist() == [True]
+    speed = torch.tensor([[1.]], dtype=ligand.dtype, requires_grad=True)
+    zero = torch.zeros((1, 3), dtype=ligand.dtype)
+    velocities = {'e3_ligand': {'tr': zero, 'rot': zero},
+                  'poi_ligand': {'tr': zero, 'rot': zero}, 'torsion': speed}
+    moved_ligand, moved_protein, body, errors = anchored_flow_step(
+        ligand, protein2, torch.eye(3, dtype=ligand.dtype)[None], velocities,
+        torch.tensor([.1], dtype=ligand.dtype), data, protein2, condition)
+    assert torch.allclose(moved_ligand[0, :4], condition['anchor1_xyz'], atol=1e-6)
+    assert torch.allclose(errors, torch.zeros(2, dtype=ligand.dtype), atol=1e-6)
+    assert not torch.allclose(moved_protein, protein2)
+    assert torch.isfinite(body).all()
+    moved_protein.square().sum().backward()
+    assert speed.grad is not None and torch.isfinite(speed.grad).all()
+    assert speed.grad.abs().sum() > 0, 'protein loss cannot train linker torsion'

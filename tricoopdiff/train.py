@@ -26,6 +26,8 @@ from tricoopdiff.models.assembly import (
     LEGACY_CONSENSUS_CHECKPOINT_VERSION, PREVIOUS_CONSENSUS_CHECKPOINT_VERSION,
     SOURCE_CONTRACT_VERSION,
     LEGACY_TORSION_REPRESENTATION,
+    FLOW_MOTION_CONTRACT, BOUNDED_REPAIR_MOTION_CONTRACT,
+    QUALITY_GATED_REPAIR_MOTION_CONTRACT, QUALITY_GATE_ERROR_SCALE,
     candidate_source_tensor,
     CANDIDATE_SOURCE_NAMES,
 )
@@ -34,6 +36,7 @@ from tricoopdiff.models.expert import (expert_base_identity, validate_expert_bas
 from tricoopdiff.runtime import (atomic_torch_save, capture_rng_state, evaluation_context,
                                 preserve_rng, restore_rng_state)
 from tricoopdiff.sdpi_flow import (
+    BOUNDED_CORRECTION_LIMITS, CORRECTION_STATE_NOISE,
     CONTINUOUS_TORSION_MODE, FLOW_VERSION, INDEPENDENT_RIGID_MODE, LEGACY_RIGID_MODE, SDPIFlow,
 )
 
@@ -61,6 +64,61 @@ def clip_grad_norm_finite(parameters, max_norm=1.0):
         for gradient in gradients:
             gradient.mul_(coefficient.to(device=gradient.device, dtype=gradient.dtype))
     return norm
+
+
+def bounded_action_regression_loss(predicted, target, scales):
+    """Average normalized action errors, omitting torsion when no rotors exist."""
+    terms = []
+    for branch in ('e3_ligand', 'poi_ligand'):
+        for component, scale in (('tr', scales['translation_angstrom']),
+                                 ('rot', scales['rotation_radians'])):
+            terms.append(torch.nn.functional.smooth_l1_loss(
+                predicted[branch][component] / scale,
+                target[branch][component] / scale))
+    if predicted['torsion'].numel():
+        terms.append(torch.nn.functional.smooth_l1_loss(
+            predicted['torsion'] / scales['torsion_radians'],
+            target['torsion'] / scales['torsion_radians']))
+    return torch.stack(terms).mean()
+
+
+def bounded_rigid_target_action(current, target):
+    """Build the smallest rigid correction observable from the available atoms."""
+    from tricoopdiff.experiments.joint_endpoint_experiment import stable_so3_log
+    from tricoopdiff.geometry.rigid import proper_rigid_fit, rotation_exp
+
+    if current.shape != target.shape or current.ndim != 3 or current.shape[0] != 1:
+        raise ValueError('rigid repair labels require matching [1, N, 3] coordinates')
+    count = current.shape[-2]
+    if count == 0:
+        raise ValueError('rigid repair labels require at least one aligned point')
+    source, destination = current.detach()[0], target.detach()[0]
+    if count >= 3:
+        rotation, _, _ = proper_rigid_fit(source, destination)
+    elif count == 2:
+        source_axis = torch.nn.functional.normalize(source[1] - source[0], dim=-1)
+        target_axis = torch.nn.functional.normalize(destination[1] - destination[0], dim=-1)
+        cross = torch.linalg.cross(source_axis, target_axis)
+        sine = torch.linalg.vector_norm(cross)
+        cosine = torch.dot(source_axis, target_axis).clamp(-1., 1.)
+        if sine.item() < 1e-7:
+            if cosine.item() >= 0:
+                rotvec = torch.zeros_like(source_axis)
+            else:
+                basis = torch.eye(3, device=source.device, dtype=source.dtype)[
+                    source_axis.abs().argmin()]
+                axis = torch.nn.functional.normalize(torch.linalg.cross(source_axis, basis), dim=-1)
+                rotvec = axis * math.pi
+        else:
+            rotvec = cross * (torch.atan2(sine, cosine) / sine)
+        rotation = rotation_exp(rotvec)
+    else:
+        # One atom has no observable orientation; do not invent one.
+        rotation = torch.eye(3, device=source.device, dtype=source.dtype)
+    return {
+        'tr': current.detach().mean(1) - target.detach().mean(1),
+        'rot': -stable_so3_log(rotation).reshape(1, 3),
+    }
 
 
 class TriCoopDiffTrainer:
@@ -510,6 +568,9 @@ def validate_assembly_checkpoint(payload):
                                                'torsion_representation_contract', LEGACY_TORSION_REPRESENTATION),
                                            protein_local_geometry_contract=model_config.get(
                                                'protein_local_geometry_contract', 'none'),
+                                           protac_anchor_contract=model_config.get(
+                                               'protac_anchor_contract'),
+                                           motion_contract=model_config.get('motion_contract', FLOW_MOTION_CONTRACT),
                                            **({'conditioning_contract': model_config['conditioning_contract']}
                                               if 'conditioning_contract' in model_config else {}))
         if model_config != expected:
@@ -557,15 +618,31 @@ def validate_assembly_checkpoint(payload):
             raise ValueError('current assembly requires cross-edge tapering, unchanged internal expert edges, and a fixed full-receptor node set')
     if version >= 25:
         profile = model_config.get('model_profile')
+        motion = model_config.get('motion_contract', FLOW_MOTION_CONTRACT)
         new_recipe = profile in ('ternary_endpoint_v2', 'ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE)
         near_config = NEAR_TARGET_SUPERVISION if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE) else LEGACY_NEAR_TARGET_SUPERVISION
-        expected = {'training_recipe': ('endpoint_near_target_v2' if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE) else 'endpoint_near_target_v1')
-                                       if new_recipe else 'endpoint_only_v1',
+        expected_recipe = ('quality_gated_iterative_repair_v1' if motion == QUALITY_GATED_REPAIR_MOTION_CONTRACT else
+                           'bounded_iterative_repair_v1' if motion == BOUNDED_REPAIR_MOTION_CONTRACT else
+                           'endpoint_near_target_v2' if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE) else
+                           'endpoint_near_target_v1' if profile == 'ternary_endpoint_v2' else 'endpoint_only_v1')
+        expected = {'training_recipe': expected_recipe,
                     'ema_update_contract': 'optimizer_step_warmup_v1' if new_recipe else 'optimizer_step_fixed_v1',
                     'near_target_supervision': near_config if new_recipe else None,
                     'validation_weights': 'ema'}
         if any(config.get(key) != value for key, value in expected.items()):
             raise ValueError('checkpoint has an incompatible endpoint/EMA training recipe')
+        if config.get('motion_contract', FLOW_MOTION_CONTRACT) != motion:
+            raise ValueError('checkpoint motion contract and controller configuration disagree')
+        if motion == BOUNDED_REPAIR_MOTION_CONTRACT:
+            if (config.get('repair_action_target_contract') != 'reachable_endpoint_step_target_v1'
+                    or config.get('repair_limits') != BOUNDED_CORRECTION_LIMITS
+                    or config.get('repair_state_noise') != CORRECTION_STATE_NOISE):
+                raise ValueError('bounded repair checkpoint has an unknown action/noise contract')
+        if motion == QUALITY_GATED_REPAIR_MOTION_CONTRACT:
+            if (config.get('repair_action_target_contract') != 'reachable_endpoint_step_target_v1'
+                    or config.get('repair_limits') != BOUNDED_CORRECTION_LIMITS
+                    or config.get('repair_state_noise') != CORRECTION_STATE_NOISE):
+                raise ValueError('quality-gated repair checkpoint has an unknown gating contract')
         if payload.get('checkpoint_kind') != 'inference_only':
             updates = payload.get('training_state', {}).get('ema_updates')
             if isinstance(updates, bool) or not isinstance(updates, int) or updates != payload.get('global_step'):
@@ -684,7 +761,18 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         configure_expert_policy(self.model.expert, self.activation_clamp, self.activation_clamp_mode)
         self.ema_decay = float(ema_decay)
         profile = self.model.trifuse.config.get('model_profile')
-        self.training_recipe = ('endpoint_near_target_v2' if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE)
+        self.motion_contract = self.model.trifuse.config.get('motion_contract', FLOW_MOTION_CONTRACT)
+        if self.motion_contract not in (FLOW_MOTION_CONTRACT, BOUNDED_REPAIR_MOTION_CONTRACT,
+                                       QUALITY_GATED_REPAIR_MOTION_CONTRACT):
+            raise ValueError('unsupported assembly motion contract')
+        if (self.motion_contract in (BOUNDED_REPAIR_MOTION_CONTRACT,
+                                     QUALITY_GATED_REPAIR_MOTION_CONTRACT)
+                and (not self.model.trifuse.config.get('candidate_driven')
+                     or self.model.trifuse.config.get('protac_anchor_contract'))):
+            raise ValueError('bounded iterative repair currently requires the candidate-driven ternary contract')
+        self.training_recipe = ('quality_gated_iterative_repair_v1' if self.motion_contract == QUALITY_GATED_REPAIR_MOTION_CONTRACT
+                                else 'bounded_iterative_repair_v1' if self.motion_contract == BOUNDED_REPAIR_MOTION_CONTRACT
+                                else 'endpoint_near_target_v2' if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE)
                                 else 'endpoint_near_target_v1' if profile == 'ternary_endpoint_v2'
                                 else 'endpoint_only_v1')
         self.ema_update_contract = ('optimizer_step_warmup_v1'
@@ -713,7 +801,7 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                      t_override=None, t_pol_override=None, coupling_override=None,
                      diagnostics=False, source=0, conditions=None, near_target_zero=None,
                      near_target_start_t=None, initialization_seed_override=None,
-                     near_noise_override=None):
+                     near_noise_override=None, task_mode=None):
         if near_target_start_t is not None and near_target_zero is None:
             raise ValueError('near-target start time requires an auxiliary entry')
         if near_target_zero is not None:
@@ -733,6 +821,28 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         ed = {**e3_data, 'coords': e3_data['coords'].to(self.device)}
         pd = {**poi_data, 'coords': poi_data['coords'].to(self.device)}
         ld = {**ligand_data, 'coords': ligand_data['coords'].to(self.device)}
+        target_poi = pd['coords']
+        protac_anchor_mode = bool(self.model.trifuse.config.get('protac_anchor_contract'))
+        if protac_anchor_mode:
+            if near_target_zero is not None or near_target_start_t is not None:
+                raise ValueError('near-target auxiliary entries are not defined for dual-anchor training')
+            if (not isinstance(conditions, dict) or
+                    conditions.get('contract') != 'synthetic_independent_binary_frames_v1' or
+                    'protein2_reference' not in conditions):
+                raise ValueError('dual-anchor training requires a synthetic binary-frame condition')
+            from tricoopdiff.initialization.protac import validate_anchor_graph_identity
+            validate_anchor_graph_identity(conditions, ld.get('mol'))
+            binary_poi = torch.as_tensor(conditions['protein2_reference'], device=self.device,
+                                         dtype=pd['coords'].dtype)
+            if binary_poi.shape != pd['coords'][0].shape or not torch.isfinite(binary_poi).all():
+                raise ValueError('synthetic binary protein-2 frame must be finite and node-aligned')
+            pd = {**pd, 'coords': binary_poi.unsqueeze(0)}
+        if self.model.trifuse.config.get('candidate_driven'):
+            from tricoopdiff.models.assembly import TASK_NAMES
+            if task_mode is None:
+                raise ValueError('candidate training requires an explicit assemble/refine task mode')
+            candidate_source_tensor(task_mode, pd['coords'], TASK_NAMES)
+            pd['task_mode'] = task_mode
         no_torsion = bool(getattr(self.model.expert.model, 'no_torsion', False))
         dt = ld['coords'].new_full((1,), 1 / self.diffusion.inference_steps)
         projection = None
@@ -741,7 +851,42 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         source = int(candidate_source_tensor(source, dt, source_names).item())
         from tricoopdiff.initialization import TernaryInitializer
         from tricoopdiff.initialization.endpoints import reachable_ligand_target, EndpointProjectionError
-        if coupling_override is None:
+        repair_mode = self.motion_contract in (BOUNDED_REPAIR_MOTION_CONTRACT,
+                                               QUALITY_GATED_REPAIR_MOTION_CONTRACT)
+
+        def project_target(data, initial_ligand, initial_poi, native_poi):
+            result = reachable_ligand_target(
+                data, initial_ligand, initial_poi, native_poi,
+                no_torsion=no_torsion, return_coupling=repair_mode)
+            return (*result, ) if repair_mode else (*result, None)
+
+        correction_coupling = None
+        if protac_anchor_mode:
+            if coupling_override is not None or int(source) != 0:
+                raise ValueError('dual-anchor training samples an SDPI conformer for each update')
+            seed = (int(torch.randint(0, 2**31 - 1, (1,)).item())
+                    if initialization_seed_override is None else int(initialization_seed_override))
+            ligand, _, _, _ = TernaryInitializer(no_torsion=no_torsion).initialize(
+                ed['coords'][0], pd['coords'][0], ld, seed=seed)
+            from tricoopdiff.initialization.protac import assemble_from_binary_anchors
+            assembled = assemble_from_binary_anchors(
+                ligand[0], pd['coords'][0],
+                torch.as_tensor(conditions['anchor1_xyz'], device=self.device,
+                                dtype=ld['coords'].dtype),
+                torch.as_tensor(conditions['anchor2_xyz'], device=self.device,
+                                dtype=ld['coords'].dtype),
+                conditions['anchor1_atoms'], conditions['anchor2_atoms'])
+            ligand = assembled['ligand'].unsqueeze(0)
+            poi = assembled['protein2'].unsqueeze(0)
+            body = assembled['protein2_rotation'].unsqueeze(0)
+            try:
+                target, projection, correction_coupling = project_target(
+                    ld, ligand, poi, target_poi)
+            except EndpointProjectionError as error:
+                error.diagnostics.update(case=case, seed=seed, no_torsion=no_torsion,
+                                         initialization='protac_binary_anchor')
+                raise
+        elif coupling_override is None:
             if int(source) != 0:
                 raise ValueError('BiTSeed training requires its actual sampled state')
             seed = (int(torch.randint(0, 2**31 - 1, (1,)).item())
@@ -749,8 +894,8 @@ class AssemblyTrainer(TriCoopDiffTrainer):
             ligand, poi, body, _ = TernaryInitializer(no_torsion=no_torsion).initialize(
                 ed['coords'][0], pd['coords'][0], ld, seed=seed)
             try:
-                target, projection = reachable_ligand_target(
-                    ld, ligand, poi, pd['coords'], no_torsion=no_torsion)
+                target, projection, correction_coupling = project_target(
+                    ld, ligand, poi, pd['coords'])
             except EndpointProjectionError as error:
                 error.diagnostics.update(case=case, seed=seed, no_torsion=no_torsion)
                 raise
@@ -769,50 +914,55 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                         or not torch.allclose(body.transpose(-1, -2) @ body, eye, atol=1e-4, rtol=1e-4)
                         or not torch.allclose(torch.linalg.det(body), body.new_ones(1), atol=1e-4, rtol=1e-4)):
                     raise ValueError('candidate training requires finite aligned coordinates and a proper body rotation')
+            # One projection path for generated and caller-supplied labels.
+            # In particular, short-chain candidates must use the full body pose
+            # in both paths, not fall back to an underdetermined CA rotation.
+            from tricoopdiff.initialization.endpoints import endpoint_input_signature
+            projection_initial, projection_native = poi, pd['coords']
+            if self.model.trifuse.config.get('candidate_driven'):
+                projection_native = pd['steric_atoms']
+                projection_initial = ((projection_native-pd['coords'].mean(1, keepdim=True))
+                    @ body.transpose(-1, -2)+poi.mean(1, keepdim=True))
+            signature = endpoint_input_signature({
+                'e3_data': {}, 'poi_data': {'native': projection_native, 'initial': projection_initial},
+                'ligand_data': {**{key: ld[key] for key in
+                    ('coords', 'edge_index', 'edge_mask', 'mask_rotate') if key in ld},
+                    'initial': ligand, 'target': ld['coords'], 'no_torsion': no_torsion}})
+            cache = getattr(self, '_endpoint_targets', {})
+            if signature not in cache:
+                projected, report, correction_coupling = project_target(
+                    ld, ligand, projection_initial, projection_native)
+                if len(cache) >= 128:
+                    cache.pop(next(iter(cache)))
+                cache[signature] = (torch.as_tensor(projected).detach().cpu().clone(), report,
+                                    correction_coupling)
+                self._endpoint_targets = cache
+            cached = cache[signature]
+            target, projection = cached[:2]
+            correction_coupling = cached[2] if repair_mode else None
             if 'target_ligand' in coupling_override:
-                # A caller-supplied label is not evidence that it belongs to
-                # this conformer's reachable set or this native target.
-                from tricoopdiff.initialization.endpoints import endpoint_input_signature
                 supplied = torch.as_tensor(coupling_override['target_ligand'],
-                                           device=self.device, dtype=ld['coords'].dtype)
+                    device=self.device, dtype=ld['coords'].dtype)
                 if supplied.numel() != ld['coords'].numel() or not torch.isfinite(supplied).all():
                     raise ValueError('precomputed target has invalid shape or nonfinite coordinates')
                 supplied = supplied.reshape_as(ld['coords'])
-                signature = endpoint_input_signature({
-                    'e3_data': {}, 'poi_data': {'native': pd['coords'], 'initial': poi},
-                    'ligand_data': {**{key: ld[key] for key in
-                        ('coords', 'edge_index', 'edge_mask', 'mask_rotate') if key in ld},
-                        'initial': ligand, 'target': supplied, 'no_torsion': no_torsion}})
-                cache = getattr(self, '_verified_override_targets', {})
-                if signature not in cache:
-                    projected, report = reachable_ligand_target(
-                        ld, ligand, poi, pd['coords'], no_torsion=no_torsion)
-                    projected = torch.as_tensor(projected, device=self.device,
-                                                dtype=supplied.dtype).reshape_as(supplied)
-                    error = (projected - supplied).square().sum(-1).mean().sqrt()
-                    if not torch.isfinite(error) or error.item() > 1e-3:
-                        raise ValueError(
-                            f'{case}: precomputed target does not match the reachable '
-                            f'native projection for this initialization (RMSD={error.item():.6g} A)')
-                    if len(cache) >= 128:
-                        cache.pop(next(iter(cache)))
-                    cache[signature] = report
-                    self._verified_override_targets = cache
-                target, projection = supplied, cache[signature]
-            else:
-                projection_initial, projection_native = poi, pd['coords']
-                if self.model.trifuse.config.get('candidate_driven'):
-                    projection_native = pd['steric_atoms']
-                    projection_initial = ((projection_native-pd['coords'].mean(1, keepdim=True))
-                        @ body.transpose(-1, -2)+poi.mean(1, keepdim=True))
-                target, projection = reachable_ligand_target(
-                    ld, ligand, projection_initial, projection_native, no_torsion=no_torsion)
+                error = (target.to(supplied).reshape_as(supplied)-supplied).square().sum(-1).mean().sqrt()
+                if not torch.isfinite(error) or error.item() > 1e-3:
+                    raise ValueError(f'{case}: precomputed target does not match the reachable '
+                                     f'native projection for this initialization (RMSD={error.item():.6g} A)')
         target_ligand = torch.as_tensor(target, device=self.device,
                                         dtype=ld['coords'].dtype).reshape_as(ld['coords'])
         if ligand.shape != ld['coords'].shape or poi.shape != pd['coords'].shape:
             raise ValueError('actual initialization atom counts must match the indexed inputs')
-        result = self._endpoint_rollout_loss(
-            ed, pd, ld, ligand, poi, body, target_ligand, source, conditions)
+        if repair_mode:
+            result = self._bounded_repair_rollout_loss(
+                ed, pd, ld, ligand, poi, body, target_ligand, target_poi,
+                correction_coupling, source, conditions,
+                add_state_noise=bool(self.model.training))
+        else:
+            result = self._endpoint_rollout_loss(
+                ed, pd, ld, ligand, poi, body, target_ligand, source, conditions,
+                target_poi=target_poi)
         result['loss_endpoint_main'] = result['loss_total']
         if projection is not None:
             result['target_projection_rmsd_angstrom'] = projection['ligand_projection_rmsd_angstrom']
@@ -836,9 +986,21 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                 with torch.no_grad():
                     near_ligand, near_poi, near_body = self.diffusion.differentiable_step(
                         near_ligand, near_poi, near_body, velocities, dt.new_ones((1,)), ld)
-            near = self._endpoint_rollout_loss(
-                ed, pd, ld, near_ligand, near_poi, near_body, target_ligand, source,
-                conditions, t_start=start_t, steps=max(1, math.ceil(self.diffusion.inference_steps * start_t)))
+            if repair_mode:
+                near_angles = (ld['coords'].new_zeros(
+                    (1, 0 if no_torsion else int(ld['edge_mask'].sum()))) if near_target_zero else
+                    near_noise_override['torsion'] if near_noise_override is not None else
+                    velocities['torsion'])
+                near_coupling = {'angles': near_angles.detach().cpu().numpy().reshape(-1)}
+                near = self._bounded_repair_rollout_loss(
+                    ed, pd, ld, near_ligand, near_poi, near_body,
+                    target_ligand, target_poi, near_coupling, source, conditions,
+                    add_state_noise=False, start_t=start_t,
+                    steps_override=max(1, math.ceil(self.diffusion.inference_steps * start_t)))
+            else:
+                near = self._endpoint_rollout_loss(
+                    ed, pd, ld, near_ligand, near_poi, near_body, target_ligand, source,
+                    conditions, t_start=start_t, steps=max(1, math.ceil(self.diffusion.inference_steps * start_t)))
             result['components']['loss_near_target'] = near['loss_total']
             result['loss_total'] = result['loss_total'] + self.near_target_weight * near['loss_total']
         if not torch.isfinite(result['loss_total']):
@@ -849,51 +1011,249 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         return {'loss_total': result['loss_total'], 'loss_score': result['loss_total'].detach().item(),
                 'loss_endpoint_main': result['loss_endpoint_main'].detach().item(),
                 'native_interface_pairs': result['native_interface_pairs'],
+                **{key: result[key] for key in ('candidate_quality_features', 'candidate_quality_target')
+                   if key in result},
                 **{key: result[key] for key in ('target_projection_rmsd_angstrom', 'target_projection_nfev')
                    if key in result},
                 **{f'{side}_ligand_interface_pairs': count
                    for side, count in result['ligand_interface_pairs'].items()},
                 **{name: value.detach().item() for name, value in result['components'].items()}}
 
-    def _endpoint_rollout_loss(self, ed, pd, ld, ligand, poi, body, target_ligand,
-                               source, conditions, t_start=1., steps=None):
-        """One geometric objective for both full starts and reachable short starts."""
-        for t, dt in self.diffusion.reverse_times(ld['coords'], steps=steps, t_start=t_start):
-            output = self._forward_state(ed, pd, ld, ligand, poi, body, t, dt, source, conditions)
-            normalized = self.diffusion.normalized_predictions(output, t)
-            velocities = self.diffusion.velocities(normalized, ed['coords'], pd['coords'])
-            ligand, poi, body = self.diffusion.differentiable_step(
-                ligand, poi, body, velocities, dt, ld)
+    def _geometry_losses(self, ed, pd, ld, ligand, poi, body, target_ligand,
+                         target_poi=None):
+        """Identical geometry definitions for initial and corrected structures."""
         # Use the same physical coordinate scale for both moving components.
         # Radius-normalizing only the protein makes sacrificing its interface
         # artificially cheap when improving the ligand. Targets are reachable.
+        target_poi = pd['coords'] if target_poi is None else target_poi
         losses = {'loss_ligand_geometry': ((ligand - target_ligand) / LIGAND_GEOMETRY_SCALE_ANGSTROM).square().mean(),
-                  'loss_protein_geometry': ((poi - pd['coords']) / PROTEIN_GEOMETRY_SCALE_ANGSTROM).square().mean()}
+                  'loss_protein_geometry': ((poi - target_poi) / PROTEIN_GEOMETRY_SCALE_ANGSTROM).square().mean()}
         if self.model.trifuse.config.get('candidate_driven'):
             moved_atoms = ((pd['steric_atoms']-pd['coords'].mean(1, keepdim=True))
                 @ body.transpose(-1, -2)+poi.mean(1, keepdim=True))
             losses['loss_protein_geometry'] = ((moved_atoms-pd['steric_atoms'])/
                                               PROTEIN_GEOMETRY_SCALE_ANGSTROM).square().mean()
         total = sum(losses.values())
+        if self.model.trifuse.config.get('candidate_driven'):
+            from tricoopdiff.geometry.rigid import rotation_angle_squared
+            # R=I restores the indexed monomer orientation. These are endpoint
+            # labels only; neither native center nor target rotation enters input.
+            losses['loss_protein_translation'] = ((poi.mean(1)-pd['coords'].mean(1)) /
+                                                 PROTEIN_GEOMETRY_SCALE_ANGSTROM).square().mean()
+            losses['loss_protein_rotation'] = rotation_angle_squared(body).mean()
         ligand_interfaces, ligand_interface_counts = terminal_ligand_interface_losses(
-            ed['coords'], pd['coords'], target_ligand, poi, ligand)
+            ed['coords'], target_poi, target_ligand, poi, ligand)
         losses.update(ligand_interfaces)
         total = total + LIGAND_INTERFACE_CONTRACT['per_interface_weight'] * sum(ligand_interfaces.values())
         interface_pairs = 0
         if self.interface_loss_weight:
             interface, interface_pairs = terminal_interface_losses(
-                ed['coords'], pd['coords'], poi, self.interface_cutoff,
+                ed['coords'], target_poi, poi, self.interface_cutoff,
                 error_scale=self.interface_error_scale)
             losses.update(interface)
             total = total + self.interface_loss_weight * sum(interface.values())
         if self.steric_loss_weight:
             steric = (candidate_fullatom_repulsion(ed, pd, ld, poi, ligand, body)
                       if self.model.trifuse.config.get('candidate_driven') else
-                      coarse_intercomponent_repulsion(ed['coords'], pd['coords'], target_ligand,
+                      coarse_intercomponent_repulsion(ed['coords'], target_poi, target_ligand,
                                                       poi, ligand, self.steric_cutoff))
             losses['loss_clash_geometry'] = steric
             total = total + self.steric_loss_weight * steric
-        total = self.endpoint_loss_weight * total
+        return losses, total, interface_pairs, ligand_interface_counts
+
+    def _bounded_repair_rollout_loss(self, ed, pd, ld, ligand, poi, body,
+                                     target_ligand, target_poi, coupling,
+                                     source, conditions, *, add_state_noise=True,
+                                     start_t=1., steps_override=None):
+        """Train bounded corrections on states produced by the current policy.
+
+        Translation/rotation teachers are recomputed from the current pose to
+        the reachable endpoint. Torsion residuals are propagated in the
+        executor's angular coordinates. Coordinates are detached between
+        steps: this is iterative supervised repair, not a 20-step BPTT path.
+        """
+        if coupling is None:
+            raise ValueError('bounded repair requires the reachable projection coupling')
+        from tricoopdiff.sdpi_flow import (
+            BOUNDED_CORRECTION_LIMITS, CORRECTION_STATE_NOISE,
+            CONTINUOUS_TORSION_MODE, INDEPENDENT_RIGID_MODE,
+        )
+
+        candidate_mode = bool(self.model.trifuse.config.get('candidate_driven'))
+        if candidate_mode:
+            pd = {**pd, 'candidate_reference': {
+                'ligand': ligand.detach().clone(), 'poi': poi.detach().clone(),
+                'body': body.detach().clone()}}
+        initial_ligand, initial_poi, initial_body = ligand.detach(), poi.detach(), body.detach()
+        initial_quality_loss = None
+        if candidate_mode and self.motion_contract == QUALITY_GATED_REPAIR_MOTION_CONTRACT:
+            zero = ligand.new_zeros(1)
+            initial_quality = self._forward_state(ed, pd, ld, initial_ligand, initial_poi,
+                                                  initial_body, zero, zero, source, conditions)
+            initial_geometry, _, _, _ = self._geometry_losses(
+                ed, pd, ld, initial_ligand, initial_poi, initial_body,
+                target_ligand, target_poi)
+            initial_interfaces, _ = terminal_ligand_interface_losses(
+                ed['coords'], target_poi, target_ligand, initial_poi, initial_ligand)
+            initial_targets = torch.stack((initial_geometry['loss_protein_geometry'],
+                ((initial_ligand-ld['coords'])/LIGAND_GEOMETRY_SCALE_ANGSTROM).square().mean(),
+                initial_interfaces['loss_interface_e3_ligand'] + initial_interfaces['loss_contact_e3_ligand'],
+                initial_interfaces['loss_interface_poi_ligand'] + initial_interfaces['loss_contact_poi_ligand'],
+                initial_geometry.get('loss_clash_geometry', initial_ligand.new_zeros(()))))
+            initial_quality_loss = torch.nn.functional.smooth_l1_loss(
+                initial_quality['quality_errors'], torch.log1p(initial_targets.detach()).reshape(1, -1))
+        steps = self.diffusion.inference_steps if steps_override is None else int(steps_override)
+        if steps < 1 or not 0 < float(start_t) <= 1:
+            raise ValueError('bounded repair requires positive steps and a start clock in (0,1]')
+        step_dt = ligand.new_full((1,), float(start_t) / steps)
+        action_modes = {'rigid_output_mode': INDEPENDENT_RIGID_MODE}
+        if self.model.trifuse.config.get('model_profile') in (
+                'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE):
+            action_modes['torsion_update_mode'] = CONTINUOUS_TORSION_MODE
+
+        remaining_torsion = torch.as_tensor(
+            coupling['angles'], device=ligand.device, dtype=ligand.dtype).reshape(1, -1)
+        # The executor subtracts actions. The projection coupling describes
+        # the start-to-target path, so its reverse correction has the opposite sign.
+        remaining_torsion = -remaining_torsion
+        noise_applied = False
+        if add_state_noise and torch.rand((), device=ligand.device).item() < CORRECTION_STATE_NOISE['probability']:
+            noise = {
+                'e3_ligand': {
+                    'tr': ligand.new_empty((1, 3)).normal_(0, CORRECTION_STATE_NOISE['translation_std_angstrom']),
+                    'rot': ligand.new_empty((1, 3)).normal_(0, CORRECTION_STATE_NOISE['rotation_std_radians']),
+                },
+                'poi_ligand': {
+                    'tr': ligand.new_empty((1, 3)).normal_(0, CORRECTION_STATE_NOISE['translation_std_angstrom']),
+                    'rot': ligand.new_empty((1, 3)).normal_(0, CORRECTION_STATE_NOISE['rotation_std_radians']),
+                },
+                'torsion': ligand.new_empty((1, remaining_torsion.shape[-1])).normal_(
+                    0, CORRECTION_STATE_NOISE['torsion_std_radians']),
+                **action_modes,
+            }
+            with torch.no_grad():
+                ligand, poi, body = self.diffusion.differentiable_step(
+                    ligand, poi, body, noise, torch.ones_like(step_dt), ld)
+            remaining_torsion = remaining_torsion - noise['torsion']
+            noise_applied = True
+
+        action_losses = []
+        for index in range(steps):
+            t = ligand.new_full((1,), float(start_t) * (1. - index / steps))
+            output = self._forward_state(ed, pd, ld, ligand, poi, body, t, step_dt,
+                                         source, conditions)
+            predicted = self.diffusion.velocities(
+                self.diffusion.normalized_predictions(output, t), ed['coords'], pd['coords'])
+            predicted = self.diffusion.bounded_correction(predicted)
+            target = {
+                'e3_ligand': bounded_rigid_target_action(ligand, target_ligand),
+                'poi_ligand': bounded_rigid_target_action(poi, target_poi),
+                'torsion': remaining_torsion,
+                **action_modes,
+            }
+            target = self.diffusion.bounded_correction(target)
+            scales = BOUNDED_CORRECTION_LIMITS
+            action_losses.append(bounded_action_regression_loss(predicted, target, scales))
+            with torch.no_grad():
+                ligand, poi, body = self.diffusion.differentiable_step(
+                    ligand.detach(), poi.detach(), body.detach(), predicted,
+                    torch.ones_like(step_dt), ld)
+                remaining_torsion = torch.remainder(
+                    remaining_torsion - predicted['torsion'].detach() + math.pi,
+                    2 * math.pi) - math.pi
+
+        losses, raw_total, interface_pairs, ligand_interface_counts = self._geometry_losses(
+            ed, pd, ld, ligand.detach(), poi.detach(), body.detach(),
+            target_ligand, target_poi)
+        repair_loss = torch.stack(action_losses).mean()
+        losses.update(loss_repair_action=repair_loss,
+                      loss_raw_endpoint_geometry=raw_total,
+                      loss_initial_endpoint_geometry=self._geometry_losses(
+                          ed, pd, ld, initial_ligand, initial_poi, initial_body,
+                          target_ligand, target_poi)[1],
+                      loss_repair_noise_applied=ligand.new_tensor(float(noise_applied)))
+        total = repair_loss
+        if candidate_mode:
+            zero = ligand.new_zeros(1)
+            final = self._forward_state(ed, pd, ld, ligand.detach(), poi.detach(),
+                                        body.detach(), zero, zero, source, conditions)
+            native_interfaces, _ = terminal_ligand_interface_losses(
+                ed['coords'], target_poi, target_ligand, poi.detach(), ligand.detach())
+            targets = torch.stack((losses['loss_protein_geometry'],
+                ((ligand.detach()-ld['coords'])/LIGAND_GEOMETRY_SCALE_ANGSTROM).square().mean(),
+                native_interfaces['loss_interface_e3_ligand'] + native_interfaces['loss_contact_e3_ligand'],
+                native_interfaces['loss_interface_poi_ligand'] + native_interfaces['loss_contact_poi_ligand'],
+                losses.get('loss_clash_geometry', ligand.new_zeros(()))))
+            quality_loss = torch.nn.functional.smooth_l1_loss(
+                final['quality_errors'], torch.log1p(targets.detach()).reshape(1, -1))
+            if initial_quality_loss is not None:
+                quality_loss = .5 * (quality_loss + initial_quality_loss)
+            losses['loss_candidate_quality'] = quality_loss
+            total = total + .1 * quality_loss
+            quality_features = final['candidate_quality_features']
+            quality_target = torch.log1p(targets.detach()).reshape(1, -1)
+        else:
+            quality_features = quality_target = None
+        ligand_rmsd = (ligand.detach() - target_ligand.detach()).square().sum(-1).mean().sqrt()
+        return {'loss_total': total, 'components': losses,
+                'native_interface_pairs': interface_pairs,
+                'ligand_interface_pairs': ligand_interface_counts,
+                'ligand_target_rmsd_angstrom': ligand_rmsd,
+                'predicted_ligand': ligand.detach(), 'predicted_poi': poi.detach(),
+                **({'candidate_quality_features': quality_features,
+                    'candidate_quality_target': quality_target}
+                   if candidate_mode else {})}
+
+    def _endpoint_rollout_loss(self, ed, pd, ld, ligand, poi, body, target_ligand,
+                               source, conditions, t_start=1., steps=None,
+                               target_poi=None):
+        """One geometric objective for both full starts and reachable short starts."""
+        candidate_mode = self.model.trifuse.config.get('candidate_driven', False)
+        if candidate_mode:
+            pd = {**pd, 'candidate_reference': {'ligand': ligand.detach().clone(),
+                'poi': poi.detach().clone(), 'body': body.detach().clone()}}
+            with torch.no_grad():
+                _, initial_total, _, _ = self._geometry_losses(
+                ed, pd, ld, ligand, poi, body, target_ligand, target_poi)
+        for t, dt in self.diffusion.reverse_times(ld['coords'], steps=steps, t_start=t_start):
+            output = self._forward_state(ed, pd, ld, ligand, poi, body, t, dt, source, conditions)
+            normalized = self.diffusion.normalized_predictions(output, t)
+            velocities = self.diffusion.velocities(normalized, ed['coords'], pd['coords'])
+            if self.model.trifuse.config.get('protac_anchor_contract'):
+                from tricoopdiff.initialization.protac import anchored_flow_step
+                ligand, poi, body, _ = anchored_flow_step(
+                    ligand, poi, body, velocities, dt, ld, pd['coords'], conditions)
+            else:
+                ligand, poi, body = self.diffusion.differentiable_step(
+                    ligand, poi, body, velocities, dt, ld)
+        losses, raw_total, interface_pairs, ligand_interface_counts = self._geometry_losses(
+            ed, pd, ld, ligand, poi, body, target_ligand, target_poi)
+        if candidate_mode:
+            # The actual terminal geometry objective remains the repair target;
+            # quality prediction is supervised separately on input and output.
+            weighted = []
+            for name, value in losses.items():
+                if name == 'loss_protein_geometry':
+                    continue  # Full-atom Cartesian error is diagnostic/quality, not the pose control target.
+                weight = (self.steric_loss_weight if name == 'loss_clash_geometry' else
+                          self.interface_loss_weight if name in ('loss_interface_geometry', 'loss_contact_geometry') else
+                          LIGAND_INTERFACE_CONTRACT['per_interface_weight']
+                          if name.startswith(('loss_interface_', 'loss_contact_')) else 1.)
+                # Angular error is already bounded by pi**2. For other terms,
+                # a square-root tail preserves more correction signal than log.
+                control_error = value if name == 'loss_protein_rotation' else torch.sqrt(1. + value) - 1.
+                weighted.append((name, weight, control_error))
+            denominator = sum(weight for _, weight, _ in weighted)
+            geometry_loss = sum(weight * after for _, weight, after in weighted) / denominator
+            # Near-target endpoint supervision already teaches preservation.
+            # A ReLU degradation surcharge has full slope for arbitrarily
+            # small worsening and rewards staying close to the initial pose.
+            total = geometry_loss
+            losses.update(loss_balanced_geometry=geometry_loss,
+                          loss_raw_endpoint_geometry=raw_total,
+                          loss_initial_endpoint_geometry=initial_total)
+        else:
+            total = self.endpoint_loss_weight * raw_total
         if self.model.trifuse.config.get('candidate_driven'):
             # Fit a value read on the *actual final structure*, not the last
             # pre-update state. Stop geometry gradients: ranking supervision
@@ -902,7 +1262,8 @@ class AssemblyTrainer(TriCoopDiffTrainer):
             final = self._forward_state(ed, pd, ld, ligand.detach(), poi.detach(),
                                         body.detach(), zero, zero, source, conditions)
             native_interfaces, _ = terminal_ligand_interface_losses(
-                ed['coords'], pd['coords'], ld['coords'], poi, ligand)
+                ed['coords'], pd['coords'] if target_poi is None else target_poi,
+                ld['coords'], poi, ligand)
             targets = torch.stack((losses['loss_protein_geometry'],
                 ((ligand-ld['coords'])/LIGAND_GEOMETRY_SCALE_ANGSTROM).square().mean(),
                 native_interfaces['loss_interface_e3_ligand'] + native_interfaces['loss_contact_e3_ligand'],
@@ -917,7 +1278,10 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         return {'loss_total': total, 'components': losses, 'native_interface_pairs': interface_pairs,
                 'ligand_interface_pairs': ligand_interface_counts,
                 'ligand_target_rmsd_angstrom': ligand_rmsd,
-                'predicted_ligand': ligand, 'predicted_poi': poi}
+                'predicted_ligand': ligand, 'predicted_poi': poi,
+                **({'candidate_quality_features': final['candidate_quality_features'],
+                    'candidate_quality_target': torch.log1p(targets.detach()).reshape(1, -1)}
+                   if candidate_mode else {})}
 
     def train_batch(self, batches):
         if len(batches) > self.effective_batch_size:
@@ -1127,6 +1491,16 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                 'training_endpoint_protocol': self.training_endpoint_protocol,
                 'expert_input_grad': getattr(self.model, 'expert_input_grad', True),
                 'training_objective': self.training_objective,
+                'motion_contract': self.motion_contract,
+                'repair_action_target_contract': ('reachable_endpoint_step_target_v1'
+                    if self.motion_contract in (BOUNDED_REPAIR_MOTION_CONTRACT,
+                                                QUALITY_GATED_REPAIR_MOTION_CONTRACT) else None),
+                'repair_limits': (dict(BOUNDED_CORRECTION_LIMITS)
+                    if self.motion_contract in (BOUNDED_REPAIR_MOTION_CONTRACT,
+                                                QUALITY_GATED_REPAIR_MOTION_CONTRACT) else None),
+                'repair_state_noise': (dict(CORRECTION_STATE_NOISE)
+                    if self.motion_contract in (BOUNDED_REPAIR_MOTION_CONTRACT,
+                                                QUALITY_GATED_REPAIR_MOTION_CONTRACT) else None),
                 'target_projection_solver': PROJECTION_SOLVER_VERSION,
                 'endpoint_loss_weight': self.endpoint_loss_weight,
                 'ligand_geometry_scale_angstrom': LIGAND_GEOMETRY_SCALE_ANGSTROM,
@@ -1243,6 +1617,18 @@ class AssemblyTrainer(TriCoopDiffTrainer):
             'training_source_mix': self.training_source_mix,
             'training_endpoint_protocol': self.training_endpoint_protocol,
         })
+        if self.motion_contract == BOUNDED_REPAIR_MOTION_CONTRACT:
+            expected.update(
+                motion_contract=BOUNDED_REPAIR_MOTION_CONTRACT,
+                repair_action_target_contract='reachable_endpoint_step_target_v1',
+                repair_limits=BOUNDED_CORRECTION_LIMITS,
+                repair_state_noise=CORRECTION_STATE_NOISE)
+        elif self.motion_contract == QUALITY_GATED_REPAIR_MOTION_CONTRACT:
+            expected.update(
+                motion_contract=QUALITY_GATED_REPAIR_MOTION_CONTRACT,
+                repair_action_target_contract='reachable_endpoint_step_target_v1',
+                repair_limits=BOUNDED_CORRECTION_LIMITS,
+                repair_state_noise=CORRECTION_STATE_NOISE)
         if payload['checkpoint_version'] >= 25:
             expected.update(training_recipe=self.training_recipe,
                             ema_update_contract=self.ema_update_contract,

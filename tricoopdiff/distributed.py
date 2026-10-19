@@ -33,11 +33,13 @@ class GradientSynchronizer:
             raise RuntimeError('distributed update aborted: a rank failed before gradient synchronization') from error
 
     def __call__(self, parameters, local_samples):
-        if local_samples < 1:
-            raise ValueError('each rank must have at least one sample')
+        if local_samples < 0:
+            raise ValueError('local sample count must be nonnegative')
         count = torch.tensor(local_samples, dtype=torch.int64, device=self.device)
         all_reduce_and_wait(count)
         total = int(count.item())
+        if total < 1:
+            return 0  # Every sample failed preparation: caller must not step.
         # Parameters can be unused on one rank (e.g. no ligand torsions). A
         # shared presence mask keeps collective order identical; globally
         # unused gradients stay None, preserving AdamW's skip semantics.

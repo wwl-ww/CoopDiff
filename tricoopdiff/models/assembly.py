@@ -115,14 +115,18 @@ CANDIDATE_SOURCE_NAMES = (*SOURCE_NAMES, 'hdock_matcha')
 CANDIDATE_FRAMEWORK_VERSION = 'hdock_matcha_joint_refinement_v1'
 QUALITY_COMPONENTS = ('protein', 'ligand', 'e3_ligand', 'poi_ligand', 'clash')
 CANDIDATE_GEOMETRY_CONTRACT = 'smooth_allatom_cross_proximity_v1'
-CANDIDATE_QUALITY_CONTRACT = 'detached_component_distribution_native_geometry_v3'
-CANDIDATE_CONDITION_CONTRACT = 'fullatom_source_clock_node_film_v1'
+CANDIDATE_QUALITY_CONTRACT = 'static_identity_current_contact_quality_v4'
+CANDIDATE_CONDITION_CONTRACT = 'candidate_reference_fullatom_source_clock_film_v2'
+CANDIDATE_REFERENCE_CONTRACT = 'immutable_pose_displacement_transport_v1'
+TASK_NAMES = ('assemble', 'refine')
+CANDIDATE_TASK_CONTRACT = 'explicit_task_cross_source_v1'
 SOURCE_CONTRACT_VERSION = 'candidate_source_conditioning_v1'
-LEGACY_PRODUCTION_MODEL_PROFILE = 'ternary_endpoint_v1'
-FEATURE_PRODUCTION_MODEL_PROFILE = 'ternary_endpoint_v2'
-PREVIOUS_PRODUCTION_MODEL_PROFILE = 'ternary_endpoint_v3'
 PRODUCTION_MODEL_PROFILE = 'ternary_endpoint_v4'
 VECTOR_EXPERT_MODEL_PROFILE = 'ternary_endpoint_v14'
+FLOW_MOTION_CONTRACT = 'sdpi_flow_velocity_v1'
+BOUNDED_REPAIR_MOTION_CONTRACT = 'bounded_iterative_correction_v1'
+QUALITY_GATED_REPAIR_MOTION_CONTRACT = 'quality_gated_bounded_repair_v1'
+QUALITY_GATE_ERROR_SCALE = 0.5
 MATCHA_CONDITIONING_CONTRACT = 'stage_specific_chemical_interface_v5'
 INFORMATION_CONTRACT = 'conditional_node_evidence_without_rigid_advice_v2'
 RIGID_DECODER_CONTRACT = 'independent_horizontal_rotor_coupling_v4'
@@ -130,6 +134,7 @@ LEGACY_TORSION_REPRESENTATION = 'directed_rotor_v1'
 TORSION_REPRESENTATION_CONTRACT = 'horizontal_equivalent_rotor_v2'
 PROTEIN_LOCAL_GEOMETRY_CONTRACT = 'intrinsic32_masked_v1'
 PROTEIN_LOCAL_GEOMETRY_CONTRACTS = ('none', PROTEIN_LOCAL_GEOMETRY_CONTRACT, 'intrinsic32_required_v1')
+PROTAC_ANCHOR_CONTRACT = 'dual_bound_anchor_node_context_v1'
 
 
 def production_model_config(node_dim, input_dim, source_conditioning=False, *,
@@ -140,23 +145,27 @@ def production_model_config(node_dim, input_dim, source_conditioning=False, *,
                             rigid_decoder_contract=RIGID_DECODER_CONTRACT,
                             torsion_representation_contract=TORSION_REPRESENTATION_CONTRACT,
                             protein_local_geometry_contract=PROTEIN_LOCAL_GEOMETRY_CONTRACT,
-                            candidate_driven=False):
-    """One explicit new-model recipe; older weights retain their own config."""
-    if model_profile not in (LEGACY_PRODUCTION_MODEL_PROFILE, FEATURE_PRODUCTION_MODEL_PROFILE,
-                            PREVIOUS_PRODUCTION_MODEL_PROFILE, PRODUCTION_MODEL_PROFILE,
-                            VECTOR_EXPERT_MODEL_PROFILE):
-        raise ValueError(f'unknown model profile: {model_profile}')
+                            protac_anchor_contract=None,
+                            candidate_driven=False, candidate_expert_frame_policy='backbone_rigid_transport_v1',
+                            motion_contract=FLOW_MOTION_CONTRACT):
+    """Construct only the implemented controller; do not synthesize retired recipes."""
+    if model_profile != VECTOR_EXPERT_MODEL_PROFILE:
+        raise ValueError(f'retired model profile: {model_profile}')
     if information_contract != INFORMATION_CONTRACT:
         raise ValueError('retired evidence contract: use conditional node evidence without rigid advice')
     if rigid_decoder_contract != RIGID_DECODER_CONTRACT:
         raise ValueError('retired action contract: use physical velocities without inverse-time gain')
+    if motion_contract not in (FLOW_MOTION_CONTRACT, BOUNDED_REPAIR_MOTION_CONTRACT,
+                               QUALITY_GATED_REPAIR_MOTION_CONTRACT):
+        raise ValueError('unknown motion contract')
     config = dict(node_dim=node_dim, input_dim=input_dim, information_contract=information_contract,
                 rigid_decoder_contract=rigid_decoder_contract,
                 source_conditioning=bool(source_conditioning),
-                direct_ternary_motion=True, global_node_context=True,
-                spatial_geometry=True, motion_attention=True,
-                global_node_attention=True, rotation_scale_normalization=True,
-                model_profile=model_profile)
+                direct_ternary_motion=True,
+                model_profile=model_profile,
+                motion_contract=motion_contract)
+    if motion_contract == FLOW_MOTION_CONTRACT:
+        config.pop('motion_contract')
     if candidate_driven:
         if expert_backend != 'matcha' or not source_conditioning:
             raise ValueError('candidate framework requires Matcha and explicit source conditioning')
@@ -164,18 +173,15 @@ def production_model_config(node_dim, input_dim, source_conditioning=False, *,
         config['candidate_geometry_contract'] = CANDIDATE_GEOMETRY_CONTRACT
         config['candidate_quality_contract'] = CANDIDATE_QUALITY_CONTRACT
         config['candidate_condition_contract'] = CANDIDATE_CONDITION_CONTRACT
-    if model_profile in (FEATURE_PRODUCTION_MODEL_PROFILE, PREVIOUS_PRODUCTION_MODEL_PROFILE,
-                         PRODUCTION_MODEL_PROFILE, VECTOR_EXPERT_MODEL_PROFILE):
-        if isinstance(expert_scalar_dim, bool) or not isinstance(expert_scalar_dim, int) or expert_scalar_dim <= 0:
-            raise ValueError('expert scalar dimension must be positive')
-        config['expert_scalar_dim'] = expert_scalar_dim
-    if model_profile == VECTOR_EXPERT_MODEL_PROFILE:
-        if isinstance(expert_vector_dim, bool) or not isinstance(expert_vector_dim, int) or expert_vector_dim <= 0:
-            raise ValueError('expert vector dimension must be a positive integer')
-        config['expert_vector_dim'] = expert_vector_dim
-        for obsolete in ('global_node_context', 'spatial_geometry', 'motion_attention',
-                         'global_node_attention', 'rotation_scale_normalization'):
-            config.pop(obsolete)
+        config['candidate_reference_contract'] = CANDIDATE_REFERENCE_CONTRACT
+        config['candidate_task_contract'] = CANDIDATE_TASK_CONTRACT
+        if candidate_expert_frame_policy not in ('legacy_argmax_v1', 'backbone_rigid_transport_v1'):
+            raise ValueError('unknown candidate expert frame policy')
+        config['candidate_expert_frame_policy'] = candidate_expert_frame_policy
+    for name, value in (('expert_scalar_dim', expert_scalar_dim), ('expert_vector_dim', expert_vector_dim)):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f'{name} must be a positive integer')
+        config[name] = value
     if torsion_representation_contract not in (LEGACY_TORSION_REPRESENTATION, TORSION_REPRESENTATION_CONTRACT):
         raise ValueError('unknown torsion representation contract')
     if torsion_representation_contract != LEGACY_TORSION_REPRESENTATION:
@@ -184,6 +190,10 @@ def production_model_config(node_dim, input_dim, source_conditioning=False, *,
         raise ValueError('unknown protein local geometry contract')
     if protein_local_geometry_contract != 'none':
         config['protein_local_geometry_contract'] = protein_local_geometry_contract
+    if protac_anchor_contract is not None:
+        if protac_anchor_contract != PROTAC_ANCHOR_CONTRACT:
+            raise ValueError('unknown PROTAC anchor conditioning contract')
+        config['protac_anchor_contract'] = protac_anchor_contract
     if expert_backend not in ('diffdock', 'matcha'):
         raise ValueError('unknown binary expert backend')
     if expert_backend == 'matcha':
@@ -205,6 +215,62 @@ def candidate_source_tensor(source, reference, source_names=SOURCE_NAMES):
             or not bool(((value >= 0) & (value < len(source_names)) & (value == value.long())).all())):
         raise ValueError('candidate source must be one declared source class')
     return value.long()
+
+
+def task_source_index(source, task_mode, reference):
+    """Keep initialization source and requested task independent and explicit."""
+    if task_mode is None:
+        raise ValueError('candidate model requires explicit task_mode: assemble=0 or refine=1')
+    return (candidate_source_tensor(source, reference, CANDIDATE_SOURCE_NAMES)
+            + len(CANDIDATE_SOURCE_NAMES)*candidate_source_tensor(task_mode, reference, TASK_NAMES))
+
+
+def migrate_legacy_candidate_task_embedding(payload):
+    """Explicitly expand a source-only candidate checkpoint to source×task rows.
+
+    Legacy candidate checkpoints had one learned embedding per source. Copying
+    each source row into both task blocks preserves the old function exactly;
+    it does not claim the checkpoint learned distinct assemble/refine behavior.
+    """
+    config = payload.get('model_config')
+    state = payload.get('model_state')
+    if not isinstance(config, dict) or not isinstance(state, dict):
+        raise ValueError('checkpoint must contain model_config and model_state mappings')
+    if (not config.get('candidate_driven') or not config.get('source_conditioning')
+            or config.get('expert_backend') != 'matcha'):
+        raise ValueError('only source-conditioned Matcha candidate checkpoints can be migrated')
+    if config.get('candidate_task_contract') not in (None,):
+        raise ValueError('checkpoint is not a legacy source-only task-conditioning checkpoint')
+    key = 'controller.source.weight'
+    source_weight = state.get(key)
+    if (not torch.is_tensor(source_weight) or source_weight.ndim != 2
+            or source_weight.shape[0] != len(CANDIDATE_SOURCE_NAMES)):
+        raise ValueError('legacy source embedding must have exactly one row per candidate source')
+
+    migrated_state = dict(state)
+    migrated_state[key] = torch.cat((source_weight, source_weight), dim=0).contiguous()
+    migrated_config = dict(config)
+    migrated_config['candidate_task_contract'] = CANDIDATE_TASK_CONTRACT
+    # Strict construction/load proves this is only a shape-preserving semantic
+    # expansion; any unrelated architecture drift must be handled separately.
+    migrated_model = TernaryAssembly(**migrated_config)
+    migrated_model.load_state_dict(migrated_state, strict=True)
+
+    migrated = dict(payload)
+    migrated['model_config'] = migrated_config
+    migrated['model_state'] = migrated_state
+    migrated['checkpoint_migration'] = {
+        'contract': 'legacy_source_embedding_to_source_task_v1',
+        'source_names': list(CANDIDATE_SOURCE_NAMES),
+        'task_names': list(TASK_NAMES),
+        'row_map': {name: {'assemble': index,
+                           'refine': index + len(CANDIDATE_SOURCE_NAMES)}
+                    for index, name in enumerate(CANDIDATE_SOURCE_NAMES)},
+        'source_weight_shape': list(source_weight.shape),
+        'migrated_weight_shape': list(migrated_state[key].shape),
+        'semantics': 'duplicate_each_source_row_into_both_task_blocks; no task-specific behavior was learned',
+    }
+    return migrated
 
 
 def candidate_fullatom_evidence(coords, types, e3, poi, ligand, body):
@@ -251,6 +317,32 @@ def candidate_fullatom_evidence(coords, types, e3, poi, ligand, body):
     return torch.cat(scalars, -1), torch.stack(vectors, 1)
 
 
+def candidate_reference_evidence(coords, types, e3, poi, ligand):
+    """Native-free pose reference held fixed throughout one correction rollout."""
+    reference = poi.get('candidate_reference')
+    if reference is None:
+        raise ValueError('candidate correction requires its original input pose')
+    initial_poi, initial_ligand, initial_body = [reference[key].to(coords)
+        for key in ('poi', 'ligand', 'body')]
+    if (initial_poi.shape != poi['coords'].shape or initial_ligand.shape != ligand['coords'].shape
+            or initial_body.shape != (1, 3, 3)
+            or any(value.requires_grad for value in (initial_poi, initial_ligand, initial_body))):
+        raise ValueError('candidate reference must be immutable and node-aligned')
+    initial = torch.cat((e3['coords'][0], initial_poi[0], initial_ligand[0]))
+    centers = torch.stack([coords[types == i].mean(0) for i in range(3)])
+    initial_centers = torch.stack([initial[types == i].mean(0) for i in range(3)])
+    displacement = (initial-coords)/10.
+    distance = torch.cdist(coords, centers, compute_mode='donot_use_mm_for_euclid_dist')/10.
+    initial_distance = torch.cdist(initial, initial_centers,
+        compute_mode='donot_use_mm_for_euclid_dist')/10.
+    scalars = torch.cat((torch.log1p(displacement.square().sum(-1, keepdim=True)),
+                         torch.log1p(distance)-torch.log1p(initial_distance)), -1)
+    e3_basis, poi_basis = e3['matcha']['reference_basis'], poi['matcha']['reference_basis']
+    basis = torch.stack((e3_basis, initial_body[0] @ poi_basis, e3_basis))[types]
+    vectors = torch.cat((bounded_vector(displacement)[:, None], basis.transpose(-1, -2)), 1)
+    return scalars, vectors
+
+
 _CHEMICAL_PATH_CACHE = OrderedDict()
 _CHEMICAL_PATH_CACHE_LIMIT = 32
 _CHEMICAL_SIGNATURE_CACHE = OrderedDict()
@@ -272,6 +364,17 @@ class ComponentStructureEncoder(nn.Module):
         self.geometry = nn.Sequential(nn.Linear(1, width), nn.SiLU(), nn.Linear(width, width + 1))
         self.chemistry = nn.Sequential(nn.Linear(6, width), nn.SiLU(), nn.Linear(width, width + 1))
         self.norm = nn.LayerNorm(width)
+
+    def _protein_messages(self, query, keys, values, query_xyz, xyz):
+        distance = torch.linalg.vector_norm(query_xyz[:, None]-xyz[None], dim=-1)/10.
+        relation = self.geometry(torch.log1p(distance)[..., None])
+        logits = query @ keys.T/math.sqrt(self.width)+relation[..., -1]
+        return (logits.softmax(-1)[..., None]*(values[None]+relation[..., :-1])).sum(1)
+
+    def _ligand_messages(self, query, keys, values, chemistry, connected):
+        relation = self.chemistry(chemistry)
+        logits = (query @ keys.T/math.sqrt(self.width)+relation[..., -1]).masked_fill(~connected, -torch.inf)
+        return (logits.softmax(-1)[..., None]*(values[None]+relation[..., :-1])).sum(1)
 
     @staticmethod
     def chemical_relations(coords, edges, attributes):
@@ -342,19 +445,24 @@ class ComponentStructureEncoder(nn.Module):
                     ligand_edges = local[edges]
                 chemistry, connected = self.chemical_relations(xyz, ligand_edges, attributes)
             pieces = []
-            for start in range(0, len(ids), 64):
-                stop = min(start + 64, len(ids))
-                logits = self.query(h[start:stop]) @ keys.T / math.sqrt(self.width)
+            chunk = 16 if len(ids) > 512 else 64
+            for start in range(0, len(ids), chunk):
+                stop = min(start + chunk, len(ids))
+                query = self.query(h[start:stop])
                 if component == 2:
-                    relation = self.chemistry(chemistry[start:stop])
-                    logits = (logits + relation[..., -1]).masked_fill(~connected[start:stop], -torch.inf)
-                    messages = values[None] + relation[..., :-1]
+                    fn = self._ligand_messages
+                    args = (query, keys, values, chemistry[start:stop], connected[start:stop])
                 else:
-                    distance = torch.linalg.vector_norm(xyz[start:stop, None] - xyz[None], dim=-1) / 10.
-                    relation = self.geometry(torch.log1p(distance)[..., None])
-                    logits = logits + relation[..., -1]
-                    messages = values[None] + relation[..., :-1]
-                pieces.append((logits.softmax(-1)[..., None] * messages).sum(1))
+                    fn = self._protein_messages
+                    args = (query, keys, values, xyz[start:stop], xyz)
+                # Save query/key inputs, not every quadratic relation MLP's
+                # activations. Bound recomputation independently of the outer
+                # rollout checkpoint; do not capture mutable loop variables.
+                if self.training and torch.is_grad_enabled():
+                    messages = checkpoint(fn, *args, use_reentrant=False)
+                else:
+                    messages = fn(*args)
+                pieces.append(messages)
             encoded[ids] = self.norm(h + torch.cat(pieces))
         return encoded
 
@@ -499,7 +607,8 @@ class LegalPoseDecoder(nn.Module):
     """
 
     def __init__(self, width, channels, *,
-                 torsion_representation_contract=LEGACY_TORSION_REPRESENTATION):
+                 torsion_representation_contract=LEGACY_TORSION_REPRESENTATION,
+                 identity_initialization=False):
         super().__init__()
         if torsion_representation_contract not in (LEGACY_TORSION_REPRESENTATION, TORSION_REPRESENTATION_CONTRACT):
             raise ValueError("unknown torsion representation contract")
@@ -522,7 +631,10 @@ class LegalPoseDecoder(nn.Module):
             for branch in BRANCHES})
         self.bond = nn.Sequential(nn.Linear(width, width), nn.SiLU(), nn.Linear(width, 1))
         for head in (*self.rigid.values(), self.bond):
-            nn.init.normal_(head[-1].weight, std=.01)
+            if identity_initialization:
+                nn.init.zeros_(head[-1].weight)
+            else:
+                nn.init.normal_(head[-1].weight, std=.01)
             nn.init.zeros_(head[-1].bias)
 
     def _relations(self, queries, positions, h, coords):
@@ -700,12 +812,17 @@ class UnifiedTernaryController(nn.Module):
 
     def __init__(self, input_dim, width, scalar_dim, vector_dim, source_conditioning,
                  torsion_representation_contract=LEGACY_TORSION_REPRESENTATION,
-                 protein_local_geometry_contract='none', candidate_driven=False):
+                 protein_local_geometry_contract='none', candidate_driven=False,
+                 protac_anchor_contract=None, motion_contract=FLOW_MOTION_CONTRACT):
         super().__init__()
         channels = max(4, width // 4)
         self.scalar_dim, self.vector_dim = scalar_dim, vector_dim
         self.candidate_driven = candidate_driven
-        self.fullatom_scalar = nn.Linear(9, width) if candidate_driven else None
+        self.motion_contract = motion_contract
+        self.protac_anchor_contract = protac_anchor_contract
+        self.protac_anchor_scalar = (nn.Linear(5, width, bias=False)
+            if protac_anchor_contract == PROTAC_ANCHOR_CONTRACT else None)
+        self.fullatom_scalar = nn.Linear(13, width) if candidate_driven else None
         self.protein = nn.Linear(input_dim, width)
         self.protein_geometry_contract = protein_local_geometry_contract
         self.protein_geometry = (nn.Linear(33, width, bias=False)
@@ -721,15 +838,21 @@ class UnifiedTernaryController(nn.Module):
         if source_conditioning:
             with torch.random.fork_rng(devices=[]):
                 torch.random.default_generator.manual_seed(0)
-                self.source = nn.Embedding(len(self.source_names), width)
-        self.quality = (nn.Sequential(nn.Linear(9 * width, width), nn.SiLU(),
+                self.source = nn.Embedding(len(self.source_names)*(2 if candidate_driven else 1), width)
+        self.quality = (nn.Sequential(nn.Linear(9 * width + 84, width), nn.SiLU(),
             nn.Linear(width, len(QUALITY_COMPONENTS))) if candidate_driven else None)
-        self.vector_input = nn.Linear(2 * vector_dim + (6 if candidate_driven else 3), channels, bias=False)
+        self.vector_input = nn.Linear(
+            2 * vector_dim + (10 if candidate_driven else 3)
+            + (2 if self.protac_anchor_scalar is not None else 0), channels, bias=False)
         self.layers = nn.ModuleList([EquivariantInteraction(width, channels) for _ in range(3)])
         self.assembly = LegalPoseDecoder(width, channels,
-            torsion_representation_contract=torsion_representation_contract)
+            torsion_representation_contract=torsion_representation_contract,
+            identity_initialization=candidate_driven)
+        if protac_anchor_contract == PROTAC_ANCHOR_CONTRACT:
+            for parameter in self.assembly.rigid.parameters():
+                parameter.requires_grad_(False)
 
-    def forward(self, graph, proposals, state, source):
+    def forward(self, graph, proposals, state, source, task_mode=None):
         coords, types = graph['node_coords'], graph['node_types']
         scalar, raw_vectors = graph.get('expert_node_features'), graph.get('expert_node_vectors')
         if scalar is None or scalar.shape != (len(coords), 2 * self.scalar_dim + 2):
@@ -762,6 +885,16 @@ class UnifiedTernaryController(nn.Module):
         h[ligand] = self.ligand(graph['node_features'][ligand])
         identity = h + self.types(types)
         h = identity + self.expert(scalar) + self.clock(state)
+        anchor_vectors = None
+        if self.protac_anchor_scalar is not None:
+            anchor_scalar = graph.get('protac_anchor_scalar')
+            anchor_vectors = graph.get('protac_anchor_vectors')
+            if (anchor_scalar is None or anchor_scalar.shape != (len(h), 5)
+                    or anchor_vectors is None or anchor_vectors.shape != (len(h), 2, 3)
+                    or not torch.isfinite(anchor_scalar).all()
+                    or not torch.isfinite(anchor_vectors).all()):
+                raise ValueError('PROTAC model requires node-aligned binary-anchor context')
+            h = h + self.protac_anchor_scalar(anchor_scalar.to(h))
         fullatom_vectors = None
         if self.candidate_driven:
             physical = graph.get('fullatom_scalar_features')
@@ -770,14 +903,27 @@ class UnifiedTernaryController(nn.Module):
                     or fullatom_vectors.shape != (len(h), 3, 3)
                     or not torch.isfinite(physical).all() or not torch.isfinite(fullatom_vectors).all()):
                 raise ValueError('candidate controller requires node-aligned all-atom proximity evidence')
-            h = h + self.fullatom_scalar(physical)
+            reference_scalar = graph.get('candidate_reference_scalar')
+            reference_vectors = graph.get('candidate_reference_vectors')
+            if (reference_scalar is None or reference_vectors is None
+                    or reference_scalar.shape != (len(h), 4)
+                    or reference_vectors.shape != (len(h), 4, 3)
+                    or not torch.isfinite(reference_scalar).all()
+                    or not torch.isfinite(reference_vectors).all()):
+                raise ValueError('candidate correction requires immutable candidate-reference evidence')
+            h = h + self.fullatom_scalar(torch.cat((physical, reference_scalar), -1))
+            fullatom_vectors = torch.cat((fullatom_vectors, reference_vectors), 1)
         if self.source is not None:
-            h = h + self.source(candidate_source_tensor(source, h, self.source_names))
+            index = (task_source_index(source, task_mode, h) if self.candidate_driven else
+                     candidate_source_tensor(source, h, self.source_names))
+            h = h + self.source(index)
         centers = torch.stack([coords[types == i].mean(0) for i in range(3)])
         offsets = bounded_vector((coords[:, None] - centers[None]) / 10.)
         # Conditional binary node evidence informs the joint controller; binary
         # rigid-head outputs are not broadcast as shared physical-body actions.
         vectors = torch.cat((bounded_vector(raw_vectors), offsets), 1)
+        if anchor_vectors is not None:
+            vectors = torch.cat((vectors, bounded_vector(anchor_vectors.to(vectors))), 1)
         if fullatom_vectors is not None:
             vectors = torch.cat((vectors, fullatom_vectors), 1)
         vectors = self.vector_input(vectors.transpose(1, 2)).transpose(1, 2)
@@ -811,23 +957,39 @@ class UnifiedTernaryController(nn.Module):
         if masks.shape != (bonds.shape[1], len(ligand_ids)):
             raise ValueError('assembly torsion masks must match directed rotating bonds')
         body_motion = self.assembly(h, vectors, coords, types, bonds, masks, state, opinions)
+        if self.protac_anchor_scalar is not None:
+            allowed = graph.get('protac_torsion_mask')
+            if allowed is None or allowed.shape != body_motion['torsion'].shape[1:]:
+                raise ValueError('PROTAC controller requires the linker-only torsion action mask')
+            body_motion['torsion'] = body_motion['torsion'] * allowed[None].to(
+                body_motion['torsion'])
+            for branch in BRANCHES:
+                body_motion[branch]['tr'] = torch.zeros_like(body_motion[branch]['tr'])
+                body_motion[branch]['rot'] = torch.zeros_like(body_motion[branch]['rot'])
+                body_motion[branch]['tor'] = body_motion['torsion']
         components = torch.stack([h[types == i].mean(0) for i in range(3)])
         result = {'normalized_velocity': body_motion,
                   'rank_features': components.mean(0, keepdim=True),
                   'residual_penalty': h.new_zeros(())}
         if self.quality is not None:
-            # A mean alone hides sparse bad contacts and heterogeneous local
-            # evidence. Keep component identity and distribution statistics;
-            # these remain invariant under node ordering and rigid transforms.
-            quality_features = torch.cat([
-                torch.cat((nodes.mean(0), nodes.amax(0),
-                           nodes.var(0, unbiased=False).add(1e-8).sqrt()))
-                for nodes in (h[types == i] for i in range(3))
-            ]).unsqueeze(0).detach()
-            # Ranking fits observed structures, not the motion representation.
-            # Its auxiliary loss must not silently retune the assembly field.
+            # Read actual contacts, not time/source/reference-conditioned motion
+            # activations. Identity stays explicit but identical across a pool.
+            def statistics(nodes):
+                return torch.cat((nodes.mean(0), nodes.amax(0),
+                    nodes.var(0, unbiased=False).add(1e-8).sqrt()))
+            quality_features = torch.cat((
+                *(statistics(identity[types == i]) for i in range(3)),
+                *(statistics(physical[types == i]) for i in range(3)),
+                torch.pdist(centers).log1p())).unsqueeze(0).detach()
             errors = torch.nn.functional.softplus(self.quality(quality_features))
-            result.update(quality_errors=errors, candidate_score=-errors.mean(-1))
+            result.update(quality_errors=errors, candidate_score=-errors.mean(-1),
+                          candidate_quality_features=quality_features)
+            if (self.motion_contract == QUALITY_GATED_REPAIR_MOTION_CONTRACT
+                    and candidate_source_tensor(task_mode, h, TASK_NAMES).item() == 1):
+                # A native-free predicted error controls edit magnitude. Cap
+                # the result again at the initial gate in refine_candidates.
+                result['repair_gate'] = (errors.mean(-1, keepdim=True)
+                    / QUALITY_GATE_ERROR_SCALE).clamp(min=.05, max=1.)
         return result
 
 
@@ -837,40 +999,6 @@ class TernaryAssembly(nn.Module):
     supports_conditions = False
     direct_ternary_motion = True
 
-    @staticmethod
-    def migrate_shared_rigid_weights(weights):
-        """Duplicate the old rigid head into separate physical-body heads."""
-        weights = dict(weights)
-        for layer in ('0', '2'):
-            for suffix in ('weight', 'bias'):
-                key = f'controller.assembly.rigid.{layer}.{suffix}'
-                value = weights.pop(key)
-                for branch in BRANCHES:
-                    weights[f'controller.assembly.rigid.{branch}.{layer}.{suffix}'] = value.clone()
-        return weights
-
-    def migrate_logit_only_geometry(self, weights):
-        """Explicit weights-only upgrade; zero new values, preserve old logits.
-
-        Optimizer state must not be restored across this parameter-shape change.
-        No unrelated missing keys or shape mismatches are accepted.
-        """
-        weights = dict(weights)
-        template = self.state_dict()
-        heads = [('controller.structure.geometry.2', 1),
-                 ('controller.assembly.distance.2', 1)]
-        heads.extend((f'controller.layers.{i}.geometry.2', layer.heads)
-                     for i, layer in enumerate(self.controller.layers))
-        for prefix, count in heads:
-            for suffix in ('weight', 'bias'):
-                key = f'{prefix}.{suffix}'
-                old, new = weights[key], torch.zeros_like(template[key])
-                if old.shape != (count, *new.shape[1:]):
-                    raise ValueError(f'{key}: not a legacy logit-only geometric head')
-                new[-count:] = old.to(new)
-                weights[key] = new
-        return weights
-
     def __init__(self, node_dim=128, input_dim=None, source_conditioning=False, *,
                  direct_ternary_motion=True, model_profile=VECTOR_EXPERT_MODEL_PROFILE,
                  expert_scalar_dim=58, expert_vector_dim=20, expert_backend='diffdock',
@@ -879,8 +1007,11 @@ class TernaryAssembly(nn.Module):
                  rigid_decoder_contract=RIGID_DECODER_CONTRACT,
                  torsion_representation_contract=LEGACY_TORSION_REPRESENTATION,
                  protein_local_geometry_contract='none', candidate_driven=False,
+                 protac_anchor_contract=None,
                  candidate_geometry_contract=None, candidate_quality_contract=None,
-                 candidate_condition_contract=None):
+                 candidate_condition_contract=None, candidate_reference_contract=None,
+                 candidate_expert_frame_policy='backbone_rigid_transport_v1', candidate_task_contract=None,
+                 motion_contract=FLOW_MOTION_CONTRACT):
         # A saved model_config without the new field reconstructs historical
         # behavior. New training recipes use production_model_config's V2.
         super().__init__()
@@ -890,6 +1021,10 @@ class TernaryAssembly(nn.Module):
             raise ValueError('retired candidate quality contract')
         if candidate_condition_contract not in (None, CANDIDATE_CONDITION_CONTRACT):
             raise ValueError('retired candidate conditioning contract')
+        if candidate_reference_contract not in (None, CANDIDATE_REFERENCE_CONTRACT):
+            raise ValueError('retired candidate reference contract')
+        if candidate_task_contract not in (None, CANDIDATE_TASK_CONTRACT):
+            raise ValueError('retired candidate task contract')
         if model_profile != VECTOR_EXPERT_MODEL_PROFILE or not direct_ternary_motion:
             raise ValueError('retired architecture: construct a fresh ternary_endpoint_v14 model')
         self.config = production_model_config(
@@ -900,11 +1035,13 @@ class TernaryAssembly(nn.Module):
             rigid_decoder_contract=rigid_decoder_contract,
             torsion_representation_contract=torsion_representation_contract,
             protein_local_geometry_contract=protein_local_geometry_contract,
-            candidate_driven=candidate_driven)
+            candidate_driven=candidate_driven, candidate_expert_frame_policy=candidate_expert_frame_policy,
+            protac_anchor_contract=protac_anchor_contract, motion_contract=motion_contract)
         self.controller = UnifiedTernaryController(
             self.config['input_dim'], node_dim, expert_scalar_dim,
             expert_vector_dim, source_conditioning, torsion_representation_contract,
-            protein_local_geometry_contract, candidate_driven)
+            protein_local_geometry_contract, candidate_driven, protac_anchor_contract,
+            motion_contract)
         self.condition_protein_geometry = (nn.Linear(33, node_dim, bias=False)
             if expert_backend == "matcha" and protein_local_geometry_contract != "none" else None)
         if expert_backend == 'matcha':
@@ -912,7 +1049,7 @@ class TernaryAssembly(nn.Module):
             self.condition_key = nn.Linear(self.config['input_dim'], node_dim)
             self.condition_value = nn.Linear(self.config['input_dim'], node_dim)
             self.condition_geometry = nn.Linear(3, node_dim, bias=False)
-            self.condition_fullatom = nn.Linear(9, node_dim, bias=False) if candidate_driven else None
+            self.condition_fullatom = nn.Linear(13, node_dim, bias=False) if candidate_driven else None
             self.condition_clock = nn.Linear(9, node_dim) if candidate_driven else None
             self.condition_ligand = LigandFeatureEncoder(node_dim)
             self.condition_chemistry = ComponentStructureEncoder(node_dim)
@@ -924,7 +1061,7 @@ class TernaryAssembly(nn.Module):
                 nn.init.zeros_(film.bias)
 
     def binary_condition(self, receptor, opposite, ligand, *, stage_index=0,
-                         ablation_mode='all', diffusion_state=None, source=0):
+                         ablation_mode='all', diffusion_state=None, source=0, task_mode=None):
         """Nodewise opposite-protein context; no target or pooled condition token."""
         if isinstance(stage_index, bool) or not isinstance(stage_index, int) or not 0 <= stage_index < 3:
             raise ValueError('Matcha condition requires an explicit valid stage index')
@@ -936,8 +1073,8 @@ class TernaryAssembly(nn.Module):
         if self.condition_fullatom is not None:
             receiving = receptor.get('candidate_fullatom_features')
             sending = opposite.get('candidate_fullatom_features')
-            if (receiving is None or sending is None or receiving.shape != (len(q), 9)
-                    or sending.shape != (len(k), 9)
+            if (receiving is None or sending is None or receiving.shape != (len(q), 13)
+                    or sending.shape != (len(k), 13)
                     or not torch.isfinite(receiving).all() or not torch.isfinite(sending).all()):
                 raise ValueError('candidate FiLM requires both proteins\' full-atom interface evidence')
             if (diffusion_state is None or diffusion_state.shape != (1, 9)
@@ -946,8 +1083,7 @@ class TernaryAssembly(nn.Module):
             receiving = self.condition_fullatom(receiving)
             sending = self.condition_fullatom(sending)
             clock = self.condition_clock(diffusion_state)
-            source_feature = self.controller.source(candidate_source_tensor(
-                source, q, CANDIDATE_SOURCE_NAMES))
+            source_feature = self.controller.source(task_source_index(source, task_mode, q))
             q = q + receiving + clock + source_feature
             k = k + sending
             value = value + sending
@@ -1001,10 +1137,10 @@ class TernaryAssembly(nn.Module):
             gamma, beta = torch.zeros_like(gamma), torch.zeros_like(beta)
         return .1 * gamma.tanh().unsqueeze(0), .1 * beta.tanh().unsqueeze(0)
 
-    def forward(self, graph, proposals, diffusion_state, source=0, *, conditions=None):
-        if conditions is not None:
+    def forward(self, graph, proposals, diffusion_state, source=0, *, conditions=None, task_mode=None):
+        if conditions is not None and self.config.get('protac_anchor_contract') is None:
             raise ValueError('retired condition-token interface: v8 reads actual ternary nodes')
-        return self.controller(graph, proposals, diffusion_state, source)
+        return self.controller(graph, proposals, diffusion_state, source, task_mode)
 
 
 class TernaryAssemblyModel(nn.Module):
@@ -1036,8 +1172,8 @@ class TernaryAssemblyModel(nn.Module):
         if trifuse.config.get('candidate_driven'):
             if not self.expert_input_grad:
                 raise ValueError('candidate endpoint training requires complete expert coordinate gradients')
-            if getattr(frozen_expert, 'frame_policy', None) != 'backbone_rigid_transport_v1':
-                raise ValueError('candidate experts require the rigid-transport backbone frame')
+            if getattr(frozen_expert, 'frame_policy', None) != trifuse.config['candidate_expert_frame_policy']:
+                raise ValueError('candidate expert frame policy differs from the saved model contract')
         self.checkpoint_ternary = bool(checkpoint_ternary)
         if isinstance(checkpoint_min_nodes, bool) or not isinstance(checkpoint_min_nodes, int) or checkpoint_min_nodes < 0:
             raise ValueError('checkpoint_min_nodes must be a nonnegative integer')
@@ -1078,16 +1214,26 @@ class TernaryAssemblyModel(nn.Module):
                                      for key in ('ligand', 'poi', 'rotation')]
                 if ligand.shape != ligand_data['coords'].shape or poi.shape != poi_data['coords'].shape:
                     raise ValueError('candidate atom counts differ from indexed features')
+                candidate_poi_data = {**poi_data, 'candidate_reference': {
+                    'ligand': ligand.detach().clone(), 'poi': poi.detach().clone(),
+                    'body': body.detach().clone()}, 'task_mode': 'refine'}
+                initial_gate = None
                 for t, dt in flow.reverse_times(ligand):
-                    output = flow.forward_state(self, e3_data, poi_data, ligand_data,
+                    output = flow.forward_state(self, e3_data, candidate_poi_data, ligand_data,
                                                 ligand, poi, body, t, dt, source_index)
-                    velocity = flow.velocities(output['normalized_velocity'],
-                                               e3_data['coords'], poi_data['coords'])
-                    ligand, poi, body = flow.step(ligand, poi, body, velocity, dt, ligand_data)
+                    if 'repair_gate' in output:
+                        initial_gate = (output['repair_gate'].detach() if initial_gate is None
+                                        else torch.minimum(initial_gate, output['repair_gate'].detach()))
+                        output = {**output, 'repair_gate': initial_gate}
+                    (ligand, poi, body), _ = flow.apply_prediction(
+                        output, t, dt, e3_data['coords'], poi_data['coords'],
+                        ligand, poi, body, ligand_data,
+                        motion_contract=self.trifuse.config.get(
+                            'motion_contract', FLOW_MOTION_CONTRACT))
                     if not all(torch.isfinite(x).all() for x in (ligand, poi, body)):
                         raise FloatingPointError('nonfinite refined candidate')
                 zero = ligand.new_zeros(1)
-                final = flow.forward_state(self, e3_data, poi_data, ligand_data,
+                final = flow.forward_state(self, e3_data, candidate_poi_data, ligand_data,
                                            ligand, poi, body, zero, zero, source_index)
                 if not all(torch.isfinite(final[key]).all()
                            for key in ('quality_errors', 'candidate_score')):
@@ -1151,6 +1297,42 @@ class TernaryAssemblyModel(nn.Module):
             return checkpoint(read, graph, use_reentrant=False)
         return read(graph)
 
+    @staticmethod
+    def _add_protac_anchor_context(graph, condition, ligand_data):
+        """Attach target-free roles and equivariant vectors from both warheads."""
+        coords, types = graph['node_coords'], graph['node_types']
+        component_indices = graph.get('component_indices')
+        ligand_ids = (component_indices[2] if component_indices is not None
+                      else (types == 2).nonzero(as_tuple=False).flatten())
+        first = torch.as_tensor(condition['anchor1_atoms'], device=coords.device,
+                                dtype=torch.long).flatten()
+        second = torch.as_tensor(condition['anchor2_atoms'], device=coords.device,
+                                 dtype=torch.long).flatten()
+        n_ligand = len(ligand_ids)
+        if (len(first) < 3 or len(second) < 3 or
+                set(first.tolist()) & set(second.tolist()) or
+                min(int(first.min()), int(second.min())) < 0 or
+                max(int(first.max()), int(second.max())) >= n_ligand):
+            raise ValueError('PROTAC anchor roles must be disjoint valid ligand atom indices')
+        roles = coords.new_zeros(len(coords), 3)
+        ligand_offset = int(ligand_ids[0])
+        roles[ligand_ids, 2] = 1
+        roles[ligand_offset + first, 0] = 1
+        roles[ligand_offset + second, 1] = 1
+        roles[ligand_offset + first, 2] = 0
+        roles[ligand_offset + second, 2] = 0
+        centers = torch.stack((coords[ligand_offset + first].mean(0),
+                               coords[ligand_offset + second].mean(0)))
+        displacement = (centers[None] - coords[:, None]) / 10.
+        distances = torch.linalg.vector_norm(displacement, dim=-1)
+        graph['protac_anchor_scalar'] = torch.cat((roles, torch.log1p(distances)), -1)
+        graph['protac_anchor_vectors'] = displacement
+        from tricoopdiff.initialization.protac import linker_torsion_mask
+        torsion_mask = linker_torsion_mask(ligand_data, first, second).to(coords.device)
+        if not bool(torsion_mask.any()):
+            raise ValueError('PROTAC condition has no rotatable bond between its warheads')
+        graph['protac_torsion_mask'] = torsion_mask
+
     def _checked_read(self, outputs, ligand, receptor, branch):
         tr, rot, tor, scalars, vectors = outputs
         count = ligand['coords'].shape[1] + receptor['coords'].shape[1]
@@ -1167,9 +1349,15 @@ class TernaryAssemblyModel(nn.Module):
 
     def forward(self, e3_data, poi_data, ligand_data, t_e3l, t_pol=None,
                 r_e3_to_poi=None, receptor_crop_cutoff=None, diffusion_state=None,
-                source=0, *, conditions=None):
-        if conditions is not None:
+                source=0, *, conditions=None, task_mode=None):
+        anchor_contract = self.trifuse.config.get('protac_anchor_contract')
+        if conditions is not None and anchor_contract is None:
             raise ValueError('assembly reads actual ternary nodes, not retired condition tokens')
+        if anchor_contract is not None:
+            if not isinstance(conditions, dict) or conditions.get('contract') not in (
+                    'external_binary_exact_bond_anchor_v1',
+                    'synthetic_independent_binary_frames_v1'):
+                raise ValueError('PROTAC model requires an explicit binary-anchor condition')
         if t_e3l.shape != (1,):
             raise ValueError('model-v2 currently requires B=1')
         if t_pol is not None and not torch.equal(t_e3l, t_pol):
@@ -1196,6 +1384,7 @@ class TernaryAssemblyModel(nn.Module):
         frame = (r_e3_to_poi[0] if r_e3_to_poi is not None
                  else torch.eye(3, device=t_e3l.device, dtype=ligand_data['coords'].dtype))
         fullatom_geometry = None
+        reference_geometry = None
         if self.trifuse.config.get('candidate_driven'):
             parts = (e3_data, poi_data, ligand_data)
             coords = torch.cat([part['coords'][0] for part in parts])
@@ -1203,8 +1392,9 @@ class TernaryAssemblyModel(nn.Module):
                 device=coords.device, dtype=torch.long) for index, part in enumerate(parts)])
             fullatom_geometry = candidate_fullatom_evidence(
                 coords, types, e3_data, poi_data, ligand_data, frame)
+            reference_geometry = candidate_reference_evidence(coords, types, e3_data, poi_data, ligand_data)
             sizes = [part['coords'].shape[1] for part in parts]
-            physical = fullatom_geometry[0].split(sizes)
+            physical = torch.cat((fullatom_geometry[0], reference_geometry[0]), -1).split(sizes)
             e3_data = {**e3_data, 'candidate_fullatom_features': physical[0]}
             poi_data = {**poi_data, 'candidate_fullatom_features': physical[1]}
         raw, node_reads = {}, []
@@ -1231,7 +1421,7 @@ class TernaryAssemblyModel(nn.Module):
                         expert_ligand = {**ligand_data, 'coords': ligand_data['coords'].detach()}
                     stage_index, _ = matcha_stage_clock(t_e3l)
                     modulation = self.trifuse.binary_condition(receptor, opposite, expert_ligand,
-                        stage_index=stage_index, diffusion_state=diffusion_state, source=source)
+                        stage_index=stage_index, diffusion_state=diffusion_state, source=source, task_mode=task_mode)
                     def read_pair(rec, lig, time, film):
                         return self.expert.read_pair(rec, lig, time, film)
                     if torch.is_grad_enabled() and (self.expert_input_grad
@@ -1280,10 +1470,13 @@ class TernaryAssemblyModel(nn.Module):
             ligand_data['coords'][0], ligand_data['features'][0],
             lig_edge_index=ligand_data['edge_index'], lig_edge_mask=ligand_data['edge_mask'],
             lig_mask_rotate=ligand_data['mask_rotate'], lig_edge_attr=ligand_data['edge_attr'])
+        if anchor_contract is not None:
+            self._add_protac_anchor_context(graph, conditions, ligand_data)
         if self.trifuse.config.get('candidate_driven'):
             scalar_geometry, vector_geometry = fullatom_geometry
             graph['fullatom_scalar_features'] = scalar_geometry
             graph['fullatom_vector_features'] = vector_geometry
+            graph['candidate_reference_scalar'], graph['candidate_reference_vectors'] = reference_geometry
         if self.trifuse.config.get('protein_local_geometry_contract', 'none') != 'none':
             required = self.trifuse.config['protein_local_geometry_contract'] == 'intrinsic32_required_v1'
             graph['protein_local_geometry'] = torch.cat((
@@ -1306,9 +1499,11 @@ class TernaryAssemblyModel(nn.Module):
         if (self.training and torch.is_grad_enabled()
                 and self._should_checkpoint_ternary(len(graph["node_coords"]), graph["node_coords"].device)):
             result = checkpoint(self.trifuse, graph, proposals, diffusion_state,
-                                source=source, use_reentrant=False)
+                                source=source, conditions=conditions,
+                                task_mode=task_mode, use_reentrant=False)
         else:
-            result = self.trifuse(graph, proposals, diffusion_state, source=source)
+            result = self.trifuse(graph, proposals, diffusion_state, source=source,
+                                  conditions=conditions, task_mode=task_mode)
         # Kept explicitly as diagnostic evidence, never consumed as another update.
         result['binary_proposals'] = proposals
         return result

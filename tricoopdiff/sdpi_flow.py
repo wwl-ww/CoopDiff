@@ -23,6 +23,18 @@ CHECKPOINT_VERSION = 17
 INDEPENDENT_RIGID_MODE = 'independent_centroids_v1'
 LEGACY_RIGID_MODE = 'dual_interfaces_v1'
 CONTINUOUS_TORSION_MODE = 'continuous_horizontal_v1'
+BOUNDED_CORRECTION_LIMITS = {
+    'translation_angstrom': 2.0,
+    'rotation_radians': 0.35,
+    'torsion_radians': 0.35,
+}
+CORRECTION_STATE_NOISE = {
+    'contract': 'small_legal_pose_noise_v1',
+    'probability': 0.5,
+    'translation_std_angstrom': 0.5,
+    'rotation_std_radians': 0.1,
+    'torsion_std_radians': 0.1,
+}
 
 
 def _check_coords(coords):
@@ -131,7 +143,7 @@ class SDPIFlow:
             yield clock[index:index + 1], (clock[index] - clock[index + 1]).reshape(1)
 
     def forward_state(self, model, e3_data, poi_data, ligand_data,
-                      ligand, poi, body, t, dt, source=0, conditions=None):
+                      ligand, poi, body, t, dt, source=0, conditions=None, task_mode=None):
         """Read the same current geometry and expert clock in both execution paths.
 
         Template coordinates supply fixed conditioning scales; moving coordinates
@@ -143,6 +155,8 @@ class SDPIFlow:
             tr_sigma, _, _ = self.t_to_sigma(t, t, t)
             crop = tr_sigma * 3 + 20
         condition_kwargs = {'conditions': conditions} if conditions is not None else {}
+        if getattr(getattr(model, 'trifuse', None), 'config', {}).get('candidate_driven'):
+            condition_kwargs['task_mode'] = task_mode if task_mode is not None else poi_data.get('task_mode')
         output = model(e3_data, {**poi_data, 'coords': poi},
                        {**ligand_data, 'coords': ligand}, t_e3l=t, t_pol=t,
                        r_e3_to_poi=body, diffusion_state=conditioning,
@@ -206,6 +220,64 @@ class SDPIFlow:
         if 'torsion_update_mode' in normalized:
             result['torsion_update_mode'] = normalized['torsion_update_mode']
         return result
+
+    @staticmethod
+    def bounded_correction(action, limits=None):
+        """Bound one physical repair action, using vector norms for SE(3)."""
+        limits = BOUNDED_CORRECTION_LIMITS if limits is None else limits
+        result = {key: ({name: value for name, value in entry.items()}
+                        if isinstance(entry, dict) else entry)
+                  for key, entry in action.items()}
+        for branch in ('e3_ligand', 'poi_ligand'):
+            for name, limit_key in (('tr', 'translation_angstrom'),
+                                    ('rot', 'rotation_radians')):
+                value = action[branch][name]
+                limit = float(limits[limit_key])
+                norm = torch.linalg.vector_norm(value, dim=-1, keepdim=True)
+                result[branch][name] = value * (limit / norm.clamp_min(1e-8)).clamp(max=1.)
+        limit = float(limits['torsion_radians'])
+        result['torsion'] = action['torsion'].clamp(-limit, limit)
+        for key in ('rigid_output_mode', 'torsion_update_mode'):
+            if key in action:
+                result[key] = action[key]
+        if any(not torch.isfinite(value).all()
+               for branch in ('e3_ligand', 'poi_ligand')
+               for value in result[branch].values()):
+            raise FloatingPointError('non-finite bounded rigid correction')
+        if not torch.isfinite(result['torsion']).all():
+            raise FloatingPointError('non-finite bounded torsion correction')
+        return result
+
+    def apply_prediction(self, output, t, dt, e3_coords, poi_coords,
+                         ligand, poi, body, ligand_data, *,
+                         motion_contract='sdpi_flow_velocity_v1', freeze_poi=False):
+        """Decode and execute a model output under its saved motion contract."""
+        from tricoopdiff.models.assembly import (
+            FLOW_MOTION_CONTRACT, BOUNDED_REPAIR_MOTION_CONTRACT,
+            QUALITY_GATED_REPAIR_MOTION_CONTRACT,
+        )
+
+        normalized = self.normalized_predictions(output, t)
+        action = self.velocities(normalized, e3_coords, poi_coords)
+        if motion_contract in (BOUNDED_REPAIR_MOTION_CONTRACT,
+                               QUALITY_GATED_REPAIR_MOTION_CONTRACT):
+            action = self.bounded_correction(action)
+            if motion_contract == QUALITY_GATED_REPAIR_MOTION_CONTRACT:
+                gate = output.get('repair_gate')
+                if (gate is None or gate.shape != (1, 1) or not torch.isfinite(gate).all()
+                        or bool(((gate < .05) | (gate > 1.)).any())):
+                    raise ValueError('quality-gated repair requires a finite [0.05, 1] gate')
+                action = {key: ({name: value * gate for name, value in entry.items()}
+                                if isinstance(entry, dict) else
+                                entry * gate if torch.is_tensor(entry) else entry)
+                          for key, entry in action.items()}
+            step = torch.ones_like(dt)
+        elif motion_contract == FLOW_MOTION_CONTRACT:
+            step = dt
+        else:
+            raise ValueError(f'unknown saved motion contract: {motion_contract!r}')
+        return self.differentiable_step(
+            ligand, poi, body, action, step, ligand_data, freeze_poi=freeze_poi), action
 
     @staticmethod
     def independent_targets(targets, ligand, poi):
