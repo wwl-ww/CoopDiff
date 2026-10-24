@@ -12,6 +12,7 @@ import gc
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -34,18 +35,19 @@ import tricoopdiff.diffdock_compat  # noqa: E402,F401
 from featurize_common import featurize_complex  # noqa: E402
 from train_entry import _load_index, _load_score_model_args, TernaryDataLoader  # noqa: E402
 from tricoopdiff.initialization.candidates import (  # noqa: E402
-    load_assembly_candidate, generate_joint_matcha_ligand,
+    load_assembly_candidate, generate_etkdg_ligand_at_hdock_interface,
 )
 from tricoopdiff.models.assembly import (  # noqa: E402
     CANDIDATE_FRAMEWORK_VERSION, TernaryAssembly, TernaryAssemblyModel,
-    FLOW_MOTION_CONTRACT, BOUNDED_REPAIR_MOTION_CONTRACT,
+    PURE_TERNARY_MODEL_PROFILE,
+    FLOW_MOTION_CONTRACT, DRIFTING_MOTION_CONTRACT, BOUNDED_REPAIR_MOTION_CONTRACT,
     QUALITY_GATED_REPAIR_MOTION_CONTRACT, QUALITY_GATE_ERROR_SCALE,
     production_model_config, CANDIDATE_GEOMETRY_CONTRACT, CANDIDATE_QUALITY_CONTRACT,
     CANDIDATE_CONDITION_CONTRACT,
-    CANDIDATE_REFERENCE_CONTRACT,
+    PURE_CANDIDATE_REFERENCE_CONTRACT,
     CANDIDATE_TASK_CONTRACT,
+    ANCHOR_RELATION_CONTRACT, TORSION_PHASE_CONTRACT, TARGET_LIGAND_FRAME_CONTRACT,
 )
-from tricoopdiff.models.expert import FrozenMatcha  # noqa: E402
 from tricoopdiff.runtime import (  # noqa: E402
     atomic_json, atomic_torch_save, capture_rng_state, restore_rng_state,
     sha256_file, preserve_rng,
@@ -53,7 +55,9 @@ from tricoopdiff.runtime import (  # noqa: E402
 from tricoopdiff.sdpi_flow import (  # noqa: E402
     BOUNDED_CORRECTION_LIMITS, CORRECTION_STATE_NOISE, SDPIFlow,
 )
-from tricoopdiff.train import AssemblyTrainer  # noqa: E402
+from tricoopdiff.train import (  # noqa: E402
+    AssemblyTrainer, drifting_training_contract, sample_drifting_starts,
+)
 from tricoopdiff.distributed import GradientSynchronizer  # noqa: E402
 from tricoopdiff.initialization.endpoints import EndpointProjectionError  # noqa: E402
 
@@ -70,8 +74,8 @@ class FeatureCacheUnavailable(FileNotFoundError):
     """No compatible reusable cache; feature reconstruction is forbidden."""
 
 
-def mark_conformer_failure(opt, entry, expert, reason):
-    protocol = generation_protocol(opt, entry, expert)
+def mark_conformer_failure(opt, entry, reason):
+    protocol = generation_protocol(opt, entry)
     path = opt.bank/entry['case']/f'initialization_failed.{protocol["generator_sha256"][:12]}.json'
     atomic_json({'protocol': protocol,
                  'case': entry['case'], 'reason': reason, 'retry': False}, path)
@@ -155,7 +159,7 @@ def finish_prefetch(pool):
 
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('generate', 'train', 'predict', 'baseline', 'migrate'))
+    parser.add_argument('mode', choices=('generate', 'train', 'predict', 'baseline'))
     parser.add_argument('--index', required=True)
     parser.add_argument('--bank', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
@@ -169,20 +173,35 @@ def arguments(argv=None):
     parser.add_argument('--adopt-cluster-sampling', action='store_true',
                         help='Explicitly reset a former flat data cursor to cluster epoch 0, retaining weights/optimizer')
     parser.add_argument('--score-model-dir', default='checkpoints/score_model')
-    parser.add_argument('--matcha-source-dir', default='results/matcha_qualification_source')
-    parser.add_argument('--matcha-weights-dir', default='results/matcha_qualification_weights')
     parser.add_argument('--hdock-dir', default='results/hdocklite_install', type=Path)
     parser.add_argument('--fftw-lib-dir', default='/home/wl/micromamba/envs/proteinprep/lib')
     parser.add_argument('--candidates', type=int, default=5)
     parser.add_argument('--hdock-workers', type=int, default=16,
-                        help='Parallel CPU docking processes; Matcha generation stays on one GPU')
-    parser.add_argument('--steps', type=int, default=5)
-    parser.add_argument('--motion-contract', choices=(FLOW_MOTION_CONTRACT,
+                        help='Parallel CPU docking processes')
+    parser.add_argument('--objective', choices=('endpoint', 'drifting'), default='endpoint')
+    parser.add_argument('--steps', type=int)
+    parser.add_argument('--drift-particles', type=int, default=8)
+    parser.add_argument('--drift-endpoint-weight', type=float, default=1.,
+                        help='Scale endpoint geometry supervision without changing the official drift field')
+    parser.add_argument('--drift-torsion-weight', type=float, default=0.,
+                        help='Auxiliary legal torsion-action supervision toward the projected target')
+    parser.add_argument('--drift-rigid-weight', type=float, default=0.,
+                        help='Auxiliary rigid-action supervision after legal torsion correction')
+    parser.add_argument('--torsion-target-phase', action='store_true',
+                        help='Predict target bond phases and derive legal torsion corrections')
+    parser.add_argument('--target-ligand-frame', action='store_true',
+                        help='Predict the target ligand rigid frame relative to E3')
+    parser.add_argument('--drift-pose-weight', type=float, default=0.,
+                        help='Direct supervision for the E3-relative target ligand frame')
+    parser.add_argument('--drift-eval-particles', type=int, default=0,
+                        help='Predict on seeded fresh legal starts per bank conformer; 0 uses the bank directly')
+    parser.add_argument('--motion-contract', choices=(FLOW_MOTION_CONTRACT, DRIFTING_MOTION_CONTRACT,
                         BOUNDED_REPAIR_MOTION_CONTRACT,
                         QUALITY_GATED_REPAIR_MOTION_CONTRACT),
                         help='Training motion contract; weights-from can deliberately change it')
-    parser.add_argument('--generator-steps-per-stage', type=int, default=10)
     parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--snapshot-every', type=int, default=1,
+                        help='Epoch snapshot interval; progress.pt still saves every update')
     parser.add_argument('--online-cache-size', type=int, default=0,
                         help='Generate and use one new pose per visit until full, then uniformly sample; 0 uses static pools')
     parser.add_argument('--reuse-generator-sha256', action='append', default=[],
@@ -195,7 +214,7 @@ def arguments(argv=None):
     parser.add_argument('--seed', type=int, default=73)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--quality-lr', type=float, default=1e-3)
-    parser.add_argument('--sdpi-replay-weight', type=float, default=.2,
+    parser.add_argument('--sdpi-replay-weight', type=float,
                         help='Fraction of motion objective on a fresh SDPI start for each pool update')
     parser.add_argument('--node-dim', type=int, default=128)
     parser.add_argument('--near-target-frequency', type=int, default=4,
@@ -207,9 +226,6 @@ def arguments(argv=None):
     parser.add_argument('--weights-from', type=Path,
                         help='Explicit weights-only start: reset optimizer/RNG/counters for a new objective')
     parser.add_argument('--checkpoint', type=Path)
-    parser.add_argument('--baseline', type=Path, help='SDPI checkpoint; migrate always reads EMA, never raw')
-    parser.add_argument('--frame-policy', choices=('legacy_argmax_v1', 'backbone_rigid_transport_v1'),
-                        default='backbone_rigid_transport_v1')
     parser.add_argument('--selection', choices=('hdock', 'learned'), default='hdock',
                         help='Keep HDOCK rank by default; learned scoring is an explicit uncalibrated experiment')
     parser.add_argument('--case', action='append', dest='cases',
@@ -217,8 +233,41 @@ def arguments(argv=None):
     parser.add_argument('--limit', type=int)
     parser.add_argument('--native-root', type=Path,
                         help='Optional post-selection metrics only; never used by the predictor')
+    parser.add_argument('--deepternary-root', type=Path, default=ROOT/'DeepTernary',
+                        help='Existing DeepTernary checkout containing DockQ; scoring assets only')
     opt = parser.parse_args(argv)
-    if min(opt.candidates, opt.steps, opt.generator_steps_per_stage, opt.epochs, opt.hdock_workers) < 1:
+    if not math.isfinite(opt.drift_endpoint_weight) or opt.drift_endpoint_weight <= 0:
+        parser.error('--drift-endpoint-weight must be finite and positive')
+    if opt.objective != 'drifting' and opt.drift_endpoint_weight != 1.:
+        parser.error('--drift-endpoint-weight requires --objective drifting')
+    if not math.isfinite(opt.drift_torsion_weight) or opt.drift_torsion_weight < 0:
+        parser.error('--drift-torsion-weight must be finite and nonnegative')
+    if opt.objective != 'drifting' and opt.drift_torsion_weight:
+        parser.error('--drift-torsion-weight requires --objective drifting')
+    if not math.isfinite(opt.drift_rigid_weight) or opt.drift_rigid_weight < 0:
+        parser.error('--drift-rigid-weight must be finite and nonnegative')
+    if opt.objective != 'drifting' and opt.drift_rigid_weight:
+        parser.error('--drift-rigid-weight requires --objective drifting')
+    if opt.torsion_target_phase and (opt.objective != 'drifting' or opt.mode != 'train'):
+        parser.error('--torsion-target-phase is a pure drifting training option')
+    if opt.target_ligand_frame and (not opt.torsion_target_phase or opt.mode != 'train'):
+        parser.error('--target-ligand-frame requires training with --torsion-target-phase')
+    if not math.isfinite(opt.drift_pose_weight) or opt.drift_pose_weight < 0:
+        parser.error('--drift-pose-weight must be finite and nonnegative')
+    if opt.drift_pose_weight and (not opt.target_ligand_frame or opt.objective != 'drifting'):
+        parser.error('--drift-pose-weight requires drifting training with --target-ligand-frame')
+    if opt.target_ligand_frame and not opt.drift_pose_weight:
+        parser.error('--target-ligand-frame requires positive --drift-pose-weight')
+    opt.steps = opt.steps if opt.steps is not None else (1 if opt.objective == 'drifting' else 5)
+    if opt.sdpi_replay_weight is None:
+        opt.sdpi_replay_weight = 0. if opt.objective == 'drifting' else .2
+    if opt.drift_particles < 2 or (opt.drift_eval_particles and opt.drift_eval_particles < 2):
+        parser.error('drifting cohorts need at least two particles')
+    if opt.objective == 'drifting' and opt.mode == 'train' and (
+            opt.steps != 1 or opt.sdpi_replay_weight != 0.
+            or opt.motion_contract not in (None, DRIFTING_MOTION_CONTRACT)):
+        parser.error('drifting uses one-pass generation and no independent SDPI replay loss')
+    if min(opt.candidates, opt.steps, opt.epochs, opt.hdock_workers, opt.snapshot_every) < 1:
         parser.error('candidate counts, steps and epochs must be positive')
     if opt.limit is not None and opt.limit < 1:
         parser.error('limit must be positive')
@@ -246,8 +295,6 @@ def arguments(argv=None):
         parser.error('weights-from is training-only and mutually exclusive with resume')
     if opt.checkpoint and opt.mode != 'predict':
         parser.error('checkpoint is a prediction-only operation')
-    if (opt.mode == 'migrate') != bool(opt.baseline):
-        parser.error('migrate requires --baseline; other modes do not accept it')
     return opt
 
 
@@ -262,47 +309,7 @@ def read_payload(path, device='cpu'):
             hashlib.sha256(contents).hexdigest())
 
 
-def matcha_reference_paths(entry, cache_dir, e3, poi):
-    """Give Matcha the same receptor residues and CA altlocs as DiffDock."""
-    import prody as pr
-
-    directory = Path(cache_dir)/'matcha_references'/entry['case']
-    directory.mkdir(parents=True, exist_ok=True)
-    paths = {}
-    for key, data in (('protein1', e3), ('protein2', poi)):
-        receptor_ca = pr.parsePDB(str(entry[key])).ca
-        selected = {
-            (chain, f'{int(number):4d}{insertion or " "}', name): xyz
-            for chain, number, insertion, name, xyz in zip(
-                receptor_ca.getChids(), receptor_ca.getResnums(),
-                receptor_ca.getIcodes(), receptor_ca.getResnames(),
-                receptor_ca.getCoords())}
-        if len(selected) != data['coords'].shape[1]:
-            raise ValueError(f'{entry["case"]}: Matcha receptor selection differs from DiffDock')
-        output = []
-        found_ca = set()
-        for line in Path(entry[key]).read_text().splitlines():
-            if not line.startswith('ATOM'):
-                continue
-            identity = (line[21], line[22:27], line[17:20])
-            if identity not in selected:
-                continue
-            if line[12:16].strip() == 'CA':
-                xyz = selected[identity]
-                line = line[:30]+''.join(f'{float(value):8.3f}' for value in xyz)+line[54:]
-                found_ca.add(identity)
-            output.append(line)
-        if found_ca != set(selected):
-            raise ValueError(f'{entry["case"]}: selected receptor CA records are missing')
-        destination = directory/f'{key}.pdb'
-        contents = '\n'.join(output)+'\nEND\n'
-        if not destination.exists() or destination.read_text() != contents:
-            destination.write_text(contents)
-        paths[key] = str(destination)
-    return paths
-
-
-def load_case(opt, entry, expert, score_args):
+def load_case(opt, entry, score_args):
     # Offline mode prevents a cache miss from silently downloading models.
     destination = Path(opt.cache_dir)/(entry['case']+'.pt')
     if opt.feature_cache_source and not destination.exists():
@@ -315,27 +322,12 @@ def load_case(opt, entry, expert, score_args):
     try:
         data = featurize_complex(entry['case'], entry['protein1'], entry['protein2'],
             entry['ligand'], score_args, opt.device, cache_dir=opt.cache_dir,
-            cache_only=opt.cached_only)
+            cache_only=opt.cached_only, cache_read_only=opt.cached_only)
     except FileNotFoundError as error:
         if opt.cached_only and 'cache-only mode requires a compatible cache directory' in str(error):
             raise FeatureCacheUnavailable(str(error)) from error
         raise
-    loader = Namespace(expert=expert, cache_dir=opt.cache_dir, device=torch.device(opt.device))
-    matcha_entry = entry
-    if opt.mode in ('generate', 'baseline'):
-        matcha_entry = {**entry, **matcha_reference_paths(entry, opt.cache_dir, data[0], data[1])}
-    e3, poi, ligand = preserve_rng(TernaryDataLoader._prepare_matcha)(loader, matcha_entry, data[:3])
-    if expert.frame_policy == 'legacy_argmax_v1':
-        parts = []
-        for part in (e3, poi):
-            centered = part['coords'][0]-part['coords'][0].mean(0)
-            first, second = part['matcha']['anchors']
-            e1 = centered[first]/centered[first].norm()
-            e2 = centered[second]-(centered[second] @ e1)*e1
-            e2 = e2/e2.norm()
-            parts.append({**part, 'matcha': {**part['matcha'],
-                'reference_basis': torch.stack((e1, e2, torch.linalg.cross(e1, e2)), -1)}})
-        e3, poi = parts
+    e3, poi, ligand = data[:3]
     from tricoopdiff.metrics.dockq import _records, _featurized_ca_coords, _fit_rigid
     table = Chem.GetPeriodicTable()
     prepared = []
@@ -392,11 +384,13 @@ def _docking_job_locked(opt, entry, directory):
     identity = {'inputs': input_identity(entry), 'seed': opt.seed,
                 'hdock_sha256': sha256_file(opt.hdock_dir/'hdock')}
     marker = directory/'docking_complete.json'
-    if marker.exists() and (directory/'Hdock.out').is_file() and json.loads(marker.read_text()) == identity:
-        return entry
+    # createpl consumes these inputs even when Hdock.out is reused from cache.
+    # Rebuild them from the pinned input identity so a restored cache is complete.
     write_hdock_input(entry['protein1'], directory/'r.pdb', 'A', np.eye(3))
     write_hdock_input(entry['protein2'], directory/'l.pdb', 'B',
                       Rotation.random(random_state=seed).as_matrix())
+    if marker.exists() and (directory/'Hdock.out').is_file() and json.loads(marker.read_text()) == identity:
+        return entry
     env = {**os.environ, 'LD_LIBRARY_PATH': opt.fftw_lib_dir,
            'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1'}
     with (directory/'hdock.log').open('w') as log:
@@ -416,7 +410,7 @@ def _docking_job_locked(opt, entry, directory):
     return entry
 
 
-def generate(opt, entries, expert, score_args):
+def generate(opt, entries, score_args):
     # Start bounded CPU searches ahead of the resident GPU generator. Do not
     # fork a process containing initialized CUDA models.
     pending = []
@@ -424,7 +418,7 @@ def generate(opt, entries, expert, score_args):
         bank_path = opt.bank/entry['case']/'candidates.pt'
         if bank_path.exists():
             existing = torch.load(bank_path, map_location='cpu', weights_only=False)
-            if not same_generation_protocol(existing['protocol'], generation_protocol(opt, entry, expert), opt):
+            if not same_generation_protocol(existing['protocol'], generation_protocol(opt, entry), opt):
                 raise ValueError('candidate bank provenance changed; use a new bank directory')
             print(f"SKIP generated {entry['case']}", flush=True)
         else:
@@ -435,7 +429,7 @@ def generate(opt, entries, expert, score_args):
         for future in as_completed(futures):
             entry = futures[future]
             try:
-                generate_case(opt, future.result(), expert, score_args)
+                generate_case(opt, future.result(), score_args)
                 (opt.bank/entry['case']/'generation_failed.json').unlink(missing_ok=True)
             except Exception as error:
                 row = {'case': entry['case'], 'error': f'{type(error).__name__}: {error}',
@@ -446,10 +440,10 @@ def generate(opt, entries, expert, score_args):
     atomic_json({'requested': len(entries), 'failed': failures}, opt.output/'generation_status.json')
 
 
-def generation_protocol(opt, entry, expert):
+def generation_protocol(opt, entry):
     protocol = {'format': CANDIDATE_FRAMEWORK_VERSION, 'inputs': input_identity(entry),
-        'expert': expert.provenance, 'seed': opt.seed, 'count': opt.candidates,
-        'steps_per_stage': opt.generator_steps_per_stage,
+        'generator': 'hdock_etkdg_interface_v1', 'seed': opt.seed, 'count': opt.candidates,
+        'placement_offset_std_angstrom': 1.5,
         'generator_sha256': sha256_file(ROOT/'tricoopdiff/initialization/candidates.py'),
         'hdock_sha256': sha256_file(opt.hdock_dir/'hdock')}
     if opt.mode == 'generate':
@@ -472,7 +466,7 @@ def same_generation_protocol(recorded, expected, opt):
 
 
 def candidate_import_paths(entry, directory, model_path, e3, poi):
-    """Remove nonprotein residues excluded from DiffDock receptor nodes."""
+    """Keep HDOCK protein chains aligned with the ternary feature residues."""
     import prody as pr
 
     selected = []
@@ -511,11 +505,11 @@ def candidate_import_paths(entry, directory, model_path, e3, poi):
     return filtered_pose, *reference_paths
 
 
-def generate_case(opt, entry, expert, score_args):
+def generate_case(opt, entry, score_args):
     """Main-thread CUDA generation, after the CPU search completes."""
     directory = opt.bank/entry['case']
-    protocol = generation_protocol(opt, entry, expert)
-    e3, poi, ligand, _ = load_case(opt, entry, expert, score_args)
+    protocol = generation_protocol(opt, entry)
+    e3, poi, ligand, _ = load_case(opt, entry, score_args)
     seed = (opt.seed+int(hashlib.sha256(entry['case'].encode()).hexdigest()[:8], 16)) % (2**31-1)
     with (directory/'export.log').open('w') as log:
         subprocess.run([str((opt.hdock_dir/'createpl').resolve()), 'Hdock.out', 'top.pdb',
@@ -528,21 +522,21 @@ def generate_case(opt, entry, expert, score_args):
         candidate = load_assembly_candidate(model_path, None,
             e3['coords'], poi['coords'], ligand, candidate_id=entry['case'], rank=rank,
             protein1_path=protein1_path, protein2_path=protein2_path)
-        candidate = generate_joint_matcha_ligand(expert, e3, poi, ligand, candidate,
-            seed=(seed+rank*1009) % (2**31-1), steps_per_stage=opt.generator_steps_per_stage)
+        candidate = generate_etkdg_ligand_at_hdock_interface(e3, ligand, candidate,
+            seed=(seed+rank*1009) % (2**31-1))
         candidates.append({key: value.detach().cpu() if torch.is_tensor(value) else value
                            for key, value in candidate.items()})
     atomic_torch_save({'protocol': protocol, 'candidates': candidates}, directory/'candidates.pt')
     print(f"GENERATED {entry['case']} {len(candidates)} candidates", flush=True)
 
 
-def load_bank(opt, entry, expert):
+def load_bank(opt, entry):
     path = opt.bank/entry['case']/'candidates.pt'
     bank, digest = read_payload(path)
     protocol = bank['protocol']
     if (protocol['format'] != CANDIDATE_FRAMEWORK_VERSION
             or protocol['inputs'] != input_identity(entry)
-            or protocol['expert'] != expert.provenance):
+            or protocol.get('generator') != 'hdock_etkdg_interface_v1'):
         raise ValueError('candidate bank input, generator or format identity differs')
     ranks = [c['provenance']['protein_candidate_rank'] for c in bank['candidates']]
     if len(ranks) != protocol['count'] or sorted(ranks) != list(range(1, protocol['count']+1)):
@@ -550,7 +544,7 @@ def load_bank(opt, entry, expert):
     return bank['candidates'], digest
 
 
-def online_candidate(opt, entry, expert, prepared, visit):
+def online_candidate(opt, entry, prepared, visit):
     """Immutable slots: visits 0..K-1 create/use that slot; later visits draw.
 
     A slot published before an interrupted optimizer update is reused on retry,
@@ -563,7 +557,7 @@ def online_candidate(opt, entry, expert, prepared, visit):
     directory = opt.bank/entry['case']
     directory.mkdir(parents=True, exist_ok=True)
     path = directory/f'online_slot_{slot}.pt'
-    protocol = {**generation_protocol(opt, entry, expert),
+    protocol = {**generation_protocol(opt, entry),
         'cache_contract': 'fill_new_then_uniform_fixed_slots_v1', 'capacity': size,
         'slot': slot, 'slot_seed': (case_seed+1009*(slot+1)) % (2**31-1)}
     with (directory/'online.lock').open('a') as lock:
@@ -571,7 +565,7 @@ def online_candidate(opt, entry, expert, prepared, visit):
         failed = directory/f'initialization_failed.{protocol["generator_sha256"][:12]}.json'
         if failed.exists():
             record = json.loads(failed.read_text())
-            if record['protocol'] != generation_protocol(opt, entry, expert):
+            if record['protocol'] != generation_protocol(opt, entry):
                 raise ValueError('failed initialization provenance differs')
             raise ConformerGenerationFailure(record['reason'])
         if path.exists():
@@ -591,45 +585,91 @@ def online_candidate(opt, entry, expert, prepared, visit):
         candidate = load_assembly_candidate(directory/f'model_{rank}.pdb', None,
             e3['coords'], poi['coords'], ligand, candidate_id=entry['case'], rank=rank,
             protein1_path=entry['protein1'], protein2_path=entry['protein2'])
-        candidate = preserve_rng(generate_joint_matcha_ligand)(expert, e3, poi, ligand, candidate,
-            seed=protocol['slot_seed'], steps_per_stage=opt.generator_steps_per_stage)
+        candidate = preserve_rng(generate_etkdg_ligand_at_hdock_interface)(
+            e3, ligand, candidate, seed=protocol['slot_seed'])
         candidate = {k: v.detach().cpu() if torch.is_tensor(v) else v for k, v in candidate.items()}
         atomic_torch_save({'protocol': protocol, 'candidate': candidate}, path)
         return candidate, path, sha256_file(path)
 
 
-def model_for(opt, expert, input_dim, payload=None):
+def model_for(opt, input_dim, payload=None):
+    requested_motion = (getattr(opt, 'motion_contract', None) or
+        (DRIFTING_MOTION_CONTRACT if opt.objective == 'drifting' else FLOW_MOTION_CONTRACT))
     config = (dict(payload['model_config']) if payload else production_model_config(
-        opt.node_dim, input_dim, True, expert_backend='matcha',
-        expert_scalar_dim=expert.node_scalar_dim, expert_vector_dim=expert.node_vector_dim,
-        candidate_driven=True, candidate_expert_frame_policy=expert.frame_policy,
-        motion_contract=getattr(opt, 'motion_contract', None) or FLOW_MOTION_CONTRACT))
+        opt.node_dim, input_dim, True, model_profile=PURE_TERNARY_MODEL_PROFILE,
+        candidate_driven=True,
+        motion_contract=requested_motion,
+        torsion_phase_contract=TORSION_PHASE_CONTRACT if getattr(opt, 'torsion_target_phase', False) else None,
+        target_ligand_frame_contract=(TARGET_LIGAND_FRAME_CONTRACT
+            if getattr(opt, 'target_ligand_frame', False) else None)))
     if payload and getattr(opt, 'weights_from', None):
-        contract = getattr(opt, 'motion_contract', None) or FLOW_MOTION_CONTRACT
+        contract = requested_motion
+        if (contract == DRIFTING_MOTION_CONTRACT
+                and 'contact_guidance_contract' not in config):
+            raise ValueError('old weights cannot silently start the contact-guided drifting '
+                             'contract; initialize a new model or resume the old contract')
         if contract == FLOW_MOTION_CONTRACT:
             config.pop('motion_contract', None)
         else:
             config['motion_contract'] = contract
+        if contract == DRIFTING_MOTION_CONTRACT:
+            config.pop('candidate_quality_contract', None)
+            if getattr(opt, 'torsion_target_phase', False):
+                config['torsion_phase_contract'] = TORSION_PHASE_CONTRACT
+            if getattr(opt, 'target_ligand_frame', False):
+                config['target_ligand_frame_contract'] = TARGET_LIGAND_FRAME_CONTRACT
+    drifting = config.get('motion_contract') == DRIFTING_MOTION_CONTRACT
     if (input_dim != config['input_dim'] or not config.get('candidate_driven')
             or config.get('candidate_geometry_contract') != CANDIDATE_GEOMETRY_CONTRACT
-            or config.get('candidate_quality_contract') != CANDIDATE_QUALITY_CONTRACT
+            or config.get('candidate_quality_contract') != (None if drifting else CANDIDATE_QUALITY_CONTRACT)
             or config.get('candidate_condition_contract') != CANDIDATE_CONDITION_CONTRACT
-            or config.get('candidate_reference_contract') != CANDIDATE_REFERENCE_CONTRACT
-            or config.get('candidate_task_contract') != CANDIDATE_TASK_CONTRACT):
+            or config.get('candidate_reference_contract') != PURE_CANDIDATE_REFERENCE_CONTRACT
+            or config.get('candidate_task_contract') != CANDIDATE_TASK_CONTRACT
+            or config.get('model_profile') != PURE_TERNARY_MODEL_PROFILE
+            or not config.get('expert_free')):
         raise ValueError('checkpoint is not a compatible candidate-driven model')
-    if payload and (payload['format'] != CANDIDATE_FRAMEWORK_VERSION
-                    or payload['expert_identity'] != expert.provenance):
-        raise ValueError('checkpoint format or frozen expert identity differs')
-    model = TernaryAssemblyModel(expert, TernaryAssembly(**config), expert_input_grad=True,
+    if payload and payload['format'] != CANDIDATE_FRAMEWORK_VERSION:
+        raise ValueError('checkpoint candidate framework differs')
+    model = TernaryAssemblyModel(None, TernaryAssembly(**config),
                                  checkpoint_ternary=True).to(opt.device)
     if payload:
-        model.trifuse.load_state_dict(payload['model_state'], strict=True)
+        state = payload['model_state']
+        if drifting and getattr(opt, 'weights_from', None):
+            state = {key: value for key, value in state.items() if not key.startswith('controller.quality.')}
+        if getattr(opt, 'weights_from', None) and config.get('target_ligand_frame_contract'):
+            previous_frame = payload['model_config'].get('target_ligand_frame_contract')
+            state = {key: value for key, value in state.items()
+                     if not key.startswith('controller.assembly.rigid.e3_ligand.')
+                     and (previous_frame in (config['target_ligand_frame_contract'],
+                                             'anchor_conditioned_ligand_target_frame_v2')
+                          or not key.startswith('controller.assembly.target_frame_head.'))}
+        new_head_names = []
+        if getattr(opt, 'weights_from', None):
+            for contract, module in (
+                    ('torsion_phase_contract', 'target_phase_head'),
+                    ('target_ligand_frame_contract', 'target_frame_head')):
+                if config.get(contract) and config.get(contract) != payload['model_config'].get(contract):
+                    if not (module == 'target_frame_head' and
+                            payload['model_config'].get(contract) ==
+                            'anchor_conditioned_ligand_target_frame_v2'):
+                        new_head_names.append(module)
+        if new_head_names:
+            missing, unexpected = model.trifuse.load_state_dict(state, strict=False)
+            expected = {f'controller.assembly.{module}.{suffix}'
+                for module in new_head_names
+                for suffix in ('0.weight', '0.bias', '2.weight', '2.bias')}
+            if set(missing) != expected or unexpected:
+                raise ValueError('target-head migration has unexpected parameter differences')
+        else:
+            model.trifuse.load_state_dict(state, strict=True)
     return model
 
 
-def train(opt, entries, expert, score_args):
+def train(opt, entries, score_args):
     global ACTIVE_PREFETCH
     training_started = time.monotonic()
+    implementation = {name: sha256_file(ROOT/name) for name in (
+        'scripts/assembly_pipeline.py', 'tricoopdiff/models/assembly.py', 'tricoopdiff/train.py')}
     if not opt.resume and (opt.output/'progress.pt').exists():
         raise ValueError('training output already contains a checkpoint; use --resume or a new directory')
     world = dist.get_world_size() if dist.is_initialized() else 1
@@ -643,6 +683,19 @@ def train(opt, entries, expert, score_args):
     if not entries:
         raise ValueError('each training rank requires at least one case')
     payload = read_payload(opt.resume, opt.device)[0] if opt.resume else None
+    if payload and rank == 0:
+        recorded_implementation = payload.get('implementation_sha256') or {}
+        changed_sources = sorted(name for name, digest in implementation.items()
+                                 if recorded_implementation.get(name) != digest)
+        if changed_sources:
+            # The file digest includes evaluation and documentation-adjacent
+            # edits in this entry point. Model/loss contracts below decide
+            # compatibility; source drift is an explicit provenance warning.
+            print('RESUME_IMPLEMENTATION_CHANGED ' + json.dumps({
+                'files': changed_sources,
+                'saved_sha256': {name: recorded_implementation.get(name) for name in changed_sources},
+                'current_sha256': {name: implementation[name] for name in changed_sources},
+            }), flush=True)
     admission = getattr(opt, 'data_admission', None)
     available = set(admission['available_cases']) if admission else None
     sampling_contract = 'deepternary_cluster_80_20_v1' if clusters else 'flat_entries_v1'
@@ -677,7 +730,7 @@ def train(opt, entries, expert, score_args):
     for i in owned_indices:
         entry = entries[i]
         if not opt.online_cache_size:
-            candidates, digest = load_bank(opt, entry, expert)
+            candidates, digest = load_bank(opt, entry)
             identity[entry['case']] = digest
         tasks.append(i)
     if opt.online_cache_size and rank_state:
@@ -693,8 +746,8 @@ def train(opt, entries, expert, score_args):
             if len(case_cache) >= 2:
                 case_cache.popitem(last=False)
             entry = entries[index]
-            case_cache[index] = (load_case(opt, entry, expert, score_args),
-                                 None if opt.online_cache_size else load_bank(opt, entry, expert)[0])
+            case_cache[index] = (load_case(opt, entry, score_args),
+                                 None if opt.online_cache_size else load_bank(opt, entry)[0])
         case_cache.move_to_end(index)
         return case_cache[index]
     transfer, transfer_digest = read_payload(opt.weights_from, opt.device) if opt.weights_from else (None, None)
@@ -715,11 +768,36 @@ def train(opt, entries, expert, score_args):
                         'gradient_clip_contract': 'independent_motion_quality_groups_v1',
                         'near_target_frequency': opt.near_target_frequency,
                         'steric_contract': 'element_0p75_vdw_cross_and_ligand_gt3bonds_v1'}
-    effective_motion_contract = (
-        getattr(opt, 'motion_contract', None) or FLOW_MOTION_CONTRACT
-        if opt.weights_from else
-        payload['model_config'].get('motion_contract', FLOW_MOTION_CONTRACT)
-        if payload else FLOW_MOTION_CONTRACT)
+    effective_motion_contract = (payload['model_config'].get('motion_contract', FLOW_MOTION_CONTRACT)
+        if payload else opt.motion_contract or
+        (DRIFTING_MOTION_CONTRACT if opt.objective == 'drifting' else FLOW_MOTION_CONTRACT))
+    if (effective_motion_contract == DRIFTING_MOTION_CONTRACT) != (opt.objective == 'drifting'):
+        raise ValueError('training objective disagrees with the saved model motion contract')
+    if opt.objective == 'drifting':
+        guidance = ((payload or transfer)['model_config'].get('contact_guidance_contract')
+            if payload or transfer else ANCHOR_RELATION_CONTRACT)
+        drift_recipe = drifting_training_contract({'contact_guidance_contract': guidance})
+        training_options = {
+            'endpoint_objective': drift_recipe['version'],
+            'drifting': {**drift_recipe, 'particles': opt.drift_particles},
+            'update_unit': 'one_case_conditional_generated_cohort_v1',
+            'node_dim': opt.node_dim, 'gradient_clip_norm': 10.,
+            'quality_target': None, 'sdpi_replay_weight': 0.,
+        }
+        if opt.drift_endpoint_weight != 1.:
+            training_options['drifting_endpoint_weight'] = opt.drift_endpoint_weight
+        if opt.drift_torsion_weight:
+            training_options['drifting_torsion_weight'] = opt.drift_torsion_weight
+        if opt.drift_rigid_weight:
+            training_options['drifting_rigid_weight'] = opt.drift_rigid_weight
+        if opt.drift_pose_weight:
+            training_options['drifting_pose_weight'] = opt.drift_pose_weight
+        if opt.torsion_target_phase or ((payload or transfer)
+                and (payload or transfer)['model_config'].get('torsion_phase_contract')):
+            training_options['torsion_phase_contract'] = TORSION_PHASE_CONTRACT
+        if opt.target_ligand_frame or ((payload or transfer)
+                and (payload or transfer)['model_config'].get('target_ligand_frame_contract')):
+            training_options['target_ligand_frame_contract'] = TARGET_LIGAND_FRAME_CONTRACT
     if effective_motion_contract in (BOUNDED_REPAIR_MOTION_CONTRACT,
                                      QUALITY_GATED_REPAIR_MOTION_CONTRACT):
         training_options.update(
@@ -736,7 +814,7 @@ def train(opt, entries, expert, score_args):
     if opt.online_cache_size:
         training_options.update(online_cache_size=opt.online_cache_size,
             online_cache_contract='fill_new_then_uniform_fixed_slots_v1',
-            hdock_candidates=opt.candidates, generator_steps_per_stage=opt.generator_steps_per_stage)
+            hdock_candidates=opt.candidates)
     if payload and payload['training_options'] != training_options:
         raise ValueError('resume model width or training objective differs')
     initial_data = None
@@ -751,7 +829,7 @@ def train(opt, entries, expert, score_args):
             continue
     if initial_data is None:
         raise ValueError('training rank has no cached-only entries')
-    model = model_for(opt, expert, initial_data[3], payload or transfer)
+    model = model_for(opt, initial_data[3], payload or transfer)
     initial_data = None
     feature_identity = (rank_state['feature_identity'].copy() if rank_state else {})
     for case, digest in feature_identity.items():
@@ -838,7 +916,7 @@ def train(opt, entries, expert, score_args):
                         if prefetch:
                             futures[entry['case']].result()
                         visit = cache_visits.get(entry['case'], 0) if clusters else epoch
-                        candidate, path, digest = online_candidate(opt, entry, expert, prepared, visit)
+                        candidate, path, digest = online_candidate(opt, entry, prepared, visit)
                         cache_visits[entry['case']] = visit+1
                         identity[str(path)] = digest
                         candidates = [candidate]
@@ -889,7 +967,7 @@ def train(opt, entries, expert, score_args):
                           f'rmsd={record["projection_rmsd_angstrom"]} A, '
                           f'nfev={record["solver_nfev"]}', flush=True)
                 elif known and opt.online_cache_size:
-                    path = mark_conformer_failure(opt, entry, expert, str(exc))
+                    path = mark_conformer_failure(opt, entry, str(exc))
                     identity[str(path)] = sha256_file(path)
                     trainer.optimizer.zero_grad(set_to_none=True)
                     active = False
@@ -939,8 +1017,9 @@ def train(opt, entries, expert, score_args):
                 states[0] = local_state
             if rank == 0:
                 checkpoint = {'format': CANDIDATE_FRAMEWORK_VERSION,
+                    'implementation_sha256': implementation,
                     'model_config': model.trifuse.config, 'model_state': model.trifuse.state_dict(),
-                    'expert_identity': expert.provenance, 'optimizer_state': trainer.optimizer.state_dict(),
+                    'expert_identity': None, 'optimizer_state': trainer.optimizer.state_dict(),
                     'bank_identity': identity, 'steps': opt.steps, 'seed': opt.seed,
                     'training_index_sha256': sha256_file(opt.index), 'training_options': training_options,
                     'weights_only_origin': (payload.get('weights_only_origin') if payload else
@@ -955,7 +1034,7 @@ def train(opt, entries, expert, score_args):
                     'sampling_contract': sampling_contract, 'sampling_origin': sampling_origin,
                     'epoch_cases': epoch_cases}
                 atomic_torch_save(checkpoint, opt.output/'progress.pt')
-                if next_position == 0:
+                if next_position == 0 and next_epoch % opt.snapshot_every == 0:
                     atomic_torch_save(checkpoint, opt.output/f'checkpoint_epoch{next_epoch}.pt')
                 summary = {'epoch': epoch, 'update': updates, 'global_cases': global_cases,
                     'ranks': [s['record'] for s in states], 'gradient_norms': norms,
@@ -986,19 +1065,28 @@ def train(opt, entries, expert, score_args):
 def backward_case(opt, trainer, model, entry, prepared, candidates, updates):
     """Accumulate one real case before global sample-weighted reduction."""
     e3, poi, ligand, _ = prepared
+    if opt.objective == 'drifting':
+        index = int(np.random.randint(len(candidates)))
+        result = trainer.backward_drifting_case(e3, poi, ligand, candidates[index],
+                                                particles=opt.drift_particles,
+                                                endpoint_weight=opt.drift_endpoint_weight,
+                                                torsion_weight=opt.drift_torsion_weight,
+                                                rigid_weight=opt.drift_rigid_weight,
+                                                pose_weight=opt.drift_pose_weight)
+        return {'case': entry['case'], 'candidate_template': index, **result}
     features, targets, records = [], [], []
     for j, candidate in enumerate(candidates):
         near = ({'near_target_zero': (updates // opt.near_target_frequency) % 2 == 0,
                  'near_target_start_t': 1.}
                 if j == 0 and opt.near_target_frequency and updates % opt.near_target_frequency == 0 else {})
-        result = trainer.compute_loss(e3, poi, ligand, case=entry['case'], source='hdock_matcha', task_mode='refine',
+        result = trainer.compute_loss(e3, poi, ligand, case=entry['case'], source='hdock_etkdg', task_mode='refine',
             coupling_override={'initial_state': {'ligand': candidate['ligand'],
                 'poi': candidate['poi'], 'body_frame': candidate['rotation']}}, **near)
         # Accumulate the complete pool without retaining five rollout graphs.
         ((1-opt.sdpi_replay_weight)*result['loss_total']/len(candidates)).backward()
         features.append(result['candidate_quality_features'])
         targets.append(result['candidate_quality_target'])
-        records.append({'candidate': j, 'task_mode': 'refine', 'source': 'hdock_matcha',
+        records.append({'candidate': j, 'task_mode': 'refine', 'source': 'hdock_etkdg',
             'loss': float(result['loss_total'].detach()),
             'components': {key: value for key, value in result.items()
                 if key.startswith('loss_') and key != 'loss_total'},
@@ -1032,28 +1120,45 @@ def backward_case(opt, trainer, model, entry, prepared, candidates, updates):
     return record
 
 
-def predict(opt, entries, expert, score_args):
+def predict(opt, entries, score_args):
     payload, checkpoint_digest = read_payload(opt.checkpoint, opt.device)
-    if payload['training_options'].get('quality_target') != 'native_crystal_log_geometry_v1':
+    drifting = payload['model_config'].get('motion_contract') == DRIFTING_MOTION_CONTRACT
+    if drifting and (opt.steps != 1 or opt.selection != 'hdock'):
+        raise ValueError('drifting predicts once and uses HDOCK rank; no learned quality head is trained')
+    if not drifting and payload['training_options'].get('quality_target') != 'native_crystal_log_geometry_v1':
         raise ValueError('retired reachable-target scorer; train the crystal-quality framework')
     if payload['steps'] != opt.steps:
         raise ValueError('deployment must use the trained refinement step count')
     if not payload.get('updates', 0):
         raise ValueError('prediction requires a trained candidate-framework checkpoint')
+    generation_contract = ('candidate_state_one_step_generation_v1' if drifting
+                           else 'candidate_state_iterative_refinement_v1')
     model = None
     for entry in entries:
-        e3, poi, ligand, input_dim = load_case(opt, entry, expert, score_args)
-        candidates, bank_digest = load_bank(opt, entry, expert)
+        e3, poi, ligand, input_dim = load_case(opt, entry, score_args)
+        candidates, bank_digest = load_bank(opt, entry)
+        if opt.drift_eval_particles:
+            if not drifting:
+                raise ValueError('fresh cohort evaluation requires a drifting checkpoint')
+            generator = torch.Generator(device=opt.device).manual_seed(opt.seed)
+            candidates = [{**candidate, **start, 'provenance': {**candidate['provenance'],
+                'drifting_draw': i, 'drifting_seed': opt.seed}}
+                for candidate in candidates for i, start in enumerate(sample_drifting_starts(
+                    candidate, ligand, opt.drift_eval_particles, generator=generator))]
         if model is None:
-            model = model_for(opt, expert, input_dim, payload)
+            model = model_for(opt, input_dim, payload)
         predictions = model.refine_candidates(e3, poi, ligand, candidates, steps=opt.steps)
-        scores = [float(p['candidate_score']) for p in predictions]
-        learned_winner = int(np.argmax(scores)) if payload.get('updates', 0) else None
+        scores = [None if drifting else float(p['candidate_score']) for p in predictions]
+        learned_winner = int(np.argmax(scores)) if not drifting and payload.get('updates', 0) else None
         winner = (learned_winner if opt.selection == 'learned' else
                   min(range(len(predictions)), key=lambda i:
                       predictions[i]['provenance']['protein_candidate_rank']))
         directory = opt.output/entry['case']
         directory.mkdir(parents=True, exist_ok=True)
+        if opt.drift_eval_particles:
+            atomic_torch_save([{key: value.cpu() if torch.is_tensor(value) else value
+                for key, value in candidate.items()} for candidate in candidates],
+                directory/'initial_states.pt')
         selection_path = directory/'selection.json'
         if selection_path.exists() and json.loads(selection_path.read_text())['checkpoint_sha256'] != checkpoint_digest:
             raise ValueError('prediction output belongs to another checkpoint; use a new directory')
@@ -1062,7 +1167,11 @@ def predict(opt, entries, expert, score_args):
         atomic_json({'case': entry['case'], 'candidate_scores': scores, 'selected_index': winner,
             'task_mode': 'refine',
             'selection_policy': opt.selection, 'experimental_learned_index': learned_winner,
-            'quality_trained_updates': payload.get('updates', 0), 'bank_sha256': bank_digest,
+            'quality_trained_updates': 0 if drifting else payload.get('updates', 0), 'bank_sha256': bank_digest,
+            'trained_updates': payload.get('updates', 0),
+            'motion_contract': payload['model_config'].get('motion_contract', FLOW_MOTION_CONTRACT),
+            'generation_contract': generation_contract,
+            'network_evaluations_per_prediction': 1 if drifting else opt.steps+1,
             'checkpoint_sha256': checkpoint_digest, 'native_used_for_selection': False,
             'quality_calibration_validated': False,
             'checkpoint_migration': payload.get('checkpoint_migration'),
@@ -1106,19 +1215,16 @@ def predict(opt, entries, expert, score_args):
                 native_path = opt.native_root/entry['case']/'gt_complex.pdb'
                 row = compute_fullatom_dockq(prediction['ligand'][0].cpu().numpy(),
                     prediction['poi'][0].cpu().numpy(), e3['coords'][0].cpu().numpy(),
-                    entry['protein1'], entry['protein2'], entry['ligand'], native_path, ROOT/'DeepTernary',
+                    entry['protein1'], entry['protein2'], entry['ligand'], native_path, opt.deepternary_root,
                     pred_poi_rotation=prediction['rotation'][0].cpu().numpy())
                 initial = candidates[index]
                 before = compute_fullatom_dockq(initial['ligand'][0].cpu().numpy(),
                     initial['poi'][0].cpu().numpy(), e3['coords'][0].cpu().numpy(),
-                    entry['protein1'], entry['protein2'], entry['ligand'], native_path, ROOT/'DeepTernary',
+                    entry['protein1'], entry['protein2'], entry['ligand'], native_path, opt.deepternary_root,
                     pred_poi_rotation=initial['rotation'][0].cpu().numpy())
                 initial_rmsd = (initial['ligand'].to(ligand['coords'])-ligand['coords']).square().sum(-1).mean().sqrt()
                 rmsd = torch.linalg.vector_norm(prediction['ligand']-ligand['coords'], dim=-1).square().mean().sqrt()
                 row.update(candidate_index=index, ligand_crystal_rmsd_angstrom=float(rmsd),
-                           initial_dockq=before['dockq'], dockq_change=row['dockq']-before['dockq'],
-                           initial_ligand_crystal_rmsd_angstrom=float(initial_rmsd),
-                           ligand_rmsd_change_angstrom=float(rmsd-initial_rmsd),
                            protein_rotation_to_indexed_target_deg=float(np.rad2deg(np.arccos(np.clip(
                                (prediction['rotation'][0].cpu().numpy().trace()-1)/2, -1, 1)))),
                            initial_protein_rotation_to_indexed_target_deg=float(np.rad2deg(np.arccos(np.clip(
@@ -1126,17 +1232,60 @@ def predict(opt, entries, expert, score_args):
                            protein_center_to_indexed_target_angstrom=float(torch.linalg.vector_norm(
                                prediction['poi'].mean(1)-poi['coords'].mean(1))),
                            ligand_rmsd_protocol='indexed_atom_order_e3_frame_no_ligand_alignment')
+                ligand_displacement = float((prediction['ligand']-initial['ligand'].to(
+                    prediction['ligand'])).square().sum(-1).mean().sqrt())
+                if drifting:
+                    # The network reads this perturbed condition, but executes
+                    # its action from the shared HDOCK/ETKDG reference template.
+                    # These differences are comparisons of two candidate pools,
+                    # not measured progress along a state-update trajectory.
+                    row.update(conditioning_dockq=before['dockq'],
+                               generated_minus_conditioning_dockq=row['dockq']-before['dockq'],
+                               conditioning_ligand_crystal_rmsd_angstrom=float(initial_rmsd),
+                               generated_minus_conditioning_ligand_rmsd_angstrom=float(rmsd-initial_rmsd),
+                               conditioning_to_generated_ligand_rmsd_angstrom=ligand_displacement)
+                else:
+                    row.update(initial_dockq=before['dockq'], dockq_change=row['dockq']-before['dockq'],
+                               initial_ligand_crystal_rmsd_angstrom=float(initial_rmsd),
+                               ligand_rmsd_change_angstrom=float(rmsd-initial_rmsd),
+                               ligand_movement_angstrom=ligand_displacement)
                 metrics.append(row)
         if opt.native_root:
+            before_dockq = 'conditioning_dockq' if drifting else 'initial_dockq'
+            before_ligand = ('conditioning_ligand_crystal_rmsd_angstrom' if drifting
+                             else 'initial_ligand_crystal_rmsd_angstrom')
+            prefix_before = 'conditioning' if drifting else 'initial'
+            prefix_after = 'generated' if drifting else 'final'
+            summary = {
+                'candidates': len(metrics),
+                f'{prefix_before}_mean_dockq': float(np.mean([m[before_dockq] for m in metrics])),
+                f'{prefix_after}_mean_dockq': float(np.mean([m['dockq'] for m in metrics])),
+                f'oracle_{prefix_before}_dockq': max(m[before_dockq] for m in metrics),
+                f'oracle_{prefix_after}_dockq': max(m['dockq'] for m in metrics),
+                'oracle_union_dockq': max(max(m[before_dockq], m['dockq']) for m in metrics),
+                f'{prefix_before}_mean_ligand_rmsd': float(np.mean([m[before_ligand] for m in metrics])),
+                f'{prefix_after}_mean_ligand_rmsd': float(np.mean([
+                    m['ligand_crystal_rmsd_angstrom'] for m in metrics])),
+                f'{prefix_after}_median_ligand_rmsd': float(np.median([
+                    m['ligand_crystal_rmsd_angstrom'] for m in metrics])),
+                'fraction_ligand_under_2a': float(np.mean([
+                    m['ligand_crystal_rmsd_angstrom'] <= 2 for m in metrics])),
+            }
+            comparison_name = ('fraction_generated_ligand_rmsd_below_conditioning' if drifting
+                               else 'fraction_ligand_improved')
+            summary[comparison_name] = float(np.mean([
+                m['ligand_crystal_rmsd_angstrom'] < m[before_ligand] for m in metrics]))
             atomic_json({'case': entry['case'], 'selected_index': winner,
                 'selected': metrics[winner] if winner is not None else None,
-                'candidates': metrics, 'native_used_for_selection': False}, directory/'metrics.json')
+                'candidates': metrics, 'native_used_for_selection': False,
+                'generation_contract': generation_contract,
+                'summary': summary}, directory/'metrics.json')
         print(f"PREDICTED {entry['case']} selected={winner}", flush=True)
 
 
 @torch.no_grad()
-def baseline(opt, entries, expert, score_args):
-    """Score frozen HDOCK + joint Matcha candidates without ternary refinement."""
+def baseline(opt, entries, score_args):
+    """Score native-free HDOCK plus ETKDG-interface candidates before refinement."""
     from tricoopdiff.metrics.dockq import (
         _featurized_ca_coords, _fit_rigid, compute_fullatom_pose_dockq,
     )
@@ -1154,8 +1303,8 @@ def baseline(opt, entries, expert, score_args):
             print(f'REUSED BASELINE {entry["case"]}', flush=True)
             continue
         try:
-            e3, poi, ligand, _ = load_case(opt, entry, expert, score_args)
-            candidates, bank_digest = load_bank(opt, entry, expert)
+            e3, poi, ligand, _ = load_case(opt, entry, score_args)
+            candidates, bank_digest = load_bank(opt, entry)
             native_path = entry['complex']
             if not Path(native_path).is_file():
                 raise FileNotFoundError(native_path)
@@ -1197,7 +1346,7 @@ def baseline(opt, entries, expert, score_args):
         cases.append(result)
         print(f'BASELINE {entry["case"]} {result["status"]}', flush=True)
     complete = [case for case in cases if case['status'] == 'complete']
-    summary = {'protocol': 'unbound_hdock_top5_joint_matcha_direct_fullatom_v2',
+    summary = {'protocol': 'unbound_hdock_top5_etkdg_interface_direct_fullatom_v1',
         'requested': len(entries), 'completed': len(complete),
         'failed': [case['case'] for case in cases if case['status'] != 'complete'],
         'top1_mean_dockq': float(np.mean([case['selected']['dockq'] for case in complete])) if complete else None,
@@ -1207,98 +1356,6 @@ def baseline(opt, entries, expert, score_args):
         'cases': cases}
     atomic_json(summary, opt.output/'summary.json')
     print(f'BASELINE COMPLETE {len(complete)}/{len(entries)}', flush=True)
-
-
-def migrate(opt, entries, expert, score_args):
-    """Convert the selected SDPI EMA once; publish only after rollout parity."""
-    from tricoopdiff.initialization import TernaryInitializer
-    from tricoopdiff.runtime import evaluation_context
-    from tricoopdiff.models.assembly import LEGACY_TORSION_REPRESENTATION
-
-    parent, digest = read_payload(opt.baseline, opt.device)
-    if parent['training_state']['epoch'] != 16 or opt.steps != 20:
-        raise ValueError('this migration requires epoch16 EMA and the original 20-step execution')
-    for key in ('stage_weights_sha256', 'source_tree_sha256', 'sequence_encoder_sha256',
-                'torsion_contract', 'node_vector_contract', 'time_contract'):
-        if parent['expert_base_identity'].get(key) != expert.provenance.get(key):
-            raise ValueError(f'pretrained expert evidence differs: {key}')
-    config = parent['model_config']
-    legacy = TernaryAssemblyModel(expert, TernaryAssembly(**config), expert_input_grad=True).to(opt.device)
-    old_weights = parent['ema_trifuse_state_dict']
-    legacy.trifuse.load_state_dict(old_weights, strict=True)
-    updated = production_model_config(config['node_dim'], config['input_dim'], True,
-        expert_backend='matcha', expert_scalar_dim=expert.node_scalar_dim,
-        expert_vector_dim=expert.node_vector_dim, candidate_driven=True,
-        candidate_expert_frame_policy=expert.frame_policy,
-        torsion_representation_contract=config.get('torsion_representation_contract', LEGACY_TORSION_REPRESENTATION),
-        protein_local_geometry_contract=config.get('protein_local_geometry_contract', 'none'))
-    model = TernaryAssemblyModel(expert, TernaryAssembly(**updated), expert_input_grad=True).to(opt.device)
-    weights = model.trifuse.state_dict()
-    copied = []
-    for key, value in old_weights.items():
-        if key == 'controller.vector_input.weight':
-            weights[key].zero_()
-            weights[key][:, :value.shape[1]] = value
-        else:
-            if key not in weights or weights[key].shape != value.shape:
-                raise ValueError(f'cannot preserve pretrained tensor: {key}')
-            weights[key] = value
-        copied.append(key)
-    for key in weights.keys()-old_weights.keys():
-        if not key.startswith('controller.quality.'):
-            weights[key].zero_()
-    model.trifuse.load_state_dict(weights, strict=True)
-    flow = SDPIFlow(inference_steps=20)
-    rows = []
-    with evaluation_context(legacy), evaluation_context(model), torch.no_grad():
-        for entry in entries:
-            e3, poi, ligand, _ = load_case(opt, entry, expert, score_args)
-            l0, p0, r0, _ = TernaryInitializer(no_torsion=False).initialize(
-                e3['coords'][0], poi['coords'][0], ligand, seed=73)
-            starts = [('sdpi73', l0, p0, r0, 'sdpi')]
-            bank_path = opt.bank/entry['case']/'candidates.pt'
-            if bank_path.exists():
-                # Pose-only comparison, not accepting this bank for training.
-                bank = read_payload(bank_path)[0]
-                if bank['protocol']['inputs'] != input_identity(entry):
-                    raise ValueError('comparison bank belongs to different inputs')
-                starts.extend((f'candidate{i+1}', *(c[k].to(l0) for k in ('ligand', 'poi', 'rotation')),
-                               'hdock_matcha') for i, c in enumerate(bank['candidates']))
-            for name, l0, p0, r0, source in starts:
-                before = [x.clone() for x in (l0, p0, r0)]
-                after = [x.clone() for x in (l0, p0, r0)]
-                reference = {**poi, 'candidate_reference': {
-                    'ligand': l0.clone(), 'poi': p0.clone(), 'body': r0.clone()}}
-                max_velocity = 0.
-                for t, dt in flow.reverse_times(l0):
-                    a = flow.forward_state(legacy, e3, poi, ligand, *before, t, dt, source=0)
-                    b = flow.forward_state(model, e3, reference, ligand, *after, t, dt, source=source,
-                        task_mode='assemble' if source == 'sdpi' else 'refine')
-                    for branch in ('e3_ligand', 'poi_ligand'):
-                        for field in ('tr', 'rot'):
-                            max_velocity = max(max_velocity, float((a['normalized_velocity'][branch][field]-
-                                b['normalized_velocity'][branch][field]).abs().max()))
-                    if a['normalized_velocity']['torsion'].numel():
-                        max_velocity = max(max_velocity, float((a['normalized_velocity']['torsion']-
-                            b['normalized_velocity']['torsion']).abs().max()))
-                    before = list(flow.step(*before, flow.velocities(a['normalized_velocity'], e3['coords'], poi['coords']), dt, ligand))
-                    after = list(flow.step(*after, flow.velocities(b['normalized_velocity'], e3['coords'], poi['coords']), dt, ligand))
-                difference = [float((a-b).abs().max()) for a, b in zip(before, after)]
-                passed = max(difference) <= 1e-3 and max_velocity <= 1e-4
-                rows.append({'case': entry['case'], 'start': name, 'max_normalized_velocity_difference': max_velocity,
-                             'terminal_max_difference': difference, 'passed': passed})
-                print(json.dumps(rows[-1]), flush=True)
-    audit = {'source_sha256': digest, 'source_epoch': 16, 'source_weights': 'ema_trifuse_state_dict',
-             'copied_tensors': len(copied), 'steps': 20, 'comparisons': rows,
-             'passed': bool(rows) and all(row['passed'] for row in rows)}
-    atomic_json(audit, opt.output/'migration_audit.json')
-    if not audit['passed']:
-        raise RuntimeError('migration changed the pretrained rollout; no checkpoint published')
-    atomic_torch_save({'format': CANDIDATE_FRAMEWORK_VERSION, 'model_config': model.trifuse.config,
-        'model_state': model.trifuse.state_dict(), 'expert_identity': expert.provenance,
-        'steps': 20, 'updates': 0,
-        'training_options': {'endpoint_objective': 'sdpi_epoch16_ema_behavior_preserved_v1'},
-        'migration_origin': audit}, opt.output/'epoch16_ema_candidate.pt')
 
 
 def main(argv=None):
@@ -1358,7 +1415,7 @@ def main(argv=None):
             locks = {(lock_root, opt.mode+'.lock')}
             if opt.mode == 'generate' or (opt.mode == 'train' and opt.online_cache_size):
                 locks.add((opt.bank, 'writer.lock'))
-            if opt.mode == 'train':
+            if opt.mode == 'train' and not opt.cached_only:
                 feature_root = Path(opt.cache_dir)
                 feature_root.mkdir(parents=True, exist_ok=True)
                 locks.add((feature_root, 'writer.lock'))
@@ -1370,14 +1427,6 @@ def main(argv=None):
                     raise RuntimeError('another process is writing this pipeline directory') from error
         if world > 1:
             dist.barrier()
-        policy = opt.frame_policy
-        source = opt.baseline if opt.mode == 'migrate' else (opt.resume or opt.weights_from or opt.checkpoint)
-        if source:
-            metadata = read_payload(source)[0]
-            policy = (metadata['expert_base_identity'].get('frame_policy', 'legacy_argmax_v1')
-                      if opt.mode == 'migrate' else
-                      metadata['model_config'].get('candidate_expert_frame_policy', 'backbone_rigid_transport_v1'))
-        expert = FrozenMatcha(opt.matcha_source_dir, opt.matcha_weights_dir, opt.device, frame_policy=policy)
         score_args = _load_score_model_args(opt.score_model_dir)
         if opt.mode == 'train' and opt.cached_only:
             objects = [cached_admission(opt, entries) if rank == 0 else None]
@@ -1390,7 +1439,7 @@ def main(argv=None):
                       f'total={len(entries)}; signatures validated on read', flush=True)
         try:
             {'generate': generate, 'train': train, 'predict': predict,
-             'baseline': baseline, 'migrate': migrate}[opt.mode](opt, entries, expert, score_args)
+            'baseline': baseline}[opt.mode](opt, entries, score_args)
         finally:
             # ThreadPoolExecutor's atexit join otherwise hides a fatal training
             # exception behind hours of outstanding CPU prefetch work.

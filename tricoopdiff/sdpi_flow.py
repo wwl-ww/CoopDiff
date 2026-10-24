@@ -151,7 +151,8 @@ class SDPIFlow:
         """
         conditioning = self.conditioning(t, dt, e3_data['coords'], poi_data['coords'])
         crop = None
-        if bool(getattr(model.expert.model, 'dynamic_max_cross', False)):
+        expert_model = getattr(getattr(model, 'expert', None), 'model', None)
+        if bool(getattr(expert_model, 'dynamic_max_cross', False)):
             tr_sigma, _, _ = self.t_to_sigma(t, t, t)
             crop = tr_sigma * 3 + 20
         condition_kwargs = {'conditions': conditions} if conditions is not None else {}

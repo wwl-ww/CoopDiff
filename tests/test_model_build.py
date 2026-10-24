@@ -5,6 +5,7 @@ if __name__ == "__main__":
 
     run_tests(__file__)
 
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -475,6 +476,73 @@ def test_initializer_body_frame():
     print("  [OK] Initializer body-frame rotation")
 
 
+def test_e3_relative_target_ligand_frame_is_rigid_equivariant():
+    from tricoopdiff.models.assembly import (
+        ligand_target_frame_label, place_ligand_in_target_frame)
+
+    e3 = torch.tensor([[[0., 0., 0.], [2., 0., 0.], [0., 3., 0.],
+                        [0., 0., 4.]]], dtype=torch.float64)
+    target = torch.tensor([[[1., 2., 3.], [2., 2., 3.], [2., 3., 3.],
+                            [3., 4., 3.]]], dtype=torch.float64)
+    edges = torch.tensor([[0, 1, 1, 2, 2, 3], [1, 0, 2, 1, 3, 2]])
+    rotation = so3_exp(torch.tensor([[.4, -.2, .7]], dtype=torch.float64))[0]
+    start = target @ rotation.T + torch.tensor([8., -3., 2.])
+    label = ligand_target_frame_label(e3, target, edges)
+    placed = place_ligand_in_target_frame(start, e3, edges, label)
+    assert torch.allclose(placed, target, atol=1e-9)
+    joint_rotation = so3_exp(torch.tensor([[-.3, .5, .2]], dtype=torch.float64))[0]
+    offset = torch.tensor([-4., 2., 9.])
+    moved_e3 = e3 @ joint_rotation.T + offset
+    moved_target = target @ joint_rotation.T + offset
+    moved_label = ligand_target_frame_label(moved_e3, moved_target, edges)
+    assert torch.allclose(moved_label, label, atol=1e-9)
+    moved_placed = place_ligand_in_target_frame(
+        start @ joint_rotation.T + offset, moved_e3, edges, moved_label)
+    assert torch.allclose(moved_placed, moved_target, atol=1e-9)
+
+
+def test_target_frame_readout_uses_predicted_protein_anchors():
+    from tricoopdiff.models.assembly import (
+        LegalPoseDecoder, TARGET_LIGAND_FRAME_CONTRACT, TORSION_PHASE_CONTRACT)
+
+    torch.manual_seed(4)
+    decoder = LegalPoseDecoder(16, 4, torsion_phase_contract=TORSION_PHASE_CONTRACT,
+                               target_ligand_frame_contract=TARGET_LIGAND_FRAME_CONTRACT)
+    assert 'e3_ligand' not in decoder.rigid, 'unused E3 rigid head must be removed'
+    assert 'poi_ligand' in decoder.rigid, 'keep the trained POI rigid action prior'
+    types = torch.tensor([0, 0, 0, 0, 1, 1, 1, 2, 2, 2])
+    coords = torch.tensor([[0., 0., 0.], [5., 0., 0.], [0., 6., 0.], [0., 0., 11.],
+                           [0., 0., 8.], [5., 0., 8.], [0., 6., 8.],
+                           [2., 1., 4.], [3., 1., 4.], [2., 2., 4.]])
+    h, vectors = torch.randn(10, 16), torch.randn(10, 4, 3)
+    roles = {branch: {'protein': torch.tensor(values), 'ligand': torch.zeros(3)}
+             for branch, values in (('e3_ligand', [8., -8., -8., -8.]),
+                                    ('poi_ligand', [8., -8., -8.]))}
+    args = (h, vectors, coords, types, torch.empty(2, 0, dtype=torch.long),
+            torch.empty(0, 3, dtype=torch.bool), torch.tensor([[0., 0., 0., 0., 0.,
+                                                                1., 1., 1., 1.]]),
+            (torch.empty(0), torch.empty(0)))
+    first_output = decoder(*args, anchor_role_logits=roles)
+    first = first_output['target_ligand_pose_local']
+    roles['e3_ligand']['protein'] = torch.tensor([-8., 8., -8., -8.])
+    second_output = decoder(*args, anchor_role_logits=roles)
+    second = second_output['target_ligand_pose_local']
+    assert first.shape == (1, 9)
+    assert torch.linalg.vector_norm(first[:, :3] - second[:, :3]) > .1, (
+        'target pose must respond to predicted protein pocket location')
+    roles['poi_ligand']['protein'] = torch.tensor([-8., 8., -8.])
+    third = decoder(*args, anchor_role_logits=roles)
+    assert not torch.allclose(second_output['poi_ligand']['tr'], third['poi_ligand']['tr'], atol=1e-5), (
+        'POI translation must read its predicted protein anchor')
+    rotation = so3_exp(torch.tensor([[.2, -.3, .4]]))[0]
+    moved = decoder(h, vectors @ rotation.T, coords @ rotation.T + torch.tensor([3., -2., 5.]),
+                    *args[3:], anchor_role_logits=roles)
+    for component in ('tr', 'rot'):
+        assert torch.allclose(moved['poi_ligand'][component],
+                              third['poi_ligand'][component] @ rotation.T, atol=1e-5), (
+            'anchor-driven POI motion must rotate with the full ternary complex')
+
+
 def test_frozen_expert_stays_eval():
     """Parent train mode must not reactivate a frozen pretrained expert."""
     import torch.nn as nn
@@ -638,13 +706,16 @@ def test_failed_expert_policy_configuration_preserves_the_live_policy():
 
 def test_expert_loader_cannot_mislabel_the_frozen_layer_count():
     import tempfile
+    import yaml
     from unittest.mock import patch
-    from tricoopdiff.models.expert import build_diffdock_expert
+    from tricoopdiff.models.expert import build_diffdock_expert, EXPERT_SIGMA_BOUNDS
 
-    source = Path(__file__).resolve().parents[1] / 'checkpoints/score_model/model_parameters.yml'
+    config = {'num_conv_layers': 11, **{f'{name}_sigma_{suffix}': value
+        for name, bounds in zip(('tr', 'rot', 'tor'), EXPERT_SIGMA_BOUNDS)
+        for suffix, value in zip(('min', 'max'), bounds)}}
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        (root / 'model_parameters.yml').write_text(source.read_text())
+        (root / 'model_parameters.yml').write_text(yaml.safe_dump(config))
         with patch('tricoopdiff.diffdock.factory.build_cg_model') as build:
             for invalid in (6, 0, True, 11.0):
                 try:
@@ -795,6 +866,191 @@ def test_candidate_quality_head_reads_three_components_and_backpropagates():
         pass
     else:
         raise AssertionError('legacy checkpoints must not silently interpret new candidate source')
+
+
+def test_drifting_generator_uses_one_call_and_executes_ligand_motion():
+    from tricoopdiff.models.assembly import (
+        TernaryAssemblyModel, production_model_config, PURE_TERNARY_MODEL_PROFILE,
+        DRIFTING_MOTION_CONTRACT,
+    )
+
+    fuse = TernaryAssembly(**production_model_config(16, 16, True,
+        model_profile=PURE_TERNARY_MODEL_PROFILE, candidate_driven=True,
+        motion_contract=DRIFTING_MOTION_CONTRACT))
+    assert fuse.controller.quality is None, 'one-pass drifting must not run a second quality evaluation'
+    assert fuse.controller.assembly.rigid['e3_ligand'][-1].weight.abs().sum() > 0
+    _, graph, _, state = assembly_fixture()
+    graph.update(fullatom_scalar_features=torch.randn(15, 9),
+                 fullatom_vector_features=torch.randn(15, 3, 3),
+                 candidate_reference_scalar=torch.zeros(15, 4),
+                 candidate_reference_vectors=torch.zeros(15, 4, 3))
+    output = fuse(graph, {}, state, source='hdock_etkdg', task_mode='refine')
+    assert 'normalized_action' in output and 'normalized_velocity' not in output
+    assert {side: tuple(output['contact_logits'][side].shape) for side in BRANCHES} == {
+        'e3_ligand': (4, 5), 'poi_ligand': (4, 6)}
+    assert {side: tuple(output['anchor_role_logits'][side]['ligand'].shape)
+            for side in BRANCHES} == {'e3_ligand': (4,), 'poi_ligand': (4,)}
+    observed = {'contract': 'external_binary_anchor_roles_v1', 'roles': {
+        'e3_ligand': {'ligand': [True, True, False, False],
+                      'protein': [True, False, False, False, False]},
+        'poi_ligand': {'ligand': [False, False, True, True],
+                       'protein': [False, True, False, False, False, False]}}}
+    conditioned_graph = {**graph, 'supplied_anchor_roles': observed['roles']}
+    supplied = fuse(conditioned_graph, {}, state, source='hdock_etkdg',
+                    task_mode='refine', conditions=observed)
+    assert supplied['anchor_role_logits']['e3_ligand']['protein'].tolist() == [8., -8., -8., -8., -8.]
+    assert supplied['anchor_role_logits']['poi_ligand']['ligand'].tolist() == [-8., -8., 8., 8.]
+    assert not torch.allclose(output['normalized_action']['poi_ligand']['tr'],
+                              supplied['normalized_action']['poi_ligand']['tr']), (
+        'observed binary anchors must change the executed pose action')
+    with torch.no_grad():
+        original = fuse.controller.anchor_relation_vector.weight.clone()
+        fuse.controller.anchor_relation_vector.weight.zero_()
+        without_contact = fuse(graph, {}, state, source='hdock_etkdg', task_mode='refine')
+        fuse.controller.anchor_relation_vector.weight.copy_(original)
+    for side in BRANCHES:
+        assert not torch.allclose(output['normalized_action'][side]['tr'],
+                                  without_contact['normalized_action'][side]['tr'], atol=1e-9), (
+            f'{side} action ignores the predicted contact direction field')
+    fuse.zero_grad(set_to_none=True)
+    action = fuse(graph, {}, state, source='hdock_etkdg', task_mode='refine')
+    sum(action['normalized_action'][side]['tr'].square().sum() for side in BRANCHES).backward()
+    assert all(head.weight.grad is not None and head.weight.grad.abs().sum() > 0
+               for head in (*fuse.controller.anchor_ligand, *fuse.controller.anchor_protein)), (
+        'anchor role predictions must influence the executed rigid actions')
+    model, calls = TernaryAssemblyModel(None, fuse), []
+
+    def forward(e3, poi, ligand, **kwargs):
+        calls.append(ligand['coords'].clone())
+        zero = ligand['coords'].new_zeros(1, 3)
+        return {'normalized_action': {
+            'rigid_output_mode': 'independent_centroids_v1',
+            'e3_ligand': {'tr': zero+.1, 'rot': zero},
+            'poi_ligand': {'tr': zero, 'rot': zero}, 'torsion': zero[:, :0]}}
+
+    model.forward = forward
+    e3, poi, ligand = [{'coords': torch.randn(1, count, 3)} for count in (5, 6, 4)]
+    candidate = {'ligand': ligand['coords'].clone(), 'poi': poi['coords'].clone(),
+        'rotation': torch.eye(3)[None], 'candidate_id': 'one-pass',
+        'provenance': {'candidate_source': 'hdock_etkdg'}}
+    result = model.refine_candidates(e3, poi, ligand, [candidate], steps=1)[0]
+    assert len(calls) == 1, 'drifting inference secretly ran an iterative solver or terminal ranker'
+    assert not torch.equal(result['ligand'], candidate['ligand']), 'ligand action was discarded'
+    assert torch.equal(result['poi'], candidate['poi'])
+    assert torch.equal(candidate['ligand'], ligand['coords']), 'generation mutated cached starts'
+    noisy = {**candidate, 'ligand': candidate['ligand']+10., 'poi': candidate['poi']-4.}
+    second = model.refine_candidates(e3, poi, ligand, [noisy], steps=1)[0]
+    assert torch.equal(calls[-1], noisy['ligand']), 'generator did not observe its sampled input'
+    assert torch.allclose(second['ligand']-result['ligand'], noisy['ligand']-candidate['ligand']), (
+        'the same action must execute on each candidate, not one shared template')
+    assert torch.allclose(second['poi'], noisy['poi'])
+
+
+def test_target_rotor_phase_reaches_one_pass_torsion_action():
+    from tricoopdiff.models.assembly import (
+        DRIFTING_MOTION_CONTRACT, PURE_TERNARY_MODEL_PROFILE,
+        TORSION_PHASE_CONTRACT, production_model_config,
+    )
+
+    config = production_model_config(16, 16, True,
+        model_profile=PURE_TERNARY_MODEL_PROFILE, candidate_driven=True,
+        motion_contract=DRIFTING_MOTION_CONTRACT,
+        torsion_phase_contract=TORSION_PHASE_CONTRACT)
+    fuse = TernaryAssembly(**config)
+    _, graph, _, state = assembly_fixture()
+    graph.update(fullatom_scalar_features=torch.randn(15, 9),
+                 fullatom_vector_features=torch.randn(15, 3, 3),
+                 candidate_reference_scalar=torch.zeros(15, 4),
+                 candidate_reference_vectors=torch.zeros(15, 4, 3))
+    graph['node_coords'][-4:] = torch.tensor([[0., 1., 0.], [1., 0., 0.],
+                                              [2., 0., 0.], [3., 1., 1.]])
+    from tricoopdiff.models.assembly import ligand_rotor_quads, torsion_phase_pairs
+    quads, indices = ligand_rotor_quads(graph['lig_edge_index'], graph['lig_edge_mask'])
+    assert len(quads) == 1 and indices.tolist() == [0]
+    current = torsion_phase_pairs(graph['node_coords'][-4:][None], quads)[0, 0]
+    angle = torch.atan2(current[1], current[0]) + .4
+    head = fuse.controller.assembly.target_phase_head[-1]
+    with torch.no_grad():
+        head.weight.zero_()
+        head.bias.copy_(torch.stack((angle.cos(), angle.sin())))
+    output = fuse(graph, {}, state, source='hdock_etkdg', task_mode='refine')
+    assert torch.allclose(output['normalized_action']['torsion'],
+                          torch.tensor([[.4 / math.pi]]), atol=1e-5), (
+        'target-phase controller must output the signed correction from the current phase')
+    output['normalized_action']['torsion'].square().sum().backward()
+    gradient = fuse.controller.assembly.target_phase_head[-1].weight.grad
+    assert gradient is not None and gradient.abs().sum() > 0, (
+        'predicted target dihedral phase must train through the executed torsion action')
+
+
+def test_two_sided_contact_field_points_from_distant_ligand_and_rotates():
+    from tricoopdiff.models.assembly import two_sided_contact_direction_field
+    from tricoopdiff.geometry.rigid import rotation_exp
+
+    coords = torch.tensor([[0., 0., 0.], [2., 0., 0.],
+                           [0., 12., 0.], [2., 12., 0.],
+                           [40., 30., 0.], [41., 30., 0.]])
+    types = torch.tensor([0, 0, 1, 1, 2, 2])
+    logits = {'e3_ligand': torch.tensor([[5., -5.], [-5., 5.]]),
+              'poi_ligand': torch.tensor([[-8., -9.], [-9., -8.]])}
+    field = two_sided_contact_direction_field(logits, coords, types)
+    assert field[types == 2].norm(dim=-1).min() > .1, (
+        'far starts need nonzero guidance even when all contact logits are negative')
+    rotation = rotation_exp(torch.tensor([[.3, -.2, .4]]))[0]
+    transformed = two_sided_contact_direction_field(
+        logits, coords @ rotation.T + torch.tensor([6., -4., 9.]), types)
+    torch.testing.assert_close(transformed, field @ rotation.T, atol=1e-6, rtol=1e-6)
+
+
+def test_anchor_relation_field_preserves_three_roles_and_equivariance():
+    from tricoopdiff.models.assembly import two_sided_anchor_relation_field
+    from tricoopdiff.geometry.rigid import rotation_exp
+
+    coords = torch.tensor([[0., 0., 0.], [2., 0., 0.],
+                           [0., 12., 0.], [2., 12., 0.],
+                           [40., 30., 0.], [41., 30., 0.]])
+    types = torch.tensor([0, 0, 1, 1, 2, 2])
+    logits = {'e3_ligand': torch.tensor([[5., -5.], [-5., 5.]]),
+              'poi_ligand': torch.tensor([[-8., -9.], [-9., -8.]])}
+    roles = {side: {'ligand': torch.tensor([5., -5.]),
+                    'protein': torch.tensor([5., -5.])} for side in BRANCHES}
+    field = two_sided_anchor_relation_field(logits, roles, coords, types)
+    assert field.shape == (6, 6, 3)
+    assert field[types == 2].norm(dim=-1).sum() > .1
+    assert not torch.allclose(field[:, 0], field[:, 2]), (
+        'anchor-anchor evidence must not be collapsed into nonanchor context')
+    rotation = rotation_exp(torch.tensor([[.3, -.2, .4]]))[0]
+    transformed = two_sided_anchor_relation_field(
+        logits, roles, coords @ rotation.T + torch.tensor([6., -4., 9.]), types)
+    torch.testing.assert_close(transformed, field @ rotation.T, atol=1e-6, rtol=1e-6)
+
+
+def test_contact_guidance_contract_is_explicit_and_legacy_loadable():
+    from tricoopdiff.models.assembly import (
+        CONTACT_GUIDANCE_CONTRACT, ANCHOR_RELATION_CONTRACT, DRIFTING_MOTION_CONTRACT,
+        PURE_TERNARY_MODEL_PROFILE, TernaryAssembly, production_model_config,
+    )
+
+    options = dict(model_profile=PURE_TERNARY_MODEL_PROFILE,
+                   candidate_driven=True, motion_contract=DRIFTING_MOTION_CONTRACT)
+    guided = production_model_config(16, 16, True, **options)
+    assert guided['contact_guidance_contract'] == ANCHOR_RELATION_CONTRACT
+    previous = production_model_config(16, 16, True, **options,
+                                       contact_guidance_contract=CONTACT_GUIDANCE_CONTRACT)
+    assert TernaryAssembly(**previous).controller.contact_guidance_contract == CONTACT_GUIDANCE_CONTRACT
+    legacy = production_model_config(16, 16, True, **options,
+                                     contact_guidance_contract=None)
+    old = TernaryAssembly(**legacy)
+    assert old.controller.contact_guidance_contract is None
+    assert not any(key.startswith('controller.contact_') for key in old.state_dict())
+    try:
+        production_model_config(16, 16, True, candidate_driven=True,
+            model_profile=PURE_TERNARY_MODEL_PROFILE,
+            contact_guidance_contract=CONTACT_GUIDANCE_CONTRACT)
+    except ValueError as error:
+        assert 'requires pure ternary drifting' in str(error)
+    else:
+        raise AssertionError('explicit contact guidance outside drifting was silently ignored')
 
 
 def test_candidate_refinement_scores_final_state_and_keeps_input_pool():

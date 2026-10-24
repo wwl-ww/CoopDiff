@@ -3,7 +3,6 @@
 import random
 from numbers import Integral
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -71,10 +70,10 @@ def assembly_candidate_from_pose(e3_reference, poi_reference, e3_pose, poi_pose,
         'ligand': apply_rigid(ligand, frame_rotation, frame_translation).unsqueeze(0),
         'poi': mapped_poi.unsqueeze(0),
         'rotation': body_rotation.unsqueeze(0),
-        'candidate_id': ('hdock_matcha', str(candidate_id), int(rank)),
+        'candidate_id': ('hdock_etkdg', str(candidate_id), int(rank)),
         'provenance': {
-            'version': 'hdock_matcha_assembly_candidate_v1',
-            'candidate_source': 'hdock_matcha',
+            'version': 'hdock_etkdg_assembly_candidate_v1',
+            'candidate_source': 'hdock_etkdg',
             'candidate_id': str(candidate_id), 'protein_candidate_rank': int(rank),
             'native_information_used': False,
             'frame': 'indexed_input_e3',
@@ -164,77 +163,44 @@ def load_assembly_candidate(protein_pose, ligand_pose, e3_reference, poi_referen
 
 
 @torch.no_grad()
-def generate_joint_matcha_ligand(expert, e3_data, poi_data, ligand_data, candidate,
-                                *, seed=73, steps_per_stage=10):
-    """Dock one fresh conformer to the fixed two-chain candidate receptor.
+def generate_etkdg_ligand_at_hdock_interface(e3_data, ligand_data, candidate, *, seed=73,
+                                            offset_std_angstrom=1.5):
+    """Place a native-blind ETKDG conformer at an HDOCK protein interface.
 
-    Both chain-wise sequence encodings enter every stage. This native-blind
-    sampler uses forward-time Matcha head units, never the reverse-clock
-    controller's scaled advice. Protein geometry and candidate rank stay fixed.
+    HDOCK supplies only the protein-protein pose. The ligand conformer is
+    generated from chemistry, randomly oriented, and centered near the
+    closest E3/POI surface midpoint; the ternary model must solve its pose.
     """
     from rdkit import Chem
     from scipy.spatial.transform import Rotation
-    from matcha.utils.transforms import apply_tor_changes_to_pos
-    from tricoopdiff.geometry.rigid import rotation_exp
+    from tricoopdiff.initialization import embed_chemical_graph
 
-    if (getattr(expert, 'backend', None) != 'matcha' or not _valid_candidate(candidate)
-            or isinstance(steps_per_stage, bool) or not isinstance(steps_per_stage, int)
-            or steps_per_stage < 1):
-        raise ValueError('joint generation requires frozen Matcha, a valid pose and positive steps')
+    if not _valid_candidate(candidate) or not np.isfinite(offset_std_angstrom) or offset_std_angstrom < 0:
+        raise ValueError('ligand placement requires a valid HDOCK pose and finite nonnegative offset')
     mol = ligand_data['mol']
     mol = Chem.Mol(mol) if isinstance(mol, bytes) else Chem.Mol(mol)
-    from tricoopdiff.initialization import embed_chemical_graph
-    generated, _, _ = embed_chemical_graph(mol, seed)
+    generated, _, _ = embed_chemical_graph(mol, int(seed))
     generated = Chem.RemoveHs(generated)
-    reference = e3_data['coords']
-    base = reference.new_tensor(generated.GetConformer().GetPositions())
-    receptor_coords = torch.cat((reference, candidate['poi'].to(reference)), 1)
-    origin = receptor_coords.mean(1, keepdim=True)
-    protein = SimpleNamespace(pos=receptor_coords-origin,
-        x=torch.cat((e3_data['matcha']['features'], poi_data['matcha']['features']), 1),
-        seq=torch.cat((e3_data['matcha']['sequence'], poi_data['matcha']['sequence']), 1),
-        is_padded_mask=torch.zeros(1, receptor_coords.shape[1], device=reference.device, dtype=torch.bool))
-    chem = ligand_data['matcha']
-    bonds, masks = chem['bonds'], chem['masks']
-    rng = np.random.RandomState(int(seed) % (2**32))
-
-    def randomize(center):
-        rotation = base.new_tensor(Rotation.random(random_state=rng).as_matrix())
-        pos = (base-base.mean(0)) @ rotation.T + center
-        angles = base.new_tensor(rng.uniform(-np.pi, np.pi, len(bonds)))
-        return apply_tor_changes_to_pos(pos, bonds, masks, angles, is_reverse_order=True)
-
-    pos = randomize(base.new_tensor(rng.normal(0, 5, 3)))
-    ligand = SimpleNamespace(pos=pos[None], x=chem['features'], t=base.new_zeros(1),
-        num_atoms=torch.tensor([len(base)], device=base.device),
-        is_padded_mask=torch.zeros(1, len(base), device=base.device, dtype=torch.bool),
-        num_rotatable_bonds=torch.tensor([len(bonds)], device=base.device),
-        rotatable_bonds=bonds, mask_rotate=[masks],
-        tor_ptr=torch.tensor([0, len(bonds)], device=base.device))
-    batch = SimpleNamespace(protein=protein, ligand=ligand)
-    from tricoopdiff.runtime import evaluation_context
-    with evaluation_context(expert), torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
-        for index, stage in enumerate(expert.stages):
-            if index == 1:
-                pos = randomize(pos.mean(0))
-            for step in range(steps_per_stage):
-                ligand.pos = pos[None]
-                ligand.t.fill_(step / steps_per_stage)
-                tr, rot, tor, _ = stage.forward_step(batch)
-                if len(bonds):
-                    if tor is None or tor.numel() != len(bonds):
-                        raise ValueError('joint Matcha torsion count differs from executor')
-                    pos = apply_tor_changes_to_pos(pos.clone(), bonds, masks,
-                        tor/steps_per_stage, is_reverse_order=False)
-                center = pos.mean(0, keepdim=True)
-                pos = (pos-center) @ rotation_exp(rot[0]/steps_per_stage).T + center + tr[0]/steps_per_stage
-                if not torch.isfinite(pos).all():
-                    raise FloatingPointError('nonfinite joint Matcha pose')
-    return {**candidate, 'ligand': pos[None]+origin,
+    reference = e3_data['coords'][0]
+    conformer = reference.new_tensor(generated.GetConformer().GetPositions())
+    poi = candidate['poi'][0].to(reference)
+    # Estimate the protein-protein interface using a small set of closest C-alpha pairs.
+    distances = torch.cdist(reference, poi)
+    count = min(64, distances.numel())
+    nearest = distances.flatten().topk(count, largest=False).indices
+    left = torch.div(nearest, len(poi), rounding_mode='floor')
+    right = nearest.remainder(len(poi))
+    center = ((reference[left] + poi[right]) * .5).mean(0)
+    rng = np.random.default_rng(int(seed) % (2**32))
+    rotation = reference.new_tensor(Rotation.random(random_state=rng).as_matrix())
+    offset = reference.new_tensor(rng.normal(0., offset_std_angstrom, size=3))
+    ligand = (conformer-conformer.mean(0)) @ rotation.T + center + offset
+    return {**candidate, 'ligand': ligand.unsqueeze(0),
         'provenance': {**candidate['provenance'], 'ligand_seed': int(seed),
-            'ligand_state': 'joint_generated', 'conformer_policy': 'etkdgv3_random',
-            'generator': 'joint_two_chain_matcha_forward_v1',
-            'steps_per_stage': steps_per_stage, 'expert_identity': expert.provenance}}
+            'ligand_state': 'etkdg_at_hdock_interface', 'native_information_used': False,
+            'conformer_policy': 'etkdgv3_random',
+            'generator': 'hdock_interface_centered_random_se3_v1',
+            'interface_anchor_pairs': int(count), 'placement_offset_std_angstrom': float(offset_std_angstrom)}}
 
 
 @torch.no_grad()

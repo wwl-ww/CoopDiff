@@ -8,6 +8,7 @@ if __name__ == "__main__":
 import copy
 import io
 import json
+import math
 import os
 import random
 import tempfile
@@ -19,6 +20,189 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+
+
+def test_two_sided_ca_contact_targets_are_side_specific_and_trainable():
+    from tricoopdiff.train import two_sided_ca_contact_loss
+
+    ligand = torch.tensor([[[1., 0., 0.], [21., 0., 0.]]])
+    e3 = torch.tensor([[[0., 0., 0.], [20., 0., 0.]]])
+    poi = torch.tensor([[[0., 20., 0.], [20., 20., 0.]]])
+    good = {'e3_ligand': torch.tensor([[4., -4.], [-4., 4.]], requires_grad=True),
+            'poi_ligand': torch.full((2, 2), -4., requires_grad=True)}
+    bad = {'e3_ligand': -good['e3_ligand'].detach(),
+           'poi_ligand': -good['poi_ligand'].detach()}
+    correct = two_sided_ca_contact_loss(good, e3, poi, ligand)
+    assert correct < two_sided_ca_contact_loss(bad, e3, poi, ligand)
+    correct.backward()
+    assert good['e3_ligand'].grad.abs().sum() > 0
+    assert good['poi_ligand'].grad.abs().sum() > 0
+    try:
+        two_sided_ca_contact_loss({'e3_ligand': good['e3_ligand']}, e3, poi, ligand)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('single-sided contact supervision silently discarded POI')
+
+
+def test_two_sided_anchor_roles_use_final_geometry_and_keep_both_sides():
+    from tricoopdiff.train import two_sided_anchor_role_loss
+
+    ligand = torch.tensor([[[1., 0., 0.], [21., 0., 0.]]])
+    e3 = torch.tensor([[[0., 0., 0.], [20., 0., 0.]]])
+    poi = torch.tensor([[[0., 20., 0.], [20., 20., 0.]]])
+    good = {side: {'ligand': torch.tensor([4., 4.], requires_grad=True),
+                   'protein': torch.tensor([4., 4.], requires_grad=True)}
+            for side in ('e3_ligand', 'poi_ligand')}
+    good['poi_ligand'] = {
+        'ligand': torch.tensor([-4., -4.], requires_grad=True),
+        'protein': torch.tensor([-4., -4.], requires_grad=True)}
+    wrong = {side: {name: -value.detach() for name, value in values.items()}
+             for side, values in good.items()}
+    loss = two_sided_anchor_role_loss(good, e3, poi, ligand)
+    assert loss < two_sided_anchor_role_loss(wrong, e3, poi, ligand)
+    loss.backward()
+    assert all(value.grad.abs().sum() > 0 for side in good.values() for value in side.values())
+
+
+def test_drifting_corrects_wrong_collapse_and_stops_at_target():
+    from tricoopdiff.train import drifting_targets
+
+    positive = torch.zeros(1, 3)
+    generated = torch.tensor([[2., 1., -1.]]).repeat(8, 1).requires_grad_()
+    goal, scale, _ = drifting_targets(generated, positive)
+    assert not goal.requires_grad and not scale.requires_grad
+    loss = (generated/scale-goal).square().mean()
+    assert loss > .1, 'positive affinity underflow made a wrong collapsed cohort look converged'
+    loss.backward()
+    assert torch.isfinite(generated.grad).all() and (generated.grad*generated).sum() > 0, (
+        'a collapsed generated distribution away from native must receive a corrective gradient')
+    moved = generated.detach()-.01*generated.grad
+    assert moved.square().mean() < generated.detach().square().mean()
+    goal, scale, _ = drifting_targets(torch.zeros(3, 3), positive)
+    assert torch.count_nonzero(goal) == 0 and torch.isfinite(scale)
+    positive = torch.tensor([[51., -30., 23.]])
+    goal, scale, _ = drifting_targets(positive.repeat(8, 1), positive)
+    assert torch.equal(goal, positive.repeat(8, 1)/scale), 'equal nonzero poses acquired numerical drift'
+    try:
+        drifting_targets(torch.ones(1, 3), positive)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a lone particle has no valid self-excluded negative distribution')
+
+
+def test_drifting_replay_gradient_equals_joint_cohort_gradient():
+    from tricoopdiff.train import drifting_targets
+
+    torch.manual_seed(19)
+    generator = torch.nn.Linear(4, 3)
+    noise, positive = torch.randn(5, 4), torch.randn(1, 3)
+    generated = generator(noise)
+    goal, scale, _ = drifting_targets(generated, positive)
+    ((generated/scale-goal).square().mean()).backward()
+    joint = [p.grad.clone() for p in generator.parameters()]
+    generator.zero_grad()
+    for index in range(len(noise)):
+        ((generator(noise[index:index+1])/scale-goal[index:index+1]).square().mean()/len(noise)).backward()
+    assert all(torch.allclose(p.grad, expected, atol=1e-6, rtol=1e-5)
+               for p, expected in zip(generator.parameters(), joint)), (
+        'sequential replay must preserve the complete cohort gradient, including its normalization')
+
+
+def test_drifting_features_keep_absolute_ligand_pose_and_all_atoms():
+    from tricoopdiff.train import drifting_geometry_features
+
+    torch.manual_seed(21)
+    e3, poi, ligand = torch.randn(1, 20, 3), torch.randn(1, 18, 3), torch.randn(1, 7, 3)
+    before = drifting_geometry_features(e3, ligand, poi, torch.eye(3)[None])
+    after = drifting_geometry_features(e3, ligand+3., poi, torch.eye(3)[None])
+    assert before['ligand'].numel() == ligand.numel()
+    assert before['protein'].numel() == poi.numel()
+    assert not torch.equal(before['ligand'], after['ligand']), 'self-alignment erased ligand placement'
+    assert not torch.equal(before['e3_ligand'], after['e3_ligand'])
+
+
+def test_drifting_torsion_teacher_matches_legal_executor_sign_and_scale():
+    from tricoopdiff.train import drifting_ligand_geometry, drifting_torsion_action_target
+    from tricoopdiff.sdpi_flow import SDPIFlow
+
+    start = torch.tensor([[[0., 1., 0.], [1., 0., 0.],
+                           [2., 0., 0.], [3., 1., 1.]]])
+    ligand = {'edge_index': torch.tensor([[0, 1, 1, 2, 2, 3],
+                                         [1, 0, 2, 1, 3, 2]]),
+              'edge_mask': torch.tensor([False, False, True, False, False, False]),
+              'mask_rotate': torch.tensor([[False, False, True, True]])}
+    zero = start.new_zeros(1, 3)
+    action = {'rigid_output_mode': 'independent_centroids_v1',
+              'torsion_update_mode': 'continuous_horizontal_v1',
+              'e3_ligand': {'tr': zero, 'rot': zero},
+              'poi_ligand': {'tr': zero, 'rot': zero},
+              'torsion': start.new_tensor([[.7]])}
+    target = SDPIFlow.differentiable_step(start, start, torch.eye(3)[None],
+        action, start.new_ones(1), ligand)[0]
+    indices, desired = drifting_torsion_action_target(
+        start, target, drifting_ligand_geometry(ligand))
+    assert indices.tolist() == [0]
+    torch.testing.assert_close(desired, start.new_tensor([[.7 / math.pi]]), atol=1e-6, rtol=1e-6)
+
+
+def test_drifting_rigid_teacher_executes_after_torsion_correction():
+    from tricoopdiff.train import (drifting_ligand_geometry,
+        drifting_torsion_action_target, drifting_rigid_action_target)
+    from tricoopdiff.sdpi_flow import SDPIFlow
+
+    ligand = torch.tensor([[[0., 1., 0.], [1., 0., 0.],
+                            [2., 0., 0.], [3., 1., 1.]]])
+    protein = ligand + torch.tensor([10., 4., 2.])
+    chemistry = {'edge_index': torch.tensor([[0, 1, 1, 2, 2, 3],
+                                            [1, 0, 2, 1, 3, 2]]),
+                 'edge_mask': torch.tensor([False, False, True, False, False, False]),
+                 'mask_rotate': torch.tensor([[False, False, True, True]])}
+    zero = ligand.new_zeros(1, 3)
+    known = {'rigid_output_mode': 'independent_centroids_v1',
+             'torsion_update_mode': 'continuous_horizontal_v1',
+             'e3_ligand': {'tr': ligand.new_tensor([[2., -1., .5]]),
+                           'rot': ligand.new_tensor([[.2, -.1, .3]])},
+             'poi_ligand': {'tr': zero, 'rot': zero},
+             'torsion': ligand.new_tensor([[.7]])}
+    frame = torch.eye(3)[None]
+    target, _, _ = SDPIFlow.differentiable_step(
+        ligand, protein, frame, known, ligand.new_ones(1), chemistry)
+    start = {'ligand': ligand, 'poi': protein, 'rotation': frame}
+    torsion = drifting_torsion_action_target(
+        ligand, target, drifting_ligand_geometry(chemistry))
+    rigid = drifting_rigid_action_target(
+        start, target, protein, torsion, chemistry, protein)
+    normalized = {**rigid, 'torsion': torsion[1],
+                  'rigid_output_mode': 'independent_centroids_v1',
+                  'torsion_update_mode': 'continuous_horizontal_v1'}
+    replay = SDPIFlow.differentiable_step(ligand, protein, frame,
+        SDPIFlow().velocities(normalized, protein, protein),
+        ligand.new_ones(1), chemistry)[0]
+    torch.testing.assert_close(replay, target, atol=2e-5, rtol=2e-5)
+
+
+def test_drifting_starts_share_legal_geometry_without_reading_target_pose():
+    from helpers import flow_example
+    from tricoopdiff.train import sample_drifting_starts
+    from tricoopdiff.geometry.rigid import is_proper_rotation
+
+    _, ligand, _, poi, _ = flow_example()
+    candidate = {'ligand': ligand['coords']+7., 'poi': poi, 'rotation': torch.eye(3, dtype=poi.dtype)[None]}
+    starts = sample_drifting_starts(candidate, ligand, 4, generator=torch.Generator().manual_seed(31))
+    shifted_labels = {**ligand, 'coords': ligand['coords']+1000.}
+    repeated = sample_drifting_starts(candidate, shifted_labels, 4,
+                                     generator=torch.Generator().manual_seed(31))
+    a, b = ligand['edge_index']
+    bond_lengths = (candidate['ligand'][:, a]-candidate['ligand'][:, b]).norm(dim=-1)
+    for first, second in zip(starts, repeated):
+        assert torch.equal(first['ligand'], second['ligand']), 'native coordinates leaked into sampled starts'
+        assert is_proper_rotation(first['rotation'])
+        lengths = (first['ligand'][:, a]-first['ligand'][:, b]).norm(dim=-1)
+        assert torch.allclose(lengths, bond_lengths, atol=1e-6), 'sampled starts left the legal molecular manifold'
+        assert torch.allclose(torch.pdist(first['poi'][0]), torch.pdist(poi[0]), atol=1e-6)
+    assert not torch.equal(starts[1]['ligand'], starts[2]['ligand'])
 
 
 def test_dockq_normalization_is_independent_of_native_chain_order():
@@ -110,6 +294,7 @@ def test_protac_training_rejects_anchor_indices_for_another_atom_order_before_ro
     other_order = Chem.RenumberAtoms(molecule, list(reversed(range(6))))
     trainer = object.__new__(AssemblyTrainer)
     trainer.device = torch.device('cpu')
+    trainer.motion_contract = 'sdpi_flow_velocity_v1'
     trainer.near_target_weight = 0.
     trainer.model = SimpleNamespace(trifuse=SimpleNamespace(config={
         'protac_anchor_contract': 'dual_bound_anchor_node_context_v1'}))
@@ -229,49 +414,6 @@ def test_featurization_cache_state_cannot_change_training_rng():
     actual = (torch.rand(1), np.random.random(), random.random())
     assert torch.equal(expected[0], actual[0])
     assert expected[1:] == actual[1:]
-
-
-def test_matcha_metadata_cache_checks_identity_and_survives_protein_flip():
-    with tempfile.TemporaryDirectory(prefix='matcha-metadata-test-') as folder:
-        root = Path(folder)
-        paths = [root / name for name in ('p1.pdb', 'p2.pdb', 'lig.pdb')]
-        for path in paths:
-            path.write_text('fixture')
-        torch.save({'fixture': True}, root / 'fixture.pt')
-        entry = dict(case='fixture', protein1=str(paths[0]), protein2=str(paths[1]), ligand=str(paths[2]))
-        class Expert:
-            backend = 'matcha'
-            provenance = {'backend': 'matcha', 'identity': 'fixture'}
-            calls = 0
-            def prepare_case(self, *args):
-                self.calls += 1
-                return tuple({**part, 'matcha': {'features': torch.ones(1, 2, 3), 'anchors': (0, 1)}}
-                             for part in args[:3])
-        loader = TernaryDataLoader.__new__(TernaryDataLoader)
-        loader.device, loader.cache_dir, loader.expert = 'cpu', folder, Expert()
-        data = tuple({'coords': torch.zeros(1, 2, 3)} for _ in range(3))
-        first = loader._prepare_matcha(entry, data)
-        second = loader._prepare_matcha(entry, data)
-        assert loader.expert.calls == 1
-        assert all(torch.equal(a['matcha']['features'], b['matcha']['features'])
-                   for a, b in zip(first, second))
-        flipped = swap_protein_reference(*second)
-        assert flipped[0]['matcha'] is second[1]['matcha']
-        loader.matcha_metadata_read_only = True
-        loader.cache_wait_seconds = 0.
-        loader._prepare_matcha(entry, data)
-        assert loader.expert.calls == 1, 'metadata followers must reuse verified writer output'
-        paths[0].write_text('changed protein')
-        try:
-            loader._prepare_matcha(entry, data)
-        except TimeoutError:
-            pass
-        else:
-            raise AssertionError('metadata followers must reject stale metadata')
-        assert loader.expert.calls == 1, 'metadata followers must never load a sequence encoder'
-        loader.matcha_metadata_read_only = False
-        loader._prepare_matcha(entry, data)
-        assert loader.expert.calls == 2, 'changed indexed inputs must invalidate Matcha metadata'
 
 
 def test_trainer_owns_recorded_activation_clamp_runtime():
@@ -1429,7 +1571,7 @@ def test_v8_unified_architecture_has_distinct_checkpoint_contract():
     trainer, batch, coupling = training_contract_endpoint_trainer_fixture(VECTOR_EXPERT_MODEL_PROFILE)
     trainer.train_step(**batch, coupling_override=coupling)
     payload = trainer.checkpoint_payload()
-    assert payload['checkpoint_version'] == 55
+    assert payload['checkpoint_version'] == 56
     assert payload['architecture'] == DIRECT_ARCHITECTURE
     assert payload['model_config']['expert_vector_dim'] == 20
     validate_assembly_checkpoint(payload)
@@ -1438,9 +1580,86 @@ def test_v8_unified_architecture_has_distinct_checkpoint_contract():
     try:
         validate_assembly_checkpoint(old)
     except ValueError as error:
-        assert 'checkpoint version 55' in str(error)
+        assert 'checkpoint version 56' in str(error)
     else:
         raise AssertionError('pre unified-controller weights were accepted under v8 semantics')
+
+
+def test_guided_pure_drifting_checkpoint_uses_its_own_recipe():
+    from tricoopdiff.models.assembly import (
+        CONTACT_GUIDANCE_CONTRACT, DRIFTING_MOTION_CONTRACT,
+        PURE_TERNARY_ARCHITECTURE, PURE_TERNARY_MODEL_PROFILE,
+        production_model_config,
+    )
+    from tricoopdiff.train import validate_assembly_checkpoint
+
+    trainer, _, _ = training_contract_endpoint_trainer_fixture('ternary_endpoint_v14')
+    payload = trainer.checkpoint_payload()
+    payload['checkpoint_version'] = 57
+    payload['architecture'] = PURE_TERNARY_ARCHITECTURE
+    payload['model_config'] = production_model_config(4, 4, True, model_profile=PURE_TERNARY_MODEL_PROFILE,
+        candidate_driven=True, motion_contract=DRIFTING_MOTION_CONTRACT,
+        contact_guidance_contract=CONTACT_GUIDANCE_CONTRACT)
+    assert payload['model_config']['contact_guidance_contract'] == CONTACT_GUIDANCE_CONTRACT
+    runtime = payload['runtime_config']
+    runtime.update(motion_contract=DRIFTING_MOTION_CONTRACT,
+                   training_recipe='conditional_geometry_drifting_v1',
+                   near_target_supervision=None,
+                   flow_time_contract='shared_ternary_flow_clock_v1',
+                   expert_runtime_identity='none')
+    validate_assembly_checkpoint(payload)
+
+    for field, wrong in (('training_recipe', 'endpoint_near_target_v2'),
+                         ('near_target_supervision', {'weight': 0.1}),
+                         ('motion_contract', 'wrong_motion')):
+        bad = copy.deepcopy(payload)
+        bad['runtime_config'][field] = wrong
+        try:
+            validate_assembly_checkpoint(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'guided drifting accepted invalid {field}')
+
+    unguided = copy.deepcopy(payload)
+    unguided['model_config'] = production_model_config(4, 4, True,
+        model_profile=PURE_TERNARY_MODEL_PROFILE, candidate_driven=True,
+        motion_contract=DRIFTING_MOTION_CONTRACT, contact_guidance_contract=None)
+    try:
+        validate_assembly_checkpoint(unguided)
+    except ValueError as error:
+        assert 'contact-guided pure ternary' in str(error)
+    else:
+        raise AssertionError('unguided drifting checkpoint acquired the guided recipe')
+
+    anchor = copy.deepcopy(payload)
+    anchor['checkpoint_version'] = 58
+    anchor['model_config'] = production_model_config(4, 4, True,
+        model_profile=PURE_TERNARY_MODEL_PROFILE, candidate_driven=True,
+        motion_contract=DRIFTING_MOTION_CONTRACT)
+    anchor['runtime_config']['training_recipe'] = 'conditional_geometry_drifting_anchor_roles_v2'
+    validate_assembly_checkpoint(anchor)
+    anchor['checkpoint_version'] = 57
+    try:
+        validate_assembly_checkpoint(anchor)
+    except ValueError as error:
+        assert 'version 58' in str(error)
+    else:
+        raise AssertionError('anchor-relation checkpoint accepted an old version')
+    phase = copy.deepcopy(anchor)
+    phase['checkpoint_version'] = 61
+    phase['model_config'] = production_model_config(4, 4, True,
+        model_profile=PURE_TERNARY_MODEL_PROFILE, candidate_driven=True,
+        motion_contract=DRIFTING_MOTION_CONTRACT,
+        torsion_phase_contract='predicted_target_rotor_phase_local_v3')
+    validate_assembly_checkpoint(phase)
+    phase['checkpoint_version'] = 60
+    try:
+        validate_assembly_checkpoint(phase)
+    except ValueError as error:
+        assert 'version 61' in str(error)
+    else:
+        raise AssertionError('explicit rotor-phase checkpoint accepted old decoder weights')
 
 
 def test_failed_stochastic_microbatch_restores_rng_and_entry_phase():
@@ -1927,21 +2146,6 @@ def test_interface_contact_cutoff_is_independent_of_error_scale():
             assert 'interface_error_scale' in str(error)
         else:
             raise AssertionError('resume silently changed PP interface loss scale')
-
-
-def test_matcha_builder_constructs_expert_on_requested_cpu_device():
-    args = parse_args(['--train_data', 'unused', '--val_data', 'unused',
-                       '--output_dir', 'unused', '--expert-backend', 'matcha', '--device', 'cpu'])
-    class ConstructionReached(Exception):
-        pass
-    with patch('tricoopdiff.models.expert.FrozenMatcha', side_effect=ConstructionReached) as factory:
-        try:
-            build_trainer(args, torch.device('cpu'), input_dim=1281)
-        except ConstructionReached:
-            pass
-        else:
-            raise AssertionError('Matcha construction was not reached')
-    assert factory.call_args.kwargs['device'] == 'cpu', 'CPU preflight must never allocate a CUDA expert'
 
 
 def test_distributed_tail_cursor_counts_real_samples_across_epochs():

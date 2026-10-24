@@ -109,12 +109,6 @@ def parse_args(argv=None):
     # from the checkpoint's model_parameters.yml, not hand-written here.
     p.add_argument("--expert_model_dir", default="checkpoints/score_model",
                    help="Dir with model_parameters.yml + best_ema_inference_epoch_model.pt")
-    p.add_argument('--expert-backend', choices=('diffdock', 'matcha'), default='diffdock')
-    p.add_argument('--matcha-source-dir', default='results/matcha_qualification_source')
-    p.add_argument('--matcha-weights-dir', default='results/matcha_qualification_weights')
-    p.add_argument('--matcha-frame-policy', choices=('legacy_argmax_v1', 'ordered_residue_com_v1'),
-                   default='legacy_argmax_v1',
-                   help='Explicit Matcha reference-frame protocol; saved identity governs resume')
 
     # Featurization
     p.add_argument("--cache_dir", default="results/featurize_cache",
@@ -149,7 +143,6 @@ def parse_args(argv=None):
     args.explicit_loss_options = [token.split('=')[0] for token in tokens
                                  if token.split('=')[0] in ('--interface-loss-weight',
                                      '--interface-cutoff', '--interface-error-scale', '--steric-loss-weight')]
-    args.explicit_frame_policy = any(token.split('=')[0] == '--matcha-frame-policy' for token in tokens)
     if args.batch_size < 1:
         p.error('--batch_size must be positive')
     return args
@@ -267,8 +260,6 @@ def restore_epoch_data_state(state, args, loader, epoch):
 def main():
     args = parse_args()
     args.generative_process = 'sdpi_flow_v1'
-    if args.expert_backend == 'matcha' and args.training_arm != 'A1':
-        raise SystemExit('Matcha BiTSeed is not implemented; do not reinterpret DiffDock endpoint caches')
     if args.nan_clamp <= 0:
         raise SystemExit("FATAL: --nan-clamp must be positive")
     device = torch.device(args.device)
@@ -348,13 +339,13 @@ def main():
         shuffle=True, device=str(device), cache_dir=args.cache_dir,
         skip_on_error=False, max_clusters=args.max_train_clusters,
         random_flip_proteins=args.random_flip_proteins,
-        expert=model.expert, cached_only=args.cached_only,
+        cached_only=args.cached_only,
     )
     val_loader = TernaryDataLoader(
         args.val_data, score_model_args,
         shuffle=False, device=str(device), cache_dir=args.cache_dir,
         skip_on_error=False, max_clusters=args.max_val_clusters,
-        expert=model.expert, cached_only=args.cached_only,
+        cached_only=args.cached_only,
     )
     # Check scoring dependencies before spending an epoch on training.
     for entry in val_loader._epoch_entries():
@@ -528,36 +519,14 @@ def build_trainer(args, device, input_dim=None):
     from tricoopdiff.models.assembly import (TernaryAssemblyModel, TernaryAssembly,
                                              VECTOR_EXPERT_MODEL_PROFILE,
                                              production_model_config)
-    from tricoopdiff.models.expert import build_diffdock_expert, FrozenMatcha
+    from tricoopdiff.models.expert import build_diffdock_expert
     from tricoopdiff.sdpi_flow import SDPIFlow
     from tricoopdiff.train import AssemblyTrainer
 
     # Build frozen DiffDock-L expert from pretrained weights (self-contained
     # vendored core — no ../DiffDock dependency). num_conv_layers (11) and the
     # full CGModel architecture come from model_parameters.yml.
-    backend = getattr(args, 'expert_backend', 'diffdock')
-    if backend == 'matcha':
-        if args.training_arm != 'A1':
-            raise ValueError('Matcha currently supports SDPI training, not DiffDock BiTSeed caches')
-        frame_policy = getattr(args, 'matcha_frame_policy', 'legacy_argmax_v1')
-        if args.resume:
-            saved_identity = torch.load(args.resume, map_location='cpu', weights_only=False)
-            saved_policy = saved_identity['expert_base_identity'].get('frame_policy', 'legacy_argmax_v1')
-            if getattr(args, 'explicit_frame_policy', False) and frame_policy != saved_policy:
-                raise ValueError('resume cannot change the Matcha frame policy')
-            frame_policy = saved_policy
-        args.matcha_frame_policy = frame_policy
-        expert_type = FrozenMatcha
-        if frame_policy == 'ordered_residue_com_v1':
-            from tricoopdiff.models.ordered_matcha_frame import FrozenOrderedResidueMatcha
-            expert_type = FrozenOrderedResidueMatcha
-        elif frame_policy != 'legacy_argmax_v1':
-            raise ValueError(f'unsupported Matcha frame policy: {frame_policy}')
-        frozen_expert = expert_type(source_dir=args.matcha_source_dir,
-                                    weights_dir=args.matcha_weights_dir,
-                                    device=str(device)).to(device)
-    else:
-        frozen_expert = build_diffdock_expert(model_dir=args.expert_model_dir, device=str(device))
+    frozen_expert = build_diffdock_expert(model_dir=args.expert_model_dir, device=str(device))
 
     # input_dim must match the ternary node feature dim, which is the receptor
     # feature dim (1281 = 1 amino-acid index + 1280 ESM2 for DiffDock-L). It is
@@ -571,10 +540,6 @@ def build_trainer(args, device, input_dim=None):
                                            model_profile=VECTOR_EXPERT_MODEL_PROFILE,
                                            expert_scalar_dim=frozen_expert.node_scalar_dim,
                                            expert_vector_dim=getattr(frozen_expert, 'node_vector_dim', 20))
-    if backend == 'matcha':
-        model_config = production_model_config(args.node_dim, input_dim, False,
-            expert_backend='matcha', expert_scalar_dim=frozen_expert.node_scalar_dim,
-            expert_vector_dim=frozen_expert.node_vector_dim)
     if args.resume:
         # Resume means reconstruct the saved architecture, not reinterpret it
         # using today's defaults. The trainer subsequently checks every runtime
@@ -826,8 +791,8 @@ class TernaryDataLoader:
     def __init__(self, data_json, score_model_args, shuffle=True, device="cuda",
                  cache_dir=None, skip_on_error=False, max_clusters=None,
                  random_flip_proteins=False, cache_read_only=False,
-                 cache_wait_seconds=3600., expert=None, cached_only=False,
-                 matcha_metadata_read_only=False, expected_esm_encoder_identity=None):
+                 cache_wait_seconds=3600., cached_only=False,
+                 expected_esm_encoder_identity=None):
         self.entries, self.clusters, self.entries_by_case = _load_index(data_json)
         if cached_only:
             if cache_dir is None:
@@ -857,12 +822,10 @@ class TernaryDataLoader:
         self.shuffle = shuffle
         self.device = device
         self.cache_dir = cache_dir
-        self.expert = expert
         self.skip_on_error = skip_on_error
         self.random_flip_proteins = bool(random_flip_proteins)
         self.expected_esm_encoder_identity = expected_esm_encoder_identity
         self.cache_read_only = bool(cache_read_only)
-        self.matcha_metadata_read_only = bool(matcha_metadata_read_only)
         self.cache_wait_seconds = float(cache_wait_seconds)
         self.skipped = []
 
@@ -922,9 +885,6 @@ class TernaryDataLoader:
             cache_wait_seconds=self.cache_wait_seconds,
             expected_esm_encoder_identity=getattr(self, 'expected_esm_encoder_identity', None),
         )
-        if getattr(self.expert, 'backend', None) == 'matcha':
-            e3_data, poi_data, ligand_data = preserve_rng(self._prepare_matcha)(
-                entry, (e3_data, poi_data, ligand_data))
         if self.random_flip_proteins and np.random.random() < 0.5:
             # Re-express the entire ternary state in the old POI-centered frame,
             # then exchange branch identities. This matches DeepTernary's
@@ -939,45 +899,6 @@ class TernaryDataLoader:
             'poi_data': poi_data,
             'ligand_data': ligand_data,
         }
-
-    def _prepare_matcha(self, entry, data):
-        """Cache only immutable sequence/chemical metadata, before protein flips."""
-        from tricoopdiff.models.expert import expert_base_identity
-
-        paths = [entry[key] for key in ('protein1', 'protein2', 'ligand')]
-        cache_path = Path(self.cache_dir) / (entry['case'] + '.pt') if self.cache_dir else None
-        identity = {'expert': expert_base_identity(self.expert),
-                    'inputs': [sha256_file(path) for path in paths],
-                    'features': sha256_file(cache_path) if cache_path and cache_path.exists() else None}
-        metadata_path = Path(self.cache_dir) / 'matcha_metadata' / (entry['case'] + '.pt') if self.cache_dir else None
-        cached = torch.load(metadata_path, map_location='cpu', weights_only=False) if metadata_path and metadata_path.exists() else None
-        if getattr(self, 'matcha_metadata_read_only', False):
-            deadline = time.monotonic() + self.cache_wait_seconds
-            announced = False
-            while cached is None or cached.get('identity') != identity:
-                if metadata_path is None:
-                    raise ValueError('read-only Matcha metadata requires cache_dir')
-                if not announced:
-                    print(f'[data] waiting for verified Matcha metadata: {entry["case"]}', flush=True)
-                    announced = True
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f'verified Matcha metadata unavailable: {metadata_path}')
-                time.sleep(min(1., max(0., deadline - time.monotonic())))
-                cached = (torch.load(metadata_path, map_location='cpu', weights_only=False)
-                          if metadata_path.is_file() else None)
-        if cached is None or cached.get('identity') != identity:
-            prepared = self.expert.prepare_case(*data, paths[:2])
-            metadata = [{key: value.detach().cpu() if torch.is_tensor(value) else value
-                         for key, value in part['matcha'].items()} for part in prepared]
-            if metadata_path:
-                metadata_path.parent.mkdir(parents=True, exist_ok=True)
-                atomic_torch_save({'identity': identity, 'metadata': metadata}, metadata_path)
-        else:
-            metadata = cached['metadata']
-        return tuple({**part, 'matcha': {
-            key: value.to(self.device) if torch.is_tensor(value) else value
-            for key, value in meta.items()}} for part, meta in zip(data, metadata))
-
 
 if __name__ == "__main__":
     main()

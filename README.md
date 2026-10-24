@@ -1,100 +1,81 @@
 # TriCoopDiff
 
-最新交接请先读 [项目交接：当前模型、实验与运行状态](doc/PROJECT_HANDOFF.md)（2026-10-10，`model-v4`）。包含运行任务、结果边界、环境资产与续跑说明。
+本分支 `feat/hdock-pure-ternary-v2` 是 HDOCK + 无二元专家三元模型路线。较早的
+`model-v4` / Matcha 交接和指标属于历史分支，不代表本分支架构或可复用权重。
 
-蛋白–配体–蛋白三元装配模型。两个冻结的二元专家通过 FiLM 接收另一侧界面的条件，提供逐节点证据；三元网络读取三个组分的完整节点与几何，独立预测合法的刚体及配体 torsion 运动。不是把两个专家的刚体建议直接平均。
+## 当前模型与入口
 
-## 本分支：候选驱动三元装配
+唯一装配路线：**HDOCK Top-K 蛋白–蛋白姿态 → ETKDG 生成配体化学构象并随机放置在蛋白界面 → 纯三元网络联合修正蛋白相对刚体姿态及配体刚体/torsion**。
 
-`feat/hdock-matcha-ternary` 的新入口是
-[`scripts/assembly_pipeline.py`](scripts/assembly_pipeline.py)：
+`scripts/assembly_pipeline.py` 的 `generate/train/predict/baseline` 共用该协议。模型直接读取
+E3、POI、配体三组节点特征、三组当前坐标、配体化学键拓扑、蛋白局部几何与全原子接触；
+配置 `ternary_only_hdock_v2` 不构造 DiffDock/Matcha 二元网络、FiLM 二元通路或二元proposal。
+ETKDG随机放置只是无训练的化学合法起点生成器，不是配体对接器；配体–蛋白匹配能力必须由
+三元模型从训练中学到。HDOCK只提供蛋白–蛋白候选，不预测配体姿态。
 
-**HDOCK Top5蛋白候选 → 固定双链受体上的Matcha配体生成 → 两侧FiLM先验＋三元联合精修 → 终态评分。**
+```bash
+python scripts/assembly_pipeline.py generate --index data/ternary_train.json \
+  --bank results/hdock_pure_train_bank --output results/hdock_pure_generate --candidates 5
+python scripts/assembly_pipeline.py train --index data/ternary_train.json \
+  --bank results/hdock_pure_train_bank --output results/hdock_pure_training --steps 5 --epochs 20
+python scripts/assembly_pipeline.py predict --index data/ternary_val.json \
+  --bank results/hdock_pure_val_bank --output results/hdock_pure_predictions \
+  --steps 5 --checkpoint results/hdock_pure_training/progress.pt
+```
 
-复用现有三元主干和合法运动更新器，不再要求网络承担宽随机初始化的全部全局搜索。
-默认5步候选修正，专家权重冻结，FiLM、三元运动头与五项质量误差头共同训练。
-候选运动头严格零初始化；整条轨迹保留自身的原始候选作为固定参考，逐节点读取位移、
-组分距离变化和原始参考轴。参考仅来自生成候选，不读取native，也不是硬性锚定起点。
-修正训练采用逐项log几何误差平衡，并对相对该候选起点误差的逐项退化施加2倍软惩罚；
-蛋白控制分别监督中心平移和SO(3)主旋转角，避免全原子MSE中位置与朝向的相互补偿；
-全原子蛋白误差仍用于结构评估和质量标签。旋转退化分母采用0.1°平方的数值底限。
-这是训练目标，不保证DockQ单调改善或推理时自动停止。
-运动终点监督更新FiLM与三元主干；评分监督只更新独立质量头，不反向改写运动表示。
-新来源独立标记 `hdock_matcha`；全原子侧链邻近几何同时进入模型输入和排斥监督。
-任务另有显式标志`assemble=0/refine=1`，与初始化来源独立；二者联合编码进入FiLM和
-三元运动主干。训练SDPI回放传assemble、候选精调传refine；推理精修明确传refine，
-缺失任务位报错，不能靠来源推断。质量头不读任务位。旧三来源权重不能静默续跑到六状态版本。
-同一份全原子接触证据进入两侧FiLM条件与三元主干，避免专家条件与联合控制看到不同几何。
-FiLM同时读取共享时间、步长与来源标志；运动与评分使用独立优化器参数组和独立梯度裁剪，
-评分学习不会通过共享梯度范数压缩运动更新。
-输入骨架参考系按刚体运动运输，短肽绕C-alpha轴的姿态由全原子对应关系保留。
+`generate` 必须先对训练/验证 index 分别运行；HDOCK、特征缓存及模型环境需事先配置。
+该路线使用独立checkpoint与候选bank格式，不兼容 Matcha/DiffDock 二元特征权重，也不读取native
+坐标初始化或推理。固定单起点的1AFQ训练已有拟合结果，不代表多起点或跨体系泛化。
 
-统一入口支持 `generate/train/predict`、CPU并行HDOCK、逐update原子保存与严格续跑，
-导出PDB/SDF及候选选择记录。命令与环境见[脚本指南](scripts/README.md)。
-新框架使用独立checkpoint格式，不将旧模型权重静默迁移。
-装配权重的迁移起点为SDPI全量训练的epoch16 **EMA**：
-`results/matcha_full_v55_seed73/checkpoint_epoch16.pt`中的`ema_trifuse_state_dict`，
-与`best_model.pt`的EMA逐tensor一致；固定验证集EMA DockQ为0.061221。
-带独立任务位的迁移已完成：`results/sdpi16_task_migration/epoch16_ema_candidate.pt`，
-`migration_audit.json`验证1AFQ的SDPI73和Top5共6个起点，在20步下运动与终态差异均为0。
-迁移保留旧固定锚点参考系、原torsion表示和运动头；新增输入零贡献，评分头重新初始化。
-原索引为6834例，cached-only准入固定5101例有缓存、1733例缺缓存。
-`data_admission.json`保存清单；文件存在仅表示可用性，化学与来源兼容性仍在读取时核验。
-原索引保留作输入身份基准；缺缓存样本不进入cluster的候选集合，不计入实际训练覆盖率。
-训练抽取复用原`TernaryDataLoader._epoch_entries`：每轮587个有效cluster各抽1例，
-80%从可用items抽、20%从可用representative抽，再打乱。
-旧逐条遍历阶段保留权重／优化器，明确重置为cluster第1轮，迁移来源记录在checkpoint的sampling_origin。
-cluster协议断点保存本轮选样、游标及每样本缓存访问次数；不是把旧逐条游标冒充cluster进度。
-每样本初态缓存容量4：前4次访问生成并使用对应新槽位，之后均匀随机4选1，不轮换替换。
-每次训练一个精修初态与一个新SDPI初态，目标权重75%／25%，显式任务位分别为refine／assemble。
-固定rank样本归属、缓存写锁、不可变槽位、原子断点和逐rank随机状态用于避免生成／续跑冲突。
-共享特征仅复制到本次私有缓存，不硬链接；禁止从PDB重建缺失化学特征或重新生成ESM。
-ETKDG失败记录并放弃该样本，不重试；缺缓存／不兼容缓存记录跳过，缓存结构损坏与模型错误仍明确停机。
-构象生成统一复用SDPI的ETKDGv3随机坐标实现；候选导入不再额外生成模板构象。
-已修复算法的失败记录按生成器版本区分，旧错误模板算法的失败不再排除样本。
-成功初态保持原始坐标、来源与哈希，只显式准许复用已记录的旧生成器；不改写生成来源。
-结构编码的节点对关系使用分块checkpoint重计算，避免在20步反传中累积全部二次规模MLP激活。
-CUDA OOM清除本样本梯度／临时显存并记录resource跳过，按其余有效样本同步；非有限梯度、
-非法CUDA状态与缓存结构损坏仍明确停机。显存跳过不是数据有效性判定，也不计入成功训练覆盖率。
-已删除旧共享刚体头／logit-only几何头的权重迁移实现；模型配置只构建现行v14主干。
+## Drifting 单步生成
 
-质量门控有界修正完成三轮全量训练。固定的MGD93 HDOCK→Matcha池含1,860个候选；
-第三轮将初始DockQ低于0.23的候选均值从0.0578提高到0.0868，其中131个跨过0.23；
-起终点联合oracle为0.8003。旧流式精修在相同93例、相同起点上，差候选终点均值为
-0.0628、52个跨过0.23、联合oracle为0.7968。该对照说明新修正器更会救差起点，
-但联合池增益较小；oracle只用于分析，不能当作可部署选择器。结果见
-`results/mgd94_quality_gated_repair_20261018/epoch3/summary.json`。
+`--objective drifting` 将训练改为同体系多个生成结果的联合漂移监督，参考
+[Generative Modeling via Drifting](https://arxiv.org/abs/2602.04770)及其
+[官方损失](https://github.com/lambertae/drifting/blob/main/drift_loss.py)。
+保留三元主干、HDOCK输入和合法刚体/torsion更新；每个候选只调用一次网络，不执行多步采样。
+此路径不构造质量评分头，仍按HDOCK排名导出，真实结构只用于训练或事后指标。
 
-学习评分未经独立校准，默认仍按HDOCK排名输出；
-`--selection learned` 仅供显式比较。真值只进入训练标签和事后指标。
-HDOCK在MGD结合态单体上的高分，不能外推到未结合态蛋白输入。
+每次更新从一个bank构象生成8个合法起点，持续重采刚体和torsion；同组共享固定键几何及
+可达真实目标。生成器读取各随机起点，并在各自姿态上执行一步动作；bank模板不是native。
+不同复合物分别计算漂移。特征保留全部配体/POI坐标、蛋白旋转、三组界面距离、化学键方向
+及torsion的sin/cos，在固定物理尺度和维度平衡后组成联合向量。
+不能把各几何块按其当前误差分别放大。
+沿用官方双向softmax、多温度、affinity下限和停止梯度目标，并严格屏蔽生成样本自身。
+先无梯度生成整组，再逐个重算反传，检查两遍结果相同；显存不随组内粒子数线性积累。
 
-### 模块职责与信息边界
+```bash
+python scripts/assembly_pipeline.py train --objective drifting --steps 1 \
+  --index data/ternary_train.json --bank results/hdock_pure_train_bank \
+  --output results/hdock_drifting --drift-particles 8 --epochs 20
+# 续跑使用同一目标、粒子数、bank和特征缓存；每次update原子保存progress.pt。
+python scripts/assembly_pipeline.py train --objective drifting --steps 1 \
+  --index data/ternary_train.json --bank results/hdock_pure_train_bank \
+  --output results/hdock_drifting --drift-particles 8 --epochs 20 \
+  --resume results/hdock_drifting/progress.pt
+python scripts/assembly_pipeline.py predict --objective drifting --steps 1 \
+  --index data/ternary_val.json --bank results/hdock_pure_val_bank \
+  --output results/hdock_drifting_predictions --checkpoint results/hdock_drifting/progress.pt
+```
 
-| 模块 | 读取 | 输出与职责 |
-| --- | --- | --- |
-| 蛋白候选生成 | 两个输入单体 | HDOCK Top5相对位姿，承担蛋白全局搜索 |
-| 配体候选生成 | 固定双链候选、配体化学图 | Matcha三阶段生成，蛋白不动，不使用native构象 |
-| 条件二元先验 | 当前受体、另一蛋白、配体、全原子接触、阶段时间 | 两侧独立FiLM条件与冻结Matcha逐节点标量／向量证据 |
-| 三元运动场 | 三组分节点、两侧证据、拓扑、接触、来源与时间 | 联合决定POI刚体及配体刚体／torsion；不平均专家刚体建议 |
-| 几何执行器 | 当前结构与联合运动 | E3固定，保持蛋白刚体与合法配体自由度，共用训练／推理更新规则 |
-| 独立质量头 | 静态组分身份、当前全原子接触分布和组分中心距离 | 预测五项log几何误差；不读取运动隐状态、时间、来源或候选参考；评分梯度不进入运动主干 |
+使用原目录资产时传绝对`--index`、`--bank`、`--cache-dir`和`--score-model-dir`；后者仅用于
+核验历史特征缓存的预处理签名，不加载二元权重。加`--cached-only`禁止重建缓存。
+事后DockQ使用`--native-root`与`--deepternary-root`指向原目录已有数据和评分程序。
+`predict --drift-eval-particles 32 --seed 2026`可固定生成条件粒子池，其中第0项为bank原模板。
+其余粒子作为独立的当前姿态，网络预测的一步动作也在该姿态上执行；不再把所有动作施加在
+同一个bank模板上。因此`metrics.json`分别报告输入粒子池和更新后粒子池的DockQ/RMSD。
+选择记录中的`generation_contract=candidate_state_one_step_generation_v1`固定这一口径。
+训练目标同时包含Drifting和投影配体／原生POI的终点几何监督，日志分别记录总loss、
+终点几何loss及输入／更新后RMSD。Drifting代理项不能单独作为结构质量指标。
 
-训练只在标签侧读取真实／可达目标；推理候选生成、精修和选择不读取答案。
-评分使用真实终态`t=0, dt=0`，不是最后一次更新前的状态。
-碰撞评分始终使用实际排斥量，不因关闭运动碰撞loss而被标成零。
-当前质量头是几何误差代理，不是DockQ估计或成功概率；默认选择仍使用HDOCK原排名。
-新评分表示有独立配置契约，旧评分权重不能静默加载或续跑。
-每次优化器更新汇总同一复合物的整个候选池，逐候选反传以控制显存；评分同时接受
-同池相对误差排序监督。运动学习率默认1e-4，独立评分头默认1e-3，均写入续跑合同。
-更换目标时仅通过显式`--weights-from`加载同架构权重，重置优化器、RNG和计数并记录来源；
-`--resume`仍要求目标完全一致，不把目标变更伪装为断点续跑。
+## 评估边界
 
-单样本验收（1AFQ_B_C_0FG，seed73，Top5共享模型，128维主干，5步执行，50次更新）：
-原始Top1为DockQ 0.9919／配体RMSD 1.626Å；旧自由精修为0.3526／8.690Å；
-候选修正器为0.9588／1.495Å。蛋白精度仍低于原始候选，配体稍有改善；
-其他四候选有改善但DockQ仍低于0.09，学习评分仍选错，不能外推泛化或排名有效性。
-结果：`results/candidate_corrector_acceptance/prediction/1AFQ_B_C_0FG/metrics.json`。
+候选生成不读取native；训练标签和事后DockQ/RMSD评估可以使用native。默认输出按HDOCK排名，
+学习质量评分未经校准前不能当作成功概率。Drifting的条件粒子池与生成池联合oracle
+只作诊断上界，不是部署选择器。
+
+## 历史记录（不属于本分支工作流）
+
+以下段落保留 `model-v4` 与更早实验说明，仅供考古；当前运行请以上述 HDOCK + 纯三元入口为准。
 
 ## 之前的宽初始化基线
 
@@ -135,7 +116,7 @@ HDOCK在MGD结合态单体上的高分，不能外推到未结合态蛋白输入
 - `doc/`：历史研究与协议文档，从 [索引](doc/README.md) 进入；旧架构、版本和结果不代表当前实现。
 - `data/`、`checkpoints/`、`results/`、`logs/`：本地资产与生成产物，不随脚本清理删除。
 
-## 部署范围与代码版本
+## 历史部署范围与代码版本
 
 以下部署说明针对 `model-v4` 的 **Matcha 条件二元专家＋三元装配模型**。FABind 在 `feat/fabind-expert` 分支，需使用该分支环境与模型；不能混用检查点。项目目前是研究代码，不是已发布的独立推理服务。
 

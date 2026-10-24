@@ -4,48 +4,35 @@
 
 ## 常用入口
 
-候选驱动框架使用一个入口 `assembly_pipeline.py`，按 `generate → train → predict`
-运行。HDOCK 只生成蛋白位姿，冻结 Matcha 在固定双链受体上生成配体；两个
-互为条件的 FiLM–Matcha 供三元主干读取，最终联合修正 POI 刚体与配体刚体/torsion。
-运动监督使用可达终点；评分头监督实际终态相对晶体结构的五种几何代理误差，
-不会把投影目标上的低 loss 当成晶体恢复。native 只用于训练标签和事后指标，不进入推理。
+当前分支的主入口 `assembly_pipeline.py` 按 `generate → train → predict` 运行：HDOCK
+生成蛋白–蛋白候选，ETKDG按配体化学图生成构象并随机放置在预测界面，纯三元模型联合
+更新蛋白相对刚体姿态及配体刚体/torsion。此路径不加载Matcha、DiffDock或其他二元专家；
+native只用于训练监督和事后指标，不用于候选初始化或推理。ETKDG放置不是配体对接，
+三元网络必须学习配体–蛋白匹配。当前分支尚无完整训练结果，勿将旧Matcha指标套用到新模型。
 
 ```bash
 CUDA_VISIBLE_DEVICES=4 python scripts/assembly_pipeline.py generate \
-  --index data/ternary_train.json --bank results/assembly_train_bank \
-  --output results/assembly_generation --candidates 5
+  --index data/ternary_train.json --bank results/hdock_pure_train_bank \
+  --output results/hdock_pure_generate --candidates 5
 CUDA_VISIBLE_DEVICES=4 python scripts/assembly_pipeline.py train \
-  --index data/ternary_train.json --bank results/assembly_train_bank \
-  --output results/assembly_training --steps 5 --epochs 20
+  --index data/ternary_train.json --bank results/hdock_pure_train_bank \
+  --output results/hdock_pure_training --steps 5 --epochs 20
 CUDA_VISIBLE_DEVICES=4 python scripts/assembly_pipeline.py train \
-  --index data/ternary_train.json --bank results/assembly_train_bank \
-  --output results/assembly_training --steps 5 --epochs 20 \
-  --resume results/assembly_training/progress.pt
+  --index data/ternary_train.json --bank results/hdock_pure_train_bank \
+  --output results/hdock_pure_training --steps 5 --epochs 20 \
+  --resume results/hdock_pure_training/progress.pt
 CUDA_VISIBLE_DEVICES=4 python scripts/assembly_pipeline.py predict \
-  --index data/ternary_val.json --bank results/assembly_val_bank \
-  --output results/assembly_predictions --steps 5 \
-  --checkpoint results/assembly_training/progress.pt
+  --index data/ternary_val.json --bank results/hdock_pure_val_bank \
+  --output results/hdock_pure_predictions --steps 5 \
+  --checkpoint results/hdock_pure_training/progress.pt
 ```
 
-验证集需先以对应 index 单独 `generate`。必须使用已部署的 HDOCKlite、FFTW、
-Matcha 三阶段权重、ESM 和特征环境；`--hdock-dir`/`--fftw-lib-dir` 可覆盖本机路径。
+训练集与验证集各自先运行 `generate`。需要 HDOCKlite、FFTW、ESM 与特征环境；不需要Matcha源码或权重。
 HDOCK 学术许可不允许向实验室之外重新分发二进制，仓库不包含它。
 入口禁止模型隐式联网下载。训练每次更新原子保存参数、优化器、RNG 和 epoch/案例游标；
 resume 校验 index/bank、生成器身份和步数，不允许静默改变来源协议。
 数据按需载入，最多保留两个案例，不把整个训练集堆到 GPU。
-运动与评分参数分组优化、独立裁剪；日志保存两组原始梯度范数、各loss分量与目标投影残差。
-FiLM读取共享时间／步长／来源和两侧全原子接触；评分监督不更新运动主干。
-候选修正器从严格零运动初始化，并在训练与推理中保留该轨迹自身的原始候选参考。
-终点几何按项log平衡，逐项退化采用2倍软惩罚；新目标不能与旧原始MSE总loss直接比较。
-旧自由运动模型的checkpoint不得作为这套修正器的恢复快照。
-已有SDPI模型经`assembly_pipeline.py migrate --baseline ... --steps 20`做明确EMA转换，
-新通道零贡献，且同起点20步行为保持验收通过后才发布新格式权重；该操作不是resume。
-精调以`--weights-from`继承转换权重，保留专家参考系和已训练运动头，
-`--sdpi-replay-weight .2`默认分配20%目标权重给每次新SDPI起点。migrate目前保留
-旧固定锚点有效域，不声称兼容原专家无法处理的短链；不能把这点当作MGD94已全部打通。
-推理必须使用已训练的新架构checkpoint，不提供未训练模型的smoke旁路。
-
-新框架不是旧 checkpoint 的续训模式；先训练新主干与评分头。`predict` 导出每个候选的
+`predict` 导出每个候选的
 完整 PDB、配体 SDF 与选择记录。可用 `--native-root` 添加**选择后的** DockQ 和原子顺序
 配体 RMSD；它不改变候选或评分。该 RMSD 尚不是对称性修正值。
 候选主干额外读取全原子跨组分距离、密度、重叠和等变方向，让配体节点看到侧链障碍。
@@ -55,8 +42,7 @@ FiLM读取共享时间／步长／来源和两侧全原子接触；评分监督�
 修正任务；比例不是已验证最优。评分有同池排序监督，独立学习率用`--quality-lr`设置。
 默认输出保留 HDOCK 排名，不让少量更新后的未校准评分覆盖这个先验；
 `--selection learned` 是显式实验开关，选择记录同时保存两种选择的索引。
-候选专家采用输入 N-CA-C 骨架参考系及刚体运输，POI 全原子位姿和监督保留绕短链轴的旋转；
-不能用只有两个 C-alpha 的拟合替代完整旋转。旧 checkpoint 不迁移到这套候选协议。
+纯三元 checkpoint/候选bank使用独立版本号，不接受旧二元专家模型权重迁移。
 
 ```bash
 python scripts/run_cpu_tests.py
@@ -66,7 +52,7 @@ python scripts/evaluate_entry.py --help
 python scripts/evaluate_index.py --help
 ```
 
-`train_entry.py` 是标准训练入口；`train_matcha_single.py` 是 Matcha 专用训练；`train_distributed.py` 的多卡实现与验收边界见[吞吐说明](../doc/TRAINING_THROUGHPUT.md)。评估入口的 backend、权重和初始化支持范围不同，使用前核对参数及[项目交接](../doc/PROJECT_HANDOFF.md)。
+`assembly_pipeline.py` 是本分支唯一推荐的模型训练与预测入口。`train_entry.py`、`train_distributed.py`、`evaluate_entry.py` 及 Matcha 专用脚本属于旧二元专家工作流，不用于本分支训练、推理或指标汇报；后续清理时应从运行文档和部署包中排除。
 
 ## 顶层工具
 

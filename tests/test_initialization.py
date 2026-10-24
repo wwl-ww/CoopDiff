@@ -6,17 +6,82 @@ if __name__ == "__main__":
     run_tests(__file__)
 
 import hashlib
+import json
 import math
 import tempfile
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 from rdkit import Chem
 from scipy.spatial.transform import Rotation
+
+
+def test_hdock_cache_hit_rebuilds_createpl_inputs():
+    import assembly_pipeline as pipeline
+
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        entry = {'case': 'cached', 'protein1': 'p1', 'protein2': 'p2'}
+        opt = SimpleNamespace(seed=73, hdock_dir=directory, fftw_lib_dir=directory)
+        identity = {'inputs': {'protein1': 'one', 'protein2': 'two'},
+                    'seed': 73, 'hdock_sha256': 'binary'}
+        (directory / 'docking_complete.json').write_text(json.dumps(identity))
+        (directory / 'Hdock.out').touch()
+        with patch.object(pipeline, 'input_identity', return_value=identity['inputs']), \
+             patch.object(pipeline, 'sha256_file', return_value='binary'), \
+             patch.object(pipeline, 'write_hdock_input') as write_input:
+            assert pipeline._docking_job_locked(opt, entry, directory) is entry
+        assert write_input.call_count == 2, 'cached Hdock.out still needs r.pdb and l.pdb for createpl'
+
+
+def test_pure_ternary_checkpoint_rejects_old_reference_contract():
+    import assembly_pipeline as pipeline
+    from tricoopdiff.models.assembly import (
+        DRIFTING_MOTION_CONTRACT, PURE_CANDIDATE_REFERENCE_CONTRACT,
+        PURE_TERNARY_MODEL_PROFILE, production_model_config,
+    )
+
+    config = production_model_config(
+        16, 16, True, model_profile=PURE_TERNARY_MODEL_PROFILE,
+        candidate_driven=True, motion_contract=DRIFTING_MOTION_CONTRACT,
+    )
+    assert config['candidate_reference_contract'] == PURE_CANDIDATE_REFERENCE_CONTRACT
+    old_config = {**config,
+                  'candidate_reference_contract': 'immutable_pose_displacement_transport_v1'}
+    payload = {'model_config': old_config, 'format': pipeline.CANDIDATE_FRAMEWORK_VERSION}
+    try:
+        pipeline.model_for(SimpleNamespace(objective='drifting', motion_contract=None,
+                                           device='cpu', weights_from=None), 16, payload)
+    except ValueError as error:
+        assert 'compatible candidate-driven model' in str(error)
+    else:
+        raise AssertionError('old reference contract entered the new pure ternary model')
+
+
+def test_old_weights_cannot_silently_skip_contact_guidance():
+    import assembly_pipeline as pipeline
+    from tricoopdiff.models.assembly import (
+        DRIFTING_MOTION_CONTRACT, PURE_TERNARY_MODEL_PROFILE, production_model_config,
+    )
+
+    config = production_model_config(
+        16, 16, True, model_profile=PURE_TERNARY_MODEL_PROFILE,
+        candidate_driven=True, motion_contract=DRIFTING_MOTION_CONTRACT,
+        contact_guidance_contract=None,
+    )
+    payload = {'model_config': config, 'format': pipeline.CANDIDATE_FRAMEWORK_VERSION}
+    opt = SimpleNamespace(objective='drifting', motion_contract=None, device='cpu',
+                          weights_from=Path('old_checkpoint.pt'))
+    try:
+        pipeline.model_for(opt, 16, payload)
+    except ValueError as error:
+        assert 'cannot silently start the contact-guided' in str(error)
+    else:
+        raise AssertionError('old weights silently disabled the new contact-guided model')
 
 
 def test_online_cache_reuses_pending_slots_and_never_generates_after_full():
@@ -38,12 +103,12 @@ def test_online_cache_reuses_pending_slots_and_never_generates_after_full():
             # Even if all files exist after an interrupted update, replay the
             # pending visit's new slot rather than randomly drawing another.
             for visit in range(4):
-                candidate, _, _ = pipeline.online_candidate(opt, entry, None, None, visit)
+                candidate, _, _ = pipeline.online_candidate(opt, entry, None, visit)
                 assert candidate['slot'] == visit
-            choices = [pipeline.online_candidate(opt, entry, None, None, visit)[0]['slot']
+            choices = [pipeline.online_candidate(opt, entry, None, visit)[0]['slot']
                        for visit in range(4, 104)]
             assert set(choices) == {0, 1, 2, 3}
-            again = [pipeline.online_candidate(opt, entry, None, None, visit)[0]['slot']
+            again = [pipeline.online_candidate(opt, entry, None, visit)[0]['slot']
                      for visit in range(4, 104)]
             assert choices == again, 'resume changed online cache choices'
             assert len(list(directory.glob('online_slot_*.pt'))) == 4
@@ -51,7 +116,7 @@ def test_online_cache_reuses_pending_slots_and_never_generates_after_full():
             atomic_json({'protocol': base, 'reason': 'joint ligand ETKDG generation failed'},
                         directory/'initialization_failed.testdigest.json')
             try:
-                pipeline.online_candidate(opt, entry, None, None, 104)
+                pipeline.online_candidate(opt, entry, None, 104)
             except pipeline.ConformerGenerationFailure:
                 pass
             else:
@@ -67,7 +132,7 @@ def test_cached_only_pipeline_never_rebuilds_missing_features():
         error = FileNotFoundError('missing: cache-only mode requires a compatible cache directory')
         with patch.object(pipeline, 'featurize_complex', side_effect=error) as read:
             try:
-                pipeline.load_case(opt, entry, None, None)
+                pipeline.load_case(opt, entry, None)
             except pipeline.FeatureCacheUnavailable:
                 pass
             else:
@@ -76,7 +141,7 @@ def test_cached_only_pipeline_never_rebuilds_missing_features():
         # Structural cache corruption is not reclassified as missing data.
         with patch.object(pipeline, 'featurize_complex', side_effect=ValueError('corrupt tensor')):
             try:
-                pipeline.load_case(opt, entry, None, None)
+                pipeline.load_case(opt, entry, None)
             except ValueError as exc:
                 assert str(exc) == 'corrupt tensor'
             else:
@@ -153,44 +218,6 @@ def test_cluster_epoch_plan_reuses_original_sampling_and_preserves_rng():
         assert all(owners[entries[i]['case']] == rank for i in shard)
 
 
-def test_joint_matcha_generator_is_native_blind_and_uses_all_three_stages():
-    from tricoopdiff.initialization.candidates import generate_joint_matcha_ligand
-
-    class Stage(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.times = []
-
-        def forward_step(self, batch):
-            self.times.append(float(batch.ligand.t))
-            assert batch.protein.pos.shape[1] == 7, 'generator dropped one protein chain'
-            return batch.ligand.pos.new_ones(1, 3), batch.ligand.pos.new_zeros(1, 3), None, None
-
-    expert = torch.nn.Module()
-    expert.backend = 'matcha'
-    expert.provenance = {'test': 'no weights'}
-    expert.stages = torch.nn.ModuleList([Stage() for _ in range(3)])
-    e3 = {'coords': torch.randn(1, 3, 3),
-          'matcha': {'features': torch.ones(1, 3, 2), 'sequence': torch.ones(1, 3, 1)}}
-    poi = {'coords': torch.randn(1, 4, 3),
-           'matcha': {'features': torch.ones(1, 4, 2), 'sequence': torch.ones(1, 4, 1)}}
-    ligand = {'mol': Chem.MolFromSmiles('CC').ToBinary(), 'coords': torch.randn(1, 2, 3),
-              'matcha': {'features': torch.zeros(1, 2, 2),
-                        'bonds': torch.empty(0, 2, dtype=torch.long),
-                        'masks': torch.empty(0, 2, dtype=torch.bool)}}
-    candidate = {'ligand': ligand['coords'], 'poi': poi['coords'], 'rotation': torch.eye(3)[None],
-                 'provenance': {'candidate_source': 'hdock_matcha'}, 'candidate_id': ('test', 1)}
-    fake = ModuleType('matcha.utils.transforms')
-    fake.apply_tor_changes_to_pos = lambda pos, *args, **kwargs: pos
-    with patch.dict('sys.modules', {'matcha.utils.transforms': fake}):
-        first = generate_joint_matcha_ligand(expert, e3, poi, ligand, candidate, seed=73, steps_per_stage=2)
-        changed = generate_joint_matcha_ligand(expert, e3, poi,
-            {**ligand, 'coords': ligand['coords']+1000}, candidate, seed=73, steps_per_stage=2)
-    assert torch.equal(first['ligand'], changed['ligand']), 'generator used the native ligand coordinates'
-    assert torch.equal(first['poi'], candidate['poi']), 'generator moved the HDOCK proteins'
-    assert all(stage.times == [0., .5, 0., .5] for stage in expert.stages)
-
-
 def test_assembly_candidate_frame_and_rigidity():
     from tricoopdiff.initialization.candidates import assembly_candidate_from_pose
     from tricoopdiff.geometry.rigid import rotation_exp
@@ -210,7 +237,7 @@ def test_assembly_candidate_frame_and_rigidity():
     assert torch.allclose(result['ligand'][0], ligand, atol=1e-5), 'ligand lost shared E3 frame'
     assert torch.allclose(result['poi'][0], placed, atol=1e-5), 'protein relative pose changed'
     assert torch.allclose(result['rotation'][0], body, atol=1e-5), 'body rotation convention changed'
-    assert result['provenance']['candidate_source'] == 'hdock_matcha'
+    assert result['provenance']['candidate_source'] == 'hdock_etkdg'
     assert not result['provenance']['native_information_used']
     distorted = pose_poi.clone()
     distorted[0, 0] += .5

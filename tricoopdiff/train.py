@@ -22,14 +22,18 @@ from tricoopdiff.models.assembly import (
     ENDPOINT_PROTOCOL_CHECKPOINT_VERSION,
     OBJECTIVE_CONTRACT_CHECKPOINT_VERSION,
     INTERFACE_OBJECTIVE_CHECKPOINT_VERSION, PRODUCTION_MODEL_PROFILE, VECTOR_EXPERT_MODEL_PROFILE,
+    PURE_TERNARY_MODEL_PROFILE, PURE_TERNARY_ARCHITECTURE,
     production_model_config,
     LEGACY_CONSENSUS_CHECKPOINT_VERSION, PREVIOUS_CONSENSUS_CHECKPOINT_VERSION,
     SOURCE_CONTRACT_VERSION,
     LEGACY_TORSION_REPRESENTATION,
-    FLOW_MOTION_CONTRACT, BOUNDED_REPAIR_MOTION_CONTRACT,
+    FLOW_MOTION_CONTRACT, DRIFTING_MOTION_CONTRACT, BOUNDED_REPAIR_MOTION_CONTRACT,
     QUALITY_GATED_REPAIR_MOTION_CONTRACT, QUALITY_GATE_ERROR_SCALE,
+    CONTACT_GUIDANCE_CONTRACT, ANCHOR_RELATION_CONTRACT, TORSION_PHASE_CONTRACT,
+    TARGET_LIGAND_FRAME_CONTRACT, ligand_target_frame_label,
+    ligand_rotor_quads, torsion_phase_pairs,
     candidate_source_tensor,
-    CANDIDATE_SOURCE_NAMES,
+    CANDIDATE_SOURCE_NAMES, PURE_CANDIDATE_SOURCE_NAMES,
 )
 from tricoopdiff.models.expert import (expert_base_identity, validate_expert_base_identity,
                                     configure_expert_policy, expert_runtime_identity, FrozenMatcha)
@@ -47,6 +51,256 @@ class NonFiniteTrainingError(FloatingPointError):
 
 LIGAND_GEOMETRY_SCALE_ANGSTROM = 1.0
 PROTEIN_GEOMETRY_SCALE_ANGSTROM = 1.0
+
+DRIFTING_TRAINING_CONTRACT = {
+    'version': 'candidate_step_geometry_drifting_endpoint_contact_v8',
+    'temperatures': [.02, .05, .2],
+    'features': 'joint_e3_frame_coordinates_bond_directions_torsion_phases_v3',
+    'rotation_feature_unit': .5,
+    'affinity_floor': 1e-3,
+    'sampling': 'shared_conformer_legal_pose_resampling_v1',
+    'decoder_reference': 'same_candidate_action_and_execution_geometry_v1',
+    'endpoint_loss': 'projected_ligand_and_native_poi_atom_mse_per_100_angstrom_squared_v1',
+    'endpoint_weight': 1.0,
+    'contact_guidance': 'two_sided_ligand_atom_to_protein_ca_8a_v1',
+    'contact_weight': 1.0,
+    'ligand_translation_std_angstrom': 3., 'ligand_rotation_std_radians': 1.5,
+    'protein_translation_std_angstrom': .5, 'protein_rotation_std_radians': .05,
+    'backward': 'detached_cohort_targets_exact_per_particle_replay_v1',
+    'reference': 'https://github.com/lambertae/drifting/blob/main/drift_loss.py',
+}
+
+ANCHOR_TRAINING_CONTRACT = {
+    **DRIFTING_TRAINING_CONTRACT,
+    'version': 'candidate_step_geometry_drifting_anchor_roles_v9',
+    'contact_guidance': ANCHOR_RELATION_CONTRACT,
+    'anchor_role_weight': 0.5,
+}
+
+
+def drifting_training_contract(model_config):
+    """Keep the v8 loss contract loadable while v9 replaces its readout."""
+    if model_config.get('contact_guidance_contract') == ANCHOR_RELATION_CONTRACT:
+        return ANCHOR_TRAINING_CONTRACT
+    return DRIFTING_TRAINING_CONTRACT
+
+
+def _balanced_binary_loss(prediction, expected):
+    positives = expected.sum().to(prediction.dtype)
+    negatives = expected.numel() - positives
+    positive_weight = (negatives / positives.clamp_min(1.)).clamp(min=1., max=16.)
+    return torch.nn.functional.binary_cross_entropy_with_logits(
+        prediction, expected.to(prediction.dtype), pos_weight=positive_weight)
+
+
+def two_sided_ca_contact_loss(logits, e3, poi, target_ligand, *, cutoff=8.):
+    """Supervise native residue neighborhoods; proteins here are C-alpha nodes."""
+    if set(logits) != {'e3_ligand', 'poi_ligand'}:
+        raise ValueError('both protein-ligand contact sides are required')
+    losses = []
+    for branch, receptor in (('e3_ligand', e3), ('poi_ligand', poi)):
+        expected = torch.cdist(target_ligand[0], receptor[0]) <= cutoff
+        prediction = logits[branch]
+        if prediction.shape != expected.shape or not torch.isfinite(prediction).all():
+            raise ValueError(f'{branch} contact logits must match ligand atoms and protein C-alpha nodes')
+        losses.append(_balanced_binary_loss(prediction, expected))
+    return torch.stack(losses).mean()
+
+
+def two_sided_anchor_role_loss(roles, e3, poi, target_ligand, *, cutoff=8.):
+    """Supervise each side's ligand-atom and protein-residue anchor roles."""
+    if set(roles) != {'e3_ligand', 'poi_ligand'}:
+        raise ValueError('both anchor role sides are required')
+    losses = []
+    for branch, receptor in (('e3_ligand', e3), ('poi_ligand', poi)):
+        contacts = torch.cdist(target_ligand[0], receptor[0]) <= cutoff
+        ligand_label, protein_label = contacts.any(1), contacts.any(0)
+        prediction = roles[branch]
+        if (set(prediction) != {'ligand', 'protein'}
+                or prediction['ligand'].shape != ligand_label.shape
+                or prediction['protein'].shape != protein_label.shape):
+            raise ValueError(f'{branch} anchor roles must match ligand atoms and protein residues')
+        losses.extend((_balanced_binary_loss(prediction['ligand'], ligand_label),
+                       _balanced_binary_loss(prediction['protein'], protein_label)))
+    return torch.stack(losses).mean()
+
+
+@torch.no_grad()
+def drifting_targets(generated, positive, temperatures=(.02, .05, .2)):
+    """Official cross-minus-self drift, with strictly excluded self pairs.
+
+    Inputs are one condition's [particles, features] and [positives, features].
+    The returned target AND scale are detached; differentiating the norm of
+    the field instead would optimize a different objective.
+    """
+    if (generated.ndim != 2 or positive.ndim != 2 or generated.shape[0] < 2
+            or positive.shape[0] < 1 or generated.shape[1] != positive.shape[1]):
+        raise ValueError('drifting requires >=2 generated particles and >=1 positive per condition')
+    if not all(torch.isfinite(value).all() for value in (generated, positive)):
+        raise FloatingPointError('nonfinite drifting features')
+    generated, positive = generated.float(), positive.float()
+    count, dimensions = generated.shape
+    targets = torch.cat((generated, positive), 0)
+    distance = torch.cdist(generated[None], targets[None],
+                           compute_mode='donot_use_mm_for_euclid_dist')[0]
+    scale = (distance.mean() / math.sqrt(dimensions)).clamp_min(1e-3)
+    normalized_distance = distance / distance.mean().clamp_min(1e-3)
+    self_mask = torch.cat((torch.eye(count, device=distance.device, dtype=torch.bool),
+                           torch.zeros(count, len(positive), device=distance.device,
+                                       dtype=torch.bool)), 1)
+    drift = torch.zeros_like(generated)
+    raw_norms = []
+    for temperature in temperatures:
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError('drifting temperatures must be finite positive')
+        logits = (-normalized_distance / temperature).masked_fill(self_mask, -torch.inf)
+        affinity = (.5 * (logits.log_softmax(-1) + logits.log_softmax(-2))).exp()
+        # Match the official sqrt(clip(A_row*A_col, min=1e-6)). Without
+        # this floor a tight, wrong cluster loses all attraction to native.
+        # Self pairs remain excluded even after the numerical floor.
+        affinity = affinity.clamp_min(DRIFTING_TRAINING_CONTRACT['affinity_floor']).masked_fill(self_mask, 0.)
+        negative, attract = affinity[:, :count], affinity[:, count:]
+        weights = torch.cat((-negative * attract.sum(-1, keepdim=True),
+                              attract * negative.sum(-1, keepdim=True)), -1)
+        # Differences avoid cancellation of large equal feature offsets at equilibrium.
+        force = (weights[..., None] * (targets[None]-generated[:, None])/scale).sum(1)
+        norm_squared = force.square().mean()
+        raw_norms.append(norm_squared)
+        drift += force / norm_squared.clamp_min(1e-8).sqrt()
+    return generated / scale + drift, scale, {
+        'raw_drift_squared': float(torch.stack(raw_norms).mean()),
+        'feature_scale': float(scale), 'surrogate_loss': float(drift.square().mean()),
+    }
+
+
+def drifting_ligand_geometry(ligand_data):
+    """Canonical chemical neighbors for angular features; no coordinates read."""
+    edges = ligand_data['edge_index']
+    quads, rotor_indices = ligand_rotor_quads(edges, ligand_data['edge_mask'])
+    return edges[:, edges[0] < edges[1]], quads, rotor_indices
+
+
+def drifting_torsion_action_target(start, target, ligand_geometry):
+    """Shortest legal per-bond phase correction, normalized by pi for the action head."""
+    _, quads, rotor_indices = ligand_geometry
+    if not len(quads):
+        return rotor_indices, start.new_empty(1, 0)
+    initial = torsion_phase_pairs(start, quads)
+    desired = torsion_phase_pairs(target, quads)
+    valid = (initial.square().sum(-1) > .5) & (desired.square().sum(-1) > .5)
+    if start.shape[0] != 1 or target.shape[0] != 1:
+        raise ValueError('torsion action teacher requires one legal start and target')
+    initial_angle = torch.atan2(initial[..., 1], initial[..., 0])
+    desired_angle = torch.atan2(desired[..., 1], desired[..., 0])
+    difference = desired_angle-initial_angle
+    return rotor_indices[valid[0]], torch.atan2(
+        difference.sin(), difference.cos())[:, valid[0]]/math.pi
+
+
+@torch.no_grad()
+def drifting_rigid_action_target(start, target_ligand, target_poi,
+                                 torsion_target, ligand_data, e3_coords):
+    """Fit rigid corrections after the exact legal torsion teacher executes."""
+    indices, normalized_torsion = torsion_target
+    zero = start['ligand'].new_zeros(1, 3)
+    torsion = start['ligand'].new_zeros(1, int(ligand_data['edge_mask'].sum()))
+    torsion[:, indices] = normalized_torsion * math.pi
+    action = {
+        'rigid_output_mode': INDEPENDENT_RIGID_MODE,
+        'torsion_update_mode': CONTINUOUS_TORSION_MODE,
+        'e3_ligand': {'tr': zero, 'rot': zero},
+        'poi_ligand': {'tr': zero, 'rot': zero},
+        'torsion': torsion,
+    }
+    corrected = SDPIFlow.differentiable_step(start['ligand'], start['poi'],
+        start['rotation'], action, start['ligand'].new_ones(1), ligand_data)[0]
+    scales = SDPIFlow.scales(e3_coords, target_poi)
+    ligand_rigid = bounded_rigid_target_action(corrected, target_ligand)
+    protein_rigid = bounded_rigid_target_action(start['poi'], target_poi)
+    return {
+        branch: {'tr': rigid['tr'] / scales[index], 'rot': rigid['rot'] / math.pi}
+        for index, (branch, rigid) in enumerate((
+            ('e3_ligand', ligand_rigid), ('poi_ligand', protein_rigid)))
+    }
+
+
+def drifting_geometry_features(e3, ligand, poi, body, ligand_geometry=None):
+    """Explicit geometry, no learned pooling and no ligand self-alignment.
+
+    Coordinates relative to the fixed E3 center retain the complete movable
+    structure. Distance blocks add interface information on fixed sequence
+    landmarks; all ligand atoms and all POI coordinates remain in raw blocks.
+    """
+    center = e3.mean(1, keepdim=True)
+    def landmarks(points):
+        indices = torch.linspace(0, points.shape[1]-1, min(16, points.shape[1]),
+                                 device=points.device).round().long()
+        return points[:, indices]
+    a, b = landmarks(e3), landmarks(poi)
+    blocks = {
+        'ligand': (ligand-center).flatten(1),
+        'protein': (poi-center).flatten(1),
+        'rotation': body.flatten(1),
+        'e3_ligand': torch.cdist(a, ligand, compute_mode='donot_use_mm_for_euclid_dist').flatten(1),
+        'poi_ligand': torch.cdist(b, ligand, compute_mode='donot_use_mm_for_euclid_dist').flatten(1),
+        'e3_poi': torch.cdist(a, b, compute_mode='donot_use_mm_for_euclid_dist').flatten(1),
+    }
+    if ligand_geometry is not None:
+        edges, quads, _ = ligand_geometry
+        if edges.shape[1]:
+            directions = ligand[:, edges[1]]-ligand[:, edges[0]]
+            blocks['bond_directions'] = torch.nn.functional.normalize(directions, dim=-1).flatten(1)
+        if len(quads):
+            blocks['torsion_phases'] = torsion_phase_pairs(ligand, quads).flatten(1)
+    return blocks
+
+
+def drifting_feature_vector(blocks):
+    """One pose kernel with fixed physical units and equal block dimensions.
+
+    Separately normalizing each block by its own current error would amplify
+    a nearly correct protein pose until it overwhelms ligand correction.
+    Joint normalization retains every coordinate without that inverse-error gain.
+    """
+    return torch.cat([value / (math.sqrt(value.shape[-1]) * (
+        DRIFTING_TRAINING_CONTRACT['rotation_feature_unit']
+        if name in ('rotation', 'bond_directions', 'torsion_phases') else 1.))
+        for name, value in blocks.items()], -1)
+
+
+@torch.no_grad()
+def sample_drifting_starts(candidate, ligand_data, particles, *, generator=None):
+    """Native-free starts sharing one conformer's bond/fragment geometry."""
+    if particles < 2:
+        raise ValueError('drifting needs at least two particles per case')
+    ligand, poi, body = [candidate[key].to(ligand_data['coords']).clone()
+                         for key in ('ligand', 'poi', 'rotation')]
+    starts = [{'ligand': ligand, 'poi': poi, 'rotation': body}]
+    recipe = DRIFTING_TRAINING_CONTRACT
+    torsions = int(ligand_data['edge_mask'].sum())
+    for _ in range(particles-1):
+        def normal(scale):
+            return torch.randn(1, 3, device=ligand.device, dtype=ligand.dtype,
+                               generator=generator) * scale
+        action = {
+            'rigid_output_mode': INDEPENDENT_RIGID_MODE,
+            'torsion_update_mode': CONTINUOUS_TORSION_MODE,
+            'e3_ligand': {'tr': normal(recipe['ligand_translation_std_angstrom']),
+                          'rot': normal(recipe['ligand_rotation_std_radians'])},
+            'poi_ligand': {'tr': normal(recipe['protein_translation_std_angstrom']),
+                           'rot': normal(recipe['protein_rotation_std_radians'])},
+            'torsion': (torch.rand(1, torsions, device=ligand.device, dtype=ligand.dtype,
+                                   generator=generator)*2-1)*math.pi,
+        }
+        moved = SDPIFlow.differentiable_step(ligand, poi, body, action,
+                                             ligand.new_ones(1), ligand_data)
+        starts.append(dict(zip(('ligand', 'poi', 'rotation'), moved)))
+    return starts
+
+
+def _model_has_no_torsion(model):
+    expert = getattr(model, 'expert', None)
+    return bool(getattr(getattr(expert, 'model', None), 'no_torsion', False))
 
 
 def clip_grad_norm_finite(parameters, max_norm=1.0):
@@ -148,7 +402,8 @@ class TriCoopDiffTrainer:
             raise ValueError("activation_clamp must be positive")
         self.activation_clamp = float(activation_clamp)
         # Numerical settings belong to this expert, not the process or another trainer.
-        configure_expert_policy(self.model.expert, self.activation_clamp, 'componentwise')
+        if self.model.expert is not None:
+            configure_expert_policy(self.model.expert, self.activation_clamp, 'componentwise')
         if torsion_expert_aux_weight < 0:
             raise ValueError("torsion_expert_aux_weight must be non-negative")
         self.torsion_expert_aux_weight = float(torsion_expert_aux_weight)
@@ -163,7 +418,7 @@ class TriCoopDiffTrainer:
                 if head is not None:
                     head.requires_grad_(False)
             fuse_parameters = [parameter for parameter in fuse_parameters if parameter.requires_grad]
-        if model.trifuse.config.get('candidate_driven'):
+        if getattr(getattr(model.trifuse, 'controller', None), 'quality', None) is not None:
             quality_parameters = list(model.trifuse.controller.quality.parameters())
             quality_ids = {id(parameter) for parameter in quality_parameters}
             parameter_groups = [
@@ -172,7 +427,9 @@ class TriCoopDiffTrainer:
                 {'params': quality_parameters, 'lr': lr, 'name': 'candidate_quality'},
             ]
         else:
-            parameter_groups = [{'params': fuse_parameters, 'lr': lr, 'name': 'trifuse'}]
+            parameter_groups = [{'params': fuse_parameters, 'lr': lr,
+                                 'name': 'assembly_motion' if model.trifuse.config.get('candidate_driven')
+                                 else 'trifuse'}]
         self._configure_optimizer(parameter_groups, weight_decay)
 
         self.global_step = 0
@@ -230,7 +487,7 @@ class TriCoopDiffTrainer:
                 raise ValueError("SDPI flow requires one shared interface clock")
         coupling = coupling_override if coupling_override is not None else self.diffusion.sample_coupling(
             e3_data['coords'], poi_data['coords'], ligand_data,
-            no_torsion=bool(getattr(self.model.expert.model, 'no_torsion', False)),
+            no_torsion=_model_has_no_torsion(self.model),
         )
         dt = t.new_full((1,), 1 / self.diffusion.inference_steps)
         ligand, poi, body, targets = self._training_state(
@@ -262,7 +519,7 @@ class TriCoopDiffTrainer:
                 losses[f'loss_{prefix}_{component}'] = (predicted - target).square().mean()
                 record_rms(f'{prefix}_{component}', predicted, target)
         tor_target = targets['torsion'] / np.pi
-        if bool(getattr(self.model.expert.model, 'no_torsion', False)):
+        if _model_has_no_torsion(self.model):
             tor_target = tor_target[:, :0]
         for name, predicted in (
             ('loss_score_tor', predictions['torsion']),
@@ -539,6 +796,7 @@ def validate_assembly_checkpoint(payload):
     if not isinstance(version, int) or not LEGACY_CONSENSUS_CHECKPOINT_VERSION <= version <= ASSEMBLY_CHECKPOINT_VERSION:
         raise ValueError(f'consensus requires checkpoint_version=18 through {ASSEMBLY_CHECKPOINT_VERSION}')
     if payload.get('architecture') not in (ARCHITECTURE, DIRECT_ARCHITECTURE,
+                                           PURE_TERNARY_ARCHITECTURE,
                                            PREVIOUS_DIRECT_ARCHITECTURE) or payload.get('generative_process') != FLOW_VERSION:
         raise ValueError('checkpoint does not describe a supported consensus SDPI flow')
     model_config = payload.get('model_config')
@@ -556,7 +814,8 @@ def validate_assembly_checkpoint(payload):
                 raise ValueError(f'production checkpoint requires a positive integer {key}')
         if model_config['model_profile'] not in ('ternary_endpoint_v1', 'ternary_endpoint_v2',
                                                'ternary_endpoint_v3', PRODUCTION_MODEL_PROFILE,
-                                               VECTOR_EXPERT_MODEL_PROFILE):
+                                               VECTOR_EXPERT_MODEL_PROFILE,
+                                               PURE_TERNARY_MODEL_PROFILE):
             raise ValueError('unknown checkpoint model profile')
         expected = production_model_config(model_config['node_dim'], model_config['input_dim'],
                                            model_config.get('source_conditioning', False),
@@ -564,6 +823,9 @@ def validate_assembly_checkpoint(payload):
                                            expert_scalar_dim=model_config.get('expert_scalar_dim', 58),
                                            expert_vector_dim=model_config.get('expert_vector_dim', 20),
                                            expert_backend=model_config.get('expert_backend', 'diffdock'),
+                                           candidate_driven=model_config.get('candidate_driven', False),
+                                           candidate_expert_frame_policy=model_config.get(
+                                               'candidate_expert_frame_policy', 'backbone_rigid_transport_v1'),
                                            torsion_representation_contract=model_config.get(
                                                'torsion_representation_contract', LEGACY_TORSION_REPRESENTATION),
                                            protein_local_geometry_contract=model_config.get(
@@ -571,11 +833,15 @@ def validate_assembly_checkpoint(payload):
                                            protac_anchor_contract=model_config.get(
                                                'protac_anchor_contract'),
                                            motion_contract=model_config.get('motion_contract', FLOW_MOTION_CONTRACT),
+                                           contact_guidance_contract=model_config.get('contact_guidance_contract'),
+                                           torsion_phase_contract=model_config.get('torsion_phase_contract'),
+                                           target_ligand_frame_contract=model_config.get('target_ligand_frame_contract'),
                                            **({'conditioning_contract': model_config['conditioning_contract']}
                                               if 'conditioning_contract' in model_config else {}))
         if model_config != expected:
             raise ValueError('checkpoint violates its production model profile')
-    expected_architecture = (DIRECT_ARCHITECTURE if model_config.get('model_profile') == VECTOR_EXPERT_MODEL_PROFILE
+    expected_architecture = (PURE_TERNARY_ARCHITECTURE if model_config.get('model_profile') == PURE_TERNARY_MODEL_PROFILE
+                             else DIRECT_ARCHITECTURE if model_config.get('model_profile') == VECTOR_EXPERT_MODEL_PROFILE
                              else PREVIOUS_DIRECT_ARCHITECTURE if direct else ARCHITECTURE)
     if payload.get('architecture') != expected_architecture:
         raise ValueError('checkpoint architecture and rigid output configuration disagree')
@@ -600,11 +866,20 @@ def validate_assembly_checkpoint(payload):
         raise ValueError('ternary endpoint v3 requires checkpoint version 26')
     if model_config.get('model_profile') == 'ternary_endpoint_v4' and version < 27:
         raise ValueError('ternary endpoint v4 requires checkpoint version 27')
-    if model_config.get('model_profile') == VECTOR_EXPERT_MODEL_PROFILE and version < ASSEMBLY_CHECKPOINT_VERSION:
-        raise ValueError(f'ternary endpoint v14 legal pose requires checkpoint version {ASSEMBLY_CHECKPOINT_VERSION}')
-    if model_config.get('model_profile') == VECTOR_EXPERT_MODEL_PROFILE:
+    if model_config.get('model_profile') in (VECTOR_EXPERT_MODEL_PROFILE, PURE_TERNARY_MODEL_PROFILE) and version < 56:
+        raise ValueError('ternary endpoint v14 legal pose requires checkpoint version 56')
+    if model_config.get('contact_guidance_contract') == CONTACT_GUIDANCE_CONTRACT and version < 57:
+        raise ValueError('two-sided contact-guided model requires checkpoint version 57')
+    if model_config.get('contact_guidance_contract') == ANCHOR_RELATION_CONTRACT and version < 58:
+        raise ValueError('anchor-relation model requires checkpoint version 58')
+    if model_config.get('torsion_phase_contract') == TORSION_PHASE_CONTRACT and version < 61:
+        raise ValueError('target rotor-phase model requires checkpoint version 61')
+    if model_config.get('target_ligand_frame_contract') == TARGET_LIGAND_FRAME_CONTRACT and version < 64:
+        raise ValueError('anchor-driven joint pose requires checkpoint version 64')
+    if model_config.get('model_profile') in (VECTOR_EXPERT_MODEL_PROFILE, PURE_TERNARY_MODEL_PROFILE):
         if config.get('pose_output_contract') != POSE_OUTPUT_CONTRACT:
             raise ValueError('legal pose output contract differs')
+    if model_config.get('model_profile') == VECTOR_EXPERT_MODEL_PROFILE:
         expert_identity = config.get('expert_runtime_identity', {})
         if model_config.get('expert_backend', 'diffdock') == 'matcha':
             if (expert_identity.get('backend') != 'matcha'
@@ -619,15 +894,23 @@ def validate_assembly_checkpoint(payload):
     if version >= 25:
         profile = model_config.get('model_profile')
         motion = model_config.get('motion_contract', FLOW_MOTION_CONTRACT)
-        new_recipe = profile in ('ternary_endpoint_v2', 'ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE)
-        near_config = NEAR_TARGET_SUPERVISION if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE) else LEGACY_NEAR_TARGET_SUPERVISION
-        expected_recipe = ('quality_gated_iterative_repair_v1' if motion == QUALITY_GATED_REPAIR_MOTION_CONTRACT else
+        drifting = motion == DRIFTING_MOTION_CONTRACT
+        guidance = model_config.get('contact_guidance_contract')
+        if drifting and (profile != PURE_TERNARY_MODEL_PROFILE
+                         or guidance not in (CONTACT_GUIDANCE_CONTRACT, ANCHOR_RELATION_CONTRACT)):
+            raise ValueError('drifting checkpoint requires contact-guided pure ternary model')
+        new_recipe = profile in ('ternary_endpoint_v2', 'ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE, PURE_TERNARY_MODEL_PROFILE)
+        near_config = NEAR_TARGET_SUPERVISION if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE, PURE_TERNARY_MODEL_PROFILE) else LEGACY_NEAR_TARGET_SUPERVISION
+        expected_recipe = ('conditional_geometry_drifting_anchor_roles_v2' if drifting
+                           and guidance == ANCHOR_RELATION_CONTRACT else
+                           'conditional_geometry_drifting_v1' if drifting else
+                           'quality_gated_iterative_repair_v1' if motion == QUALITY_GATED_REPAIR_MOTION_CONTRACT else
                            'bounded_iterative_repair_v1' if motion == BOUNDED_REPAIR_MOTION_CONTRACT else
-                           'endpoint_near_target_v2' if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE) else
+                           'endpoint_near_target_v2' if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE, PURE_TERNARY_MODEL_PROFILE) else
                            'endpoint_near_target_v1' if profile == 'ternary_endpoint_v2' else 'endpoint_only_v1')
         expected = {'training_recipe': expected_recipe,
                     'ema_update_contract': 'optimizer_step_warmup_v1' if new_recipe else 'optimizer_step_fixed_v1',
-                    'near_target_supervision': near_config if new_recipe else None,
+                    'near_target_supervision': near_config if new_recipe and not drifting else None,
                     'validation_weights': 'ema'}
         if any(config.get(key) != value for key, value in expected.items()):
             raise ValueError('checkpoint has an incompatible endpoint/EMA training recipe')
@@ -693,8 +976,11 @@ def validate_assembly_checkpoint(payload):
         raise ValueError('invalid consensus runtime range')
     validate_score_norm_version(config)
     if version >= PREVIOUS_CONSENSUS_CHECKPOINT_VERSION:
-        if config.get('flow_time_contract') != 'shared_flow_expert_clock_v1':
-            raise ValueError('checkpoint has an unknown flow/expert time contract')
+        expected_clock = ('shared_ternary_flow_clock_v1'
+                          if model_config.get('model_profile') == PURE_TERNARY_MODEL_PROFILE
+                          else 'shared_flow_expert_clock_v1')
+        if config.get('flow_time_contract') != expected_clock:
+            raise ValueError('checkpoint has an unknown flow clock contract')
         if config.get('candidate_source_contract') != SOURCE_CONTRACT_VERSION:
             raise ValueError('checkpoint has an unknown candidate source contract')
         if config.get('training_source_mix') not in ('sdpi_only', 'sdpi_bitseed_1_1'):
@@ -758,11 +1044,12 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         self.effective_batch_size = effective_batch_size
         self.resume_best_val_dockq = float('-inf')
         self.activation_clamp_mode = validate_clamp_mode(activation_clamp_mode)
-        configure_expert_policy(self.model.expert, self.activation_clamp, self.activation_clamp_mode)
+        if self.model.expert is not None:
+            configure_expert_policy(self.model.expert, self.activation_clamp, self.activation_clamp_mode)
         self.ema_decay = float(ema_decay)
         profile = self.model.trifuse.config.get('model_profile')
         self.motion_contract = self.model.trifuse.config.get('motion_contract', FLOW_MOTION_CONTRACT)
-        if self.motion_contract not in (FLOW_MOTION_CONTRACT, BOUNDED_REPAIR_MOTION_CONTRACT,
+        if self.motion_contract not in (FLOW_MOTION_CONTRACT, DRIFTING_MOTION_CONTRACT, BOUNDED_REPAIR_MOTION_CONTRACT,
                                        QUALITY_GATED_REPAIR_MOTION_CONTRACT):
             raise ValueError('unsupported assembly motion contract')
         if (self.motion_contract in (BOUNDED_REPAIR_MOTION_CONTRACT,
@@ -770,15 +1057,20 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                 and (not self.model.trifuse.config.get('candidate_driven')
                      or self.model.trifuse.config.get('protac_anchor_contract'))):
             raise ValueError('bounded iterative repair currently requires the candidate-driven ternary contract')
-        self.training_recipe = ('quality_gated_iterative_repair_v1' if self.motion_contract == QUALITY_GATED_REPAIR_MOTION_CONTRACT
+        self.training_recipe = ('conditional_geometry_drifting_anchor_roles_v2'
+            if self.motion_contract == DRIFTING_MOTION_CONTRACT
+            and self.model.trifuse.config.get('contact_guidance_contract') == ANCHOR_RELATION_CONTRACT else
+            'conditional_geometry_drifting_v1' if self.motion_contract == DRIFTING_MOTION_CONTRACT
+                                else 'quality_gated_iterative_repair_v1' if self.motion_contract == QUALITY_GATED_REPAIR_MOTION_CONTRACT
                                 else 'bounded_iterative_repair_v1' if self.motion_contract == BOUNDED_REPAIR_MOTION_CONTRACT
-                                else 'endpoint_near_target_v2' if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE)
+                                else 'endpoint_near_target_v2' if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE, PURE_TERNARY_MODEL_PROFILE)
                                 else 'endpoint_near_target_v1' if profile == 'ternary_endpoint_v2'
                                 else 'endpoint_only_v1')
         self.ema_update_contract = ('optimizer_step_warmup_v1'
                                     if self.training_recipe != 'endpoint_only_v1'
                                     else 'optimizer_step_fixed_v1')
-        self.near_target_supervision = (dict(NEAR_TARGET_SUPERVISION) if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE)
+        self.near_target_supervision = (None if self.motion_contract == DRIFTING_MOTION_CONTRACT
+                                       else dict(NEAR_TARGET_SUPERVISION) if profile in ('ternary_endpoint_v3', 'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE, PURE_TERNARY_MODEL_PROFILE)
                                        else dict(LEGACY_NEAR_TARGET_SUPERVISION) if profile == 'ternary_endpoint_v2'
                                        else None)
         self.near_target_weight = (self.near_target_supervision['weight']
@@ -797,11 +1089,163 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         self.set_phase(1)
         self.ema = {name: value.detach().clone() for name, value in self.model.trifuse.state_dict().items()}
 
+    def backward_drifting_case(self, ed, pd, ld, candidate, *, particles=8,
+                               endpoint_weight=1., torsion_weight=0., rigid_weight=0.,
+                               pose_weight=0.):
+        """Build a complete cohort, then replay its exact frozen targets.
+
+        Two forwards per particle keep memory independent of cohort size.
+        This is the same gradient as holding every generator graph jointly:
+        no optimizer step occurs between cohort construction and replay.
+        """
+        if self.motion_contract != DRIFTING_MOTION_CONTRACT:
+            raise ValueError('drifting training requires its one-pass model contract')
+        if not math.isfinite(endpoint_weight) or endpoint_weight <= 0:
+            raise ValueError('drifting endpoint weight must be finite and positive')
+        if not math.isfinite(torsion_weight) or torsion_weight < 0:
+            raise ValueError('drifting torsion weight must be finite and nonnegative')
+        if not math.isfinite(rigid_weight) or rigid_weight < 0:
+            raise ValueError('drifting rigid weight must be finite and nonnegative')
+        if not math.isfinite(pose_weight) or pose_weight < 0:
+            raise ValueError('drifting pose weight must be finite and nonnegative')
+        from tricoopdiff.initialization.endpoints import reachable_ligand_target
+
+        starts = sample_drifting_starts(candidate, ld, particles)
+        ligand_geometry = drifting_ligand_geometry(ld)
+        initial = starts[0]
+        with torch.no_grad():
+            initial_atoms = ((pd['steric_atoms']-pd['coords'].mean(1, keepdim=True))
+                @ initial['rotation'].transpose(-1, -2)+initial['poi'].mean(1, keepdim=True))
+            target, projection = reachable_ligand_target(
+                ld, initial['ligand'], initial_atoms, pd['steric_atoms'])
+            target = torch.as_tensor(target, device=ld['coords'].device,
+                                     dtype=ld['coords'].dtype).reshape_as(ld['coords'])
+            torsion_targets = ([drifting_torsion_action_target(
+                start['ligand'], target, ligand_geometry) for start in starts]
+                if torsion_weight or rigid_weight else None)
+            rigid_targets = ([drifting_rigid_action_target(start, target, pd['coords'],
+                torsion_targets[index], ld, ed['coords']) for index, start in enumerate(starts)]
+                if rigid_weight else None)
+            target_phases = (torsion_phase_pairs(target, ligand_geometry[1])
+                if torsion_weight and self.model.trifuse.config.get('torsion_phase_contract')
+                else None)
+            pose_target = (ligand_target_frame_label(ed['coords'], target, ld['edge_index'])
+                if pose_weight else None)
+            positive = drifting_geometry_features(ed['coords'], target, pd['coords'],
+                                                  torch.eye(3, device=target.device)[None], ligand_geometry)
+            outputs = [self.model.generate_candidate(ed, pd, ld, start) for start in starts]
+            features = [drifting_geometry_features(ed['coords'], out['ligand'],
+                        out['poi'], out['rotation'], ligand_geometry) for out in outputs]
+            goal, scale, field_info = drifting_targets(
+                torch.cat([drifting_feature_vector(f) for f in features]),
+                drifting_feature_vector(positive), DRIFTING_TRAINING_CONTRACT['temperatures'])
+            rmsd = lambda x, y: (x-y).square().sum(-1).mean().sqrt()
+            before = [float(rmsd(s['ligand'], ld['coords'])) for s in starts]
+            after = [float(rmsd(o['ligand'], ld['coords'])) for o in outputs]
+            movement = [float(rmsd(s['ligand'], o['ligand'])) for s, o in zip(starts, outputs)]
+        recipe = drifting_training_contract(self.model.trifuse.config)
+        total, endpoint_total, contact_total, anchor_total = 0., 0., 0., 0.
+        torsion_total, phase_total, rigid_total, pose_total, replay_error = 0., 0., 0., 0., 0.
+        for index, start in enumerate(starts):
+            out = self.model.generate_candidate(ed, pd, ld, start, return_aux=True)
+            current = drifting_geometry_features(ed['coords'], out['ligand'], out['poi'],
+                                                  out['rotation'], ligand_geometry)
+            for name in current:
+                error = (current[name].detach()-features[index][name]).abs().max()
+                replay_error = max(replay_error, float(error))
+                if not torch.allclose(current[name].detach(), features[index][name], atol=1e-4, rtol=1e-5):
+                    raise RuntimeError('drifting cohort replay changed; gradients would target another function')
+            loss = (drifting_feature_vector(current)/scale-goal[index:index+1]).square().mean()
+            endpoint = ((out['ligand']-target).square().sum(-1).mean()
+                        + (out['poi']-pd['coords']).square().sum(-1).mean()) / 100.
+            if self.model.trifuse.config.get('contact_guidance_contract'):
+                if 'contact_logits' not in out:
+                    raise ValueError('contact-guided model omitted its two-sided contact readout')
+                contact = two_sided_ca_contact_loss(
+                    out['contact_logits'], ed['coords'], pd['coords'], target)
+            else:
+                contact = endpoint.new_zeros(())
+            if self.model.trifuse.config.get('contact_guidance_contract') == ANCHOR_RELATION_CONTRACT:
+                if 'anchor_role_logits' not in out:
+                    raise ValueError('anchor-relation model omitted its role readout')
+                anchor = two_sided_anchor_role_loss(
+                    out['anchor_role_logits'], ed['coords'], pd['coords'], target)
+            else:
+                anchor = endpoint.new_zeros(())
+            if torsion_targets is not None:
+                indices, desired = torsion_targets[index]
+                predicted = out['normalized_torsion_action']
+                if predicted.shape != (1, int(ld['edge_mask'].sum())):
+                    raise ValueError('torsion action disagrees with chemical rotor count')
+                torsion_loss = (torch.nn.functional.mse_loss(predicted[:, indices], desired)
+                    if len(indices) else endpoint.new_zeros(()))
+            else:
+                torsion_loss = endpoint.new_zeros(())
+            if target_phases is not None and len(indices):
+                predicted_phase = out['predicted_torsion_target_phase']
+                positions = torch.searchsorted(ligand_geometry[2], indices)
+                phase_loss = torch.nn.functional.mse_loss(
+                    predicted_phase[:, indices], target_phases[:, positions])
+            else:
+                phase_loss = endpoint.new_zeros(())
+            if rigid_targets is not None:
+                predicted_rigid = out['normalized_rigid_action']
+                rigid_loss = torch.stack([
+                    torch.nn.functional.mse_loss(
+                        predicted_rigid[branch][component],
+                        rigid_targets[index][branch][component])
+                    for branch in ('e3_ligand', 'poi_ligand')
+                    for component in ('tr', 'rot')]).mean()
+            else:
+                rigid_loss = endpoint.new_zeros(())
+            if pose_target is not None:
+                pose_loss = torch.nn.functional.mse_loss(
+                    out['predicted_ligand_pose_local'], pose_target)
+            else:
+                pose_loss = endpoint.new_zeros(())
+            objective = (loss + recipe['endpoint_weight'] * endpoint_weight * endpoint
+                         + recipe['contact_weight'] * contact
+                         + recipe.get('anchor_role_weight', 0.) * anchor
+                         + torsion_weight * (torsion_loss + phase_loss)
+                         + rigid_weight * rigid_loss + pose_weight * pose_loss)
+            (objective/particles).backward()
+            total += float(objective.detach())/particles
+            endpoint_total += float(endpoint.detach())/particles
+            contact_total += float(contact.detach())/particles
+            anchor_total += float(anchor.detach())/particles
+            torsion_total += float(torsion_loss.detach())/particles
+            phase_total += float(phase_loss.detach())/particles
+            rigid_total += float(rigid_loss.detach())/particles
+            pose_total += float(pose_loss.detach())/particles
+        return {'loss': total, 'loss_contract': recipe['version'],
+                'drifting_endpoint_weight': endpoint_weight,
+                'drifting_torsion_weight': torsion_weight,
+                'drifting_rigid_weight': rigid_weight,
+                'drifting_pose_weight': pose_weight,
+                'endpoint_geometry_loss': endpoint_total,
+                'two_sided_contact_loss': contact_total,
+                'two_sided_anchor_role_loss': anchor_total,
+                'torsion_action_loss': torsion_total,
+                'torsion_target_phase_loss': phase_total,
+                'rigid_action_loss': rigid_total,
+                'ligand_target_frame_loss': pose_total,
+                'particles': particles, 'network_evaluations_per_prediction': 1,
+                'before_ligand_rmsd': before, 'after_ligand_rmsd': after,
+                'ligand_movement_angstrom': movement,
+                'mean_ligand_rmsd': float(np.mean(after)),
+                'median_ligand_rmsd': float(np.median(after)),
+                'fraction_ligand_improved': float(np.mean(np.array(after) < np.array(before))),
+                'target_projection_rmsd_angstrom': projection['ligand_projection_rmsd_angstrom'],
+                'drift_field': field_info,
+                'max_replay_error': replay_error}
+
     def compute_loss(self, e3_data, poi_data, ligand_data, case='unknown',
                      t_override=None, t_pol_override=None, coupling_override=None,
                      diagnostics=False, source=0, conditions=None, near_target_zero=None,
                      near_target_start_t=None, initialization_seed_override=None,
                      near_noise_override=None, task_mode=None):
+        if self.motion_contract == DRIFTING_MOTION_CONTRACT:
+            raise ValueError('drifting requires backward_drifting_case on a complete conditional cohort')
         if near_target_start_t is not None and near_target_zero is None:
             raise ValueError('near-target start time requires an auxiliary entry')
         if near_target_zero is not None:
@@ -843,10 +1287,11 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                 raise ValueError('candidate training requires an explicit assemble/refine task mode')
             candidate_source_tensor(task_mode, pd['coords'], TASK_NAMES)
             pd['task_mode'] = task_mode
-        no_torsion = bool(getattr(self.model.expert.model, 'no_torsion', False))
+        no_torsion = _model_has_no_torsion(self.model)
         dt = ld['coords'].new_full((1,), 1 / self.diffusion.inference_steps)
         projection = None
-        source_names = (CANDIDATE_SOURCE_NAMES if self.model.trifuse.config.get('candidate_driven')
+        source_names = ((PURE_CANDIDATE_SOURCE_NAMES if self.model.trifuse.config.get('expert_free')
+                         else CANDIDATE_SOURCE_NAMES) if self.model.trifuse.config.get('candidate_driven')
                         else ('sdpi', 'bitseed'))
         source = int(candidate_source_tensor(source, dt, source_names).item())
         from tricoopdiff.initialization import TernaryInitializer
@@ -974,7 +1419,7 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                 velocities = near_noise_override if near_noise_override is not None else {
                     'rigid_output_mode': INDEPENDENT_RIGID_MODE,
                     **({'torsion_update_mode': CONTINUOUS_TORSION_MODE}
-                       if self.model.trifuse.config.get('model_profile') in ('ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE) else {}),
+                       if self.model.trifuse.config.get('model_profile') in ('ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE, PURE_TERNARY_MODEL_PROFILE) else {}),
                     'torsion': near_ligand.new_empty((1, 0 if no_torsion else int(ld['edge_mask'].sum()))).normal_(
                         0, self.near_target_supervision['torsion_std_radians']),
                     **{branch: {'tr': near_ligand.new_empty((1, 3)).normal_(
@@ -1108,7 +1553,7 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         step_dt = ligand.new_full((1,), float(start_t) / steps)
         action_modes = {'rigid_output_mode': INDEPENDENT_RIGID_MODE}
         if self.model.trifuse.config.get('model_profile') in (
-                'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE):
+                'ternary_endpoint_v4', VECTOR_EXPERT_MODEL_PROFILE, PURE_TERNARY_MODEL_PROFILE):
             action_modes['torsion_update_mode'] = CONTINUOUS_TORSION_MODE
 
         remaining_torsion = torch.as_tensor(
@@ -1358,7 +1803,8 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         names = {id(parameter): name for name, parameter in self.model.named_parameters()}
         parameters = [parameter for group in self.optimizer.param_groups for parameter in group['params']]
         return {
-            'expert_base_identity': expert_base_identity(self.model.expert),
+            'expert_base_identity': (expert_base_identity(self.model.expert)
+                                     if self.model.expert is not None else 'none'),
             'model_config': dict(self.model.trifuse.config),
             'trifuse_state_dict': self.model.trifuse.state_dict(),
             'ema_trifuse_state_dict': self.ema,
@@ -1476,7 +1922,11 @@ class AssemblyTrainer(TriCoopDiffTrainer):
         from tricoopdiff.initialization.endpoints import PROJECTION_SOLVER_VERSION
         """Build the shared training/inference payload without writing files."""
         payload = {
-            'checkpoint_version': ASSEMBLY_CHECKPOINT_VERSION,
+            'checkpoint_version': (64 if self.model.trifuse.config.get('target_ligand_frame_contract')
+                == TARGET_LIGAND_FRAME_CONTRACT else 61 if self.model.trifuse.config.get('torsion_phase_contract')
+                == TORSION_PHASE_CONTRACT else 58 if self.model.trifuse.config.get('contact_guidance_contract')
+                == ANCHOR_RELATION_CONTRACT else 57
+                if self.model.trifuse.config.get('contact_guidance_contract') else 56),
             'architecture': self.model.architecture, 'generative_process': FLOW_VERSION,
             'expert_lora_config': None, 'expert_lora_state_dict': {},
             'runtime_config': {
@@ -1485,7 +1935,9 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                 'activation_clamp_mode': self.activation_clamp_mode,
                 'residual_weight': self.residual_weight, 'ema_decay': self.ema_decay,
                 'optimizer_groups': self.optimizer_config,
-                'flow_time_contract': 'shared_flow_expert_clock_v1',
+                'flow_time_contract': ('shared_ternary_flow_clock_v1'
+                    if self.model.trifuse.config.get('model_profile') == PURE_TERNARY_MODEL_PROFILE
+                    else 'shared_flow_expert_clock_v1'),
                 'candidate_source_contract': SOURCE_CONTRACT_VERSION,
                 'training_source_mix': self.training_source_mix,
                 'training_endpoint_protocol': self.training_endpoint_protocol,
@@ -1515,15 +1967,18 @@ class AssemblyTrainer(TriCoopDiffTrainer):
                 'effective_batch_size': self.effective_batch_size,
                 'training_recipe': self.training_recipe,
                 'pose_output_contract': (dict(POSE_OUTPUT_CONTRACT)
-                                         if self.model.trifuse.config.get('model_profile') == VECTOR_EXPERT_MODEL_PROFILE
+                                         if self.model.trifuse.config.get('model_profile') in (
+                                             VECTOR_EXPERT_MODEL_PROFILE, PURE_TERNARY_MODEL_PROFILE)
                                          else None),
                 'ema_update_contract': self.ema_update_contract,
                 'near_target_supervision': self.near_target_supervision,
                 'validation_weights': 'ema',
                 'validation_dockq_protocol': REAL_VALIDATION_DOCKQ_PROTOCOL,
-                'expert_runtime_identity': expert_runtime_identity(self.model.expert),
+                'expert_runtime_identity': (expert_runtime_identity(self.model.expert)
+                                            if self.model.expert is not None else 'none'),
                 'expert_crop_policy': (getattr(self.model.expert, 'crop_policy', EXPERT_CROP_POLICY)
-                                       if self.model.trifuse.config.get('model_profile') == VECTOR_EXPERT_MODEL_PROFILE
+                                       if self.model.expert is not None and
+                                       self.model.trifuse.config.get('model_profile') == VECTOR_EXPERT_MODEL_PROFILE
                                        else None),
             },
             **self._optimization_payload({'epoch': epoch, 'best_val_loss': best_val_loss,
@@ -1581,7 +2036,7 @@ class AssemblyTrainer(TriCoopDiffTrainer):
             raise ValueError('historical protein loss used protein-radius units; load weights only, not resume')
         if payload['runtime_config'].get('ligand_interface_contract') != LIGAND_INTERFACE_CONTRACT:
             raise ValueError('ligand interface supervision differs; load weights only, not resume')
-        if (payload['checkpoint_version'] not in (24, 25, 26, 27, 39, ASSEMBLY_CHECKPOINT_VERSION)
+        if (payload['checkpoint_version'] not in (24, 25, 26, 27, 39, 56, ASSEMBLY_CHECKPOINT_VERSION)
                 or payload['runtime_config'].get('training_objective') != REAL_ENDPOINT_OBJECTIVE):
             raise ValueError('training objective differs or checkpoint is historical; load weights only')
         for key in ('inference_steps', 'endpoint_loss_weight', 'interface_loss_weight',
@@ -1594,8 +2049,14 @@ class AssemblyTrainer(TriCoopDiffTrainer):
             'interface_error_scale', payload['runtime_config']['interface_cutoff'])
         if saved_scale != self.interface_error_scale:
             raise ValueError('checkpoint interface_error_scale differs from the trainer')
-        validate_expert_base_identity(payload, self.model.expert)
-        if payload['runtime_config']['expert_runtime_identity'] != expert_runtime_identity(self.model.expert):
+        if self.model.expert is not None:
+            validate_expert_base_identity(payload, self.model.expert)
+            expected_expert_runtime = expert_runtime_identity(self.model.expert)
+        else:
+            if payload.get('expert_base_identity') != 'none':
+                raise ValueError('pure ternary checkpoint cannot contain a binary expert identity')
+            expected_expert_runtime = 'none'
+        if payload['runtime_config']['expert_runtime_identity'] != expected_expert_runtime:
             raise ValueError('checkpoint expert runtime configuration differs')
         saved_grad = payload['runtime_config'].get('expert_input_grad', False)
         if saved_grad != getattr(self.model, 'expert_input_grad', True):
